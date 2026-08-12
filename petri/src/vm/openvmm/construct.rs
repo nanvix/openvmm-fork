@@ -32,6 +32,9 @@ use crate::openvmm::petri_disk_to_openvmm;
 use crate::vm::PetriVmProperties;
 use crate::vm::append_cmdline;
 use anyhow::Context;
+use chipset_resources::microvm::MicrovmPortbHandle;
+use chipset_resources::microvm::MicrovmShutdownHandle;
+use chipset_resources::microvm::MicrovmSnapshotRequestHandle;
 use framebuffer::FRAMEBUFFER_SIZE;
 use framebuffer::Framebuffer;
 use framebuffer::FramebufferAccess;
@@ -52,6 +55,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LateMapVtl0MemoryPolicy;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::NumaNode;
 use openvmm_defs::config::NumaTopology;
 use openvmm_defs::config::PcieDeviceConfig;
@@ -62,6 +66,7 @@ use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
+use openvmm_defs::config::build_microvm_command_line;
 use openvmm_pcat_locator::RomFileLocation;
 use pal_async::DefaultDriver;
 use pal_async::socket::PolledSocket;
@@ -96,6 +101,7 @@ use vm_manifest_builder::VmChipsetResult;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
+use vm_resource::ResourceId;
 use vm_resource::kind::SerialBackendHandle;
 use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
@@ -117,6 +123,7 @@ impl PetriVmConfigOpenVmm {
         let PetriVmConfig {
             name: _,
             arch,
+            machine_profile,
             host_log_levels,
             firmware,
             memory,
@@ -128,6 +135,18 @@ impl PetriVmConfigOpenVmm {
             pcie_virtio_blk_drives,
             physical_nvme_devices,
         } = petri_vm_config;
+
+        let is_microvm = matches!(machine_profile, MachineProfile::Microvm { .. });
+        if is_microvm {
+            anyhow::ensure!(
+                matches!(arch, MachineArch::X86_64),
+                "microVM requires an x86-64 guest"
+            );
+            anyhow::ensure!(
+                matches!(firmware, Firmware::LinuxDirect { .. }),
+                "microVM requires an uncompressed Xen PVH LinuxDirect artifact"
+            );
+        }
 
         if !physical_nvme_devices.is_empty() {
             anyhow::bail!("Physical NVMe devices are only supported with the Hyper-V backend");
@@ -157,20 +176,25 @@ impl PetriVmConfigOpenVmm {
             use_virtio_vsock: properties.use_virtio_vsock,
             no_vmbus: properties.no_vmbus,
             no_hv: properties.no_hv,
+            is_microvm,
         };
 
         let mut chipset = VmManifestBuilder::new(
-            match firmware {
-                Firmware::LinuxDirect { .. } => {
-                    vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect
+            if is_microvm {
+                vm_manifest_builder::BaseChipsetType::Microvm
+            } else {
+                match firmware {
+                    Firmware::LinuxDirect { .. } => {
+                        vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect
+                    }
+                    Firmware::OpenhclLinuxDirect { .. } => {
+                        vm_manifest_builder::BaseChipsetType::HclHost
+                    }
+                    Firmware::OpenhclUefi { .. } => vm_manifest_builder::BaseChipsetType::HclHost,
+                    Firmware::Pcat { .. } => vm_manifest_builder::BaseChipsetType::HypervGen1,
+                    Firmware::Uefi { .. } => vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
+                    Firmware::OpenhclPcat { .. } => todo!("OpenVMM OpenHCL PCAT"),
                 }
-                Firmware::OpenhclLinuxDirect { .. } => {
-                    vm_manifest_builder::BaseChipsetType::HclHost
-                }
-                Firmware::OpenhclUefi { .. } => vm_manifest_builder::BaseChipsetType::HclHost,
-                Firmware::Pcat { .. } => vm_manifest_builder::BaseChipsetType::HypervGen1,
-                Firmware::Uefi { .. } => vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
-                Firmware::OpenhclPcat { .. } => todo!("OpenVMM OpenHCL PCAT"),
             },
             match arch {
                 MachineArch::X86_64 => vm_manifest_builder::MachineArch::X86_64,
@@ -180,15 +204,9 @@ impl PetriVmConfigOpenVmm {
 
         let mut load_mode = setup.load_firmware()?;
 
-        // If using pipette-as-init, replace the initrd with the pre-built
-        // one that has pipette injected. run_core() guarantees that
-        // prebuilt_initrd is set when uses_pipette_as_init is true.
-        if properties.uses_pipette_as_init {
+        // Replace the initrd when the builder supplied a modified copy.
+        if let Some(prebuilt) = properties.prebuilt_initrd.as_ref() {
             if let LoadMode::Linux { initrd, .. } = &mut load_mode {
-                let prebuilt = properties
-                    .prebuilt_initrd
-                    .as_ref()
-                    .expect("uses_pipette_as_init requires prebuilt_initrd");
                 let file = std::fs::File::open(prebuilt).with_context(|| {
                     format!("failed to open prebuilt initrd at {}", prebuilt.display())
                 })?;
@@ -196,23 +214,48 @@ impl PetriVmConfigOpenVmm {
             }
         }
 
-        let (emulated_serial_config, log_stream_tasks, linux_direct_serial_agent) =
-            if !properties.enable_serial {
-                // No emulated serial backends (OpenHCL VMBus serial stubs may still exist)
-                ([None, None, None, None], Vec::new(), None)
-            } else {
-                let SerialData {
-                    emulated_serial_config,
-                    serial_tasks,
-                    linux_direct_serial_agent,
-                } = setup.configure_serial(log_source)?;
-                (
-                    emulated_serial_config,
-                    serial_tasks,
-                    linux_direct_serial_agent,
-                )
+        if is_microvm {
+            load_mode = match load_mode {
+                LoadMode::Linux { kernel, initrd, .. } => LoadMode::Pvh {
+                    kernel,
+                    initrd,
+                    cmdline: build_microvm_command_line(&[])?,
+                },
+                _ => unreachable!("microVM firmware was validated as LinuxDirect"),
             };
+        }
+
+        let (
+            emulated_serial_config,
+            log_stream_tasks,
+            linux_direct_serial_agent,
+            microvm_portb_input,
+            microvm_portb_output,
+        ) = if !properties.enable_serial {
+            // No emulated serial backends (OpenHCL VMBus serial stubs may still exist)
+            ([None, None, None, None], Vec::new(), None, None, None)
+        } else {
+            let SerialData {
+                emulated_serial_config,
+                serial_tasks,
+                linux_direct_serial_agent,
+                microvm_portb_input,
+                microvm_portb_output,
+            } = setup.configure_serial(log_source)?;
+            (
+                emulated_serial_config,
+                serial_tasks,
+                linux_direct_serial_agent,
+                microvm_portb_input,
+                microvm_portb_output,
+            )
+        };
         let mut emulated_serial_config = emulated_serial_config;
+        let microvm_portb = is_microvm.then(|| {
+            emulated_serial_config[0]
+                .take()
+                .unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource())
+        });
 
         let (video_dev, framebuffer, framebuffer_view) = match setup.config_video()? {
             Some((v, fb, fba)) => {
@@ -344,7 +387,7 @@ impl PetriVmConfigOpenVmm {
 
         // Configure the serial ports now that they have been updated by the
         // OpenHCL configuration.
-        if properties.enable_serial {
+        if properties.enable_serial && !is_microvm {
             chipset = chipset.with_serial(emulated_serial_config);
             // Set so that we don't pull serial data until the guest is
             // ready. Otherwise, Linux will drop the input serial data
@@ -581,7 +624,7 @@ impl PetriVmConfigOpenVmm {
             }
         };
 
-        let vmgs = if firmware.is_openhcl() {
+        let vmgs = if firmware.is_openhcl() || is_microvm {
             None
         } else {
             Some(memdiff_vmgs(&vmgs).await?)
@@ -594,6 +637,23 @@ impl PetriVmConfigOpenVmm {
             isa_dma_controller,
             capabilities,
         } = chipset;
+
+        if let Some(io) = microvm_portb {
+            chipset_devices.extend([
+                ChipsetDeviceHandle {
+                    name: MicrovmPortbHandle::ID.to_owned(),
+                    resource: MicrovmPortbHandle { io }.into_resource(),
+                },
+                ChipsetDeviceHandle {
+                    name: MicrovmShutdownHandle::ID.to_owned(),
+                    resource: MicrovmShutdownHandle.into_resource(),
+                },
+                ChipsetDeviceHandle {
+                    name: MicrovmSnapshotRequestHandle::ID.to_owned(),
+                    resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+                },
+            ]);
+        }
 
         // Add the TPM
         if let Some(tpm) = setup.config_tpm().await? {
@@ -639,8 +699,9 @@ impl PetriVmConfigOpenVmm {
 
         let config = Config {
             // Firmware
+            machine_profile,
             load_mode,
-            firmware_event_send: Some(firmware_event_send),
+            firmware_event_send: (!is_microvm).then_some(firmware_event_send),
 
             // CPU and RAM
             numa,
@@ -656,7 +717,7 @@ impl PetriVmConfigOpenVmm {
 
             // Basic virtualization device support
             hypervisor: HypervisorConfig {
-                with_hv: !properties.no_hv,
+                with_hv: !properties.no_hv && !is_microvm,
                 with_vtl2,
                 with_isolation: match firmware.isolation() {
                     Some(IsolationType::Vbs) => Some(openvmm_defs::config::IsolationType::Vbs),
@@ -665,7 +726,7 @@ impl PetriVmConfigOpenVmm {
                 },
                 nested_virt: false,
             },
-            vmbus: if properties.no_vmbus {
+            vmbus: if properties.no_vmbus || is_microvm {
                 None
             } else {
                 Some(VmbusConfig {
@@ -710,6 +771,8 @@ impl PetriVmConfigOpenVmm {
             rtc_delta_milliseconds: 0,
         };
 
+        openvmm_defs::config::validate_machine_config(&config, None)?;
+
         // Make the pipette connection listener.
         let path = format!("{vsock_path_string}_{PIPETTE_PORT}");
         let pipette_listener = PolledSocket::new(
@@ -745,6 +808,8 @@ impl PetriVmConfigOpenVmm {
                 pipette_listener,
                 vtl2_pipette_listener,
                 linux_direct_serial_agent,
+                microvm_portb_input,
+                microvm_portb_output,
                 tcp_pipette_port: None,
                 driver: driver.clone(),
                 output_dir: log_source.output_dir().to_owned(),
@@ -783,12 +848,15 @@ struct PetriVmConfigSetupCore<'a> {
     use_virtio_vsock: bool,
     no_vmbus: bool,
     no_hv: bool,
+    is_microvm: bool,
 }
 
 struct SerialData {
     emulated_serial_config: [Option<Resource<SerialBackendHandle>>; 4],
     serial_tasks: Vec<Task<anyhow::Result<()>>>,
     linux_direct_serial_agent: Option<LinuxDirectSerialAgent>,
+    microvm_portb_input: Option<pal_async::socket::WriteHalf<UnixStream>>,
+    microvm_portb_output: Option<mesh::Receiver<Vec<u8>>>,
 }
 
 enum VideoDevice {
@@ -810,11 +878,40 @@ impl PetriVmConfigSetupCore<'_> {
             .create_serial_stream()
             .context("failed to create serial0 stream")?;
         let (serial0_read, serial0_write) = serial0_host.split();
-        let serial0_task = self.driver.spawn(
-            "serial0-console",
-            crate::log_task(serial0_log_file, serial0_read, "serial0-console"),
-        );
+        let (serial0_task, microvm_portb_output) = if self.is_microvm {
+            let (output_send, output_recv) = mesh::channel();
+            (
+                self.driver.spawn(
+                    "microvm-portb-console",
+                    crate::log_task_with_output(
+                        serial0_log_file,
+                        serial0_read,
+                        "microvm-portb-console",
+                        output_send,
+                    ),
+                ),
+                Some(output_recv),
+            )
+        } else {
+            (
+                self.driver.spawn(
+                    "serial0-console",
+                    crate::log_task(serial0_log_file, serial0_read, "serial0-console"),
+                ),
+                None,
+            )
+        };
         serial_tasks.push(serial0_task);
+
+        if self.is_microvm {
+            return Ok(SerialData {
+                emulated_serial_config: [serial0, None, None, None],
+                serial_tasks,
+                linux_direct_serial_agent: None,
+                microvm_portb_input: Some(serial0_write),
+                microvm_portb_output,
+            });
+        }
 
         let serial2 = if self.firmware.is_openhcl() {
             let (serial2_host, serial2) = self
@@ -841,12 +938,16 @@ impl PetriVmConfigSetupCore<'_> {
                 emulated_serial_config: [serial0, serial1, serial2, None],
                 serial_tasks,
                 linux_direct_serial_agent: Some(linux_direct_serial_agent),
+                microvm_portb_input: None,
+                microvm_portb_output: None,
             })
         } else {
             Ok(SerialData {
                 emulated_serial_config: [serial0, None, serial2, None],
                 serial_tasks,
                 linux_direct_serial_agent: None,
+                microvm_portb_input: None,
+                microvm_portb_output: None,
             })
         }
     }

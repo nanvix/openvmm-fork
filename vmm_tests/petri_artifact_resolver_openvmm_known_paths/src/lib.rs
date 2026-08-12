@@ -72,6 +72,8 @@ impl petri_artifacts_core::ResolveTestArtifact for OpenvmmKnownPathsTestArtifact
             _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_AARCH64 => linux_direct_arm_image_path(),
             _ if id == loadable::LINUX_DIRECT_TEST_INITRD_X64 => linux_direct_test_initrd_path(MachineArch::X86_64),
             _ if id == loadable::LINUX_DIRECT_TEST_INITRD_AARCH64 => linux_direct_test_initrd_path(MachineArch::Aarch64),
+            _ if id == loadable::MICROVM_PVH_TEST_KERNEL_X64 => microvm_pvh_kernel_path(),
+            _ if id == loadable::MICROVM_PVH_TEST_INITRD_X64 => microvm_pvh_initrd_path(),
 
             _ if id == petritools::PETRITOOLS_EROFS_X64 => petritools_erofs_path(MachineArch::X86_64),
             _ if id == petritools::PETRITOOLS_EROFS_AARCH64 => petritools_erofs_path(MachineArch::Aarch64),
@@ -456,6 +458,8 @@ fn virtio_win_path() -> anyhow::Result<PathBuf> {
 const OPENVMM_CCA_TEST_ROOT_ENV_VAR: &str = "OPENVMM_CCA_TEST_ROOT";
 const OPENVMM_CCA_TMK_VMM_ENV_VAR: &str = "OPENVMM_CCA_TMK_VMM";
 const OPENVMM_CCA_SIMPLE_TMK_ENV_VAR: &str = "OPENVMM_CCA_SIMPLE_TMK";
+const OPENVMM_MICROVM_PVH_KERNEL_ENV_VAR: &str = "OPENVMM_MICROVM_PVH_KERNEL";
+const OPENVMM_MICROVM_PVH_INITRD_ENV_VAR: &str = "OPENVMM_MICROVM_PVH_INITRD";
 
 fn cca_missing_command(description: &'static str) -> MissingCommand<'static> {
     MissingCommand::XFlowey {
@@ -644,6 +648,32 @@ fn linux_direct_test_initrd_path(arch: MachineArch) -> anyhow::Result<PathBuf> {
             description: "linux direct test initrd",
         },
     )
+}
+
+fn microvm_pvh_kernel_path() -> anyhow::Result<PathBuf> {
+    env_path_or(OPENVMM_MICROVM_PVH_KERNEL_ENV_VAR, || {
+        get_path(
+            "../nvx/build",
+            "vmlinux-blk",
+            MissingCommand::Custom {
+                description: "microVM Xen PVH test kernel",
+                cmd: "set OPENVMM_MICROVM_PVH_KERNEL to an hvc_xe9/virtio-blk-enabled vmlinux",
+            },
+        )
+    })
+}
+
+fn microvm_pvh_initrd_path() -> anyhow::Result<PathBuf> {
+    env_path_or(OPENVMM_MICROVM_PVH_INITRD_ENV_VAR, || {
+        get_path(
+            "../nvx/build",
+            "initramfs.cpio.gz",
+            MissingCommand::Custom {
+                description: "microVM Alpine test initramfs",
+                cmd: "set OPENVMM_MICROVM_PVH_INITRD to a microVM Alpine initramfs",
+            },
+        )
+    })
 }
 
 /// Path to our packaged petritools erofs image.

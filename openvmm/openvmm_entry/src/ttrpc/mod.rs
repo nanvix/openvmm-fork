@@ -31,6 +31,9 @@ use crate::vm_controller::VmControllerRpc;
 use anyhow::Context;
 use anyhow::anyhow;
 use anyhow::bail;
+use chipset_resources::microvm::MicrovmPortbHandle;
+use chipset_resources::microvm::MicrovmShutdownHandle;
+use chipset_resources::microvm::MicrovmSnapshotRequestHandle;
 use futures::FutureExt;
 use futures::StreamExt;
 use guid::Guid;
@@ -54,10 +57,13 @@ use net_backend_resources::consomme::HostPortConfig;
 use net_backend_resources::consomme::HostPortProtocol;
 use net_backend_resources::mac_address::MacAddress;
 use netvsp_resources::NetvspHandle;
+use openvmm_defs::config::ArchTopologyConfig;
 use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MICROVM_ABI_VERSION_1;
+use openvmm_defs::config::MachineProfile as OpenvmmMachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
 use openvmm_defs::config::NumaNode;
@@ -74,6 +80,8 @@ use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
+use openvmm_defs::config::X86TopologyConfig;
+use openvmm_defs::config::build_microvm_command_line;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -85,6 +93,7 @@ use pal_async::DefaultPool;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use scsidisk_resources::SimpleScsiDiskHandle;
+use serial_core::resources::DisconnectedSerialBackendHandle;
 use std::fs::File;
 use std::future::Future;
 use std::sync::Arc;
@@ -97,6 +106,7 @@ use virtio_resources::VirtioPciDeviceHandle;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
+use vm_resource::ResourceId;
 use vm_resource::kind::DiskHandleKind;
 use vm_resource::kind::NetEndpointHandleKind;
 use vm_resource::kind::PciDeviceHandleKind;
@@ -104,6 +114,7 @@ use vm_resource::kind::SerialBackendHandle;
 use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vmcore::non_volatile_store::resources::EphemeralNonVolatileStoreHandle;
+use vmotherboard::ChipsetDeviceHandle;
 
 #[derive(mesh::MeshPayload)]
 pub struct Parameters {
@@ -693,6 +704,73 @@ impl VmService {
             bail!("VM already created");
         }
 
+        let requested_profile =
+            vmservice::vm_config::MachineProfile::from_i32(req_config.machine_profile)
+                .with_context(|| {
+                    format!("unknown machine profile {}", req_config.machine_profile)
+                })?;
+        let machine_profile = match requested_profile {
+            vmservice::vm_config::MachineProfile::Standard => OpenvmmMachineProfile::Standard,
+            vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm {
+                abi_version: MICROVM_ABI_VERSION_1,
+            },
+        };
+        let is_microvm = matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. });
+        if is_microvm {
+            anyhow::ensure!(
+                cfg!(guest_arch = "x86_64"),
+                "microVM requires an x86-64 guest"
+            );
+            anyhow::ensure!(
+                matches!(
+                    req_config.boot_config.as_ref(),
+                    Some(vmservice::vm_config::BootConfig::PvhBoot(_))
+                ),
+                "the microVM profile requires pvh_boot"
+            );
+            anyhow::ensure!(
+                req_config
+                    .processor_config
+                    .as_ref()
+                    .map(|config| config.processor_count)
+                    .unwrap_or(1)
+                    == 1,
+                "microVM ABI version 1 requires exactly one vCPU"
+            );
+            anyhow::ensure!(
+                req_config.numa_config.is_none(),
+                "microVM ABI version 1 does not support custom NUMA topology"
+            );
+            anyhow::ensure!(
+                req_config.pcie.is_none(),
+                "microVM ABI version 1 does not support PCIe"
+            );
+            anyhow::ensure!(
+                req_config.hvsocket_config.is_none(),
+                "microVM ABI version 1 does not support hvsocket"
+            );
+
+            let serial_ports = req_config
+                .serial_config
+                .iter()
+                .flat_map(|config| &config.ports)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                serial_ports.len() <= 1 && serial_ports.iter().all(|port| port.port == 0),
+                "microVM ABI version 1 accepts only serial port 0 as its portb endpoint"
+            );
+            if let Some(devices) = &req_config.devices_config {
+                anyhow::ensure!(
+                    devices.scsi_disks.is_empty()
+                        && devices.vpmem_disks.is_empty()
+                        && devices.nic_config.is_empty()
+                        && devices.windows_device.is_empty()
+                        && devices.virtiofs_config.is_empty()
+                        && devices.virtio_console.is_none(),
+                    "microVM ABI version 1 supports only the optional virtio-blk device"
+                );
+            }
+        }
         // Snapshot the fd registry so tap NIC backends can resolve descriptors
         // passed in over the fd-passing protocol.
         let registry = self.registry.clone();
@@ -726,6 +804,9 @@ impl VmService {
             .context("missing boot configuration")?
         {
             vmservice::vm_config::BootConfig::DirectBoot(boot) => {
+                if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                    bail!("the microVM profile requires pvh_boot");
+                }
                 let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
                 let initrd = if boot.initrd_path.is_empty() {
                     None
@@ -744,7 +825,30 @@ impl VmService {
                     None,
                 )
             }
+            vmservice::vm_config::BootConfig::PvhBoot(boot) => {
+                if !matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                    bail!("pvh_boot requires the microVM profile");
+                }
+                let kernel = File::open(boot.kernel_path).context("failed to open PVH kernel")?;
+                let initrd = if boot.initrd_path.is_empty() {
+                    None
+                } else {
+                    Some(File::open(boot.initrd_path).context("failed to open PVH initrd")?)
+                };
+                (
+                    LoadMode::Pvh {
+                        kernel,
+                        initrd,
+                        cmdline: build_microvm_command_line(&[boot.kernel_cmdline])?,
+                    },
+                    vm_manifest_builder::BaseChipsetType::Microvm,
+                    None,
+                )
+            }
             vmservice::vm_config::BootConfig::Uefi(uefi) => {
+                if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                    bail!("the microVM profile requires pvh_boot");
+                }
                 let firmware = File::open(&uefi.firmware_path).with_context(|| {
                     format!("failed to open uefi firmware {}", uefi.firmware_path)
                 })?;
@@ -813,8 +917,22 @@ impl VmService {
             }
         };
 
-        let mut chipset_builder =
-            VmManifestBuilder::new(base_chipset_type, arch).with_serial(ports);
+        let microvm_portb = if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+            if ports.iter().skip(1).any(Option::is_some) {
+                bail!("microVM ABI version 1 accepts only serial port 0 as its portb endpoint");
+            }
+            Some(
+                ports[0]
+                    .take()
+                    .unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource()),
+            )
+        } else {
+            None
+        };
+        let mut chipset_builder = VmManifestBuilder::new(base_chipset_type, arch);
+        if microvm_portb.is_none() {
+            chipset_builder = chipset_builder.with_serial(ports);
+        }
         if let Some((base_template_json, secure_boot_enabled)) = uefi_config {
             // The UEFI helper device backs the firmware's variable store and
             // runtime services, so it is required for a UEFI boot. The store is
@@ -832,9 +950,25 @@ impl VmService {
             ));
         }
         let layout_config = chipset_builder.layout_config();
-        let chipset = chipset_builder
+        let mut chipset = chipset_builder
             .build()
             .context("failed to build vm configuration")?;
+        if let Some(io) = microvm_portb {
+            chipset.chipset_devices.extend([
+                ChipsetDeviceHandle {
+                    name: MicrovmPortbHandle::ID.to_owned(),
+                    resource: MicrovmPortbHandle { io }.into_resource(),
+                },
+                ChipsetDeviceHandle {
+                    name: MicrovmShutdownHandle::ID.to_owned(),
+                    resource: MicrovmShutdownHandle.into_resource(),
+                },
+                ChipsetDeviceHandle {
+                    name: MicrovmSnapshotRequestHandle::ID.to_owned(),
+                    resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+                },
+            ]);
+        }
 
         // Build the NUMA topology. A `MemoryConfig` and an explicit
         // `NumaConfig` are mutually exclusive (mirrors the CLI `--memory` vs
@@ -887,6 +1021,7 @@ impl VmService {
 
         let mut config = Config {
             // TODO: devices, other stuff
+            machine_profile,
             load_mode,
             ide_disks: vec![],
             floppy_disks: vec![],
@@ -901,10 +1036,14 @@ impl VmService {
                 proc_count: config_proc_count,
                 vps_per_socket: None,
                 enable_smt: None,
-                arch: Default::default(),
+                arch: if is_microvm {
+                    Some(ArchTopologyConfig::X86(X86TopologyConfig::default()))
+                } else {
+                    None
+                },
             },
             hypervisor: HypervisorConfig {
-                with_hv: true,
+                with_hv: matches!(machine_profile, OpenvmmMachineProfile::Standard),
                 ..Default::default()
             },
             #[cfg(windows)]
@@ -914,7 +1053,8 @@ impl VmService {
             vga_firmware: None,
             vtl2_gfx: false,
             virtio_devices: vec![],
-            vmbus: Some(VmbusConfig::default()),
+            vmbus: matches!(machine_profile, OpenvmmMachineProfile::Standard)
+                .then_some(VmbusConfig::default()),
             vtl2_vmbus: None,
             vmbus_devices: vec![],
             #[cfg(windows)]
@@ -954,6 +1094,20 @@ impl VmService {
         let mut scsi_rpc = None;
         let mut consomme_rpc = None;
         if let Some(devices_config) = req_config.devices_config {
+            if let Some(virtio_blk) = devices_config.virtio_blk {
+                anyhow::ensure!(is_microvm, "fixed virtio-blk requires the microVM profile");
+                let vmservice::VirtioBlk { backend, read_only } = virtio_blk;
+                let disk =
+                    build_disk_backend(backend.context("missing blk backend")?, read_only).await?;
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
+                    virtio_resources::blk::VirtioBlkHandle { disk, read_only }.into_resource(),
+                ));
+                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
+                    unreachable!("microVM was validated with pvh_boot");
+                };
+                openvmm_defs::config::append_microvm_virtio_blk_discovery(cmdline)?;
+            }
             if !devices_config.scsi_disks.is_empty() {
                 let mut devices = Vec::new();
                 for disk in devices_config.scsi_disks {
@@ -1045,12 +1199,17 @@ impl VmService {
         }
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
+            if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                bail!("microVM ABI version 1 does not support hvsocket");
+            }
             let listener = UnixListener::bind(&hvsocket_config.path).with_context(|| {
                 format!("failed to bind hvsocket path: {}", hvsocket_config.path)
             })?;
             config.vmbus.as_mut().unwrap().vsock_listener = Some(listener);
             config.vmbus.as_mut().unwrap().vsock_path = Some(hvsocket_config.path);
         }
+
+        openvmm_defs::config::validate_machine_config(&config, None)?;
 
         let (send, recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
@@ -1066,7 +1225,12 @@ impl VmService {
             .launch_worker(
                 VM_WORKER,
                 VmWorkerParameters {
-                    hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
+                    hypervisor: if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. })
+                    {
+                        openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
+                    } else {
+                        openvmm_helpers::hypervisor::choose_hypervisor()?
+                    },
                     cfg: config,
                     saved_state: None,
                     shared_memory: None,
@@ -1085,6 +1249,7 @@ impl VmService {
 
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
+            machine_profile,
             mesh,
             vm_worker: worker,
             vnc_worker: None,
@@ -1221,10 +1386,12 @@ impl VmService {
                 }
             }
             VmControllerEvent::ExitRequested { code } => {
-                // The protocol has no `exit` power action, so this should not
-                // occur in ttrpc/grpc mode; log rather than exiting the server
-                // out from under its clients.
-                tracing::warn!(code, "unexpected exit request in server mode");
+                let reason = format!("guest exited with status {code}");
+                tracing::info!(code, "guest halted with process status");
+                self.lifecycle = VmLifecycle::Halted(reason);
+                if let Some((_, response)) = self.wait_vm_response.take() {
+                    response.send(Ok(()));
+                }
             }
             VmControllerEvent::WorkerStopped { error } => {
                 if let Some(err) = &error {

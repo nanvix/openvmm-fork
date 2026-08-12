@@ -142,6 +142,10 @@ pub mod artifacts {
             LINUX_DIRECT_TEST_INITRD_AARCH64,
             /// Test linux direct bzImage kernel (from OpenVMM deps)
             LINUX_DIRECT_TEST_BZIMAGE_X64,
+            /// microVM Xen PVH kernel with hvc_xe9 and virtio-blk support.
+            MICROVM_PVH_TEST_KERNEL_X64,
+            /// microVM Alpine initramfs with lifecycle helpers.
+            MICROVM_PVH_TEST_INITRD_X64,
             /// PCAT firmware DLL
             PCAT_FIRMWARE_X64,
             /// SVGA firmware DLL
@@ -169,6 +173,14 @@ pub mod artifacts {
         }
 
         impl IsLoadable for LINUX_DIRECT_TEST_BZIMAGE_X64 {
+            const ARCH: MachineArch = MachineArch::X86_64;
+        }
+
+        impl IsLoadable for MICROVM_PVH_TEST_KERNEL_X64 {
+            const ARCH: MachineArch = MachineArch::X86_64;
+        }
+
+        impl IsLoadable for MICROVM_PVH_TEST_INITRD_X64 {
             const ARCH: MachineArch = MachineArch::X86_64;
         }
 

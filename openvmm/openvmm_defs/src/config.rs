@@ -60,6 +60,307 @@ pub struct Config {
     pub layout: vmm_core_defs::LayoutConfig,
     // This is used for testing. TODO: resourcify, and also store this in VMGS.
     pub rtc_delta_milliseconds: i64,
+    /// The versioned guest-visible machine contract.
+    pub machine_profile: MachineProfile,
+}
+
+/// The initial microVM guest ABI version.
+pub const MICROVM_ABI_VERSION_1: u32 = 1;
+/// ABI-v1 command line owned by the microVM profile.
+pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
+/// Maximum ABI-v1 command-line size, including its trailing NUL.
+pub const MICROVM_COMMAND_LINE_MAX_SIZE: usize = 64 * 1024;
+/// Fixed ABI-v1 virtio-blk MMIO base.
+pub const MICROVM_VIRTIO_BLK_MMIO_BASE: u64 = 0xd000_3000;
+/// Reserved ABI-v1 virtio-net MMIO base.
+pub const MICROVM_VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
+/// Reserved ABI-v1 virtio-fs MMIO base.
+pub const MICROVM_VIRTIO_FS_MMIO_BASE: u64 = 0xd000_1000;
+/// Reserved ABI-v1 virtio-console MMIO base.
+pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
+/// Fixed ABI-v1 virtio transport window length.
+pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
+/// Fixed ABI-v1 virtio-blk interrupt.
+pub const MICROVM_VIRTIO_BLK_IRQ: u32 = 4;
+/// ABI-v1 virtio MMIO reservations in stable device order.
+pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 4] = [
+    MICROVM_VIRTIO_NET_MMIO_BASE,
+    MICROVM_VIRTIO_FS_MMIO_BASE,
+    MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+    MICROVM_VIRTIO_BLK_MMIO_BASE,
+];
+
+fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
+    for (index, base) in MICROVM_VIRTIO_MMIO_BASES.iter().copied().enumerate() {
+        let end = base
+            .checked_add(MICROVM_VIRTIO_MMIO_LEN)
+            .ok_or_else(|| anyhow::anyhow!("microVM virtio MMIO reservation overflows"))?;
+        anyhow::ensure!(
+            base >= 0xc000_0000 && end <= 0x1_0000_0000,
+            "microVM virtio MMIO reservation {index} is outside the fixed aperture"
+        );
+        if let Some(next) = MICROVM_VIRTIO_MMIO_BASES.get(index + 1) {
+            anyhow::ensure!(end <= *next, "microVM virtio MMIO reservations overlap");
+        }
+    }
+    Ok(())
+}
+
+/// Appends the fixed ABI-v1 virtio-blk discovery token.
+pub fn append_microvm_virtio_blk_discovery(cmdline: &mut String) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cmdline
+            .split_ascii_whitespace()
+            .any(|token| token.starts_with("virtio_mmio.device=")),
+        "microVM command line already contains virtio-mmio discovery"
+    );
+    use std::fmt::Write as _;
+    write!(
+        cmdline,
+        " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
+    )?;
+    anyhow::ensure!(
+        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
+        "microVM kernel command line exceeds the 64-KiB ABI limit after device discovery"
+    );
+    Ok(())
+}
+
+fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
+    let LoadMode::Pvh { cmdline, .. } = &config.load_mode else {
+        anyhow::bail!("microVM ABI version 1 requires PVH load mode");
+    };
+    anyhow::ensure!(
+        !cmdline.contains('\0'),
+        "microVM command line contains an embedded NUL"
+    );
+    anyhow::ensure!(
+        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
+        "microVM command line exceeds the 64-KiB ABI limit"
+    );
+
+    let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
+    let base_tokens = MICROVM_BASE_COMMAND_LINE
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        tokens.starts_with(&base_tokens),
+        "microVM command line does not begin with the ABI-v1 base tokens"
+    );
+    for prefix in ["earlycon=", "console=", "virtio_mmio.device="] {
+        let count = tokens
+            .iter()
+            .filter(|token| token.starts_with(prefix))
+            .count();
+        let expected = if prefix == "virtio_mmio.device=" {
+            config.virtio_devices.len()
+        } else {
+            1
+        };
+        anyhow::ensure!(
+            count == expected,
+            "microVM command line has an invalid number of {prefix} tokens"
+        );
+    }
+    if !config.virtio_devices.is_empty() {
+        let expected = format!(
+            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
+        );
+        anyhow::ensure!(
+            tokens.last().copied() == Some(expected.as_str()),
+            "microVM virtio-blk discovery token is not stable"
+        );
+    }
+    Ok(())
+}
+
+/// Builds the ABI-v1 microVM command line and rejects profile-owned user tokens.
+pub fn build_microvm_command_line(user_args: &[String]) -> anyhow::Result<String> {
+    for arg in user_args {
+        if arg.contains('\0') {
+            anyhow::bail!("microVM kernel command line contains an embedded NUL");
+        }
+        if arg.split_ascii_whitespace().any(|token| {
+            ["earlycon=", "console=", "virtio_mmio.device="]
+                .iter()
+                .any(|reserved| token.starts_with(reserved))
+        }) {
+            anyhow::bail!(
+                "microVM kernel command line cannot override earlycon, console, or virtio-mmio discovery"
+            );
+        }
+    }
+
+    let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+    for arg in user_args.iter().filter(|arg| !arg.is_empty()) {
+        cmdline.push(' ');
+        cmdline.push_str(arg);
+    }
+    if cmdline.len() >= MICROVM_COMMAND_LINE_MAX_SIZE {
+        anyhow::bail!("microVM kernel command line exceeds the 64-KiB ABI limit");
+    }
+    Ok(cmdline)
+}
+
+/// The guest-visible machine contract, independent of the hypervisor backend.
+#[derive(MeshPayload, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MachineProfile {
+    /// The standard OpenVMM machine.
+    #[default]
+    Standard,
+    /// The microVM machine.
+    Microvm { abi_version: u32 },
+}
+
+/// Validates the microVM machine contract. Standard-machine configurations are unchanged.
+pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> anyhow::Result<()> {
+    let MachineProfile::Microvm { abi_version } = config.machine_profile else {
+        anyhow::ensure!(
+            !matches!(config.load_mode, LoadMode::Pvh { .. }),
+            "PVH load mode requires the microVM profile"
+        );
+        return Ok(());
+    };
+
+    anyhow::ensure!(
+        abi_version == MICROVM_ABI_VERSION_1,
+        "unsupported microVM ABI version {abi_version}"
+    );
+    validate_microvm_virtio_reservations()?;
+    validate_microvm_command_line(config)?;
+    anyhow::ensure!(
+        matches!(config.load_mode, LoadMode::Pvh { .. }),
+        "microVM ABI version 1 requires PVH load mode"
+    );
+    if let Some(hypervisor_id) = hypervisor_id {
+        anyhow::ensure!(
+            matches!(hypervisor_id, "kvm" | "whp"),
+            "microVM ABI version 1 requires the KVM or WHP hypervisor"
+        );
+    }
+    anyhow::ensure!(
+        config.processor_topology.proc_count == 1,
+        "microVM ABI version 1 requires exactly one vCPU"
+    );
+    anyhow::ensure!(
+        config.processor_topology.vps_per_socket.is_none()
+            && config.processor_topology.enable_smt.is_none()
+            && matches!(
+                &config.processor_topology.arch,
+                Some(ArchTopologyConfig::X86(X86TopologyConfig {
+                    apic_id_offset: 0,
+                    x2apic: X2ApicConfig::Auto,
+                }))
+            ),
+        "microVM ABI version 1 requires its fixed x86 APIC topology"
+    );
+    anyhow::ensure!(
+        config.numa.nodes.len() == 1 && config.numa.distances.is_empty(),
+        "microVM ABI version 1 requires a single NUMA node"
+    );
+    anyhow::ensure!(
+        !config.hypervisor.with_hv
+            && config.hypervisor.with_vtl2.is_none()
+            && config.hypervisor.with_isolation.is_none()
+            && !config.hypervisor.nested_virt,
+        "microVM ABI version 1 does not support Hyper-V enlightenments, VTL2, isolation, or nested virtualization"
+    );
+
+    let expected_chipset = BaseChipsetManifest {
+        with_generic_cmos_rtc: true,
+        ..BaseChipsetManifest::empty()
+    };
+    anyhow::ensure!(
+        config.chipset == expected_chipset,
+        "microVM ABI version 1 chipset is not the microVM allowlist"
+    );
+    anyhow::ensure!(
+        config.chipset_capabilities.with_ioapic
+            && config.chipset_capabilities.with_pic
+            && config.chipset_capabilities.with_pit
+            && !config.chipset_capabilities.with_generic_isa_dma
+            && !config.chipset_capabilities.with_psp
+            && !config.chipset_capabilities.with_guest_watchdog
+            && !config.chipset_capabilities.with_i440bx_host_pci_bridge,
+        "microVM ABI version 1 chipset capabilities do not match the fixed profile"
+    );
+
+    let mut chipset_ids = config
+        .chipset_devices
+        .iter()
+        .map(|device| (device.name.as_str(), device.resource.id()))
+        .collect::<Vec<_>>();
+    chipset_ids.sort_unstable();
+    anyhow::ensure!(
+        chipset_ids
+            == [
+                ("ioapic", "generic-ioapic"),
+                ("microvm-portb", "microvm-portb"),
+                ("microvm-shutdown", "microvm-shutdown"),
+                ("microvm-snapshot-request", "microvm-snapshot-request"),
+                ("pic", "pic"),
+                ("pit", "pit"),
+            ],
+        "microVM ABI version 1 chipset-device inventory is not exact"
+    );
+
+    anyhow::ensure!(
+        config.floppy_disks.is_empty() && config.ide_disks.is_empty(),
+        "microVM ABI version 1 does not support floppy or IDE devices"
+    );
+    anyhow::ensure!(
+        config.pcie_root_complexes.is_empty()
+            && config.pcie_devices.is_empty()
+            && config.pcie_switches.is_empty()
+            && config.pcie_generic_initiators.is_empty()
+            && config.vpci_devices.is_empty()
+            && config.pci_chipset_devices.is_empty()
+            && config.isa_dma_controller.is_none(),
+        "microVM ABI version 1 does not support PCI, PCIe, VPCI, or ISA DMA"
+    );
+    anyhow::ensure!(
+        config.vmbus.is_none() && config.vtl2_vmbus.is_none() && config.vmbus_devices.is_empty(),
+        "microVM ABI version 1 does not support VMBus"
+    );
+    anyhow::ensure!(
+        config.framebuffer.is_none() && config.vga_firmware.is_none() && !config.vtl2_gfx,
+        "microVM ABI version 1 does not support graphics or VGA firmware"
+    );
+    anyhow::ensure!(
+        config.vmgs.is_none(),
+        "microVM ABI version 1 does not support VMGS"
+    );
+    anyhow::ensure!(
+        config.firmware_event_send.is_none() && config.debugger_rpc.is_none(),
+        "microVM ABI version 1 does not support firmware or debugger resources"
+    );
+    anyhow::ensure!(
+        config.rtc_delta_milliseconds == 0,
+        "microVM ABI version 1 RTC must be anchored directly to UTC"
+    );
+    #[cfg(windows)]
+    anyhow::ensure!(
+        config.kernel_vmnics.is_empty() && config.vpci_resources.is_empty(),
+        "microVM ABI version 1 does not support kernel NIC or VPCI resources"
+    );
+
+    anyhow::ensure!(
+        config.virtio_devices.len() <= 1,
+        "microVM ABI version 1 permits at most one virtio-blk device"
+    );
+    for (bus, device) in &config.virtio_devices {
+        anyhow::ensure!(
+            *bus == VirtioBus::Mmio && device.id() == "virtio-blk",
+            "microVM ABI version 1 permits only an MMIO virtio-blk device"
+        );
+    }
+    anyhow::ensure!(
+        config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024
+            && config.layout.chipset_high_mmio_size == 0
+            && config.layout.vtl2_chipset_mmio_size == 0,
+        "microVM ABI version 1 requires the fixed 3-GiB/4-GiB RAM split"
+    );
+    Ok(())
 }
 
 pub const DEFAULT_GIC_DISTRIBUTOR_BASE: u64 = 0xFFFF_0000;
@@ -154,6 +455,11 @@ pub enum LoadMode {
         com_serial: Option<SerialInformation>,
     },
     None,
+    Pvh {
+        kernel: File,
+        initrd: Option<File>,
+        cmdline: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, MeshPayload)]

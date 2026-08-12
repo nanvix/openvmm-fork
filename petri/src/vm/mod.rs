@@ -23,6 +23,8 @@ use async_trait::async_trait;
 use get_resources::ged::FirmwareEvent;
 use guid::Guid;
 use mesh::CancelContext;
+use openvmm_defs::config::MICROVM_ABI_VERSION_1;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use pal_async::DefaultDriver;
 use pal_async::task::Spawn;
@@ -227,6 +229,8 @@ pub struct PetriVmConfig {
     pub name: String,
     /// The architecture of the VM
     pub arch: MachineArch,
+    /// The guest-visible machine contract.
+    pub machine_profile: MachineProfile,
     /// Log levels for the host VMM process.
     pub host_log_levels: Option<OpenvmmLogConfig>,
     /// Firmware and/or OS to load into the VM and associated settings
@@ -456,6 +460,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             config: PetriVmConfig {
                 name: make_vm_safe_name(params.test_name),
                 arch: artifacts.arch,
+                machine_profile: MachineProfile::Standard,
                 host_log_levels: None,
                 firmware: artifacts.firmware,
                 memory: Default::default(),
@@ -537,6 +542,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             config: PetriVmConfig {
                 name: make_vm_safe_name(params.test_name),
                 arch: artifacts.arch,
+                machine_profile: MachineProfile::Standard,
                 host_log_levels: None,
                 firmware: artifacts.firmware,
                 memory: Default::default(),
@@ -583,7 +589,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         self.minimal_mode
     }
 
-    /// Supply a pre-built initrd with pipette already injected.
+    /// Supply a pre-built Linux-direct initrd.
     ///
     /// When set, the builder skips the runtime gzip decompress/inject/
     /// recompress cycle, using this initrd directly. Use
@@ -606,20 +612,11 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// iteration.
     pub fn prepare_initrd(&self) -> anyhow::Result<TempPath> {
         use anyhow::Context;
-        use std::io::Write;
-
-        let initrd_path = self
-            .config
-            .firmware
-            .linux_direct_initrd()
-            .context("prepare_initrd requires Linux direct boot with initrd")?;
         let pipette_path = self
             .pipette_binary
             .as_ref()
             .context("prepare_initrd requires a pipette binary")?;
 
-        let initrd_gz = std::fs::read(initrd_path)
-            .with_context(|| format!("failed to read initrd at {}", initrd_path.display()))?;
         let pipette_data = std::fs::read(pipette_path.get()).with_context(|| {
             format!(
                 "failed to read pipette binary at {}",
@@ -627,14 +624,33 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             )
         })?;
 
-        let merged_gz =
-            initrd_cpio::inject_into_initrd(&initrd_gz, "pipette", &pipette_data, 0o100755)
-                .context("failed to inject pipette into initrd")?;
+        self.prepare_initrd_with_file("pipette", &pipette_data, 0o100755)
+    }
+
+    /// Build a copy of the Linux-direct initrd with one file injected.
+    pub fn prepare_initrd_with_file(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: u32,
+    ) -> anyhow::Result<TempPath> {
+        use anyhow::Context;
+        use std::io::Write;
+
+        let initrd_path = self
+            .config
+            .firmware
+            .linux_direct_initrd()
+            .context("initrd injection requires Linux direct boot with initrd")?;
+        let initrd_gz = std::fs::read(initrd_path)
+            .with_context(|| format!("failed to read initrd at {}", initrd_path.display()))?;
+        let merged_gz = initrd_cpio::inject_into_initrd(&initrd_gz, path, data, mode)
+            .with_context(|| format!("failed to inject {path} into initrd"))?;
 
         let mut tmp = tempfile::NamedTempFile::new()
             .context("failed to create temp file for pre-built initrd")?;
         tmp.write_all(&merged_gz)
-            .context("failed to write pre-built initrd")?;
+            .context("failed to write modified initrd")?;
 
         Ok(tmp.into_temp_path())
     }
@@ -1056,6 +1072,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     fn uses_pipette_as_init(&self) -> bool {
         self.config.firmware.is_linux_direct()
             && !self.config.firmware.is_openhcl()
+            && matches!(self.config.machine_profile, MachineProfile::Standard)
             && self.pipette_binary.is_some()
     }
 
@@ -1360,6 +1377,28 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Set the VM to use the specified memory config.
     pub fn with_memory(mut self, memory: MemoryConfig) -> Self {
         self.config.memory = memory;
+        self
+    }
+
+    /// Select the microVM ABI version 1 machine profile.
+    pub fn with_microvm_machine(mut self) -> Self {
+        self.config.machine_profile = MachineProfile::Microvm {
+            abi_version: MICROVM_ABI_VERSION_1,
+        };
+        self.config.proc_topology.vp_count = 1;
+        self.config.proc_topology.vps_per_socket = None;
+        self.minimal_mode = true;
+        self.enable_serial = true;
+        self.use_virtio_vsock = false;
+        self.no_vmbus = true;
+        self.no_hv = true;
+        self.config.vmbus_storage_controllers.clear();
+        self.config.pcie_nvme_drives.clear();
+        self.config.pcie_virtio_blk_drives.clear();
+        self.config.physical_nvme_devices.clear();
+        self.agent_image = None;
+        self.openhcl_agent_image = None;
+        self.boot_device_type = BootDeviceType::None;
         self
     }
 
@@ -2745,6 +2784,15 @@ impl BootDeviceType {
 }
 
 impl Firmware {
+    /// Constructs a microVM Xen PVH kernel/initramfs pair.
+    pub fn microvm_pvh(resolver: &ArtifactResolver<'_>) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        Firmware::LinuxDirect {
+            kernel: resolver.require(MICROVM_PVH_TEST_KERNEL_X64).erase(),
+            initrd: resolver.require(MICROVM_PVH_TEST_INITRD_X64).erase(),
+        }
+    }
+
     /// Constructs a standard [`Firmware::LinuxDirect`] configuration.
     pub fn linux_direct(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
         use petri_artifacts_vmm_test::artifacts::loadable::*;
