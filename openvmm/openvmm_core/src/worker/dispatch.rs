@@ -56,8 +56,8 @@ use membacking::SharedMemoryBacking;
 use memory_range::MemoryRange;
 use mesh::MeshPayload;
 use mesh::error::RemoteError;
-use mesh::payload::Protobuf;
 use mesh::payload::message::ProtobufMessage;
+use mesh::rpc::Rpc;
 use mesh_worker::Worker;
 use mesh_worker::WorkerId;
 use mesh_worker::WorkerRpc;
@@ -86,6 +86,7 @@ use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::X86TopologyConfig;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::SavedState;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_pcat_locator::RomFileLocation;
@@ -100,7 +101,6 @@ use pcie::switch::GenericPcieSwitch;
 use scsi_core::ResolveScsiDeviceHandleParams;
 use scsidisk::atapi_scsi::AtapiScsiDisk;
 use serial_16550_resources::ComPort;
-use state_unit::SavedStateUnit;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::fs::File;
@@ -136,7 +136,6 @@ use vmbus_channel::channel::VmbusDevice;
 use vmbus_server::HvsockRelayChannel;
 use vmbus_server::VmbusServer;
 use vmbus_server::hvsock::HvsockRelay;
-use vmcore::save_restore::SavedStateRoot;
 use vmcore::vm_task::VmTaskDriverSource;
 use vmcore::vm_task::thread::ThreadDriverBackend;
 use vmcore::vmtime::VmTime;
@@ -266,13 +265,6 @@ pub struct Manifest {
     machine_profile: MachineProfile,
 }
 
-#[derive(Protobuf, SavedStateRoot)]
-#[mesh(package = "openvmm")]
-pub struct SavedState {
-    #[mesh(1)]
-    pub units: Vec<SavedStateUnit>,
-}
-
 async fn open_simple_disk(
     resolver: &ResourceResolver,
     disk_type: Resource<DiskHandleKind>,
@@ -319,18 +311,22 @@ impl Worker for VmWorker {
     const ID: WorkerId<Self::Parameters> = VM_WORKER;
 
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+        let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
+        let snapshot_ready = parameters.snapshot_ready;
+        let restore_time = match (
+            parameters.restore_downtime,
+            parameters.restore_tsc_frequency_hz,
+        ) {
+            (Some(downtime), Some(frequency)) => Some((downtime, frequency)),
+            (None, None) => None,
+            _ => anyhow::bail!("restore downtime and TSC frequency must be provided together"),
+        };
+        tracing::debug!(?restore_time, "received snapshot restore time contract");
+        let restore_cpu_contract = parameters.restore_cpu_contract;
         openvmm_defs::config::validate_machine_config(
             &parameters.cfg,
             Some(parameters.hypervisor.id()),
         )?;
-        if matches!(
-            parameters.cfg.machine_profile,
-            MachineProfile::Microvm { .. }
-        ) && parameters.saved_state.is_some()
-        {
-            anyhow::bail!("saved-state restore is unavailable for microVM ABI version 1");
-        }
-
         let (device_thread, device_driver) = new_device_thread();
 
         let manifest = Manifest::from_config(parameters.cfg);
@@ -338,9 +334,14 @@ impl Worker for VmWorker {
         let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
             .context("failed to resolve hypervisor backend")?;
 
+        let file_mapping_mode = if parameters.shared_memory_copy_on_write {
+            membacking::FileMappingMode::CopyOnWrite
+        } else {
+            membacking::FileMappingMode::Shared
+        };
         let shared_memory = parameters
             .shared_memory
-            .map(|fd| SharedMemoryBacking::from_mappable(fd.into()));
+            .map(|fd| SharedMemoryBacking::from_mappable_with_mode(fd.into(), file_mapping_mode));
 
         let vm = block_on(InitializedVm::new(
             VmTaskDriverSource::new(ThreadDriverBackend::new(device_driver)),
@@ -348,13 +349,37 @@ impl Worker for VmWorker {
             manifest,
             shared_memory,
         ))?;
+        if let Some(expected_cpu_contract) = restore_cpu_contract {
+            #[cfg(guest_arch = "x86_64")]
+            {
+                let destination_contract = vm.partition.cpu_compatibility_contract();
+                let destination_cpu_contract = mesh::payload::encode(destination_contract.clone());
+                if destination_cpu_contract != expected_cpu_contract {
+                    let expected_contract: virt::x86::CpuCompatibilityContract =
+                        mesh::payload::decode(&expected_cpu_contract)
+                            .context("failed to decode snapshot CPU contract")?;
+                    let first_cpuid_difference = expected_contract
+                        .cpuid
+                        .iter()
+                        .zip(&destination_contract.cpuid)
+                        .find(|(expected, destination)| expected != destination);
+                    anyhow::bail!(
+                        "destination CPU contract does not match the snapshot; first CPUID difference: {first_cpuid_difference:?}"
+                    );
+                }
+            }
+            #[cfg(not(guest_arch = "x86_64"))]
+            anyhow::bail!("snapshot CPU contracts are only supported for x86-64 guests");
+        }
         let saved_state = parameters
             .saved_state
             .map(|m| m.parse())
             .transpose()
             .context("failed to decode saved state")?;
 
-        let vm = block_with_io(|_| vm.load(saved_state, parameters.notify))?;
+        let mut vm = block_with_io(|_| vm.load(saved_state, parameters.notify, restore_time))?;
+        vm.snapshot_boundary_requests = snapshot_boundary_requests;
+        vm.snapshot_ready = snapshot_ready;
 
         LOADED_VM.store(&vm);
 
@@ -387,7 +412,7 @@ impl Worker for VmWorker {
             shared_memory,
         ))?;
         pal_async::local::block_on(async {
-            let mut vm = vm.load(Some(saved_state), notify).await?;
+            let mut vm = vm.load(Some(saved_state), notify, None).await?;
 
             LOADED_VM.store(&vm);
 
@@ -729,6 +754,12 @@ pub(crate) struct LoadedVm {
     state_units: StateUnits,
     inner: LoadedVmInner,
     running: bool,
+    snapshot_boundary_requests:
+        Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
+    snapshot_ready: Option<mesh::Sender<()>>,
+    snapshot_stop_guard: Option<vmm_core::partition_unit::StopGuard>,
+    snapshot_transaction_complete: Option<Rpc<(), ()>>,
+    snapshot_capture_wall_clock: Option<mesh::payload::Timestamp>,
 }
 
 /// Most of the VM state for [`LoadedVm`], excluding things that are necessary
@@ -1071,6 +1102,10 @@ impl InitializedVm {
                     .map(|typ| typ.into())
                     .unwrap_or(virt::IsolationType::None),
                 nested_virt: cfg.hypervisor.nested_virt,
+                versioned_cpu_contract: matches!(
+                    cfg.machine_profile,
+                    MachineProfile::Microvm { .. }
+                ),
             })
             .context("failed to create the prototype partition")?;
 
@@ -1220,7 +1255,7 @@ impl InitializedVm {
                     "shared memory restore not supported with {nodes_with_ranges} memory nodes"
                 );
             }
-            Some(smb.into_mappable())
+            Some(smb.into_parts())
         } else {
             None
         };
@@ -1257,8 +1292,10 @@ impl InitializedVm {
             if mem.hugepages {
                 backing = backing.hugepages(mem.hugepage_size);
             }
-            if let Some(mappable) = existing_mappable.take() {
-                backing = backing.existing_mappable(mappable);
+            if let Some((mappable, file_mapping_mode)) = existing_mappable.take() {
+                backing = backing
+                    .existing_mappable(mappable)
+                    .file_mapping_mode(file_mapping_mode);
             }
 
             memory_builder = memory_builder.add_backing(backing);
@@ -1370,6 +1407,7 @@ impl InitializedVm {
         self,
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
+        restore_time: Option<(std::time::Duration, u64)>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
 
@@ -2980,6 +3018,11 @@ impl InitializedVm {
         let mut this = LoadedVm {
             state_units,
             running: false,
+            snapshot_boundary_requests: None,
+            snapshot_ready: None,
+            snapshot_stop_guard: None,
+            snapshot_transaction_complete: None,
+            snapshot_capture_wall_clock: None,
             inner: LoadedVmInner {
                 driver_source,
                 resolver,
@@ -3036,9 +3079,41 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
+            if let Some((_, saved_frequency)) = restore_time {
+                let destination_frequency = this
+                    .inner
+                    .partition
+                    .tsc_frequency_hz()?
+                    .context("destination backend does not expose a guest TSC frequency")?;
+                anyhow::ensure!(
+                    destination_frequency == saved_frequency,
+                    "destination TSC frequency {destination_frequency} Hz does not match saved frequency {saved_frequency} Hz"
+                );
+                this.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
+            }
             this.restore(saved_state)
                 .await
                 .context("loadedvm restore failed")?;
+            if let Some((downtime, frequency)) = restore_time {
+                this.state_units
+                    .advance_time(downtime)
+                    .await
+                    .context("failed to advance restored VM time")?;
+                #[cfg(guest_arch = "x86_64")]
+                this.inner
+                    .partition_unit
+                    .advance_tsc(
+                        downtime,
+                        frequency,
+                        this.inner.partition.apic_frequency_hz()?,
+                    )
+                    .await
+                    .context("failed to advance restored vCPU TSC")?;
+                this.inner
+                    .partition
+                    .advance_snapshot_time(downtime)
+                    .context("failed to advance backend snapshot clock")?;
+            }
         } else {
             // Assign PCI bus numbers/BARs before building firmware so that the
             // ACPI tables (specifically the SRAT generic-initiator entries) can
@@ -3456,6 +3531,59 @@ impl LoadedVm {
         true
     }
 
+    async fn establish_snapshot_boundary(
+        &mut self,
+        request: chipset_resources::microvm::MicrovmSnapshotBoundaryRequest,
+    ) {
+        if self.snapshot_stop_guard.is_some() {
+            tracing::warn!("dropping duplicate microVM snapshot boundary request");
+            request.release_write.send(());
+            request.transaction_complete.complete(());
+            return;
+        }
+        let Some(snapshot_ready) = self.snapshot_ready.clone() else {
+            request.release_write.send(());
+            request.transaction_complete.complete(());
+            return;
+        };
+
+        match self
+            .inner
+            .partition_unit
+            .temporarily_stop_vps_at_io_boundary(request.release_write, request.write_completed)
+            .await
+        {
+            Ok(stop_guard) => {
+                self.snapshot_stop_guard = Some(stop_guard);
+                self.snapshot_transaction_complete = Some(request.transaction_complete);
+                self.snapshot_capture_wall_clock = Some(std::time::SystemTime::now().into());
+                snapshot_ready.send(());
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "failed to establish snapshot PMIO boundary"
+                );
+                request.transaction_complete.complete(());
+            }
+        }
+    }
+
+    fn release_snapshot_boundary(&mut self) -> anyhow::Result<()> {
+        let transaction_complete = self
+            .snapshot_transaction_complete
+            .take()
+            .context("no active microVM snapshot boundary")?;
+        let stop_guard = self
+            .snapshot_stop_guard
+            .take()
+            .context("snapshot boundary is missing its vCPU stop guard")?;
+        self.snapshot_capture_wall_clock = None;
+        transaction_complete.complete(());
+        drop(stop_guard);
+        Ok(())
+    }
+
     /// Assign PCI bus numbers and BAR addresses for all boot modes.
     ///
     /// This pre-programs PCI config space (bus numbers, bridge windows,
@@ -3509,6 +3637,9 @@ impl LoadedVm {
             WorkerRpc(Result<WorkerRpc<RestartState>, mesh::RecvError>),
             VmRpc(Result<VmRpc, mesh::RecvError>),
             Halt(Result<HaltReason, mesh::RecvError>),
+            SnapshotBoundary(
+                Result<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest, mesh::RecvError>,
+            ),
         }
 
         // Start a task to handle state unit inspections by filtering the worker
@@ -3536,11 +3667,23 @@ impl LoadedVm {
                 let a = rpc_recv.recv().map(Event::VmRpc);
                 let b = worker_rpc.recv().map(Event::WorkerRpc);
                 let c = self.inner.halt_recv.recv().map(Event::Halt);
-                (a, b, c).race().await
+                let d = async {
+                    match self.snapshot_boundary_requests.as_mut() {
+                        Some(requests) => Event::SnapshotBoundary(requests.recv().await),
+                        None => std::future::pending().await,
+                    }
+                };
+                (a, b, c, d).race().await
             };
 
             match event {
                 Event::WorkerRpc(Err(_)) => break,
+                Event::SnapshotBoundary(Ok(request)) => {
+                    self.establish_snapshot_boundary(request).await;
+                }
+                Event::SnapshotBoundary(Err(_)) => {
+                    self.snapshot_boundary_requests = None;
+                }
                 Event::WorkerRpc(Ok(message)) => match message {
                     WorkerRpc::Stop => break,
                     WorkerRpc::Restart(rpc) => {
@@ -3613,6 +3756,91 @@ impl LoadedVm {
                             })
                             .await;
                         }
+                    }
+                    VmRpc::QuiesceForSnapshot(rpc) => {
+                        rpc.handle(async |timeout| {
+                            if !matches!(
+                                self.inner.machine_profile,
+                                MachineProfile::Microvm { .. }
+                            ) {
+                                return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                                    RemoteError::new(anyhow::anyhow!(
+                                        "guest-requested snapshot quiesce requires the microVM profile"
+                                    )),
+                                ));
+                            }
+                            if !self.running {
+                                return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                                    RemoteError::new(anyhow::anyhow!("VM is already stopped")),
+                                ));
+                            }
+
+                            if let Err(error) = self.state_units.quiesce_for_save(timeout).await {
+                                return Err(if error.has_uncertain_state() {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::Uncertain(
+                                        RemoteError::new(error),
+                                    )
+                                } else {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                });
+                            }
+                            self.running = false;
+
+                            let saved_state = self.save().await.map_err(|error| {
+                                openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                    RemoteError::new(error),
+                                )
+                            })?;
+                            let tsc_frequency_hz = self
+                                .inner
+                                .partition
+                                .tsc_frequency_hz()
+                                .map_err(|error| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(anyhow::anyhow!(
+                                            "backend does not expose a guest TSC frequency"
+                                        )),
+                                    )
+                                })?;
+                            let capture_wall_clock = self
+                                .snapshot_capture_wall_clock
+                                .ok_or_else(|| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(anyhow::anyhow!(
+                                            "snapshot boundary has no wall-clock timestamp"
+                                        )),
+                                    )
+                                })?;
+                            Ok(openvmm_defs::rpc::SnapshotSaveResponse {
+                                state_unit_names: saved_state.inventory.clone(),
+                                saved_state: ProtobufMessage::new(saved_state),
+                                tsc_frequency_hz,
+                                capture_wall_clock,
+                                cpu_contract: mesh::payload::encode(
+                                    self.inner.partition.cpu_compatibility_contract(),
+                                ),
+                            })
+                        })
+                        .await;
+                    }
+                    VmRpc::ResumeAfterFailedSnapshot(rpc) => {
+                        rpc.handle_failable(async |timeout| {
+                            self.state_units.resume_after_failed_save(timeout).await?;
+                            self.running = true;
+                            self.release_snapshot_boundary()?;
+                            anyhow::Ok(())
+                        })
+                        .await;
+                    }
+                    VmRpc::ReleaseSnapshotBoundary(rpc) => {
+                        rpc.handle_failable_sync(|()| self.release_snapshot_boundary())
                     }
                     VmRpc::Nmi(rpc) => rpc.handle_sync(|vpindex| {
                         if vpindex < self.inner.processor_topology.vp_count() {
@@ -3950,11 +4178,15 @@ impl LoadedVm {
     async fn save(&mut self) -> anyhow::Result<SavedState> {
         Ok(SavedState {
             units: self.state_units.save().await?,
+            inventory: self.state_units.inventory(),
         })
     }
 
     /// Restore state on the VM.
     async fn restore(&mut self, state: SavedState) -> anyhow::Result<()> {
+        if !state.inventory.is_empty() {
+            self.state_units.validate_inventory(&state.inventory)?;
+        }
         self.state_units.restore(state.units).await?;
         Ok(())
     }

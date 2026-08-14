@@ -7,9 +7,12 @@ use crate::config::Config;
 use crate::rpc::VmRpc;
 use hypervisor_resources::HypervisorKind;
 use mesh::MeshPayload;
+use mesh::payload::Protobuf;
 use mesh::payload::message::ProtobufMessage;
 use mesh_worker::WorkerId;
+use state_unit::SavedStateUnit;
 use vm_resource::Resource;
+use vmcore::save_restore::SavedStateRoot;
 use vmm_core_defs::HaltReason;
 
 /// File descriptor (Unix) or handle (Windows) for file-backed guest RAM.
@@ -20,6 +23,17 @@ pub type SharedMemoryFd = std::os::fd::OwnedFd;
 pub type SharedMemoryFd = std::os::windows::io::OwnedHandle;
 
 pub const VM_WORKER: WorkerId<VmWorkerParameters> = WorkerId::new("VmWorker");
+
+/// Complete saved state consumed by the VM worker.
+#[derive(Protobuf, SavedStateRoot)]
+#[mesh(package = "openvmm")]
+pub struct SavedState {
+    #[mesh(1)]
+    pub units: Vec<SavedStateUnit>,
+    /// Complete state-unit inventory, including units with no mutable state.
+    #[mesh(2)]
+    pub inventory: Vec<String>,
+}
 
 /// Launch parameters for the VM worker.
 #[derive(MeshPayload)]
@@ -33,6 +47,19 @@ pub struct VmWorkerParameters {
     /// File-backed guest RAM handle. When set, guest memory uses this
     /// fd/handle instead of allocating anonymous memory.
     pub shared_memory: Option<SharedMemoryFd>,
+    /// Whether writes to `shared_memory` must remain private to this VM.
+    pub shared_memory_copy_on_write: bool,
+    /// Deferred microVM PMIO requests awaiting an exact post-OUT boundary.
+    pub snapshot_boundary_requests:
+        Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
+    /// Notifies the controller after the worker establishes the boundary.
+    pub snapshot_ready: Option<mesh::Sender<()>>,
+    /// Host downtime to apply before starting a restored VM.
+    pub restore_downtime: Option<std::time::Duration>,
+    /// Saved effective TSC frequency required by restore.
+    pub restore_tsc_frequency_hz: Option<u64>,
+    /// Saved canonical CPU contract required by restore.
+    pub restore_cpu_contract: Option<Vec<u8>>,
     /// The VM RPC channel.
     pub rpc: mesh::Receiver<VmRpc>,
     /// The notification channel.

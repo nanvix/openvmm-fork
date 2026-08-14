@@ -565,6 +565,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 name = "chipset"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bitfield-struct 0.11.0",
  "chipset_device",
@@ -632,6 +633,7 @@ dependencies = [
 name = "chipset_device_resources"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset_device",
  "guestmem",
@@ -676,6 +678,7 @@ dependencies = [
 name = "chipset_legacy"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset",
  "chipset_device",
@@ -4507,6 +4510,7 @@ dependencies = [
  "range_map_vec",
  "slab",
  "sparse_mmap",
+ "tempfile",
  "thiserror 2.0.16",
  "tracing",
  "virt",
@@ -5781,6 +5785,7 @@ name = "openvmm_defs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chipset_resources",
  "floppy_resources",
  "framebuffer",
  "get_resources",
@@ -5793,12 +5798,14 @@ dependencies = [
  "mesh_worker",
  "net_backend_resources",
  "openvmm_pcat_locator",
+ "state_unit",
  "thiserror 2.0.16",
  "unix_socket",
  "virt",
  "virt_whp",
  "vm_resource",
  "vmbus_proxy",
+ "vmcore",
  "vmgs_resources",
  "vmm_core_defs",
  "vmotherboard",
@@ -5958,9 +5965,13 @@ dependencies = [
  "hypervisor_resources",
  "libc",
  "mesh",
+ "nix 0.30.1",
  "openvmm_defs",
+ "pal",
+ "sha2",
  "sparse_mmap",
  "tempfile",
+ "thiserror 2.0.16",
  "tracing",
  "vm_resource",
 ]
@@ -7815,6 +7826,7 @@ dependencies = [
  "libc",
  "pal",
  "parking_lot",
+ "tempfile",
  "thiserror 2.0.16",
  "trycopy",
  "windows-sys 0.61.0",
@@ -10667,6 +10679,7 @@ name = "vmm_tests"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "disk_backend_resources",
  "disk_vhd1",
  "fs-err",
@@ -10706,6 +10719,7 @@ dependencies = [
  "tracing",
  "unix_socket",
  "vfio_assigned_device_resources",
+ "virt",
  "virtio_resources",
  "vm_resource",
  "vmgs_resources",

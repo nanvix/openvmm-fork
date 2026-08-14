@@ -40,6 +40,12 @@ impl Worker {
             cfg,
             saved_state: None,
             shared_memory,
+            shared_memory_copy_on_write: false,
+            snapshot_boundary_requests: None,
+            snapshot_ready: None,
+            restore_downtime: None,
+            restore_tsc_frequency_hz: None,
+            restore_cpu_contract: None,
             rpc: rpc_recv,
             notify: notify_send,
         };

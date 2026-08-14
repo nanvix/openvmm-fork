@@ -1002,6 +1002,50 @@ impl Apic {
     pub fn registers(&self) -> &ApicRegisters {
         ApicRegisters::from_array_ref(&self.registers)
     }
+
+    /// Advances the LAPIC timer by host downtime using the interrupt clock.
+    pub fn advance_timer(&mut self, duration: std::time::Duration, frequency_hz: u64) {
+        let registers = ApicRegisters::from_array(self.registers);
+        let mut registers = registers;
+        if registers.timer_ccr == 0 {
+            return;
+        }
+
+        let timer_mode = (registers.lvt_timer >> 17) & 0x3;
+        if timer_mode == 2 {
+            // TSC-deadline mode is handled through IA32_TSC_DEADLINE.
+            return;
+        }
+        let divider_shift = match registers.timer_dcr & 0xb {
+            0xb => 0,
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            3 => 4,
+            8 => 5,
+            9 => 6,
+            0xa => 7,
+            _ => return,
+        };
+        let elapsed_ticks = duration.as_nanos().saturating_mul(u128::from(frequency_hz))
+            / 1_000_000_000
+            / (1_u128 << divider_shift);
+
+        if elapsed_ticks >= u128::from(registers.timer_ccr) {
+            if timer_mode == 1 && registers.timer_icr != 0 {
+                let remaining = elapsed_ticks - u128::from(registers.timer_ccr);
+                let period = u128::from(registers.timer_icr);
+                registers.timer_ccr = (period - remaining % period) as u32;
+            } else {
+                // A zero current count disables the timer. Rearm for one tick
+                // so an expired one-shot is delivered immediately on start.
+                registers.timer_ccr = 1;
+            }
+        } else {
+            registers.timer_ccr -= elapsed_ticks as u32;
+        }
+        self.registers = *registers.as_array();
+    }
 }
 
 #[repr(C)]
@@ -1578,6 +1622,44 @@ pub struct Tsc {
     pub value: u64,
 }
 
+/// IA32_TSC_DEADLINE state.
+#[repr(C)]
+#[derive(Default, Debug, PartialEq, Eq, Protobuf, Inspect)]
+#[mesh(package = "virt.x86")]
+pub struct TscDeadline {
+    #[mesh(1)]
+    #[inspect(hex)]
+    pub value: u64,
+}
+
+impl HvRegisterState<HvX64RegisterName, 1> for TscDeadline {
+    fn names(&self) -> &'static [HvX64RegisterName; 1] {
+        &[HvX64RegisterName::TscDeadline]
+    }
+
+    fn get_values<'a>(&self, it: impl Iterator<Item = &'a mut HvRegisterValue>) {
+        for (dest, src) in it.zip([self.value]) {
+            *dest = src.into();
+        }
+    }
+
+    fn set_values(&mut self, it: impl Iterator<Item = HvRegisterValue>) {
+        for (src, dest) in it.zip([&mut self.value]) {
+            *dest = src.as_u64();
+        }
+    }
+}
+
+impl StateElement<X86PartitionCapabilities, X86VpInfo> for TscDeadline {
+    fn is_present(caps: &X86PartitionCapabilities) -> bool {
+        caps.tsc_deadline
+    }
+
+    fn at_reset(_caps: &X86PartitionCapabilities, _vp_info: &X86VpInfo) -> Self {
+        Self { value: 0 }
+    }
+}
+
 impl HvRegisterState<HvX64RegisterName, 1> for Tsc {
     fn names(&self) -> &'static [HvX64RegisterName; 1] {
         &[HvX64RegisterName::Tsc]
@@ -1707,6 +1789,12 @@ pub struct SyntheticMsrs {
     #[mesh(5)]
     #[inspect(iter_by_index)]
     pub sint: [u64; 16],
+    /// KVM wall-clock GPA/configuration MSR.
+    #[mesh(6)]
+    pub kvm_wall_clock: u64,
+    /// KVM system-time GPA/configuration MSR.
+    #[mesh(7)]
+    pub kvm_system_time: u64,
 }
 
 impl HvRegisterState<HvX64RegisterName, 20> for SyntheticMsrs {
@@ -1762,16 +1850,22 @@ impl HvRegisterState<HvX64RegisterName, 20> for SyntheticMsrs {
 
 impl StateElement<X86PartitionCapabilities, X86VpInfo> for SyntheticMsrs {
     fn is_present(caps: &X86PartitionCapabilities) -> bool {
-        caps.hv1
+        caps.hv1 || caps.kvm_clock
     }
 
     fn at_reset(_caps: &X86PartitionCapabilities, _vp_info: &X86VpInfo) -> Self {
-        Self {
-            vp_assist_page: 0,
-            scontrol: 1,
-            siefp: 0,
-            simp: 0,
-            sint: [0x10000; 16],
+        if _caps.hv1 {
+            Self {
+                vp_assist_page: 0,
+                scontrol: 1,
+                siefp: 0,
+                simp: 0,
+                sint: [0x10000; 16],
+                kvm_wall_clock: 0,
+                kvm_system_time: 0,
+            }
+        } else {
+            Self::default()
         }
     }
 }
@@ -1962,6 +2056,7 @@ state_trait! {
     (12, "cet", cet, set_cet, Cet),
     (13, "cet_ss", cet_ss, set_cet_ss, CetSs),
     (14, "tsc_aux", tsc_aux, set_tsc_aux, TscAux),
+    (15, "tsc_deadline", tsc_deadline, set_tsc_deadline, TscDeadline),
 
     // Synic state
     (100, "synic", synic_msrs, set_synic_msrs, SyntheticMsrs),

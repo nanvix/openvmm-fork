@@ -197,6 +197,8 @@ struct VmResources {
     consomme_rpc: Option<mesh::Sender<net_backend_resources::consomme::ConsommeRequest>>,
     ged_rpc: Option<mesh::Sender<get_resources::ged::GuestEmulationRequest>>,
     vtl2_settings: Option<vtl2_settings_proto::Vtl2Settings>,
+    microvm_snapshot_requests:
+        Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     /// Receives dirty rectangles from the synthetic video device for the VNC worker.
     dirty_rect_recv: Option<mesh::Receiver<Vec<video_core::DirtyRect>>>,
     #[cfg(windows)]
@@ -236,6 +238,7 @@ async fn vm_config_from_command_line(
     spawner: impl Spawn,
     mesh: &VmmMesh,
     opt: &Options,
+    restore_machine_contract: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
 ) -> anyhow::Result<(Config, VmResources)> {
     let is_microvm = opt.machine == MachineProfileCli::Microvm;
     opt.validate_microvm_options()?;
@@ -1277,9 +1280,22 @@ async fn vm_config_from_command_line(
         .context("failed to build chipset configuration")?;
 
     if let Some(io) = microvm_portb_cfg {
+        let restore_entropy = if opt.restore_entropy {
+            let mut entropy = [0_u8; 64];
+            getrandom::fill(&mut entropy).context("failed to generate restore entropy")?;
+            let mut packet = b"OPENVMM_ENTROPY_V1\0".to_vec();
+            packet.extend(entropy);
+            packet
+        } else {
+            Vec::new()
+        };
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmPortbHandle::ID.to_owned(),
-            resource: MicrovmPortbHandle { io }.into_resource(),
+            resource: MicrovmPortbHandle {
+                io,
+                restore_entropy,
+            }
+            .into_resource(),
         });
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmShutdownHandle::ID.to_owned(),
@@ -1287,7 +1303,14 @@ async fn vm_config_from_command_line(
         });
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmSnapshotRequestHandle::ID.to_owned(),
-            resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+            resource: {
+                let (notify, requests) = mesh::channel();
+                resources.microvm_snapshot_requests = Some(requests);
+                MicrovmSnapshotRequestHandle {
+                    notify: Some(notify),
+                }
+                .into_resource()
+            },
         });
     }
 
@@ -1295,29 +1318,39 @@ async fn vm_config_from_command_line(
         if arch != MachineArch::X86_64 {
             bail!("the microVM profile requires an x86-64 guest");
         }
-        if opt.restore_snapshot.is_some() {
-            bail!("snapshot restore is unavailable for microVM ABI version 1");
-        }
         if opt.igvm.is_some() || opt.pcat || opt.uefi {
             bail!("the microVM profile requires Xen PVH direct boot");
         }
 
-        let kernel = fs_err::File::open(
-            (opt.kernel.0)
+        let (kernel, initrd, cmdline) = if let Some(contract) = restore_machine_contract {
+            (
+                tempfile::tempfile().context("failed to create inert restore kernel handle")?,
+                None,
+                contract.effective_command_line.clone(),
+            )
+        } else {
+            let kernel = fs_err::File::open(
+                (opt.kernel.0)
+                    .as_ref()
+                    .context("must provide a PVH kernel when using --machine microvm")?,
+            )
+            .context("failed to open PVH kernel")?;
+            let initrd = (opt.initrd.0)
                 .as_ref()
-                .context("must provide a PVH kernel when using --machine microvm")?,
-        )
-        .context("failed to open PVH kernel")?;
-        let initrd = (opt.initrd.0)
-            .as_ref()
-            .map(fs_err::File::open)
-            .transpose()
-            .context("failed to open PVH initrd")?;
+                .map(fs_err::File::open)
+                .transpose()
+                .context("failed to open PVH initrd")?;
+            (
+                kernel.into(),
+                initrd.map(Into::into),
+                build_microvm_command_line(&opt.cmdline)?,
+            )
+        };
 
         load_mode = LoadMode::Pvh {
-            kernel: kernel.into(),
-            initrd: initrd.map(Into::into),
-            cmdline: build_microvm_command_line(&opt.cmdline)?,
+            kernel,
+            initrd,
+            cmdline,
         };
         with_hv = false;
     } else if opt.restore_snapshot.is_some() {
@@ -2524,46 +2557,131 @@ pub(crate) const GUEST_ARCH: &str = if cfg!(guest_arch = "x86_64") {
 fn prepare_snapshot_restore(
     snapshot_dir: &Path,
     opt: &Options,
+    expected_hypervisor: &str,
+    effective_command_line: Option<&str>,
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
     mesh::payload::message::ProtobufMessage,
+    Option<(Duration, u64, Vec<u8>)>,
 )> {
-    let (manifest, state_bytes) = openvmm_helpers::snapshot::read_snapshot(snapshot_dir)?;
+    let expected_microvm_contract = if opt.machine == MachineProfileCli::Microvm {
+        anyhow::ensure!(
+            opt.virtio_blk.is_empty(),
+            "microVM snapshot restore with virtio-blk requires immutable media identity"
+        );
+        Some((
+            expected_hypervisor,
+            effective_command_line
+                .context("microVM restore requires an effective PVH command line")?,
+        ))
+    } else {
+        None
+    };
+    let memory_verification = if opt.unsafe_skip_snapshot_memory_verification {
+        tracing::warn!(
+            "snapshot memory SHA-256 verification is disabled; memory.bin integrity is not checked"
+        );
+        openvmm_helpers::snapshot::SnapshotMemoryVerification::SkipSha256
+    } else {
+        openvmm_helpers::snapshot::SnapshotMemoryVerification::Sha256
+    };
+    prepare_snapshot_restore_for_config(
+        snapshot_dir,
+        opt.memory_size(),
+        opt.processors,
+        expected_microvm_contract,
+        memory_verification,
+    )
+}
+
+pub(crate) fn prepare_snapshot_restore_for_config(
+    snapshot_dir: &Path,
+    expected_memory_size: u64,
+    expected_vp_count: u32,
+    expected_microvm_contract: Option<(&str, &str)>,
+    memory_verification: openvmm_helpers::snapshot::SnapshotMemoryVerification,
+) -> anyhow::Result<(
+    openvmm_defs::worker::SharedMemoryFd,
+    mesh::payload::message::ProtobufMessage,
+    Option<(Duration, u64, Vec<u8>)>,
+)> {
+    let (manifest, state_bytes, memory_file) =
+        openvmm_helpers::snapshot::read_snapshot_with_memory_verification(
+            snapshot_dir,
+            expected_memory_size,
+            memory_verification,
+        )?;
 
     // Validate manifest against current VM config.
     openvmm_helpers::snapshot::validate_manifest(
         &manifest,
         GUEST_ARCH,
-        opt.memory_size(),
-        opt.processors,
+        expected_memory_size,
+        expected_vp_count,
         system_page_size(),
     )?;
+    let restore_time =
+        if let Some((expected_hypervisor, effective_command_line)) = expected_microvm_contract {
+            let saved_contract = manifest
+                .machine_contract
+                .as_ref()
+                .context("microVM snapshot is missing its authoritative machine contract")?;
+            let expected_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
+                expected_hypervisor,
+                effective_command_line.to_owned(),
+                expected_memory_size,
+                saved_contract.state_unit_names.clone(),
+                saved_contract.capture_wall_clock,
+                saved_contract.tsc_frequency_hz,
+                saved_contract.cpu_contract.clone(),
+            )?;
+            openvmm_helpers::snapshot::validate_microvm_machine_contract(
+                &manifest,
+                &expected_contract,
+            )?;
+            let capture_time: std::time::SystemTime = saved_contract
+                .capture_wall_clock
+                .try_into()
+                .context("snapshot capture wall clock is invalid")?;
+            let downtime = std::time::SystemTime::now()
+                .duration_since(capture_time)
+                .context("destination wall clock is before snapshot capture time")?;
+            anyhow::ensure!(
+                downtime <= Duration::from_secs(30 * 24 * 60 * 60),
+                "snapshot host downtime exceeds the supported 30-day bound"
+            );
+            Some((
+                downtime,
+                saved_contract.tsc_frequency_hz,
+                saved_contract.cpu_contract.clone(),
+            ))
+        } else {
+            None
+        };
 
-    // Open memory.bin (existing file, no create, no resize).
-    let memory_file = fs_err::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(snapshot_dir.join("memory.bin"))?;
+    // Map the exact handle that was hashed above. The worker uses a writable
+    // copy-on-write view so the reusable artifact remains immutable.
+    let shared_memory_fd =
+        openvmm_helpers::shared_memory::file_to_copy_on_write_memory_fd(memory_file)?;
 
-    // Validate file size matches expected memory size.
-    let file_size = memory_file.metadata()?.len();
-    if file_size != manifest.memory_size_bytes {
-        anyhow::bail!(
-            "memory.bin size ({file_size} bytes) doesn't match manifest ({} bytes)",
-            manifest.memory_size_bytes,
+    // The manifest and state.bin inventories describe the same machine boundary.
+    // Require them to agree before worker and partition construction.
+    let state_msg: mesh::payload::message::ProtobufMessage = mesh::payload::decode(&state_bytes)
+        .context("failed to decode saved state from snapshot")?;
+    if let Some(contract) = &manifest.machine_contract {
+        let inventory_msg: mesh::payload::message::ProtobufMessage =
+            mesh::payload::decode(&state_bytes)
+                .context("failed to decode saved state inventory from snapshot")?;
+        let saved_state: openvmm_defs::worker::SavedState = inventory_msg
+            .parse()
+            .context("failed to parse saved state inventory from snapshot")?;
+        anyhow::ensure!(
+            saved_state.inventory == contract.state_unit_names,
+            "snapshot manifest state-unit inventory does not match state.bin"
         );
     }
 
-    let shared_memory_fd =
-        openvmm_helpers::shared_memory::file_to_shared_memory_fd(memory_file.into())?;
-
-    // Reconstruct ProtobufMessage from the saved state bytes.
-    // The save side wrote mesh::payload::encode(ProtobufMessage), so we decode
-    // back to ProtobufMessage.
-    let state_msg: mesh::payload::message::ProtobufMessage = mesh::payload::decode(&state_bytes)
-        .context("failed to decode saved state from snapshot")?;
-
-    Ok((shared_memory_fd, state_msg))
+    Ok((shared_memory_fd, state_msg, restore_time))
 }
 
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
@@ -2666,10 +2784,108 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
 async fn run_control_inner(
     driver: &DefaultDriver,
     mesh_slot: &mut Option<VmmMesh>,
-    opt: Options,
+    mut opt: Options,
 ) -> anyhow::Result<i32> {
     let mesh = mesh_slot.as_ref().unwrap();
-    let (mut vm_config, mut resources) = vm_config_from_command_line(driver, mesh, &opt).await?;
+    let restore_machine_contract = if opt.machine == MachineProfileCli::Microvm
+        && let Some(snapshot_dir) = &opt.restore_snapshot
+    {
+        let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(snapshot_dir)?;
+        let contract = manifest
+            .machine_contract
+            .context("microVM snapshot is missing its authoritative machine contract")?;
+        anyhow::ensure!(
+            contract.machine_profile == "microvm"
+                && contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_1,
+            "snapshot is not a supported microVM ABI-v1 snapshot"
+        );
+        anyhow::ensure!(
+            opt.cmdline.is_empty(),
+            "restore-time command-line overrides are not allowed"
+        );
+        anyhow::ensure!(
+            opt.memory == Default::default()
+                && !opt.deprecated_private_memory
+                && !opt.deprecated_prefetch
+                && !opt.deprecated_thp
+                && opt.deprecated_memory_backing_file.is_none(),
+            "restore-time memory overrides are not allowed"
+        );
+        opt.memory.size = Some(vmm_cli::MemorySize(manifest.memory_size_bytes));
+        Some(contract)
+    } else {
+        None
+    };
+    if restore_machine_contract.is_some() && !opt.restore_entropy {
+        tracing::warn!(
+            "restoring cloned guest RNG state without fresh entropy injection; cryptographic workloads are unsafe"
+        );
+    }
+    let (mut vm_config, mut resources) =
+        vm_config_from_command_line(driver, mesh, &opt, restore_machine_contract.as_ref()).await?;
+    let effective_command_line = match &vm_config.load_mode {
+        LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
+        _ => None,
+    };
+    let has_microvm_block = !vm_config.virtio_devices.is_empty();
+
+    let snapshot_destination = opt.snapshot_destination.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        }
+    });
+    let snapshot_memory_file = if let Some(destination) = &snapshot_destination
+        && opt.memory_backing_file().is_none()
+    {
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent_metadata = fs_err::symlink_metadata(parent)
+            .with_context(|| format!("failed to inspect snapshot parent {}", parent.display()))?;
+        anyhow::ensure!(
+            parent_metadata.file_type().is_dir(),
+            "snapshot parent is not a directory: {}",
+            parent.display()
+        );
+        anyhow::ensure!(
+            fs_err::symlink_metadata(destination)
+                .is_err_and(|error| { error.kind() == io::ErrorKind::NotFound }),
+            "snapshot destination already exists or cannot be inspected: {}",
+            destination.display()
+        );
+        let file = tempfile::Builder::new()
+            .prefix(".openvmm-microvm-memory-")
+            .tempfile_in(parent)
+            .context("failed to create snapshot memory backing")?;
+        file.as_file()
+            .set_len(opt.memory_size())
+            .context("failed to size snapshot memory backing")?;
+        Some(file)
+    } else {
+        None
+    };
+    let snapshot_memory_handle = if snapshot_destination.is_some() {
+        if let Some(file) = &snapshot_memory_file {
+            Some(
+                file.reopen()
+                    .context("failed to duplicate automatic snapshot RAM handle")?,
+            )
+        } else {
+            opt.memory_backing_file()
+                .map(|path| {
+                    openvmm_helpers::shared_memory::open_memory_backing_file_handle(
+                        path,
+                        opt.memory_size(),
+                    )
+                })
+                .transpose()?
+        }
+    } else {
+        None
+    };
 
     let mut vnc_worker = None;
     if opt.gfx || opt.vnc.vnc {
@@ -2790,36 +3006,63 @@ async fn run_control_inner(
     // spin up the VM
     let (vm_rpc, rpc_recv) = mesh::channel();
     let (notify_send, notify_recv) = mesh::channel();
+    let snapshot_boundary_requests = resources.microvm_snapshot_requests.take();
+    let (snapshot_ready, snapshot_requests) = if snapshot_boundary_requests.is_some() {
+        let (ready, requests) = mesh::channel();
+        (Some(ready), Some(requests))
+    } else {
+        (None, None)
+    };
+    let hypervisor = match &opt.hypervisor {
+        Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
+        None if opt.machine == MachineProfileCli::Microvm => {
+            openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
+        }
+        None => openvmm_helpers::hypervisor::choose_hypervisor()?,
+    };
+    let source_hypervisor = hypervisor.id().to_owned();
     let vm_worker = {
         let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
 
-        let (shared_memory, saved_state) = if let Some(snapshot_dir) = &opt.restore_snapshot {
-            let (fd, state_msg) = prepare_snapshot_restore(snapshot_dir, &opt)?;
-            (Some(fd), Some(state_msg))
-        } else {
-            let shared_memory = opt
-                .memory_backing_file()
-                .map(|path| {
-                    openvmm_helpers::shared_memory::open_memory_backing_file(
-                        path,
-                        opt.memory_size(),
-                    )
-                })
-                .transpose()?;
-            (shared_memory, None)
-        };
+        let (shared_memory, saved_state, shared_memory_copy_on_write, restore_time) =
+            if let Some(snapshot_dir) = &opt.restore_snapshot {
+                let (fd, state_msg, restore_time) = prepare_snapshot_restore(
+                    snapshot_dir,
+                    &opt,
+                    &source_hypervisor,
+                    effective_command_line.as_deref(),
+                )?;
+                (Some(fd), Some(state_msg), true, restore_time)
+            } else if let Some(file) = &snapshot_memory_handle {
+                let file = file
+                    .try_clone()
+                    .context("failed to duplicate snapshot RAM handle for worker")?;
+                let shared_memory = openvmm_helpers::shared_memory::file_to_shared_memory_fd(file)?;
+                (Some(shared_memory), None, false, None)
+            } else {
+                let shared_memory = opt
+                    .memory_backing_file()
+                    .map(|path| {
+                        openvmm_helpers::shared_memory::open_memory_backing_file(
+                            path,
+                            opt.memory_size(),
+                        )
+                    })
+                    .transpose()?;
+                (shared_memory, None, false, None)
+            };
 
         let params = VmWorkerParameters {
-            hypervisor: match &opt.hypervisor {
-                Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
-                None if opt.machine == MachineProfileCli::Microvm => {
-                    openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
-                }
-                None => openvmm_helpers::hypervisor::choose_hypervisor()?,
-            },
+            hypervisor,
             cfg: vm_config,
             saved_state,
             shared_memory,
+            shared_memory_copy_on_write,
+            snapshot_boundary_requests,
+            snapshot_ready,
+            restore_downtime: restore_time.as_ref().map(|(downtime, _, _)| *downtime),
+            restore_tsc_frequency_hz: restore_time.as_ref().map(|(_, frequency, _)| *frequency),
+            restore_cpu_contract: restore_time.map(|(_, _, cpu_contract)| cpu_contract),
             rpc: rpc_recv,
             notify: notify_send,
         };
@@ -2875,11 +3118,23 @@ async fn run_control_inner(
         vm_rpc: vm_rpc.clone(),
         paravisor_diag: Some(paravisor_diag),
         igvm_path: opt.igvm.clone(),
-        memory_backing_file: opt.memory_backing_file().cloned(),
+        memory_backing_file: opt.memory_backing_file().cloned().or_else(|| {
+            snapshot_memory_file
+                .as_ref()
+                .map(|file| file.path().to_owned())
+        }),
+        snapshot_memory_handle,
         memory: opt.memory_size(),
         processors: opt.processors,
         log_file: opt.log_file.clone(),
         crash_dump_path: opt.crash_dump_path.clone(),
+        snapshot_requests,
+        snapshot_destination,
+        snapshot_quiesce_timeout: Duration::from_millis(opt.snapshot_quiesce_timeout_ms),
+        source_hypervisor,
+        effective_command_line,
+        has_microvm_block,
+        snapshot_memory_file,
         guest_power_actions: vm_controller::GuestPowerActions {
             shutdown: opt.guest_shutdown_action,
             reset: opt.guest_reset_action,

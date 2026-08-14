@@ -234,6 +234,8 @@ pub struct ProtoPartitionConfig<'a> {
     /// backend recognizes it via [`Hypervisor::recognizes_nested_virt`]; a
     /// backend that receives an unrecognized request may silently ignore it.
     pub nested_virt: bool,
+    /// Build the reproducible CPU/clock contract used by a versioned machine profile.
+    pub versioned_cpu_contract: bool,
 }
 
 /// Partition creation configuration.
@@ -392,6 +394,30 @@ pub struct HvConfig {
 
 /// Methods for manipulating a VM partition.
 pub trait Partition: 'static + Hv1 + Inspect + Send + Sync {
+    /// Returns the effective x86 CPU compatibility contract.
+    #[cfg(guest_arch = "x86_64")]
+    fn cpu_compatibility_contract(&self) -> crate::x86::CpuCompatibilityContract;
+
+    /// Returns the effective guest TSC frequency when applicable.
+    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Requests the effective guest TSC frequency when supported.
+    fn set_tsc_frequency_hz(&self, _frequency_hz: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Advances any backend-specific guest clock by snapshot downtime.
+    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Returns the effective LAPIC interrupt clock frequency when available.
+    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+
     /// Returns a trait object for initial page imports during the initial start
     /// flow.
     fn supports_initial_page_acceptance(

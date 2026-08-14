@@ -190,7 +190,7 @@ pub struct Options {
         short = 'm',
         long,
         value_name = "PARAMS",
-        default_value = "1GB",
+        default_value = "",
         value_parser = parse_memory_config,
         conflicts_with = "numa",
         long_help = r#"Configure guest RAM.
@@ -284,9 +284,26 @@ Examples:
     #[clap(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["deprecated_memory_backing_file", "numa"]
+        conflicts_with_all = ["deprecated_memory_backing_file", "numa", "kernel", "initrd"]
     )]
     pub restore_snapshot: Option<PathBuf>,
+
+    /// Expose a fresh OPENVMM_ENTROPY_V1 packet through the private portb restore channel.
+    #[clap(long, requires = "restore_snapshot")]
+    pub restore_entropy: bool,
+
+    /// Skip SHA-256 verification of snapshot memory during restore. This trusts
+    /// memory.bin after checking only its file type and exact length.
+    #[clap(long, requires = "restore_snapshot")]
+    pub unsafe_skip_snapshot_memory_verification: bool,
+
+    /// Capture a microVM snapshot to this directory when the guest writes PMIO 0x605.
+    #[clap(long, value_name = "DIR", conflicts_with = "restore_snapshot")]
+    pub snapshot_destination: Option<PathBuf>,
+
+    /// Maximum time allowed to quiesce the VM for a guest-requested snapshot.
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 5000)]
+    pub snapshot_quiesce_timeout_ms: u64,
 
     /// use private anonymous memory for guest RAM
     #[clap(long = "private-memory", hide = true, conflicts_with_all = ["deprecated_memory_backing_file", "restore_snapshot", "numa"])]
@@ -1435,10 +1452,24 @@ impl Options {
                 && matches!(self.x2apic, X2ApicConfig::Auto),
             "microVM ABI version 1 owns CPU topology and APIC configuration"
         );
-        anyhow::ensure!(
-            self.restore_snapshot.is_none(),
-            "snapshot restore is unavailable for microVM ABI version 1"
-        );
+        if self.snapshot_destination.is_some() {
+            anyhow::ensure!(
+                !self.private_memory(),
+                "microVM snapshot capture requires shared file-backed RAM"
+            );
+            anyhow::ensure!(
+                !self.memory.hugepages,
+                "microVM snapshot capture does not support explicit hugepage backing"
+            );
+            anyhow::ensure!(
+                self.snapshot_quiesce_timeout_ms != 0,
+                "microVM snapshot quiesce timeout must be nonzero"
+            );
+            anyhow::ensure!(
+                self.virtio_blk.is_empty(),
+                "microVM snapshot capture with virtio-blk is unavailable until immutable media identity is implemented"
+            );
+        }
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
             "microVM ABI version 1 requires Xen PVH direct boot"
@@ -1777,7 +1808,9 @@ fn parse_acs_capability_mask(value: &str) -> anyhow::Result<u16> {
 
 fn parse_memory_config(s: &str) -> anyhow::Result<MemoryCli> {
     // Bare shortcut: `--memory 64G` sets only the size.
-    let memory = if !s.contains('=') && !s.contains(',') {
+    let memory = if s.is_empty() {
+        MemoryCli::default()
+    } else if !s.contains('=') && !s.contains(',') {
         MemoryCli {
             size: Some(s.parse::<vmm_cli::MemorySize>()?),
             ..Default::default()
@@ -5044,6 +5077,23 @@ mod tests {
 
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn test_snapshot_memory_verification_bypass_requires_restore() {
+        assert!(
+            Options::try_parse_from(["openvmm", "--unsafe-skip-snapshot-memory-verification",])
+                .is_err()
+        );
+
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--restore-snapshot",
+            "snapshot",
+            "--unsafe-skip-snapshot-memory-verification",
+        ])
+        .unwrap();
+        assert!(opt.unsafe_skip_snapshot_memory_verification);
     }
 
     #[test]

@@ -1064,6 +1064,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         }
     }
 
+    /// Returns the kernel and initrd paths for a direct-boot Linux VM.
+    pub fn linux_direct_boot_files(&self) -> Option<(&Path, &Path)> {
+        match &self.config.firmware {
+            Firmware::LinuxDirect { kernel, initrd } => Some((kernel.get(), initrd.get())),
+            _ => None,
+        }
+    }
+
     /// Whether pipette will run as PID 1 init in the initrd.
     ///
     /// True for non-OpenHCL Linux direct boot when a pipette binary is

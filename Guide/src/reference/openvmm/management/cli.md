@@ -29,9 +29,64 @@ as well as the generated CLI help (via `cargo run -- --help`).
 
   One optional `--virtio-blk <DISK>` is exposed at MMIO `0xd0003000`, IRQ 4,
   using split rings. Firmware, ACPI, SMBIOS, PCI, VMBus, UARTs, graphics,
-  isolation, nested virtualization, and other devices are rejected. Snapshot
-  capture, restore, pulse-save/restore, and worker restart are unavailable in
-  ABI version 1 Phase 1.
+  isolation, nested virtualization, and other devices are rejected. Host-driven
+  save/restore, pulse-save/restore, and worker restart remain unavailable.
+
+  Guest-requested snapshot capture and new-process restore are available for
+  the no-block ABI-v1 machine on Linux/KVM and Windows/WHP. Capture with the
+  optional virtio-blk device is rejected until immutable media identity is
+  implemented.
+* `--snapshot-destination <DIR>`: Publish a microVM snapshot when the guest
+  writes to PMIO port `0x605`. The destination must not exist and its parent
+  must already be a directory. OpenVMM automatically creates file-backed RAM
+  in that parent when no memory backing file was supplied, quiesces the VM,
+  writes and flushes a sibling staging directory, and atomically renames it to
+  `DIR`. After a successful commit, the source VM terminates without executing
+  the instruction after the snapshot `out`.
+
+  `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
+  timeout and defaults to 5000. A request with no configured destination is
+  ignored and the guest continues. Capture currently requires microVM ABI v1,
+  one vCPU, KVM or WHP, shared file-backed RAM, and no virtio-blk device.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm --memory 128M \
+    --kernel vmlinux --initrd initramfs.cpio.gz \
+    --snapshot-destination snapshot
+  ```
+* `--restore-snapshot <DIR>`: Restore a microVM from a committed snapshot.
+  The manifest supplies the authoritative RAM size, one-vCPU topology, ABI,
+  fixed device inventory, effective kernel command line, source backend, CPU
+  contract, and TSC frequency. Kernel, initrd, command-line, memory, processor,
+  device, and topology overrides are not accepted. Restore requires the same
+  backend kind as capture. ABI-v1 WHP microVMs use a 1 GHz virtual TSC that is
+  configured before partition setup and reproduced on restore.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm \
+    --restore-snapshot snapshot --restore-entropy
+  ```
+* `--restore-entropy`: Make a fresh `OPENVMM_ENTROPY_V1` packet available on
+  the private portb restore channel. The guest must consume the packet and
+  explicitly reseed its RNG. Restoring cloned RNG state without this option is
+  unsafe for cryptographic workloads and emits a warning.
+* `--unsafe-skip-snapshot-memory-verification`: Skip restore-time SHA-256
+  verification of `memory.bin`. This requires `--restore-snapshot` and is
+  intended only for benchmarking or snapshots whose memory backing is
+  independently trusted and immutable. Manifest validation, `state.bin`
+  SHA-256 verification, regular-file checks, and the exact `memory.bin` length
+  check remain enabled. The ttrpc restore API does not expose this bypass.
+
+  A committed snapshot contains exactly `manifest.bin`, `state.bin`, and
+  `memory.bin`. By default, restore rejects unknown files, symlinks, malformed
+  or oversized data, and length or SHA-256 mismatches before starting a vCPU.
+  `memory.bin` is opened through a private writable copy-on-write mapping, so
+  the same snapshot can be restored repeatedly without modifying its
+  artifacts.
+
+  Snapshot integrity checks detect accidental or untrusted modification, but
+  they do not authenticate or encrypt a snapshot. Treat all three artifacts as
+  sensitive guest state and protect the directory with host access controls.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:

@@ -86,6 +86,8 @@ use windows_sys::Win32::System::Memory::PAGE_READONLY;
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::PAGE_READWRITE;
 #[cfg(windows)]
+use windows_sys::Win32::System::Memory::PAGE_WRITECOPY;
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::SECTION_MAP_READ;
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::SECTION_MAP_WRITE;
@@ -342,7 +344,8 @@ impl MapperTask {
         // `soft_lp` module. They also depend on the partition delivering write
         // faults to raise deferred-protect windows, so don't even build one when
         // the partition can't resolve faults.
-        let soft_lp = if self.inner.supports_memory_fault_resolution {
+        let copy_on_write = matches!(params.backing, MappingBacking::CopyOnWriteFile { .. });
+        let soft_lp = if self.inner.supports_memory_fault_resolution && !copy_on_write {
             SoftLp::new(
                 params.range,
                 &params.policy,
@@ -363,8 +366,15 @@ impl MapperTask {
                 mappable,
                 file_offset,
             } => {
-                self.map_file(&params, mappable, *file_offset, deferred_protect)?;
+                self.map_file(&params, mappable, *file_offset, deferred_protect, false)?;
                 false
+            }
+            MappingBacking::CopyOnWriteFile {
+                mappable,
+                file_offset,
+            } => {
+                self.map_file(&params, mappable, *file_offset, false, true)?;
+                true
             }
             MappingBacking::Private => {
                 self.map_private(&params, deferred_protect)?;
@@ -390,6 +400,7 @@ impl MapperTask {
         mappable: &super::mappable::Mappable,
         file_offset: u64,
         deferred_protect: bool,
+        copy_on_write: bool,
     ) -> Result<(), MappingError> {
         let &MappingParams {
             range,
@@ -411,18 +422,29 @@ impl MapperTask {
         // fails with ERROR_INVALID_PARAMETER). Deferred protect implies
         // `writable`.
         #[cfg(windows)]
-        let (protect, access) = (
-            if writable {
-                PAGE_READWRITE
-            } else {
-                PAGE_READONLY
-            },
-            if writable {
-                SECTION_MAP_READ | SECTION_MAP_WRITE
-            } else {
-                SECTION_MAP_READ
-            },
-        );
+        let (protect, access) = if copy_on_write {
+            (
+                if writable {
+                    PAGE_WRITECOPY
+                } else {
+                    PAGE_READONLY
+                },
+                SECTION_MAP_READ,
+            )
+        } else {
+            (
+                if writable {
+                    PAGE_READWRITE
+                } else {
+                    PAGE_READONLY
+                },
+                if writable {
+                    SECTION_MAP_READ | SECTION_MAP_WRITE
+                } else {
+                    SECTION_MAP_READ
+                },
+            )
+        };
         // `deferred_protect` is only consulted on Windows below; keep it live on
         // other targets so the shared parameter doesn't warn.
         let _ = deferred_protect;
@@ -439,13 +461,23 @@ impl MapperTask {
                 )
             }
             _ => {
-                self.inner.mapping.map_file(
-                    range.start() as usize,
-                    range.len() as usize,
-                    mappable,
-                    file_offset,
-                    writable,
-                )
+                if copy_on_write {
+                    self.inner.mapping.map_file_copy_on_write(
+                        range.start() as usize,
+                        range.len() as usize,
+                        mappable,
+                        file_offset,
+                        writable,
+                    )
+                } else {
+                    self.inner.mapping.map_file(
+                        range.start() as usize,
+                        range.len() as usize,
+                        mappable,
+                        file_offset,
+                        writable,
+                    )
+                }
             }
         };
 

@@ -4792,9 +4792,54 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
     dev.stop().await;
 
     // Save state.
-    let saved = dev.save().expect("save should succeed");
+    let mut saved = dev.save().expect("save should succeed");
     assert_eq!(saved.queues.len(), 1);
     assert!(saved.queues[0].common.enable);
+
+    let features = guest.queue_features();
+    let queue = &mut saved.queues[0].common;
+    crate::transport::core::validate_restored_queue(0, queue, features, &mem, &mut Vec::new())
+        .expect("valid queue was rejected");
+
+    let original_size = queue.size;
+    queue.size = 3;
+    assert!(
+        crate::transport::core::validate_restored_queue(0, queue, features, &mem, &mut Vec::new(),)
+            .is_err()
+    );
+    queue.size = original_size;
+
+    let original_avail = queue.avail_addr;
+    queue.avail_addr = queue.desc_addr;
+    assert!(
+        crate::transport::core::validate_restored_queue(0, queue, features, &mem, &mut Vec::new(),)
+            .is_err()
+    );
+    queue.avail_addr = original_avail;
+
+    let original_desc = queue.desc_addr;
+    queue.desc_addr = u64::MAX - 15;
+    assert!(
+        crate::transport::core::validate_restored_queue(0, queue, features, &mem, &mut Vec::new(),)
+            .is_err()
+    );
+    queue.desc_addr = 1 << 60;
+    assert!(
+        crate::transport::core::validate_restored_queue(0, queue, features, &mem, &mut Vec::new(),)
+            .is_err()
+    );
+    queue.desc_addr = original_desc;
+
+    let original_progress = queue.queue_state;
+    queue.queue_state = Some(QueueState {
+        avail_index: original_size + 1,
+        used_index: 0,
+    });
+    assert!(
+        crate::transport::core::validate_restored_queue(0, queue, features, &mem, &mut Vec::new(),)
+            .is_err()
+    );
+    queue.queue_state = original_progress;
 
     // Create a new device and restore into it.
     let interrupt2 = LineInterrupt::detached();

@@ -12,6 +12,7 @@ use self::spec::StatusRegA;
 use self::spec::StatusRegB;
 use self::spec::StatusRegC;
 use self::spec::StatusRegD;
+use anyhow::Context;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
@@ -245,6 +246,21 @@ impl ChangeDeviceState for Rtc {
 
         self.update_timers();
         self.update_interrupt_line_level();
+    }
+
+    async fn advance_time(&mut self, duration: Duration) -> anyhow::Result<()> {
+        let delta = i64::try_from(duration.as_millis())
+            .context("RTC downtime does not fit in milliseconds")?;
+        let current = self.real_time_source.get_time();
+        let advanced = current
+            .as_millis_since_unix_epoch()
+            .checked_add(delta)
+            .context("RTC time overflow while applying snapshot downtime")?;
+        self.real_time_source
+            .set_time(LocalClockTime::from_millis_since_unix_epoch(advanced));
+        self.update_timers();
+        self.update_interrupt_line_level();
+        Ok(())
     }
 }
 
@@ -981,6 +997,9 @@ mod save_restore {
             pub addr: u8,
             #[mesh(2)]
             pub cmos: [u8; 256],
+            /// Guest-visible RTC time at the stopped snapshot boundary.
+            #[mesh(3)]
+            pub clock_time_millis: i64,
         }
     }
 
@@ -990,18 +1009,33 @@ mod save_restore {
         fn save(&mut self) -> Result<Self::SavedState, SaveError> {
             let RtcState { addr, ref cmos } = self.state;
 
-            let saved_state = state::SavedState { addr, cmos: cmos.0 };
+            let saved_state = state::SavedState {
+                addr,
+                cmos: cmos.0,
+                clock_time_millis: self
+                    .real_time_source
+                    .get_time()
+                    .as_millis_since_unix_epoch(),
+            };
 
             Ok(saved_state)
         }
 
         fn restore(&mut self, state: Self::SavedState) -> Result<(), RestoreError> {
-            let state::SavedState { addr, cmos } = state;
+            let state::SavedState {
+                addr,
+                cmos,
+                clock_time_millis,
+            } = state;
 
             self.state = RtcState {
                 addr,
                 cmos: CmosData(cmos),
             };
+            self.real_time_source
+                .set_time(LocalClockTime::from_millis_since_unix_epoch(
+                    clock_time_millis,
+                ));
 
             self.update_timers();
             self.update_interrupt_line_level();
@@ -1017,6 +1051,7 @@ mod tests {
     use local_clock::MockLocalClock;
     use local_clock::MockLocalClockAccessor;
     use test_with_tracing::test;
+    use vmcore::save_restore::SaveRestore;
 
     fn new_test_rtc_with_mode(
         mode: RtcMode,
@@ -1071,6 +1106,25 @@ mod tests {
         rtc.io_write(RtcIoPort::ADDR.0, &temp).unwrap();
         temp[0] = data;
         rtc.io_write(RtcIoPort::DATA.0, &temp).unwrap();
+    }
+
+    #[test]
+    fn restore_preserves_guest_epoch_and_advances_downtime() {
+        let (mut pool, _vm_time_keeper, clock, mut rtc) = new_test_rtc();
+        clock.tick(Duration::from_secs(10));
+        let captured_time = clock.get_time();
+        let saved = rtc.save().unwrap();
+
+        clock.tick(Duration::from_secs(60));
+        rtc.restore(saved).unwrap();
+        assert_eq!(clock.get_time(), captured_time);
+
+        pool.run_until(rtc.advance_time(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            clock.get_time() - captured_time,
+            Duration::from_secs(3).into()
+        );
     }
 
     fn get_rtc_data(rtc: &mut Rtc, addr: CmosReg, bcd: bool, hour24: bool) -> u8 {

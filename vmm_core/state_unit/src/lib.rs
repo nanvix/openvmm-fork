@@ -36,6 +36,7 @@ use futures::future::join_all;
 use futures_concurrency::stream::Merge;
 use inspect::Inspect;
 use inspect::InspectMut;
+use mesh::CancelContext;
 use mesh::MeshPayload;
 use mesh::Receiver;
 use mesh::Sender;
@@ -58,6 +59,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
 use tracing::Instrument;
@@ -82,6 +84,9 @@ pub enum StateRequest {
 
     /// Restore state of a stopped unit.
     Restore(FailableRpc<SavedStateBlob, ()>),
+
+    /// Advance guest-visible time while stopped after snapshot restore.
+    AdvanceTime(FailableRpc<Duration, ()>),
 
     /// Inspect state.
     Inspect(inspect::Deferred),
@@ -114,6 +119,12 @@ pub trait StateUnit: InspectMut {
     ///
     /// Must only be called while stopped.
     async fn restore(&mut self, buffer: SavedStateBlob) -> Result<(), RestoreError>;
+
+    /// Advance guest-visible time after restore. Most units derive their
+    /// deadlines from VM time and need no direct adjustment.
+    async fn advance_time(&mut self, _duration: Duration) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Runs a simple unit that only needs to respond to state requests.
@@ -165,7 +176,8 @@ impl StateRequest {
             | StateRequest::Stop(_)
             | StateRequest::Reset(_)
             | StateRequest::Save(_)
-            | StateRequest::Restore(_) => {
+            | StateRequest::Restore(_)
+            | StateRequest::AdvanceTime(_) => {
                 // Handle for concurrent inspect requests.
                 enum Event {
                     OpDone,
@@ -197,6 +209,10 @@ impl StateRequest {
                 rpc.handle_failable(async |buffer| unit.restore(buffer).await)
                     .await
             }
+            StateRequest::AdvanceTime(rpc) => {
+                rpc.handle_failable(async |duration| unit.advance_time(duration).await)
+                    .await
+            }
             StateRequest::Inspect(req) => req.inspect(unit),
         }
     }
@@ -218,6 +234,8 @@ enum State {
     Resetting,
     Saving,
     Restoring,
+    AdvancingTime,
+    QuiesceUncertain,
 }
 
 #[derive(Debug)]
@@ -366,6 +384,23 @@ pub struct StateTransitionError {
     errors: UnitErrorSet,
 }
 
+/// A bounded quiesce failed and the VM must not be saved.
+#[derive(Debug, Error)]
+#[error("failed to quiesce state units for save: {failures:?}")]
+pub struct QuiesceForSaveError {
+    failures: Vec<(String, String)>,
+    uncertain: bool,
+}
+
+impl QuiesceForSaveError {
+    /// Returns whether any unit may have partially changed ownership or state.
+    ///
+    /// When true, the VM cannot be resumed safely and must be terminated.
+    pub fn has_uncertain_state(&self) -> bool {
+        self.uncertain
+    }
+}
+
 fn extract<T, E: Into<anyhow::Error>, U>(
     op: &'static str,
     iter: impl IntoIterator<Item = (Arc<str>, Result<T, E>)>,
@@ -437,6 +472,26 @@ impl StateUnits {
         }
     }
 
+    /// Returns every registered state-unit name in stable registration order.
+    pub fn inventory(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .units
+            .values()
+            .map(|unit| unit.name.to_string())
+            .collect()
+    }
+
+    /// Verifies that a saved inventory exactly matches the registered units.
+    pub fn validate_inventory(&self, saved_inventory: &[String]) -> anyhow::Result<()> {
+        let current_inventory = self.inventory();
+        anyhow::ensure!(
+            saved_inventory == current_inventory,
+            "saved state-unit inventory does not match the current machine: saved={saved_inventory:?}, current={current_inventory:?}"
+        );
+        Ok(())
+    }
+
     /// Save and restore will use `name` as the save ID, so this forms part of
     /// the saved state.
     ///
@@ -501,6 +556,182 @@ impl StateUnits {
         )
         .await;
         self.running = false;
+    }
+
+    /// Stops all units in reverse dependency order within `timeout`.
+    ///
+    /// A timeout or communication failure after a stop request is sent leaves
+    /// ownership uncertain. The returned error reports this via
+    /// [`QuiesceForSaveError::has_uncertain_state`]; callers must terminate the
+    /// VM rather than attempt rollback in that case.
+    pub async fn quiesce_for_save(&mut self, timeout: Duration) -> Result<(), QuiesceForSaveError> {
+        assert!(self.running);
+
+        enum UnitResult {
+            Stopped,
+            DependencyFailed,
+            Uncertain(anyhow::Error),
+        }
+
+        let context = CancelContext::new().with_timeout(timeout);
+        let mut operations = Vec::new();
+        let ready_set;
+        {
+            let mut inner = self.inner.lock();
+            ready_set = inner.ready_set(None);
+            for (&id, unit) in &mut inner.units {
+                assert_eq!(
+                    unit.state,
+                    State::Running,
+                    "unit {} is not running before save quiesce",
+                    unit.name,
+                );
+                let name = unit.name.clone();
+                let dependencies = unit.dependents.clone();
+                let ready_set = ready_set.clone();
+                let mut context = context.clone();
+                let stop = state_change(name.clone(), unit, StateRequest::Stop, Some(()));
+                operations.push(async move {
+                    if !ready_set.wait("quiesce_for_save", id, &dependencies).await {
+                        ready_set.done(id, false);
+                        return (name, id, UnitResult::DependencyFailed);
+                    }
+
+                    let result = match context.until_cancelled(stop).await {
+                        Ok(Ok(Some(()))) => UnitResult::Stopped,
+                        Ok(Ok(None)) => {
+                            UnitResult::Uncertain(anyhow::anyhow!("stop request was not sent"))
+                        }
+                        Ok(Err(error)) => UnitResult::Uncertain(error.into()),
+                        Err(reason) => UnitResult::Uncertain(reason.into()),
+                    };
+                    ready_set.done(id, matches!(result, UnitResult::Stopped));
+                    (name, id, result)
+                });
+                unit.state = State::Stopping;
+            }
+        }
+
+        let start = Instant::now();
+        let results = join_all(operations).await;
+        tracing::info!(duration = ?Instant::now() - start, "save quiesce complete");
+
+        let mut failures = Vec::new();
+        let mut uncertain = false;
+        let mut inner = self.inner.lock();
+        for (name, id, result) in results {
+            let Some(unit) = inner.units.get_mut(&id) else {
+                continue;
+            };
+            match result {
+                UnitResult::Stopped => unit.state = State::Stopped,
+                UnitResult::DependencyFailed => {
+                    unit.state = State::Running;
+                    failures.push((
+                        name.to_string(),
+                        "a dependent unit did not quiesce".to_owned(),
+                    ));
+                }
+                UnitResult::Uncertain(error) => {
+                    unit.state = State::QuiesceUncertain;
+                    uncertain = true;
+                    failures.push((name.to_string(), format!("{error:#}")));
+                }
+            }
+        }
+        drop(inner);
+
+        if failures.is_empty() {
+            self.running = false;
+            Ok(())
+        } else {
+            Err(QuiesceForSaveError {
+                failures,
+                uncertain,
+            })
+        }
+    }
+
+    /// Restarts every unit after a save failure that occurred after a fully
+    /// successful quiesce but before publication committed.
+    pub async fn resume_after_failed_save(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.running, "VM was not successfully quiesced for save");
+        anyhow::ensure!(
+            self.inner
+                .lock()
+                .units
+                .values()
+                .all(|unit| unit.state == State::Stopped),
+            "state-unit rollback is unsafe because not every unit is cleanly stopped"
+        );
+
+        enum StartResult {
+            Started,
+            DependencyFailed,
+            Uncertain(anyhow::Error),
+        }
+
+        let context = CancelContext::new().with_timeout(timeout);
+        let mut operations = Vec::new();
+        let ready_set;
+        {
+            let mut inner = self.inner.lock();
+            ready_set = inner.ready_set(None);
+            for (&id, unit) in &mut inner.units {
+                let name = unit.name.clone();
+                let dependencies = unit.dependencies.clone();
+                let ready_set = ready_set.clone();
+                let mut context = context.clone();
+                let start = state_change(name.clone(), unit, StateRequest::Start, Some(()));
+                operations.push(async move {
+                    if !ready_set.wait("snapshot_rollback", id, &dependencies).await {
+                        ready_set.done(id, false);
+                        return (name, id, StartResult::DependencyFailed);
+                    }
+
+                    let result = match context.until_cancelled(start).await {
+                        Ok(Ok(Some(()))) => StartResult::Started,
+                        Ok(Ok(None)) => {
+                            StartResult::Uncertain(anyhow::anyhow!("start request was not sent"))
+                        }
+                        Ok(Err(error)) => StartResult::Uncertain(error.into()),
+                        Err(reason) => StartResult::Uncertain(reason.into()),
+                    };
+                    ready_set.done(id, matches!(result, StartResult::Started));
+                    (name, id, result)
+                });
+                unit.state = State::Starting;
+            }
+        }
+
+        let results = join_all(operations).await;
+        let mut failures = Vec::new();
+        let mut inner = self.inner.lock();
+        for (name, id, result) in results {
+            let Some(unit) = inner.units.get_mut(&id) else {
+                continue;
+            };
+            match result {
+                StartResult::Started => unit.state = State::Running,
+                StartResult::DependencyFailed => {
+                    unit.state = State::Stopped;
+                    failures.push(format!("{name}: a dependency did not restart"));
+                }
+                StartResult::Uncertain(error) => {
+                    unit.state = State::QuiesceUncertain;
+                    failures.push(format!("{name}: {error:#}"));
+                }
+            }
+        }
+        drop(inner);
+
+        anyhow::ensure!(
+            failures.is_empty(),
+            "snapshot rollback could not safely restart all state units: {}",
+            failures.join("; ")
+        );
+        self.running = true;
+        Ok(())
     }
 
     /// Resets all the state units.
@@ -621,6 +852,30 @@ impl StateUnits {
 
         check("restore", r)?;
 
+        Ok(())
+    }
+
+    /// Advances guest-visible time on all stopped units in dependency order.
+    pub async fn advance_time(&mut self, duration: Duration) -> Result<(), StateTransitionError> {
+        assert!(!self.running);
+        let results = self
+            .run_op(
+                "advance_time",
+                None,
+                State::Stopped,
+                State::AdvancingTime,
+                State::Stopped,
+                StateRequest::AdvanceTime,
+                |_, _| Some(duration),
+                |unit| &unit.dependencies,
+            )
+            .await;
+        check(
+            "advance_time",
+            results
+                .into_iter()
+                .map(|(name, result)| (name, result.map_err(anyhow::Error::from))),
+        )?;
         Ok(())
     }
 
@@ -1106,6 +1361,187 @@ mod tests {
         fn inspect_mut(&mut self, req: inspect::Request<'_>) {
             req.respond();
         }
+    }
+
+    struct SlowStopUnit {
+        driver: DefaultDriver,
+        delay: Duration,
+    }
+
+    impl StateUnit for SlowStopUnit {
+        async fn start(&mut self) {}
+
+        async fn stop(&mut self) {
+            pal_async::timer::PolledTimer::new(&self.driver)
+                .sleep(self.delay)
+                .await;
+        }
+
+        async fn reset(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+            Ok(None)
+        }
+
+        async fn restore(&mut self, _state: SavedStateBlob) -> Result<(), RestoreError> {
+            Err(RestoreError::SavedStateNotSupported)
+        }
+    }
+
+    impl InspectMut for SlowStopUnit {
+        fn inspect_mut(&mut self, req: inspect::Request<'_>) {
+            req.respond();
+        }
+    }
+
+    struct SlowRollbackStartUnit {
+        driver: DefaultDriver,
+        starts: u32,
+    }
+
+    impl StateUnit for SlowRollbackStartUnit {
+        async fn start(&mut self) {
+            if self.starts != 0 {
+                pal_async::timer::PolledTimer::new(&self.driver)
+                    .sleep(Duration::from_secs(1))
+                    .await;
+            }
+            self.starts += 1;
+        }
+
+        async fn stop(&mut self) {}
+
+        async fn reset(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+            Ok(None)
+        }
+
+        async fn restore(&mut self, _state: SavedStateBlob) -> Result<(), RestoreError> {
+            Err(RestoreError::SavedStateNotSupported)
+        }
+    }
+
+    impl InspectMut for SlowRollbackStartUnit {
+        fn inspect_mut(&mut self, req: inspect::Request<'_>) {
+            req.respond();
+        }
+    }
+
+    #[async_test]
+    async fn test_exact_inventory_validation(driver: DefaultDriver) {
+        let units = StateUnits::new();
+        let _first = units
+            .add("first")
+            .spawn(&driver, |recv| run_unit(TestUnit::default(), recv))
+            .unwrap();
+        let _second = units
+            .add("second")
+            .spawn(&driver, |recv| run_unit(TestUnit::default(), recv))
+            .unwrap();
+
+        assert_eq!(units.inventory(), ["first", "second"]);
+        units
+            .validate_inventory(&["first".to_owned(), "second".to_owned()])
+            .unwrap();
+        assert!(units.validate_inventory(&["first".to_owned()]).is_err());
+        assert!(
+            units
+                .validate_inventory(&["second".to_owned(), "first".to_owned()])
+                .is_err()
+        );
+        assert!(
+            units
+                .validate_inventory(&["first".to_owned(), "second".to_owned(), "extra".to_owned(),])
+                .is_err()
+        );
+    }
+
+    #[async_test]
+    async fn test_quiesce_and_resume_after_failed_save(driver: DefaultDriver) {
+        let mut units = StateUnits::new();
+        let _unit = units
+            .add("unit")
+            .spawn(&driver, |recv| run_unit(TestUnit::default(), recv))
+            .unwrap();
+        units.start().await;
+
+        units
+            .quiesce_for_save(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!units.is_running());
+
+        units
+            .resume_after_failed_save(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(units.is_running());
+    }
+
+    #[async_test]
+    async fn test_quiesce_timeout_is_uncertain(driver: DefaultDriver) {
+        let mut units = StateUnits::new();
+        let _unit = units
+            .add("slow")
+            .spawn(&driver, {
+                let driver = driver.clone();
+                |recv| {
+                    run_unit(
+                        SlowStopUnit {
+                            driver,
+                            delay: Duration::from_secs(1),
+                        },
+                        recv,
+                    )
+                }
+            })
+            .unwrap();
+        units.start().await;
+
+        let started = std::time::Instant::now();
+        let error = units
+            .quiesce_for_save(Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.has_uncertain_state());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            units
+                .resume_after_failed_save(Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[async_test]
+    async fn test_rollback_start_timeout_is_bounded(driver: DefaultDriver) {
+        let mut units = StateUnits::new();
+        let _unit = units
+            .add("slow-rollback")
+            .spawn(&driver, {
+                let driver = driver.clone();
+                |recv| run_unit(SlowRollbackStartUnit { driver, starts: 0 }, recv)
+            })
+            .unwrap();
+        units.start().await;
+        units
+            .quiesce_for_save(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = units
+            .resume_after_failed_save(Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot rollback"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!units.is_running());
     }
 
     #[async_test]

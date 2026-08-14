@@ -44,6 +44,7 @@ scsidisk_resources.workspace = true
 storvsp_resources.workspace = true
 vfio_assigned_device_resources.workspace = true
 virtio_resources.workspace = true
+virt.workspace = true
 vm_resource.workspace = true
 disk_vhd1.workspace = true
 
@@ -57,6 +58,7 @@ unix_socket.workspace = true
 vmgs_resources.workspace = true
 
 anyhow.workspace = true
+base64.workspace = true
 fs-err.workspace = true
 futures.workspace = true
 jiff.workspace = true

@@ -14,12 +14,16 @@ pub mod capabilities {
     /// Support for resetting a partition running Windows.
     pub const WINDOWS_PARTITION_RESET: &str = "windows_partition_reset";
 
+    /// A microVM PVH kernel and initramfs are provisioned for the test run.
+    pub const MICROVM_PVH: &str = "microvm_pvh";
+
     /// All capability names known to petri, including those defined by
     /// incubators. Incubator device capabilities are the device's profile
     /// `name` with `-` replaced by `_` (e.g. `edu-initiator` → `edu_initiator`).
     pub const KNOWN_CAPABILITIES: &[&str] = &[
         VPCI,
         WINDOWS_PARTITION_RESET,
+        MICROVM_PVH,
         "test_disk",
         "edu_initiator",
         "ivshmem_target",

@@ -1087,6 +1087,12 @@ mod x86 {
             let mut default = self.vp.partition.cpuid.result(function, index, &default);
 
             match CpuidFunction(function) {
+                CpuidFunction::VersionAndFeatures => {
+                    let ebx = x86defs::cpuid::VersionAndFeaturesEbx::from(default[1]);
+                    default[1] = ebx
+                        .with_initial_apic_id(self.inner.vp_info.apic_id as u8)
+                        .into();
+                }
                 // The hypervisor does not consistently set this.
                 CpuidFunction::ExtendedTopologyEnumeration
                 | CpuidFunction::V2ExtendedTopologyEnumeration => {

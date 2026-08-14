@@ -78,6 +78,15 @@ trait ControlVp: ProtobufSaveRestore {
     /// Scrub per-VP state for a VTL.
     fn scrub(&mut self, vtl: Vtl) -> anyhow::Result<()>;
 
+    /// Advances the stopped vCPU TSC after snapshot downtime.
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()>;
+
     #[cfg(feature = "gdb")]
     fn debug(&mut self) -> &mut dyn DebugVp;
 
@@ -173,6 +182,65 @@ where
                 })
             }
         }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let cycles = duration
+            .as_nanos()
+            .checked_mul(u128::from(frequency_hz))
+            .context("TSC downtime adjustment overflows")?
+            / 1_000_000_000;
+        let cycles = u64::try_from(cycles).context("TSC downtime adjustment exceeds u64")?;
+        let mut access = self.vp.access_state(Vtl::Vtl0);
+        let mut tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
+        let tsc_deadline = access
+            .tsc_deadline()
+            .context("failed to read stopped vCPU TSC deadline")?;
+        let mut apic = apic_frequency_hz
+            .map(|frequency| {
+                let mut apic = access
+                    .apic()
+                    .context("failed to read stopped LAPIC timer")?;
+                apic.advance_timer(duration, frequency);
+                anyhow::Ok(apic)
+            })
+            .transpose()?;
+        let previous_tsc = tsc.value;
+        tsc.value = tsc.value.wrapping_add(cycles);
+        access
+            .set_tsc(&tsc)
+            .context("failed to adjust stopped vCPU TSC")?;
+        access
+            .set_tsc_deadline(&tsc_deadline)
+            .context("failed to reprogram stopped vCPU TSC deadline")?;
+        if let Some(apic) = apic.take() {
+            access
+                .set_apic(&apic)
+                .context("failed to reprogram stopped LAPIC timer")?;
+        }
+        access
+            .commit()
+            .context("failed to commit adjusted vCPU TSC")?;
+        let observed_tsc = access
+            .tsc()
+            .context("failed to read back adjusted vCPU TSC")?
+            .value;
+        tracing::debug!(
+            previous_tsc,
+            requested_tsc = tsc.value,
+            observed_tsc,
+            cycles,
+            frequency_hz,
+            ?duration,
+            "adjusted restored vCPU TSC"
+        );
+        Ok(())
     }
 
     fn inspect_vp(
@@ -831,7 +899,8 @@ impl VpSet {
     /// Stops all VPs.
     pub async fn stop(&mut self) {
         if self.started {
-            self.vps
+            let stops = self
+                .vps
                 .iter()
                 .map(|vp| {
                     let (send, recv) = mesh::oneshot();
@@ -839,10 +908,42 @@ impl VpSet {
                     // Ignore VPs whose runners have been dropped.
                     async { recv.await.ok() }
                 })
-                .collect::<JoinAll<_>>()
-                .await;
+                .collect::<JoinAll<_>>();
             self.started = false;
+            stops.await;
         }
+    }
+
+    /// Stops all VPs at a deferred I/O completion boundary.
+    pub async fn stop_at_io_boundary(
+        &mut self,
+        release_io: mesh::OneshotSender<()>,
+        io_completed: mesh::OneshotReceiver<()>,
+    ) -> anyhow::Result<()> {
+        let stops = self.started.then(|| {
+            let stops = self
+                .vps
+                .iter()
+                .map(|vp| {
+                    let (send, recv) = mesh::oneshot();
+                    vp.send.send(VpEvent::Stop(send));
+                    async { recv.await.ok() }
+                })
+                .collect::<JoinAll<_>>();
+            self.started = false;
+            stops
+        });
+
+        // Every VP has observed a queued stop event before the deferred I/O is
+        // completed, so the originating VP cannot re-enter guest execution.
+        release_io.send(());
+        io_completed
+            .await
+            .context("deferred I/O completion channel closed")?;
+        if let Some(stops) = stops {
+            stops.await;
+        }
+        Ok(())
     }
 
     /// Resets per-VP state on all VPs concurrently.
@@ -927,6 +1028,32 @@ impl VpSet {
             .collect::<TryJoinAll<_>>()
             .await?;
 
+        Ok(())
+    }
+
+    /// Advances TSC state on every stopped vCPU.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.started, "vCPUs must be stopped before adjusting TSC");
+        self.vps
+            .iter()
+            .enumerate()
+            .map(|(index, vp)| async move {
+                vp.send
+                    .call_failable(
+                        |rpc| VpEvent::State(StateEvent::AdvanceTsc(rpc)),
+                        (duration, frequency_hz, apic_frequency_hz),
+                    )
+                    .await
+                    .with_context(|| format!("vp{index} TSC adjustment"))
+            })
+            .collect::<TryJoinAll<_>>()
+            .await?;
         Ok(())
     }
 
@@ -1101,6 +1228,8 @@ enum StateEvent {
     Restore(Rpc<SavedStateBlob, Result<(), RestoreError>>),
     Reset(mesh::rpc::FailableRpc<(), ()>),
     Scrub(mesh::rpc::FailableRpc<Vtl, ()>),
+    #[cfg(guest_arch = "x86_64")]
+    AdvanceTsc(mesh::rpc::FailableRpc<(std::time::Duration, u64, Option<u64>), ()>),
     #[cfg(feature = "dump")]
     GetDumpVpState(Rpc<Vtl, anyhow::Result<hyperv_dump::VpState>>),
     #[cfg(feature = "gdb")]
@@ -1347,6 +1476,12 @@ impl RunnerInner {
             StateEvent::Restore(rpc) => rpc.handle_sync(|data| vp.restore(data)),
             StateEvent::Reset(rpc) => rpc.handle_failable_sync(|()| vp.reset()),
             StateEvent::Scrub(rpc) => rpc.handle_failable_sync(|vtl| vp.scrub(vtl)),
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::AdvanceTsc(rpc) => {
+                rpc.handle_failable_sync(|(duration, frequency_hz, apic_frequency_hz)| {
+                    vp.advance_tsc(duration, frequency_hz, apic_frequency_hz)
+                })
+            }
             #[cfg(feature = "dump")]
             StateEvent::GetDumpVpState(rpc) => rpc.handle_sync(|vtl| vp.get_dump_vp_state(vtl)),
             #[cfg(feature = "gdb")]

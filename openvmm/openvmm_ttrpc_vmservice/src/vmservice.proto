@@ -574,12 +574,26 @@ message HVSocketConfig {
     string path = 1;
 }
 
+// Snapshot options for the microVM machine profile.
+message MicrovmSnapshotConfig {
+    // Publish a guest-requested snapshot to this previously nonexistent path.
+    string destination_path = 1;
+    // Restore authoritatively from this snapshot directory.
+    string restore_path = 2;
+    // Expose fresh host entropy through the private portb restore channel.
+    bool restore_entropy = 3;
+    // Maximum quiesce time for capture. Zero selects the five-second default.
+    uint64 quiesce_timeout_ms = 4;
+}
+
 message CreateVMRequest {
     VMConfig config = 1;
     // Optional ID to be used by the VM service in log messages. It's up to the
     // server/virtstack to make use of this field. Useful for debugging to be able to
     // correlate events in the virtstack for a given vm that the client launched.
     string log_id = 2;
+    // Optional microVM snapshot capture or restore configuration.
+    MicrovmSnapshotConfig microvm_snapshot = 3;
 }
 
 message MemoryStats {

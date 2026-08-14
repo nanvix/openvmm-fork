@@ -642,7 +642,11 @@ impl PetriVmConfigOpenVmm {
             chipset_devices.extend([
                 ChipsetDeviceHandle {
                     name: MicrovmPortbHandle::ID.to_owned(),
-                    resource: MicrovmPortbHandle { io }.into_resource(),
+                    resource: MicrovmPortbHandle {
+                        io,
+                        restore_entropy: Vec::new(),
+                    }
+                    .into_resource(),
                 },
                 ChipsetDeviceHandle {
                     name: MicrovmShutdownHandle::ID.to_owned(),

@@ -12,6 +12,8 @@ use super::task::run_device_task;
 use crate::DynVirtioDevice;
 use crate::QueueResources;
 use crate::VirtioDoorbells;
+use crate::queue::QueueCoreCompleteWork;
+use crate::queue::QueueCoreGetWork;
 use crate::queue::QueueParams;
 use crate::queue::QueueState;
 use crate::spec::VirtioDeviceFeatures;
@@ -497,17 +499,31 @@ impl VirtioTransportCore {
             queue_items
                 .iter()
                 .enumerate()
-                .map(|(i, (q, _))| (i, q.size)),
+                .map(|(i, (q, _))| (i, q.size, self.queues[i].initial_size)),
             self.queues.len(),
             saved_queue_count,
-            crate::MAX_QUEUE_SIZE,
         )?;
 
-        // Restore feature negotiation.
-        self.driver_feature = VirtioDeviceFeatures::new();
-        for (i, &bank) in common.driver_feature_banks.iter().enumerate() {
-            self.driver_feature.set_bank(i, bank);
+        let mut restored_features = VirtioDeviceFeatures::new();
+        for (index, &bank) in common.driver_feature_banks.iter().enumerate() {
+            restored_features.set_bank(index, bank);
         }
+        let mut ring_ranges = Vec::new();
+        for (index, (queue, _)) in queue_items.iter().enumerate() {
+            if !queue.enable {
+                continue;
+            }
+            validate_restored_queue(
+                index,
+                queue,
+                restored_features,
+                &self.guest_memory,
+                &mut ring_ranges,
+            )?;
+        }
+
+        // Restore feature negotiation.
+        self.driver_feature = restored_features;
         self.device_feature_select = common.device_feature_select;
         self.driver_feature_select = common.driver_feature_select;
         self.queue_select = common.queue_select;
@@ -541,4 +557,89 @@ impl VirtioTransportCore {
 
         Ok(())
     }
+}
+
+pub(crate) fn validate_restored_queue(
+    index: usize,
+    queue: &super::saved_state::state::CommonQueueState,
+    features: VirtioDeviceFeatures,
+    guest_memory: &GuestMemory,
+    previous_ranges: &mut Vec<(usize, &'static str, std::ops::Range<u64>)>,
+) -> Result<(), RestoreError> {
+    let invalid = |message: String| {
+        RestoreError::InvalidSavedState(anyhow::anyhow!("queue {index}: {message}"))
+    };
+    if queue.size == 0 || (!features.ring_packed() && !queue.size.is_power_of_two()) {
+        return Err(invalid(format!(
+            "invalid {} ring size {}",
+            if features.ring_packed() {
+                "packed"
+            } else {
+                "split"
+            },
+            queue.size
+        )));
+    }
+
+    let descriptor_length = u64::from(queue.size)
+        .checked_mul(16)
+        .ok_or_else(|| invalid("descriptor length overflow".to_owned()))?;
+    let (available_length, used_length) = if features.ring_packed() {
+        (4, 4)
+    } else {
+        (
+            u64::from(queue.size)
+                .checked_mul(2)
+                .and_then(|length| length.checked_add(6))
+                .ok_or_else(|| invalid("available ring length overflow".to_owned()))?,
+            u64::from(queue.size)
+                .checked_mul(8)
+                .and_then(|length| length.checked_add(6))
+                .ok_or_else(|| invalid("used ring length overflow".to_owned()))?,
+        )
+    };
+    let specifications = [
+        ("descriptor", queue.desc_addr, descriptor_length, 16),
+        ("available", queue.avail_addr, available_length, 2),
+        ("used", queue.used_addr, used_length, 4),
+    ];
+    let mut queue_ranges = Vec::new();
+    for (name, address, length, alignment) in specifications {
+        if address % alignment != 0 {
+            return Err(invalid(format!(
+                "{name} ring address {address:#x} is not {alignment}-byte aligned"
+            )));
+        }
+        let end = address
+            .checked_add(length)
+            .ok_or_else(|| invalid(format!("{name} ring range overflows")))?;
+        guest_memory
+            .subrange(address, length, true)
+            .map_err(|error| invalid(format!("{name} ring is outside guest RAM: {error}")))?;
+        let range = address..end;
+        for (other_index, other_name, other_range) in
+            previous_ranges.iter().chain(queue_ranges.iter())
+        {
+            if range.start < other_range.end && other_range.start < range.end {
+                return Err(invalid(format!(
+                    "{name} ring overlaps queue {other_index} {other_name} ring"
+                )));
+            }
+        }
+        queue_ranges.push((index, name, range));
+    }
+
+    let params = QueueParams {
+        size: queue.size,
+        enable: true,
+        desc_addr: queue.desc_addr,
+        avail_addr: queue.avail_addr,
+        used_addr: queue.used_addr,
+    };
+    QueueCoreGetWork::new(features, guest_memory.clone(), params, queue.queue_state)
+        .map_err(|error| invalid(format!("invalid available progress: {error}")))?;
+    QueueCoreCompleteWork::new(features, guest_memory.clone(), params, queue.queue_state)
+        .map_err(|error| invalid(format!("invalid used progress: {error}")))?;
+    previous_ranges.extend(queue_ranges);
+    Ok(())
 }

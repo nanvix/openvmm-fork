@@ -22,15 +22,15 @@ These are stored as three files in a snapshot directory:
 
 ## Prerequisites
 
-Snapshots require **file-backed guest memory**. Pass `file=<PATH>` in the
-`--memory` option when launching the VM so that guest RAM is written to a
-file on disk rather than held in anonymous memory.
+Host-driven snapshots require **file-backed guest memory**. Pass `file=<PATH>`
+in the `--memory` option when launching a standard VM. A microVM launched with
+`--snapshot-destination` automatically creates temporary file-backed RAM in
+the destination's parent directory when no backing file was supplied.
 
 ```admonish warning
-The memory backing file and the snapshot directory must be on the **same
-filesystem**. OpenVMM creates a hard link from the backing file to
-`memory.bin` inside the snapshot directory, which does not work across
-filesystem boundaries.
+The memory backing file and snapshot destination must be on the **same
+filesystem**. OpenVMM copies memory into a uniquely named sibling staging
+directory and atomically renames the completed directory into place.
 ```
 
 ## Saving a snapshot
@@ -52,13 +52,13 @@ specifying the output directory:
 save-snapshot path/to/snapshot-dir
 ```
 
-OpenVMM writes `manifest.bin`, `state.bin`, and a hard link to `memory.bin`
-into the specified directory.
+OpenVMM writes and flushes `manifest.bin`, `state.bin`, and an independent
+`memory.bin` in a sibling staging directory. The destination must not already
+exist. Publishing the completed directory is the commit point.
 
 ```admonish warning
-After saving, the VM remains **paused** and resume is blocked. Resuming
-would mutate guest RAM through `memory.bin`, corrupting the snapshot.
-Use `shutdown` to exit OpenVMM after saving.
+After a host-driven save, the VM remains **paused**. Guest-requested microVM
+capture instead terminates the source process after publication commits.
 ```
 
 ## Restoring a snapshot
@@ -75,9 +75,28 @@ cargo run -- \
   --restore-snapshot path/to/snapshot-dir
 ```
 
-`--restore-snapshot` automatically opens `memory.bin` from the snapshot
-directory, so `file=...` should not be specified in `--memory` (the two
-options are mutually exclusive).
+`--restore-snapshot` verifies and opens `memory.bin` from the snapshot
+directory, so `file=...` should not be specified in `--memory` (the two options
+are mutually exclusive). Guest writes use a private copy-on-write mapping and
+do not modify the snapshot artifact.
+
+For controlled benchmarks or an independently protected immutable artifact,
+you can skip only the full `memory.bin` digest scan:
+
+```bash
+cargo run -- \
+  --restore-snapshot path/to/snapshot-dir \
+  --unsafe-skip-snapshot-memory-verification
+```
+
+```admonish danger
+`--unsafe-skip-snapshot-memory-verification` allows same-length modifications
+of guest RAM to reach the restored VM undetected. Manifest validation,
+`state.bin` SHA-256 verification, regular-file checks, and the exact memory
+length check remain enabled, but they do not protect the contents of
+`memory.bin`. Do not use this option for an artifact that another process or
+user can modify.
+```
 
 ```admonish note
 The `--memory` and `--processors` values must match the values recorded in
@@ -87,18 +106,23 @@ validation error and refuse to start.
 
 ## Device configuration on restore
 
-The snapshot only stores device *state*, not device *configuration*. All
-device flags (e.g. `--disk`, `--nic`, `--serial`, `--virtio-blk`, etc.)
-must be specified on the restore command line exactly as they were when
-the snapshot was saved — they are not read from the snapshot.
+For standard-machine snapshots, device flags must still be supplied on restore
+and must reproduce the saved machine. For microVM ABI-v1 snapshots, the
+manifest is authoritative for RAM, topology, ABI, fixed devices, placement,
+features, interrupts, and the effective PVH command line. Restore-time
+guest-visible overrides are rejected.
 
-The snapshot manifest validates that `--memory`, `--processors`,
-architecture, and page size match the values recorded at save time. However,
-it does **not** record the list of CLI device flags. Instead, device
-configuration compatibility is enforced at the state-unit level: each
-emulated device saves its state under a unique name (e.g. `"pit"`,
-`"vmbus"`, `"ide"`), and restore matches saved-state entries to the
-currently instantiated devices by name.
+The ABI-v1 CPU contract records the effective CPUID/XSTATE surface and TSC
+frequency. WHP microVMs use a reproducible 1 GHz virtual TSC configured before
+partition setup; restore recreates and validates that rate before any vCPU
+runs. KVM snapshots likewise require the destination to reproduce their saved
+backend CPU and clock contract.
+
+Every snapshot records a complete state-unit inventory. Each emulated device
+saves state under a unique name (for example `"pit"`, `"vmbus"`, or `"ide"`),
+and restore requires the saved and current inventories to match exactly. A
+microVM manifest additionally records and validates the exact device inventory
+and order.
 
 The rules are:
 
@@ -106,24 +130,20 @@ The rules are:
 |---|---|
 | Device set matches exactly | Restore succeeds |
 | Snapshot contains a device not in current config | **Restore fails** — unknown unit name |
-| Current config has a device not in snapshot | Restore succeeds — device starts in its default/initial state |
+| Current config has a device not in snapshot | **Restore fails** — inventory mismatch |
 
 In practice this means:
 
 - You must pass the **same device flags** on restore as you did on save.
   Removing a device that was present at save time will cause restore to
   fail.
-- Adding a *new* device that was not present at save time is technically
-  allowed — the new device will start in its power-on default state.
-  This is not tested and the device may not be functional, since the
-  guest OS will not have enumerated or initialised it during boot.
-  The supported path is to use the same device flags on save and restore.
+- Adding a new device that was not present at save time fails inventory
+  validation rather than starting an unenumerated device in its default state.
 
 ```admonish warning
-There is no single error message that tells you "your device configuration
-changed". Instead you will see errors like `restore failed: unknown unit
-name` when saved-state entries cannot be matched. If you see this, compare
-your restore command line with the one used at save time.
+Inventory errors identify the saved and current state-unit lists. Compare the
+restore configuration with the capture configuration when restoring a standard
+machine.
 ```
 
 ## Device save/restore support
@@ -180,13 +200,11 @@ immediately with a clear error if any active device does not support it.
 
 - Snapshots are **not portable** across architectures (e.g., you cannot
   restore an x86_64 snapshot on aarch64)
-- After restoring, `memory.bin` in the snapshot directory becomes the live
-  guest RAM backing file and will be modified as the VM runs. To restore
-  from the same snapshot multiple times, copy the snapshot directory before
-  each restore.
+- Restores use private copy-on-write RAM, so a committed snapshot can be
+  restored repeatedly without copying it or modifying `memory.bin`.
 - VMs using VPCI or PCIe devices do not currently support save/restore
 - OpenHCL-based VMs do not currently support this snapshot mechanism
 - VMs using PCAT firmware do not support save/restore
-- `--memory` and `--processors` must be specified on restore and match the
-  snapshot manifest values. A future version may read these from the snapshot
-  automatically.
+- Standard-machine restore still requires matching `--memory` and
+  `--processors`. MicroVM ABI-v1 restore reads them authoritatively from the
+  manifest and rejects overrides.

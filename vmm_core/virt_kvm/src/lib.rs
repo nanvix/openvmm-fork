@@ -76,6 +76,9 @@ pub enum KvmError {
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to compute topology cpuid")]
     TopologyCpuid(#[source] virt::x86::topology::UnknownVendor),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    TscFrequencyCpuid(#[from] virt::x86::TscFrequencyCpuidError),
 }
 
 #[derive(Inspect)]
