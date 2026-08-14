@@ -10,6 +10,9 @@ use petri::openvmm::OpenVmmPetriBackend;
 use std::ffi::OsString;
 use std::io::Read;
 use std::io::Write;
+use std::net::SocketAddr;
+use std::net::TcpListener;
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::Child;
 use std::process::ChildStdin;
@@ -26,6 +29,7 @@ use vmm_test_macros::vmm_test_with;
 
 const MICROVM_BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
 const PHASE_2_TIMEOUT: Duration = Duration::from_secs(60);
+const PHASE_3_TX_COUNT: usize = 10_000;
 
 struct OpenvmmTestProcess {
     child: Option<Child>,
@@ -192,6 +196,96 @@ impl Drop for OpenvmmTestProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+struct TcpConsole {
+    stream: TcpStream,
+    output_recv: mpsc::Receiver<Vec<u8>>,
+    output: Vec<u8>,
+}
+
+impl TcpConsole {
+    fn connect(address: SocketAddr) -> anyhow::Result<Self> {
+        let started = Instant::now();
+        let stream = loop {
+            match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+                Ok(stream) => break stream,
+                Err(error) if started.elapsed() < PHASE_2_TIMEOUT => {
+                    let _ = error;
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to connect to microVM console at {address}")
+                    });
+                }
+            }
+        };
+        stream.set_nodelay(true)?;
+        let mut reader = stream.try_clone()?;
+        let (output_send, output_recv) = mpsc::channel();
+        thread::spawn(move || {
+            let mut chunk = vec![0; 4096];
+            while let Ok(count) = reader.read(&mut chunk) {
+                if count == 0 || output_send.send(chunk[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            stream,
+            output_recv,
+            output: Vec::new(),
+        })
+    }
+
+    fn send_line(&mut self, line: &str) -> anyhow::Result<()> {
+        writeln!(self.stream, "{line}")?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.stream.write_all(bytes)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn wait_for(&mut self, marker: &[u8]) -> anyhow::Result<()> {
+        let started = Instant::now();
+        while !contains_bytes(&self.output, marker) {
+            let remaining = PHASE_2_TIMEOUT.saturating_sub(started.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "timed out waiting for console marker {:?}; output: {}",
+                String::from_utf8_lossy(marker),
+                output_tail(&self.output)
+            );
+            match self
+                .output_recv
+                .recv_timeout(remaining.min(Duration::from_millis(100)))
+            {
+                Ok(chunk) => self.output.extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!(
+                        "console disconnected before marker {:?}; output: {}",
+                        String::from_utf8_lossy(marker),
+                        output_tail(&self.output)
+                    )
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        drop(self.stream);
+        while let Ok(chunk) = self.output_recv.recv_timeout(Duration::from_millis(100)) {
+            self.output.extend_from_slice(&chunk);
+        }
+        self.output
     }
 }
 
@@ -530,6 +624,149 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     Ok(())
 }
 
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    requires(microvm_pvh),
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
+async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const SNAPSHOT_MARKER: &[u8] = b"PHASE3-SNAPSHOT-NOW";
+    const RX_MARKER: &[u8] = b"PHASE3-RX-RESTORED";
+    const DONE_MARKER: &[u8] = b"PHASE3-TX-DONE";
+    const BINARY_MARKER: &[u8] = b"\0\r\n\x7f\xffPHASE3-BINARY";
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("phase-3 test requires direct-boot Linux artifacts")?;
+    let hypervisor = if cfg!(windows) {
+        "whp"
+    } else if cfg!(target_os = "linux") {
+        "kvm"
+    } else {
+        anyhow::bail!("microVM phase-3 restore requires Windows/WHP or Linux/KVM");
+    };
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-phase3-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create phase-3 test directory")?;
+    let snapshot_dir = temp_dir.path().join("snapshot");
+    let address = {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.local_addr()?
+    };
+
+    let mut capture_args = phase_2_args(hypervisor);
+    capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--virtio-console".into(),
+        format!("listen=tcp:{address}").into(),
+    ]);
+    let source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    let mut source_console = TcpConsole::connect(address)?;
+    source_console.wait_for(MICROVM_BOOT_MARKER)?;
+    source_console.send_line(&format!(
+        "set -eu; \
+         grep -q 'console=hvc1' /proc/cmdline || {{ nvx-exit 50; exit; }}; \
+         grep -q 'virtio_mmio.device=0x1000@0xd0002000:7' /proc/cmdline || {{ nvx-exit 51; exit; }}; \
+         [ -e /sys/class/tty/hvc1 ] || {{ nvx-exit 52; exit; }}; \
+         stty -F /dev/hvc1 raw -echo; \
+         printf '\\000\\015\\012\\177\\377PHASE3-BINARY\\n'; \
+         rm -f /tmp/phase3-tx-started /tmp/phase3-restored; \
+         (i=0; while [ $i -lt {PHASE_3_TX_COUNT} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; while [ ! -e /tmp/phase3-restored ]; do sleep 0.01; done; fi; done) & tx_pid=$!; \
+         while [ ! -e /tmp/phase3-tx-started ]; do sleep 0.01; done; \
+         echo PHASE3-SNAPSHOT-NOW; nvx-snapshot; \
+            phase3_rx=$(dd bs=1 count=5 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+            [ \"$phase3_rx\" = 000d0a7fff ] || {{ nvx-exit 53; exit; }}; \
+             touch /tmp/phase3-restored; \
+            echo PHASE3-RX-RESTORED; \
+         wait $tx_pid; echo PHASE3-TX-DONE; nvx-exit 37"
+    ))?;
+    source_console.wait_for(SNAPSHOT_MARKER)?;
+    source_console.send_bytes(&[0, 13, 10, 127, 255])?;
+    let (status, source_process_output) = source.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "phase-3 source exited with {status}; process output: {}",
+        output_tail(&source_process_output)
+    );
+    let source_console_output = source_console.finish();
+    for index in 0..100 {
+        let marker = format!("PHASE3-TX-{index:05}");
+        anyhow::ensure!(
+            count_output_lines(&source_console_output, marker.as_bytes()) == 1,
+            "source did not forward the expected pre-snapshot TX prefix at record {index}"
+        );
+    }
+    anyhow::ensure!(
+        count_output_lines(&source_console_output, b"PHASE3-TX-00100") == 0,
+        "source TX advanced past the deterministic snapshot boundary"
+    );
+    anyhow::ensure!(snapshot_dir.is_dir(), "phase-3 snapshot was not published");
+    openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+
+    for restore_index in 0..2 {
+        let mut restore_args = phase_2_args(hypervisor);
+        restore_args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--restore-entropy".into(),
+        ]);
+        let restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        let mut restore_console = TcpConsole::connect(address)?;
+        restore_console.wait_for(RX_MARKER)?;
+        restore_console.wait_for(DONE_MARKER)?;
+        let (status, process_output) = restore.wait()?;
+        anyhow::ensure!(
+            status.code() == Some(37),
+            "phase-3 restore {restore_index} exited with {status}; process output: {}",
+            output_tail(&process_output)
+        );
+        let restore_output = restore_console.finish();
+        let mut combined = source_console_output.clone();
+        combined.extend_from_slice(&restore_output);
+        anyhow::ensure!(
+            contains_bytes(&combined, BINARY_MARKER),
+            "phase-3 binary marker was lost across restore"
+        );
+        for index in 0..PHASE_3_TX_COUNT {
+            let marker = format!("PHASE3-TX-{index:05}");
+            anyhow::ensure!(
+                count_output_lines(&combined, marker.as_bytes()) == 1,
+                "phase-3 restore {restore_index} lost or duplicated TX record {index}; source tail: {}; restore tail: {}",
+                output_tail(&source_console_output),
+                output_tail(&restore_output)
+            );
+        }
+        anyhow::ensure!(
+            count_output_lines(&restore_output, RX_MARKER) == 1,
+            "phase-3 restore {restore_index} did not preserve queued RX exactly once"
+        );
+        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
+            .with_context(|| format!("phase-3 restore {restore_index} modified the snapshot"))?;
+    }
+
+    Ok(())
+}
+
 #[openvmm_test_no_agent(ignore(
     reason = "requires a published microVM PVH kernel and initramfs",
     microvm_pvh_x64
@@ -539,7 +776,7 @@ async fn phase_1_block(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::R
     use disk_backend_resources::layer::RamDiskLayerHandle;
     use openvmm_defs::config::LoadMode;
     use openvmm_defs::config::VirtioBus;
-    use openvmm_defs::config::append_microvm_virtio_blk_discovery;
+    use openvmm_defs::config::append_microvm_virtio_discovery;
     use virtio_resources::blk::VirtioBlkHandle;
 
     const TIMEOUT: Duration = Duration::from_secs(30);
@@ -577,7 +814,7 @@ exit 37
                     panic!("microVM test did not produce PVH load mode");
                 };
                 cmdline.push_str(" nvx_exec=/microvm-block-test.sh");
-                append_microvm_virtio_blk_discovery(cmdline).unwrap();
+                append_microvm_virtio_discovery(cmdline, false, true).unwrap();
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
                     VirtioBlkHandle {

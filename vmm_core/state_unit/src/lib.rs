@@ -30,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+use anyhow::Context as _;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::join_all;
@@ -71,10 +72,16 @@ use vmcore::save_restore::SavedStateBlob;
 #[derive(Debug, MeshPayload)]
 pub enum StateRequest {
     /// Start asynchronous operations.
-    Start(Rpc<(), ()>),
+    Start(FailableRpc<(), ()>),
 
     /// Stop asynchronous operations.
     Stop(Rpc<(), ()>),
+
+    /// Stop accepting new host input before a snapshot vCPU boundary.
+    QuiesceInput(FailableRpc<(), ()>),
+
+    /// Resume host input after a failed snapshot transaction.
+    ResumeInput(FailableRpc<(), ()>),
 
     /// Reset a stopped unit to initial state.
     Reset(FailableRpc<(), ()>),
@@ -100,10 +107,20 @@ pub enum StateRequest {
 #[expect(async_fn_in_trait)] // Don't need Send bounds
 pub trait StateUnit: InspectMut {
     /// Start asynchronous processing.
-    async fn start(&mut self);
+    async fn start(&mut self) -> anyhow::Result<()>;
 
     /// Stop asynchronous processing.
     async fn stop(&mut self);
+
+    /// Stops accepting new host input while preserving runtime state.
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Resumes host input after a failed snapshot transaction.
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Reset to initial state.
     ///
@@ -174,6 +191,8 @@ impl StateRequest {
 
             StateRequest::Start(_)
             | StateRequest::Stop(_)
+            | StateRequest::QuiesceInput(_)
+            | StateRequest::ResumeInput(_)
             | StateRequest::Reset(_)
             | StateRequest::Save(_)
             | StateRequest::Restore(_)
@@ -201,8 +220,16 @@ impl StateRequest {
     /// Runs this state request against `unit`.
     pub async fn apply(self, unit: &mut impl StateUnit) {
         match self {
-            StateRequest::Start(rpc) => rpc.handle(async |()| unit.start().await).await,
+            StateRequest::Start(rpc) => rpc.handle_failable(async |()| unit.start().await).await,
             StateRequest::Stop(rpc) => rpc.handle(async |()| unit.stop().await).await,
+            StateRequest::QuiesceInput(rpc) => {
+                rpc.handle_failable(async |()| unit.quiesce_input().await)
+                    .await
+            }
+            StateRequest::ResumeInput(rpc) => {
+                rpc.handle_failable(async |()| unit.resume_input().await)
+                    .await
+            }
             StateRequest::Reset(rpc) => rpc.handle_failable(async |()| unit.reset().await).await,
             StateRequest::Save(rpc) => rpc.handle_failable(async |()| unit.save().await).await,
             StateRequest::Restore(rpc) => {
@@ -517,26 +544,128 @@ impl StateUnits {
     /// via [`StateUnits::add`] while the VM was running.
     ///
     /// Does nothing if all units are stopped, via [`StateUnits::stop`].
-    pub async fn start_stopped_units(&mut self) {
+    pub async fn start_stopped_units(&mut self) -> anyhow::Result<()> {
         if self.is_running() {
-            self.start().await;
+            self.start().await?;
         }
+        Ok(())
     }
 
     /// Starts all the state units.
-    pub async fn start(&mut self) {
-        self.run_op(
-            "start",
-            None,
-            State::Stopped,
-            State::Starting,
-            State::Running,
-            StateRequest::Start,
-            |_, _| Some(()),
-            |unit| &unit.dependencies,
-        )
-        .await;
-        self.running = true;
+    pub async fn start(&mut self) -> anyhow::Result<()> {
+        enum StartResult {
+            Started,
+            DependencyFailed,
+            Failed(anyhow::Error),
+            Uncertain(anyhow::Error),
+        }
+
+        let was_running = self.running;
+        let mut operations = Vec::new();
+        let ready_set;
+        {
+            let mut inner = self.inner.lock();
+            if let Some(unit) = inner
+                .units
+                .values()
+                .find(|unit| !matches!(unit.state, State::Stopped | State::Running))
+            {
+                anyhow::bail!(
+                    "state unit '{}' cannot be started from terminal state {:?}",
+                    unit.name,
+                    unit.state
+                );
+            }
+            ready_set = inner.ready_set(None);
+            for (&id, unit) in &mut inner.units {
+                if unit.state == State::Running {
+                    ready_set.done(id, true);
+                    continue;
+                }
+                assert_eq!(
+                    unit.state,
+                    State::Stopped,
+                    "unit {} is not stopped before start",
+                    unit.name,
+                );
+                let name = unit.name.clone();
+                let dependencies = unit.dependencies.clone();
+                let ready_set = ready_set.clone();
+                let start = state_change(name.clone(), unit, StateRequest::Start, Some(()));
+                operations.push(async move {
+                    if !ready_set.wait("start", id, &dependencies).await {
+                        ready_set.done(id, false);
+                        return (name, id, StartResult::DependencyFailed);
+                    }
+
+                    let result = match start.await {
+                        Ok(Some(Ok(()))) => StartResult::Started,
+                        Ok(Some(Err(error))) => StartResult::Failed(error.into()),
+                        Ok(None) => {
+                            StartResult::Uncertain(anyhow::anyhow!("start request was not sent"))
+                        }
+                        Err(error) => StartResult::Uncertain(error.into()),
+                    };
+                    ready_set.done(id, matches!(result, StartResult::Started));
+                    (name, id, result)
+                });
+                unit.state = State::Starting;
+            }
+        }
+
+        let start = Instant::now();
+        let results = join_all(operations).await;
+        tracing::info!(duration = ?Instant::now() - start, "state-unit start complete");
+
+        let mut failures = Vec::new();
+        let mut started_ids = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            for (name, id, result) in results {
+                let Some(unit) = inner.units.get_mut(&id) else {
+                    continue;
+                };
+                match result {
+                    StartResult::Started => {
+                        unit.state = State::Running;
+                        started_ids.push(id);
+                    }
+                    StartResult::DependencyFailed => {
+                        unit.state = State::Stopped;
+                        failures.push(format!("{name}: a dependency did not start"));
+                    }
+                    StartResult::Failed(error) => {
+                        unit.state = State::QuiesceUncertain;
+                        failures.push(format!("{name}: {error:#}"));
+                    }
+                    StartResult::Uncertain(error) => {
+                        unit.state = State::QuiesceUncertain;
+                        failures.push(format!("{name}: {error:#}"));
+                    }
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            self.running = true;
+            Ok(())
+        } else {
+            if !started_ids.is_empty() {
+                self.run_op(
+                    "failed_start_rollback",
+                    Some(&started_ids),
+                    State::Running,
+                    State::Stopping,
+                    State::Stopped,
+                    StateRequest::Stop,
+                    |_, _| Some(()),
+                    |unit| &unit.dependents,
+                )
+                .await;
+            }
+            self.running = was_running;
+            anyhow::bail!("state units could not start: {}", failures.join("; "))
+        }
     }
 
     /// Stops all the state units.
@@ -556,6 +685,58 @@ impl StateUnits {
         )
         .await;
         self.running = false;
+    }
+
+    /// Stops host-input producers before establishing a snapshot vCPU boundary.
+    pub async fn quiesce_input_for_save(&self, timeout: Duration) -> anyhow::Result<()> {
+        self.run_input_op("quiesce_input", timeout, StateRequest::QuiesceInput)
+            .await
+    }
+
+    /// Resumes host-input producers before releasing a failed snapshot boundary.
+    pub async fn resume_input_after_save(&self, timeout: Duration) -> anyhow::Result<()> {
+        self.run_input_op("resume_input", timeout, StateRequest::ResumeInput)
+            .await
+    }
+
+    async fn run_input_op(
+        &self,
+        operation: &'static str,
+        timeout: Duration,
+        request: impl Copy + FnOnce(FailableRpc<(), ()>) -> StateRequest,
+    ) -> anyhow::Result<()> {
+        let operations = {
+            let inner = self.inner.lock();
+            inner
+                .units
+                .values()
+                .map(|unit| {
+                    let name = unit.name.clone();
+                    let operation = state_change(name.clone(), unit, request, Some(()));
+                    async move { (name, operation.await) }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut context = CancelContext::new().with_timeout(timeout);
+        let results = context
+            .until_cancelled(join_all(operations))
+            .await
+            .with_context(|| format!("{operation} timed out"))?;
+        let mut failures = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(error))) => failures.push(format!("{name}: {error}")),
+                Ok(None) => failures.push(format!("{name}: request was not sent")),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "{operation} failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
     }
 
     /// Stops all units in reverse dependency order within `timeout`.
@@ -668,6 +849,7 @@ impl StateUnits {
         enum StartResult {
             Started,
             DependencyFailed,
+            Failed(anyhow::Error),
             Uncertain(anyhow::Error),
         }
 
@@ -690,7 +872,8 @@ impl StateUnits {
                     }
 
                     let result = match context.until_cancelled(start).await {
-                        Ok(Ok(Some(()))) => StartResult::Started,
+                        Ok(Ok(Some(Ok(())))) => StartResult::Started,
+                        Ok(Ok(Some(Err(error)))) => StartResult::Failed(error.into()),
                         Ok(Ok(None)) => {
                             StartResult::Uncertain(anyhow::anyhow!("start request was not sent"))
                         }
@@ -716,6 +899,10 @@ impl StateUnits {
                 StartResult::DependencyFailed => {
                     unit.state = State::Stopped;
                     failures.push(format!("{name}: a dependency did not restart"));
+                }
+                StartResult::Failed(error) => {
+                    unit.state = State::QuiesceUncertain;
+                    failures.push(format!("{name}: {error:#}"));
                 }
                 StartResult::Uncertain(error) => {
                     unit.state = State::QuiesceUncertain;
@@ -1292,7 +1479,9 @@ mod tests {
     struct SavedState(bool);
 
     impl StateUnit for TestUnit {
-        async fn start(&mut self) {}
+        async fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         async fn stop(&mut self) {}
 
@@ -1334,7 +1523,9 @@ mod tests {
     }
 
     impl StateUnit for TestUnitSetDep {
-        async fn start(&mut self) {}
+        async fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         async fn stop(&mut self) {}
 
@@ -1369,7 +1560,9 @@ mod tests {
     }
 
     impl StateUnit for SlowStopUnit {
-        async fn start(&mut self) {}
+        async fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         async fn stop(&mut self) {
             pal_async::timer::PolledTimer::new(&self.driver)
@@ -1402,13 +1595,14 @@ mod tests {
     }
 
     impl StateUnit for SlowRollbackStartUnit {
-        async fn start(&mut self) {
+        async fn start(&mut self) -> anyhow::Result<()> {
             if self.starts != 0 {
                 pal_async::timer::PolledTimer::new(&self.driver)
                     .sleep(Duration::from_secs(1))
                     .await;
             }
             self.starts += 1;
+            Ok(())
         }
 
         async fn stop(&mut self) {}
@@ -1427,6 +1621,42 @@ mod tests {
     }
 
     impl InspectMut for SlowRollbackStartUnit {
+        fn inspect_mut(&mut self, req: inspect::Request<'_>) {
+            req.respond();
+        }
+    }
+
+    struct StartResultUnit {
+        started: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+        fail: bool,
+    }
+
+    impl StateUnit for StartResultUnit {
+        async fn start(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail, "intentional start failure");
+            self.started.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn stop(&mut self) {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+
+        async fn reset(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+            Ok(None)
+        }
+
+        async fn restore(&mut self, _state: SavedStateBlob) -> Result<(), RestoreError> {
+            Err(RestoreError::SavedStateNotSupported)
+        }
+    }
+
+    impl InspectMut for StartResultUnit {
         fn inspect_mut(&mut self, req: inspect::Request<'_>) {
             req.respond();
         }
@@ -1468,7 +1698,7 @@ mod tests {
             .add("unit")
             .spawn(&driver, |recv| run_unit(TestUnit::default(), recv))
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
 
         units
             .quiesce_for_save(Duration::from_secs(1))
@@ -1501,7 +1731,7 @@ mod tests {
                 }
             })
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
 
         let started = std::time::Instant::now();
         let error = units
@@ -1528,7 +1758,7 @@ mod tests {
                 |recv| run_unit(SlowRollbackStartUnit { driver, starts: 0 }, recv)
             })
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
         units
             .quiesce_for_save(Duration::from_secs(1))
             .await
@@ -1567,13 +1797,13 @@ mod tests {
             .add("b")
             .spawn(&driver, |recv| run_unit(TestUnit::default(), recv))
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
 
         let _c = units
             .add("c")
             .spawn(&driver, |recv| run_unit(TestUnit::default(), recv));
         units.stop().await;
-        units.start().await;
+        units.start().await.unwrap();
 
         units.stop().await;
 
@@ -1620,7 +1850,7 @@ mod tests {
                 )
             })
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
         units.stop().await;
 
         let state = units.save().await.unwrap();
@@ -1628,6 +1858,63 @@ mod tests {
         a_val.store(false, Ordering::Relaxed);
 
         units.restore(state).await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_start_failure_blocks_dependent(driver: DefaultDriver) {
+        let mut units = StateUnits::new();
+        let independent_started = Arc::new(AtomicBool::new(false));
+        let independent_stopped = Arc::new(AtomicBool::new(false));
+        let _independent = units
+            .add("independent")
+            .spawn(&driver, |recv| {
+                run_unit(
+                    StartResultUnit {
+                        started: independent_started.clone(),
+                        stopped: independent_stopped.clone(),
+                        fail: false,
+                    },
+                    recv,
+                )
+            })
+            .unwrap();
+        let failed = units
+            .add("failed")
+            .spawn(&driver, |recv| {
+                run_unit(
+                    StartResultUnit {
+                        started: Arc::new(AtomicBool::new(false)),
+                        stopped: Arc::new(AtomicBool::new(false)),
+                        fail: true,
+                    },
+                    recv,
+                )
+            })
+            .unwrap();
+        let dependent_started = Arc::new(AtomicBool::new(false));
+        let _dependent = units
+            .add("dependent")
+            .depends_on(failed.handle())
+            .spawn(&driver, |recv| {
+                run_unit(
+                    StartResultUnit {
+                        started: dependent_started.clone(),
+                        stopped: Arc::new(AtomicBool::new(false)),
+                        fail: false,
+                    },
+                    recv,
+                )
+            })
+            .unwrap();
+
+        let error = units.start().await.unwrap_err();
+        assert!(error.to_string().contains("intentional start failure"));
+        assert!(independent_started.load(Ordering::Relaxed));
+        assert!(independent_stopped.load(Ordering::Relaxed));
+        assert!(!dependent_started.load(Ordering::Relaxed));
+        assert!(!units.is_running());
+        let retry_error = units.start().await.unwrap_err();
+        assert!(retry_error.to_string().contains("terminal state"));
     }
 
     #[async_test]

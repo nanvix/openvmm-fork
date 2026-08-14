@@ -20,8 +20,10 @@ use fd_passing::FdRegistry;
 struct FdRegistry {}
 
 use crate::cli_args::GuestPowerAction;
+use crate::cli_args::SerialConfigCli;
 use crate::meshworker::VmmMesh;
 use crate::serial_io::bind_serial;
+use crate::serial_io::bind_serial_without_cleanup;
 use crate::serial_io::connect_serial;
 use crate::vm_controller::GuestPowerActions;
 use crate::vm_controller::InspectTarget;
@@ -787,6 +789,7 @@ impl VmService {
             None
         };
 
+        let mut restore_console_config = None;
         let mut req_config = if authoritative_restore.is_some() {
             let requested = requested_config.unwrap_or_else(|| vmservice::VmConfig {
                 machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
@@ -799,7 +802,6 @@ impl VmService {
             anyhow::ensure!(
                 requested.memory_config.is_none()
                     && requested.processor_config.is_none()
-                    && requested.devices_config.is_none()
                     && requested.boot_config.is_none()
                     && requested.windows_options.is_none()
                     && requested.hvsocket_config.is_none()
@@ -807,6 +809,18 @@ impl VmService {
                     && requested.pcie.is_none(),
                 "restore configuration may contain only serial attachments and guest power actions"
             );
+            if let Some(devices) = &requested.devices_config {
+                anyhow::ensure!(
+                    devices.scsi_disks.is_empty()
+                        && devices.vpmem_disks.is_empty()
+                        && devices.nic_config.is_empty()
+                        && devices.windows_device.is_empty()
+                        && devices.virtiofs_config.is_empty()
+                        && devices.virtio_blk.is_none(),
+                    "restore devices_config may contain only a virtio-console attachment"
+                );
+                restore_console_config = devices.virtio_console.clone();
+            }
             vmservice::VmConfig {
                 serial_config: requested.serial_config,
                 guest_power_actions: requested.guest_power_actions,
@@ -855,6 +869,11 @@ impl VmService {
                 Some((
                     &source_hypervisor,
                     &restore.machine_contract.effective_command_line,
+                    restore
+                        .machine_contract
+                        .attachments
+                        .iter()
+                        .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
                 )),
                 openvmm_helpers::snapshot::SnapshotMemoryVerification::Sha256,
             )?;
@@ -932,10 +951,15 @@ impl VmService {
                         && devices.vpmem_disks.is_empty()
                         && devices.nic_config.is_empty()
                         && devices.windows_device.is_empty()
-                        && devices.virtiofs_config.is_empty()
-                        && devices.virtio_console.is_none(),
-                    "microVM ABI version 1 supports only the optional virtio-blk device"
+                        && devices.virtiofs_config.is_empty(),
+                    "microVM ABI version 1 supports only fixed virtio-console and optional virtio-blk devices"
                 );
+                if let Some(console) = &devices.virtio_console {
+                    anyhow::ensure!(
+                        !console.socket_path.is_empty(),
+                        "microVM virtio-console requires a socket path"
+                    );
+                }
                 if snapshot_destination.is_some() {
                     anyhow::ensure!(
                         devices.virtio_blk.is_none(),
@@ -963,6 +987,13 @@ impl VmService {
         }
         let any_serial_configured = ports.iter().any(|port| port.is_some());
         let com1_configured = ports[0].is_some();
+        let has_requested_microvm_console = is_microvm
+            && authoritative_restore.is_none()
+            && req_config
+                .devices_config
+                .as_ref()
+                .and_then(|devices| devices.virtio_console.as_ref())
+                .is_some();
 
         #[cfg(guest_arch = "aarch64")]
         let arch = vm_manifest_builder::MachineArch::Aarch64;
@@ -1027,7 +1058,10 @@ impl VmService {
                         LoadMode::Pvh {
                             kernel,
                             initrd,
-                            cmdline: build_microvm_command_line(&[boot.kernel_cmdline])?,
+                            cmdline: build_microvm_command_line(
+                                &[boot.kernel_cmdline],
+                                has_requested_microvm_console,
+                            )?,
                         },
                         vm_manifest_builder::BaseChipsetType::Microvm,
                         None,
@@ -1169,6 +1203,7 @@ impl VmService {
                     name: MicrovmSnapshotRequestHandle::ID.to_owned(),
                     resource: MicrovmSnapshotRequestHandle {
                         notify: microvm_snapshot_notify,
+                        input_gate_timeout: snapshot_quiesce_timeout,
                     }
                     .into_resource(),
                 },
@@ -1321,6 +1356,101 @@ impl VmService {
 
         let mut scsi_rpc = None;
         let mut consomme_rpc = None;
+        let mut microvm_console_attachment = None;
+        let mut microvm_console_socket_cleanup = None;
+        if let Some(restore) = &authoritative_restore {
+            let has_console = restore
+                .machine_contract
+                .devices
+                .iter()
+                .any(|device| device.stable_id == "console:microvm-virtio0");
+            let attachment = restore
+                .machine_contract
+                .attachments
+                .iter()
+                .find(|attachment| attachment.stable_id == "console:microvm-virtio0");
+            anyhow::ensure!(
+                has_console == attachment.is_some(),
+                "snapshot microVM console device and attachment inventories disagree"
+            );
+            if let Some(attachment) = attachment {
+                let requested_attachment = restore_console_config.as_ref().map(|console| {
+                    if console.connect {
+                        SerialConfigCli::ConnectPipe(PathBuf::from(&console.socket_path))
+                    } else {
+                        SerialConfigCli::Pipe(PathBuf::from(&console.socket_path))
+                    }
+                });
+                let (endpoint_config, resource_attachment, snapshot_attachment) =
+                    crate::microvm_console_attachment_from_snapshot(
+                        attachment,
+                        requested_attachment.as_ref(),
+                    )?;
+                crate::validate_microvm_console_attachment_namespace(
+                    &snapshot_attachment,
+                    &restore.path,
+                )?;
+                let (backend, disconnect_policy) = match endpoint_config {
+                    SerialConfigCli::Pipe(path) => {
+                        let backend = bind_serial_without_cleanup(&path).with_context(|| {
+                            format!(
+                                "failed to recreate virtio console listener: {}",
+                                path.display()
+                            )
+                        })?;
+                        microvm_console_socket_cleanup =
+                            crate::microvm_console_socket_cleanup(path)?;
+                        (
+                            backend,
+                            virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                        )
+                    }
+                    SerialConfigCli::Tcp(address) => (
+                        crate::serial_io::bind_tcp_serial(&address)?,
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                    ),
+                    SerialConfigCli::ConnectPipe(path) => (
+                        crate::serial_io::connect_serial_with_timeout(
+                            &path,
+                            Duration::from_millis(
+                                openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                            ),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to reconnect virtio console client: {}",
+                                path.display()
+                            )
+                        })?,
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                    ),
+                    SerialConfigCli::ConnectTcp(address) => (
+                        crate::serial_io::connect_tcp_serial(
+                            &address,
+                            Duration::from_millis(
+                                openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                            ),
+                        )?,
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                    ),
+                    SerialConfigCli::None => (
+                        DisconnectedSerialBackendHandle.into_resource(),
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                    ),
+                    _ => unreachable!("saved microVM console was validated as an attachment"),
+                };
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
+                    virtio_resources::console::VirtioConsoleHandle {
+                        backend,
+                        disconnect_policy,
+                        attachment: Some(resource_attachment),
+                    }
+                    .into_resource(),
+                ));
+                microvm_console_attachment = Some(snapshot_attachment);
+            }
+        }
         if let Some(devices_config) = req_config.devices_config {
             if let Some(virtio_blk) = devices_config.virtio_blk {
                 anyhow::ensure!(is_microvm, "fixed virtio-blk requires the microVM profile");
@@ -1331,10 +1461,6 @@ impl VmService {
                     VirtioBus::Mmio,
                     virtio_resources::blk::VirtioBlkHandle { disk, read_only }.into_resource(),
                 ));
-                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
-                    unreachable!("microVM was validated with pvh_boot");
-                };
-                openvmm_defs::config::append_microvm_virtio_blk_discovery(cmdline)?;
             }
             if !devices_config.scsi_disks.is_empty() {
                 let mut devices = Vec::new();
@@ -1402,17 +1528,80 @@ impl VmService {
 
             if let Some(virtio_console) = devices_config.virtio_console {
                 if !virtio_console.socket_path.is_empty() {
-                    let (serial_fn, action) = open_socket_backend(virtio_console.connect);
-                    let backend =
-                        serial_fn(virtio_console.socket_path.as_ref()).with_context(|| {
-                            format!(
-                                "failed to {} virtio console socket: {}",
-                                action, virtio_console.socket_path
-                            )
-                        })?;
+                    let (backend, disconnect_policy, attachment) = if is_microvm {
+                        let endpoint_config = if virtio_console.connect {
+                            SerialConfigCli::ConnectPipe(PathBuf::from(&virtio_console.socket_path))
+                        } else {
+                            SerialConfigCli::Pipe(PathBuf::from(&virtio_console.socket_path))
+                        };
+                        let (endpoint_config, attachment, snapshot_attachment) =
+                            crate::microvm_console_attachment_from_cli(&endpoint_config)?;
+                        if let Some(snapshot_dir) = &snapshot_destination {
+                            crate::validate_microvm_console_attachment_namespace(
+                                &snapshot_attachment,
+                                snapshot_dir,
+                            )?;
+                        }
+                        let backend = match endpoint_config {
+                            SerialConfigCli::Pipe(path) => {
+                                let backend =
+                                    bind_serial_without_cleanup(&path).with_context(|| {
+                                        format!(
+                                            "failed to bind virtio console socket: {}",
+                                            path.display()
+                                        )
+                                    })?;
+                                microvm_console_socket_cleanup =
+                                    crate::microvm_console_socket_cleanup(path)?;
+                                backend
+                            }
+                            SerialConfigCli::ConnectPipe(path) => {
+                                crate::serial_io::connect_serial_with_timeout(
+                                    &path,
+                                    Duration::from_millis(
+                                        openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                                    ),
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "failed to connect virtio console socket: {}",
+                                        path.display()
+                                    )
+                                })?
+                            }
+                            _ => unreachable!("path input produced a non-path attachment"),
+                        };
+                        microvm_console_attachment = Some(snapshot_attachment);
+                        (
+                            backend,
+                            virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                            Some(attachment),
+                        )
+                    } else {
+                        let (serial_fn, action) = open_socket_backend(virtio_console.connect);
+                        let backend =
+                            serial_fn(virtio_console.socket_path.as_ref()).with_context(|| {
+                                format!(
+                                    "failed to {} virtio console socket: {}",
+                                    action, virtio_console.socket_path
+                                )
+                            })?;
+                        (
+                            backend,
+                            virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                            None,
+                        )
+                    };
                     let resource: Resource<VirtioDeviceHandle> =
-                        virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
-                    if cfg!(windows) || cfg!(target_os = "macos") {
+                        virtio_resources::console::VirtioConsoleHandle {
+                            backend,
+                            disconnect_policy,
+                            attachment,
+                        }
+                        .into_resource();
+                    if is_microvm {
+                        config.virtio_devices.push((VirtioBus::Mmio, resource));
+                    } else if cfg!(windows) || cfg!(target_os = "macos") {
                         config.vpci_devices.push(VpciDeviceConfig {
                             vtl: DeviceVtl::Vtl0,
                             instance_id: Guid::new_random(),
@@ -1424,6 +1613,21 @@ impl VmService {
                     }
                 }
             }
+        }
+
+        if is_microvm && authoritative_restore.is_none() {
+            let has_console = config
+                .virtio_devices
+                .iter()
+                .any(|(_, device)| device.id() == "virtio-console");
+            let has_block = config
+                .virtio_devices
+                .iter()
+                .any(|(_, device)| device.id() == "virtio-blk");
+            let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
+                unreachable!("microVM was validated with pvh_boot");
+            };
+            openvmm_defs::config::append_microvm_virtio_discovery(cmdline, has_console, has_block)?;
         }
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
@@ -1443,7 +1647,10 @@ impl VmService {
             LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
             _ => None,
         };
-        let has_microvm_block = !config.virtio_devices.is_empty();
+        let has_microvm_block = config
+            .virtio_devices
+            .iter()
+            .any(|(_, device)| device.id() == "virtio-blk");
         let snapshot_memory_file = if let Some(destination) = &snapshot_destination {
             let parent = destination
                 .parent()
@@ -1562,6 +1769,8 @@ impl VmService {
             source_hypervisor,
             effective_command_line,
             has_microvm_block,
+            microvm_console_attachment,
+            microvm_console_socket_cleanup,
             snapshot_memory_file,
             guest_power_actions,
         };
@@ -1663,11 +1872,15 @@ impl VmService {
 
     async fn resume_vm(&mut self) -> anyhow::Result<()> {
         let vm = self.vm.clone().context("VM not created yet")?;
-        vm.worker_rpc
+        let resumed = vm
+            .worker_rpc
             .call(VmRpc::Resume, ())
             .await
-            .map(drop)
             .context("resume failed")?;
+        anyhow::ensure!(
+            resumed,
+            "VM did not resume; a state unit failed to start or the VM was already running"
+        );
         if !matches!(self.lifecycle, VmLifecycle::Halted(_)) {
             self.lifecycle = VmLifecycle::Running;
         }
@@ -2404,7 +2617,13 @@ async fn build_virtio_device(
         }
         Kind::Console(vmservice::VirtioConsole { backend }) => {
             let backend = build_serial_backend(backend.context("missing console backend")?)?;
-            virtio_resources::console::VirtioConsoleHandle { backend }.into_resource()
+            virtio_resources::console::VirtioConsoleHandle {
+                backend,
+                disconnect_policy:
+                    virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                attachment: None,
+            }
+            .into_resource()
         }
         Kind::VhostUser(vhost_user) => build_vhost_user_device(vhost_user)?,
     })

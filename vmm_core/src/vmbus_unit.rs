@@ -77,8 +77,9 @@ impl VmbusServerHandle {
 struct VmbusServerUnit(VmbusServer);
 
 impl StateUnit for &'_ VmbusServerUnit {
-    async fn start(&mut self) {
+    async fn start(&mut self) -> anyhow::Result<()> {
         self.0.start();
+        Ok(())
     }
 
     async fn stop(&mut self) {
@@ -133,8 +134,9 @@ impl<T: 'static + VmbusDevice> ChannelUnit<T> {
 }
 
 impl<T: 'static + VmbusDevice + ?Sized> StateUnit for &'_ ChannelUnit<T> {
-    async fn start(&mut self) {
+    async fn start(&mut self) -> anyhow::Result<()> {
         self.0.start();
+        Ok(())
     }
 
     async fn stop(&mut self) {
@@ -194,8 +196,9 @@ impl<T: SimpleVmbusDevice> Inspect for SimpleChannelUnit<T> {
 }
 
 impl<T: SimpleVmbusDevice> StateUnit for &'_ SimpleChannelUnit<T> {
-    async fn start(&mut self) {
+    async fn start(&mut self) -> anyhow::Result<()> {
         self.0.start();
+        Ok(())
     }
 
     async fn stop(&mut self) {

@@ -107,6 +107,7 @@ use std::fs::File;
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use virt::ProtoPartition;
 use virt::VpIndex;
 use virtio::PciInterruptModel;
@@ -760,6 +761,7 @@ pub(crate) struct LoadedVm {
     snapshot_stop_guard: Option<vmm_core::partition_unit::StopGuard>,
     snapshot_transaction_complete: Option<Rpc<(), ()>>,
     snapshot_capture_wall_clock: Option<mesh::payload::Timestamp>,
+    snapshot_input_gate_timeout: Option<Duration>,
 }
 
 /// Most of the VM state for [`LoadedVm`], excluding things that are necessary
@@ -1407,7 +1409,7 @@ impl InitializedVm {
         self,
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
-        restore_time: Option<(std::time::Duration, u64)>,
+        restore_time: Option<(Duration, u64)>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
 
@@ -2876,30 +2878,38 @@ impl InitializedVm {
                 .await?;
             match bus {
                 VirtioBus::Mmio => {
-                    let (mmio_start, mmio_len, irq, disabled_features) =
-                        if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
-                            const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
-                            let start = openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE;
-                            let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
-                            anyhow::ensure!(
-                                start >= chipset_mmio.low.start()
-                                    && start
-                                        .checked_add(len)
-                                        .is_some_and(|end| end <= chipset_mmio.low.end()),
-                                "microVM virtio-blk slot is outside the fixed low-MMIO aperture"
-                            );
-                            (
-                                start,
-                                len,
+                    let (mmio_start, mmio_len, irq, disabled_features) = if matches!(
+                        cfg.machine_profile,
+                        MachineProfile::Microvm { .. }
+                    ) {
+                        const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
+                        let (start, irq) = match id.as_str() {
+                            "virtio-console" => (
+                                openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+                                openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
+                            ),
+                            "virtio-blk" => (
+                                openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
                                 openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
-                                VIRTIO_F_RING_PACKED,
-                            )
-                        } else {
-                            let start =
-                                virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
-                            virtio_mmio_index += 1;
-                            (start, 0x1000, virtio_mmio_irq, 0)
+                            ),
+                            _ => anyhow::bail!(
+                                "unsupported microVM virtio device '{id}' reached worker construction"
+                            ),
                         };
+                        let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
+                        anyhow::ensure!(
+                            start >= chipset_mmio.low.start()
+                                && start
+                                    .checked_add(len)
+                                    .is_some_and(|end| end <= chipset_mmio.low.end()),
+                            "microVM virtio slot for '{id}' is outside the fixed low-MMIO aperture"
+                        );
+                        (start, len, irq, VIRTIO_F_RING_PACKED)
+                    } else {
+                        let start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
+                        virtio_mmio_index += 1;
+                        (start, 0x1000, virtio_mmio_irq, 0)
+                    };
                     let id = format!("{id}-{mmio_start}");
                     let gm = gm.clone();
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
@@ -3023,6 +3033,7 @@ impl InitializedVm {
             snapshot_stop_guard: None,
             snapshot_transaction_complete: None,
             snapshot_capture_wall_clock: None,
+            snapshot_input_gate_timeout: None,
             inner: LoadedVmInner {
                 driver_source,
                 resolver,
@@ -3517,7 +3528,13 @@ impl LoadedVm {
         if self.running {
             return false;
         }
-        self.state_units.start().await;
+        if let Err(error) = self.state_units.start().await {
+            tracing::error!(
+                error = error.as_ref() as &dyn std::error::Error,
+                "VM state units failed to start"
+            );
+            return false;
+        }
         self.running = true;
         true
     }
@@ -3534,18 +3551,44 @@ impl LoadedVm {
     async fn establish_snapshot_boundary(
         &mut self,
         request: chipset_resources::microvm::MicrovmSnapshotBoundaryRequest,
-    ) {
+    ) -> bool {
         if self.snapshot_stop_guard.is_some() {
-            tracing::warn!("dropping duplicate microVM snapshot boundary request");
+            tracelimit::warn_ratelimited!("dropping duplicate microVM snapshot boundary request");
             request.release_write.send(());
             request.transaction_complete.complete(());
-            return;
+            return true;
         }
         let Some(snapshot_ready) = self.snapshot_ready.clone() else {
             request.release_write.send(());
             request.transaction_complete.complete(());
-            return;
+            return true;
         };
+
+        if let Err(error) = self
+            .state_units
+            .quiesce_input_for_save(request.input_gate_timeout)
+            .await
+        {
+            tracelimit::error_ratelimited!(
+                error = error.as_ref() as &dyn std::error::Error,
+                "failed to gate host input before snapshot boundary"
+            );
+            if let Err(resume_error) = self
+                .state_units
+                .resume_input_after_save(request.input_gate_timeout)
+                .await
+            {
+                tracelimit::error_ratelimited!(
+                    error = resume_error.as_ref() as &dyn std::error::Error,
+                    "host-input gate rollback is uncertain; terminating VM worker"
+                );
+                request.transaction_complete.complete(());
+                return false;
+            }
+            request.release_write.send(());
+            request.transaction_complete.complete(());
+            return true;
+        }
 
         match self
             .inner
@@ -3557,19 +3600,40 @@ impl LoadedVm {
                 self.snapshot_stop_guard = Some(stop_guard);
                 self.snapshot_transaction_complete = Some(request.transaction_complete);
                 self.snapshot_capture_wall_clock = Some(std::time::SystemTime::now().into());
+                self.snapshot_input_gate_timeout = Some(request.input_gate_timeout);
                 snapshot_ready.send(());
+                true
             }
             Err(error) => {
-                tracing::error!(
+                tracelimit::error_ratelimited!(
                     error = error.as_ref() as &dyn std::error::Error,
                     "failed to establish snapshot PMIO boundary"
                 );
+                if let Err(resume_error) = self
+                    .state_units
+                    .resume_input_after_save(request.input_gate_timeout)
+                    .await
+                {
+                    tracelimit::error_ratelimited!(
+                        error = resume_error.as_ref() as &dyn std::error::Error,
+                        "host input is uncertain after boundary failure; terminating VM worker"
+                    );
+                    request.transaction_complete.complete(());
+                    return false;
+                }
                 request.transaction_complete.complete(());
+                true
             }
         }
     }
 
-    fn release_snapshot_boundary(&mut self) -> anyhow::Result<()> {
+    async fn release_snapshot_boundary(&mut self) -> anyhow::Result<()> {
+        let input_gate_timeout = self
+            .snapshot_input_gate_timeout
+            .context("snapshot boundary is missing its input-gate timeout")?;
+        self.state_units
+            .resume_input_after_save(input_gate_timeout)
+            .await?;
         let transaction_complete = self
             .snapshot_transaction_complete
             .take()
@@ -3579,6 +3643,7 @@ impl LoadedVm {
             .take()
             .context("snapshot boundary is missing its vCPU stop guard")?;
         self.snapshot_capture_wall_clock = None;
+        self.snapshot_input_gate_timeout = None;
         transaction_complete.complete(());
         drop(stop_guard);
         Ok(())
@@ -3611,7 +3676,10 @@ impl LoadedVm {
         let stop_guard = self.inner.partition_unit.temporarily_stop_vps().await;
 
         // Start state units so device config space is accessible.
-        self.state_units.start().await;
+        self.state_units
+            .start()
+            .await
+            .context("failed to start devices for PCI resource assignment")?;
 
         let result = ecam_config_access::assign_pci_resources_for_root_complexes(
             &self.inner.chipset,
@@ -3679,7 +3747,9 @@ impl LoadedVm {
             match event {
                 Event::WorkerRpc(Err(_)) => break,
                 Event::SnapshotBoundary(Ok(request)) => {
-                    self.establish_snapshot_boundary(request).await;
+                    if !self.establish_snapshot_boundary(request).await {
+                        break;
+                    }
                 }
                 Event::SnapshotBoundary(Err(_)) => {
                     self.snapshot_boundary_requests = None;
@@ -3718,7 +3788,12 @@ impl LoadedVm {
                             }
                             Err(err) => {
                                 if stopped {
-                                    self.state_units.start().await;
+                                    if let Err(start_error) = self.state_units.start().await {
+                                        rpc.complete(Err(RemoteError::new(start_error.context(
+                                            "worker restart failed and the VM could not resume",
+                                        ))));
+                                        continue;
+                                    }
                                 }
                                 rpc.complete(Err(RemoteError::new(err)));
                             }
@@ -3834,13 +3909,14 @@ impl LoadedVm {
                         rpc.handle_failable(async |timeout| {
                             self.state_units.resume_after_failed_save(timeout).await?;
                             self.running = true;
-                            self.release_snapshot_boundary()?;
+                            self.release_snapshot_boundary().await?;
                             anyhow::Ok(())
                         })
                         .await;
                     }
                     VmRpc::ReleaseSnapshotBoundary(rpc) => {
-                        rpc.handle_failable_sync(|()| self.release_snapshot_boundary())
+                        rpc.handle_failable(async |()| self.release_snapshot_boundary().await)
+                            .await
                     }
                     VmRpc::Nmi(rpc) => rpc.handle_sync(|vpindex| {
                         if vpindex < self.inner.processor_topology.vp_count() {
@@ -3884,7 +3960,7 @@ impl LoadedVm {
                             )
                             .await?;
                             self.inner.vmbus_devices.push(device);
-                            self.state_units.start_stopped_units().await;
+                            self.state_units.start_stopped_units().await?;
                             anyhow::Ok(())
                         })
                         .await
@@ -4032,7 +4108,7 @@ impl LoadedVm {
                             // MSI. The guest may begin probing config space
                             // immediately after receiving the interrupt, so
                             // the device must be ready first.
-                            self.state_units.start_stopped_units().await;
+                            self.state_units.start_stopped_units().await?;
 
                             // Now attach the device and notify the guest.
                             if let Err(e) = rc.lock().hotplug_add_device(

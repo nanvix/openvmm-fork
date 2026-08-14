@@ -1292,6 +1292,101 @@ struct VirtioPciTestDevice {
 type TestDeviceQueueWorkFn =
     Arc<dyn Fn(u16, &mut VirtioQueue, VirtioQueueCallbackWork) + Send + Sync>;
 
+mod private_state {
+    use mesh::payload::Protobuf;
+    use vmcore::save_restore::SavedStateRoot;
+
+    #[derive(Protobuf, SavedStateRoot)]
+    #[mesh(package = "virtio.test_private_state")]
+    pub struct SavedState {
+        #[mesh(1)]
+        pub value: u64,
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct PrivateStateTestDevice {
+    value: Arc<AtomicUsize>,
+}
+
+impl VirtioDevice for PrivateStateTestDevice {
+    fn traits(&self) -> DeviceTraits {
+        DeviceTraits {
+            device_id: VirtioDeviceType::CONSOLE,
+            device_features: VirtioDeviceFeatures::new(),
+            max_queues: 0,
+            device_register_length: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn read_registers_u32(&mut self, _offset: u16) -> u32 {
+        0
+    }
+
+    async fn write_registers_u32(&mut self, _offset: u16, _val: u32) {}
+
+    async fn start_queue(
+        &mut self,
+        _idx: u16,
+        _resources: QueueResources,
+        _features: &VirtioDeviceFeatures,
+        _initial_state: Option<QueueState>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("private-state test device has no queues")
+    }
+
+    async fn stop_queue(&mut self, _idx: u16) -> Option<QueueState> {
+        None
+    }
+
+    fn supports_save_restore(&self) -> bool {
+        true
+    }
+
+    fn save_device(
+        &mut self,
+    ) -> Result<Option<vmcore::save_restore::SavedStateBlob>, vmcore::save_restore::SaveError> {
+        Ok(Some(vmcore::save_restore::SavedStateBlob::new(
+            private_state::SavedState {
+                value: self.value.load(Ordering::Relaxed) as u64,
+            },
+        )))
+    }
+
+    fn restore_device(
+        &mut self,
+        state: Option<vmcore::save_restore::SavedStateBlob>,
+    ) -> Result<(), vmcore::save_restore::RestoreError> {
+        let state = state.ok_or_else(|| {
+            vmcore::save_restore::RestoreError::InvalidSavedState(anyhow::anyhow!(
+                "missing private test state"
+            ))
+        })?;
+        let state: private_state::SavedState = state.parse()?;
+        let value = usize::try_from(state.value).map_err(|_| {
+            vmcore::save_restore::RestoreError::InvalidSavedState(anyhow::anyhow!(
+                "private test state is out of range"
+            ))
+        })?;
+        self.value.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn device_state_validator(&self) -> crate::DeviceStateValidator {
+        Box::new(|state, _features, _queues, _guest_memory| {
+            let state = state.ok_or_else(|| {
+                vmcore::save_restore::RestoreError::InvalidSavedState(anyhow::anyhow!(
+                    "missing private test state"
+                ))
+            })?;
+            let _: private_state::SavedState = state.parse()?;
+            Ok(())
+        })
+    }
+}
+
 /// A minimal VirtioDevice whose start_queue() always returns an error.
 /// Used to test that transports correctly handle enable failures.
 #[derive(InspectMut)]
@@ -4874,6 +4969,109 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
 
     // Stop and clean up.
     dev2.stop().await;
+}
+
+#[async_test]
+async fn mmio_restore_rejects_missing_active_queue_progress(driver: DefaultDriver) {
+    use vmcore::device_state::ChangeDeviceState;
+    use vmcore::save_restore::SaveRestore;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    let mem = GuestMemory::new("test", test_mem.clone());
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+    let traits = DeviceTraits {
+        device_id: VirtioDeviceType::CONSOLE,
+        device_features: VirtioDeviceFeatures::new()
+            .with_bank(0, VIRTIO_F_RING_INDIRECT_DESC | VIRTIO_F_RING_EVENT_IDX),
+        max_queues: 1,
+        device_register_length: 0,
+        ..Default::default()
+    };
+    let mut source = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(&driver_source, traits.clone(), None)),
+        &driver,
+        mem.clone(),
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    guest
+        .setup_chipset_device(&mut source, guest.queue_features())
+        .await;
+    source.stop().await;
+    let mut saved = source.save().unwrap();
+    assert!(saved.queues[0].common.enable);
+    assert!(saved.queues[0].common.queue_state.take().is_some());
+
+    let mut destination = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(&driver_source, traits, None)),
+        &driver,
+        mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    assert!(destination.restore(saved).is_err());
+}
+
+#[async_test]
+async fn mmio_private_state_round_trip(driver: DefaultDriver) {
+    use vmcore::device_state::ChangeDeviceState;
+    use vmcore::save_restore::SaveRestore;
+
+    let source_value = Arc::new(AtomicUsize::new(42));
+    let mut source = VirtioMmioDevice::new(
+        Box::new(PrivateStateTestDevice {
+            value: source_value,
+        }),
+        &driver,
+        GuestMemory::empty(),
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    source.stop().await;
+    let saved = source.save().expect("private state save should succeed");
+    assert!(saved.device_state.is_some());
+
+    let restored_value = Arc::new(AtomicUsize::new(0));
+    let mut destination = VirtioMmioDevice::new(
+        Box::new(PrivateStateTestDevice {
+            value: restored_value.clone(),
+        }),
+        &driver,
+        GuestMemory::empty(),
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    destination
+        .restore(saved)
+        .expect("private state restore should validate");
+    destination.start();
+    for _ in 0..100 {
+        if restored_value.load(Ordering::Relaxed) == 42 {
+            break;
+        }
+        yield_now().await;
+    }
+    assert_eq!(restored_value.load(Ordering::Relaxed), 42);
+
+    destination.stop().await;
+    let mut invalid = destination.save().unwrap();
+    invalid.device_state = Some(vmcore::save_restore::SavedStateBlob::new(
+        vmcore::save_restore::NoSavedState,
+    ));
+    assert!(destination.restore(invalid).is_err());
 }
 
 #[async_test]

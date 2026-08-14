@@ -26,6 +26,8 @@ use mesh::rpc::RpcSend;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 
 /// Commands sent from the transport to the device task.
 pub enum DeviceCommand {
@@ -36,11 +38,15 @@ pub enum DeviceCommand {
     /// Guest writes status=0 — stop all queues, reset device.
     Disable(Rpc<(), ()>),
     /// ChangeDeviceState::stop() — stop queues, return states for resume.
-    Stop(Rpc<(), Vec<Option<QueueState>>>),
+    Stop(Rpc<(), StopResult>),
     /// ChangeDeviceState::start() — restart queues with saved states.
     Start(FailableRpc<StartParams, ()>),
     /// ChangeDeviceState::reset() — stop queues, reset device.
     Reset(Rpc<(), ()>),
+    /// Gate host input before establishing a snapshot vCPU boundary.
+    QuiesceInput(FailableRpc<(), ()>),
+    /// Resume host input after a failed snapshot transaction.
+    ResumeInput(FailableRpc<(), ()>),
     /// Config register read at byte offset with byte length.
     ReadConfig {
         offset: u16,
@@ -82,6 +88,25 @@ pub struct EnableParams {
 pub struct StartParams {
     pub queues: Vec<(u16, QueueResources, Option<QueueState>)>,
     pub features: VirtioDeviceFeatures,
+    pub device_state: DeviceRestoreState,
+}
+
+/// Whether this start follows restore, and its optional private payload.
+pub enum DeviceRestoreState {
+    NotRestored,
+    Restored(Option<SavedStateBlob>),
+}
+
+impl DeviceRestoreState {
+    pub fn is_restored(&self) -> bool {
+        matches!(self, Self::Restored(_))
+    }
+}
+
+/// Queue and device-private state captured after a device has stopped.
+pub struct StopResult {
+    pub queues: Vec<Option<QueueState>>,
+    pub device_state: Result<Option<SavedStateBlob>, SaveError>,
 }
 
 /// Transport-side state machine tracking in-flight device operations.
@@ -214,27 +239,35 @@ impl DeviceTask {
         self.device.reset().await;
     }
 
-    async fn stop(&mut self) -> Vec<Option<QueueState>> {
+    async fn stop(&mut self) -> StopResult {
         let mut states = vec![None; self.max_queues as usize];
         for idx in 0..self.max_queues {
             states[idx as usize] = self.device.stop_queue(idx).await;
         }
-        states
+        StopResult {
+            queues: states,
+            device_state: self.device.save_device(),
+        }
     }
 
     async fn start(&mut self, params: StartParams) -> anyhow::Result<()> {
+        if let DeviceRestoreState::Restored(state) = params.device_state {
+            self.device.restore_device(state)?;
+        }
         for (idx, resources, initial_state) in params.queues {
-            self.device
+            if let Err(error) = self
+                .device
                 .start_queue(idx, resources, &params.features, initial_state)
                 .await
-                .map_err(|err| {
-                    tracelimit::error_ratelimited!(
-                        error = &*err as &dyn std::error::Error,
-                        idx,
-                        "virtio device start_queue failed on resume"
-                    );
-                    err
-                })?;
+            {
+                tracelimit::error_ratelimited!(
+                    error = &*error as &dyn std::error::Error,
+                    idx,
+                    "virtio device start_queue failed on resume"
+                );
+                self.stop_all_queues().await;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -242,6 +275,14 @@ impl DeviceTask {
     async fn reset(&mut self) {
         self.stop_all_queues().await;
         self.device.reset().await;
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.device.quiesce_input().await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.device.resume_input().await
     }
 
     async fn stop_all_queues(&mut self) {
@@ -283,6 +324,14 @@ pub async fn run_device_task(
             }
             DeviceCommand::Reset(rpc) => {
                 rpc.handle(async |()| task.reset().await).await;
+            }
+            DeviceCommand::QuiesceInput(rpc) => {
+                rpc.handle_failable(async |()| task.quiesce_input().await)
+                    .await;
+            }
+            DeviceCommand::ResumeInput(rpc) => {
+                rpc.handle_failable(async |()| task.resume_input().await)
+                    .await;
             }
             DeviceCommand::ReadConfig {
                 offset,

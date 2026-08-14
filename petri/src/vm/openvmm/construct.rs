@@ -219,7 +219,7 @@ impl PetriVmConfigOpenVmm {
                 LoadMode::Linux { kernel, initrd, .. } => LoadMode::Pvh {
                     kernel,
                     initrd,
-                    cmdline: build_microvm_command_line(&[])?,
+                    cmdline: build_microvm_command_line(&[], false)?,
                 },
                 _ => unreachable!("microVM firmware was validated as LinuxDirect"),
             };
@@ -654,7 +654,11 @@ impl PetriVmConfigOpenVmm {
                 },
                 ChipsetDeviceHandle {
                     name: MicrovmSnapshotRequestHandle::ID.to_owned(),
-                    resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+                    resource: MicrovmSnapshotRequestHandle {
+                        notify: None,
+                        input_gate_timeout: std::time::Duration::from_secs(5),
+                    }
+                    .into_resource(),
                 },
             ]);
         }

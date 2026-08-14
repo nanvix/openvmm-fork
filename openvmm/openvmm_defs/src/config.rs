@@ -68,6 +68,8 @@ pub struct Config {
 pub const MICROVM_ABI_VERSION_1: u32 = 1;
 /// ABI-v1 command line owned by the microVM profile.
 pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
+/// ABI-v1 command line when the virtio console is present.
+pub const MICROVM_CONSOLE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc1 reboot=t panic=-1";
 /// Maximum ABI-v1 command-line size, including its trailing NUL.
 pub const MICROVM_COMMAND_LINE_MAX_SIZE: usize = 64 * 1024;
 /// Fixed ABI-v1 virtio-blk MMIO base.
@@ -82,6 +84,10 @@ pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
 pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 /// Fixed ABI-v1 virtio-blk interrupt.
 pub const MICROVM_VIRTIO_BLK_IRQ: u32 = 4;
+/// Fixed ABI-v1 virtio-console interrupt.
+pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
+/// ABI-v1 client console reconnect timeout.
+pub const MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS: u64 = 5_000;
 /// ABI-v1 virtio MMIO reservations in stable device order.
 pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 4] = [
     MICROVM_VIRTIO_NET_MMIO_BASE,
@@ -106,8 +112,12 @@ fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Appends the fixed ABI-v1 virtio-blk discovery token.
-pub fn append_microvm_virtio_blk_discovery(cmdline: &mut String) -> anyhow::Result<()> {
+/// Appends present virtio devices in fixed-address order.
+pub fn append_microvm_virtio_discovery(
+    cmdline: &mut String,
+    has_console: bool,
+    has_block: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         !cmdline
             .split_ascii_whitespace()
@@ -115,10 +125,18 @@ pub fn append_microvm_virtio_blk_discovery(cmdline: &mut String) -> anyhow::Resu
         "microVM command line already contains virtio-mmio discovery"
     );
     use std::fmt::Write as _;
-    write!(
-        cmdline,
-        " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
-    )?;
+    if has_console {
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
+        )?;
+    }
+    if has_block {
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
+        )?;
+    }
     anyhow::ensure!(
         cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
         "microVM kernel command line exceeds the 64-KiB ABI limit after device discovery"
@@ -140,9 +158,21 @@ fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
     );
 
     let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
-    let base_tokens = MICROVM_BASE_COMMAND_LINE
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>();
+    let has_console = config
+        .virtio_devices
+        .iter()
+        .any(|(_, device)| device.id() == "virtio-console");
+    let has_block = config
+        .virtio_devices
+        .iter()
+        .any(|(_, device)| device.id() == "virtio-blk");
+    let base_tokens = if has_console {
+        MICROVM_CONSOLE_COMMAND_LINE
+    } else {
+        MICROVM_BASE_COMMAND_LINE
+    }
+    .split_ascii_whitespace()
+    .collect::<Vec<_>>();
     anyhow::ensure!(
         tokens.starts_with(&base_tokens),
         "microVM command line does not begin with the ABI-v1 base tokens"
@@ -162,20 +192,36 @@ fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
             "microVM command line has an invalid number of {prefix} tokens"
         );
     }
-    if !config.virtio_devices.is_empty() {
-        let expected = format!(
+    let mut expected_discovery = Vec::new();
+    if has_console {
+        expected_discovery.push(format!(
+            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
+        ));
+    }
+    if has_block {
+        expected_discovery.push(format!(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
-        );
+        ));
+    }
+    if !expected_discovery.is_empty() {
         anyhow::ensure!(
-            tokens.last().copied() == Some(expected.as_str()),
-            "microVM virtio-blk discovery token is not stable"
+            tokens.ends_with(
+                &expected_discovery
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            ),
+            "microVM virtio discovery tokens are not in fixed-address order"
         );
     }
     Ok(())
 }
 
 /// Builds the ABI-v1 microVM command line and rejects profile-owned user tokens.
-pub fn build_microvm_command_line(user_args: &[String]) -> anyhow::Result<String> {
+pub fn build_microvm_command_line(
+    user_args: &[String],
+    has_console: bool,
+) -> anyhow::Result<String> {
     for arg in user_args {
         if arg.contains('\0') {
             anyhow::bail!("microVM kernel command line contains an embedded NUL");
@@ -191,7 +237,12 @@ pub fn build_microvm_command_line(user_args: &[String]) -> anyhow::Result<String
         }
     }
 
-    let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+    let mut cmdline = if has_console {
+        MICROVM_CONSOLE_COMMAND_LINE
+    } else {
+        MICROVM_BASE_COMMAND_LINE
+    }
+    .to_owned();
     for arg in user_args.iter().filter(|arg| !arg.is_empty()) {
         cmdline.push(' ');
         cmdline.push_str(arg);
@@ -345,14 +396,27 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     );
 
     anyhow::ensure!(
-        config.virtio_devices.len() <= 1,
-        "microVM ABI version 1 permits at most one virtio-blk device"
+        config.virtio_devices.len() <= 2,
+        "microVM ABI version 1 permits at most one virtio-console and one virtio-blk device"
     );
+    let mut has_console = false;
+    let mut has_block = false;
     for (bus, device) in &config.virtio_devices {
         anyhow::ensure!(
-            *bus == VirtioBus::Mmio && device.id() == "virtio-blk",
-            "microVM ABI version 1 permits only an MMIO virtio-blk device"
+            *bus == VirtioBus::Mmio,
+            "microVM ABI version 1 permits only virtio-mmio devices"
         );
+        match device.id() {
+            "virtio-console" => anyhow::ensure!(
+                !std::mem::replace(&mut has_console, true),
+                "microVM ABI version 1 permits only one virtio-console device"
+            ),
+            "virtio-blk" => anyhow::ensure!(
+                !std::mem::replace(&mut has_block, true),
+                "microVM ABI version 1 permits only one virtio-blk device"
+            ),
+            id => anyhow::bail!("microVM ABI version 1 does not permit virtio device '{id}'"),
+        }
     }
     anyhow::ensure!(
         config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024

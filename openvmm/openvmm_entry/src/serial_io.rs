@@ -9,6 +9,7 @@ use pal_async::pipe::PolledPipe;
 use serial_socket::net::OpenSocketSerialConfig;
 use std::io;
 use std::net::SocketAddr;
+use std::net::TcpStream;
 use std::path::Path;
 use unix_socket::UnixListener;
 use vm_resource::IntoResource;
@@ -47,6 +48,18 @@ pub fn anonymous_serial_pair(
 }
 
 pub fn bind_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    bind_serial_inner(path, true)
+}
+
+/// Binds a listener without removing an existing socket path.
+pub fn bind_serial_without_cleanup(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    bind_serial_inner(path, false)
+}
+
+fn bind_serial_inner(
+    path: &Path,
+    cleanup_existing: bool,
+) -> io::Result<Resource<SerialBackendHandle>> {
     #[cfg(windows)]
     {
         use serial_socket::windows::OpenWindowsPipeSerialConfig;
@@ -63,7 +76,9 @@ pub fn bind_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
         }
     }
 
-    cleanup_socket(path);
+    if cleanup_existing {
+        cleanup_socket(path);
+    }
     Ok(OpenSocketSerialConfig::from(UnixListener::bind(path)?).into_resource())
 }
 
@@ -88,8 +103,40 @@ pub fn connect_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> 
     Ok(OpenSocketSerialConfig::from(unix_socket::UnixStream::connect(path)?).into_resource())
 }
 
+pub fn connect_serial_with_timeout(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<Resource<SerialBackendHandle>> {
+    let path = path.to_owned();
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("serial-connect".to_owned())
+        .spawn(move || {
+            let _ = send.send(connect_serial(&path));
+        })?;
+    match recv.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("serial endpoint did not connect within {timeout:?}"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "serial connection worker terminated without a result",
+        )),
+    }
+}
+
 pub fn bind_tcp_serial(addr: &SocketAddr) -> anyhow::Result<Resource<SerialBackendHandle>> {
     let listener = std::net::TcpListener::bind(addr)
         .with_context(|| format!("failed to bind tcp address {addr}"))?;
     Ok(OpenSocketSerialConfig::from(listener).into_resource())
+}
+
+pub fn connect_tcp_serial(
+    addr: &SocketAddr,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Resource<SerialBackendHandle>> {
+    let stream = TcpStream::connect_timeout(addr, timeout)
+        .with_context(|| format!("failed to connect to tcp address {addr}"))?;
+    Ok(OpenSocketSerialConfig::from(stream).into_resource())
 }

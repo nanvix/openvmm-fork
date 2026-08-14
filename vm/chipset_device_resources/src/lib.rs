@@ -92,6 +92,9 @@ pub trait ConfigureChipsetDevice: Send {
 #[async_trait]
 trait DynChipsetDevice: ChipsetDevice + ProtobufSaveRestore + InspectMut {
     fn start(&mut self);
+    async fn start_fallible(&mut self) -> anyhow::Result<()>;
+    async fn quiesce_input(&mut self) -> anyhow::Result<()>;
+    async fn resume_input(&mut self) -> anyhow::Result<()>;
     async fn stop(&mut self);
     async fn reset(&mut self);
     async fn advance_time(&mut self, duration: std::time::Duration) -> anyhow::Result<()>;
@@ -102,7 +105,16 @@ impl<T: ChangeDeviceState + ChipsetDevice + ProtobufSaveRestore + InspectMut> Dy
     for T
 {
     fn start(&mut self) {
-        self.start()
+        ChangeDeviceState::start(self)
+    }
+    async fn start_fallible(&mut self) -> anyhow::Result<()> {
+        ChangeDeviceState::start_fallible(self).await
+    }
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        ChangeDeviceState::quiesce_input(self).await
+    }
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        ChangeDeviceState::resume_input(self).await
     }
     async fn stop(&mut self) {
         self.stop().await
@@ -134,6 +146,18 @@ impl<T: ChangeDeviceState + ChipsetDevice + ProtobufSaveRestore + InspectMut> Fr
 impl ChangeDeviceState for ErasedChipsetDevice {
     fn start(&mut self) {
         self.0.start()
+    }
+
+    async fn start_fallible(&mut self) -> anyhow::Result<()> {
+        self.0.start_fallible().await
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.0.quiesce_input().await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.0.resume_input().await
     }
 
     async fn stop(&mut self) {

@@ -64,8 +64,8 @@ pub(crate) enum VirtioRestoreError {
         saved: u32,
         device: u32,
     },
-    #[error("saved state has {saved} feature banks, device only has {device}")]
-    TooManyFeatureBanks { saved: usize, device: usize },
+    #[error("saved state has {saved} feature banks, expected {expected}")]
+    FeatureBankCountMismatch { saved: usize, expected: usize },
     #[error("queue count mismatch: saved {saved} vs device {device}")]
     QueueCountMismatch { saved: usize, device: usize },
     #[error("queue {index}: saved size {size} exceeds device maximum {max}")]
@@ -87,11 +87,11 @@ pub(crate) fn validate_restore(
 ) -> Result<(), RestoreError> {
     // Validate feature banks.
     let saved_banks = &common.driver_feature_banks;
-    if saved_banks.len() > 2 {
+    if saved_banks.len() != 2 {
         return Err(RestoreError::InvalidSavedState(
-            VirtioRestoreError::TooManyFeatureBanks {
+            VirtioRestoreError::FeatureBankCountMismatch {
                 saved: saved_banks.len(),
-                device: 2,
+                expected: 2,
             }
             .into(),
         ));

@@ -44,18 +44,26 @@ In other words: This API is _very_ WIP, and user discretion is advised.
 
 ## microVM snapshots
 
-`CreateVMRequest.microvm_snapshot` exposes the phase-2 microVM capture and
+`CreateVMRequest.microvm_snapshot` exposes the microVM capture and
 restore flow over both transports:
 
 * `destination_path` configures guest-requested capture. Supply the normal
 	ABI-v1 microVM configuration, including PVH boot files and memory. The path
 	must not exist. `quiesce_timeout_ms` defaults to five seconds when zero.
-* `restore_path` selects manifest-authoritative restore. `config` may be absent,
-	or may contain only the microVM profile, serial port 0 host attachment, and
-	guest power actions. Guest-visible boot, memory, processor, device, NUMA, and
-	PCIe fields are rejected.
+* `restore_path` selects manifest-authoritative restore. `config` may be
+  absent, or may contain only the microVM profile, serial port 0 host
+  attachment, a matching `DevicesConfig.virtio_console` attachment, and guest
+  power actions. Guest-visible boot, memory, processor, other device, NUMA,
+  and PCIe fields are rejected. A saved listener is reconstructed from the
+  manifest; a saved client requires the matching path configuration.
 * `restore_entropy` requests fresh entropy and is valid only with
 	`restore_path`.
+
+On cold boot, `DevicesConfig.virtio_console` may configure one microVM Unix
+socket or named-pipe endpoint. Listener mode recreates the path on restore.
+Client mode is required and uses the ABI-v1 five-second connection timeout
+before vCPUs start. The device uses MMIO `0xd0002000`, IRQ 7, and selects
+`hvc1`; its canonical path and policy become the stable restore attachment.
 
 Capture and restore paths are mutually exclusive. A successful capture halts
 the managed source VM at the committed boundary and terminates the OpenVMM
