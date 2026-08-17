@@ -895,6 +895,7 @@ fn test_ttrpc_interface(
                                 virtiofs_config: vec![vmservice::VirtioFsConfig {
                                     tag: "testfs".to_string(),
                                     root_path: virtiofs_root.to_string_lossy().into(),
+                                    ..Default::default()
                                 }],
                                 // A SCSI controller keeps a request channel
                                 // alive for the lifetime of the VM, which used

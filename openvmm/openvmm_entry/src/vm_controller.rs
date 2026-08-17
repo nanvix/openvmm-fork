@@ -140,6 +140,8 @@ pub struct VmController {
     pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
     pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+    pub(crate) microvm_filesystem: Option<openvmm_defs::config::MicrovmFilesystemConfig>,
+    pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     #[cfg(target_os = "linux")]
     pub(crate) _microvm_managed_tap: Option<crate::MicrovmManagedTap>,
@@ -675,6 +677,9 @@ impl VmController {
                     .zip(self.microvm_egress_policy.as_ref())
                     .zip(self.microvm_network_attachment.clone())
                     .map(|((network, policy), attachment)| (network, policy, attachment)),
+                self.microvm_filesystem
+                    .as_ref()
+                    .zip(self.microvm_filesystem_attachment.clone()),
                 self.microvm_console_attachment.clone(),
                 self.memory,
                 response.state_unit_names,

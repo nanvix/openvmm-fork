@@ -915,6 +915,222 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
     Ok(())
 }
 
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    requires(microvm_pvh),
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
+async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const BEFORE_MARKER: &[u8] = b"PHASE5-FS-BEFORE";
+    const AFTER_MARKER: &[u8] = b"PHASE5-FS-AFTER";
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("phase-5 test requires direct-boot Linux artifacts")?;
+    let hypervisor = if cfg!(windows) {
+        "whp"
+    } else if cfg!(target_os = "linux") {
+        "kvm"
+    } else {
+        anyhow::bail!("microVM phase-5 restore requires Windows/WHP or Linux/KVM");
+    };
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-phase5-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create phase-5 test directory")?;
+    let snapshot_dir = temp_dir.path().join("snapshot");
+
+    let read_only_root = temp_dir.path().join("read-only");
+    fs_err::create_dir(&read_only_root)?;
+    fs_err::write(read_only_root.join("seed"), b"PHASE5-READ-ONLY")?;
+    let mut read_only_args = phase_2_args(hypervisor);
+    read_only_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--mount".into(),
+        format!("/mnt/share,{},ro", read_only_root.display()).into(),
+    ]);
+    let mut read_only = OpenvmmTestProcess::launch(openvmm.get(), &read_only_args)?;
+    read_only.wait_for(MICROVM_BOOT_MARKER)?;
+    read_only.send_line(
+        "set -eu; mkdir -p /mnt/share; mount -t virtiofs microvm /mnt/share; \
+         [ \"$(cat /mnt/share/seed)\" = PHASE5-READ-ONLY ]; \
+         if touch /mnt/share/mutation 2>/dev/null; then nvx-exit 20; fi; \
+         grep -q 'virtio_mmio.device=0x1000@0xd0001000:6' /proc/cmdline; \
+         grep -q 'virtfs_tag=microvm' /proc/cmdline; \
+         grep -q 'virtfs_mode=ro' /proc/cmdline; nvx-exit 38",
+    )?;
+    let (status, output) = read_only.wait()?;
+    anyhow::ensure!(
+        status.code() == Some(38) && !read_only_root.join("mutation").exists(),
+        "phase-5 read-only enforcement failed with {status}: {}",
+        output_tail(&output)
+    );
+
+    let root = temp_dir.path().join("live-root");
+    fs_err::create_dir(&root)?;
+    fs_err::create_dir(root.join("directory"))?;
+    fs_err::write(root.join("directory").join("entry-a"), b"a")?;
+    fs_err::write(root.join("directory").join("entry-b"), b"b")?;
+    let long_name_suffix = "x".repeat(80);
+    for index in 0..1000 {
+        fs_err::write(
+            root.join("directory")
+                .join(format!("{index:04}-{long_name_suffix}")),
+            b"",
+        )?;
+    }
+    fs_err::write(root.join("open-handle"), b"")?;
+
+    let mut capture_args = phase_2_args(hypervisor);
+    capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--mount".into(),
+        format!("/mnt/share,{},rw", root.display()).into(),
+    ]);
+    let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.send_line(
+        "set -eu; mkdir -p /mnt/share; mount -t virtiofs microvm /mnt/share; \
+         grep -q 'virtfs_dir=/mnt/share' /proc/cmdline; \
+         grep -q 'virtfs_mode=rw' /proc/cmdline; \
+         exec 3<>/mnt/share/open-handle; \
+         mkfifo /tmp/phase5-directory; exec 5<>/tmp/phase5-directory; \
+         find /mnt/share/directory -mindepth 1 -maxdepth 1 -type f >&5 & dir_pid=$!; \
+         IFS= read -r first_entry <&5; sleep 1; \
+         printf PHASE5-HANDLE-BEFORE >&3; \
+         dd if=/dev/zero of=/mnt/share/active.bin bs=1M count=32 2>/dev/null & io_pid=$!; \
+         echo PHASE5-FS-BEFORE; nvx-snapshot; wait \"$io_pid\"; \
+         printf PHASE5-HANDLE-AFTER >&3; exec 3>&-; \
+         [ \"$(wc -c </mnt/share/active.bin)\" = 33554432 ]; \
+         [ \"$(cat /mnt/share/open-handle)\" = \
+           PHASE5-HANDLE-BEFOREPHASE5-HANDLE-AFTER ]; \
+         dir_count=1; while [ \"$dir_count\" -lt 1002 ]; do \
+           IFS= read -r next_entry <&5; dir_count=$((dir_count + 1)); \
+         done; wait \"$dir_pid\"; [ \"$dir_count\" = 1002 ]; \
+         if IFS= read -r -t 1 unexpected_entry <&5; then nvx-exit 21; fi; exec 5>&-; \
+         echo PHASE5-FS-AFTER; nvx-exit 37",
+    )?;
+    let (status, source_output) = source.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "phase-5 snapshot source exited with {status}; output: {}",
+        output_tail(&source_output)
+    );
+    anyhow::ensure!(
+        count_output_lines(&source_output, BEFORE_MARKER) == 1
+            && count_output_lines(&source_output, AFTER_MARKER) == 0,
+        "phase-5 source crossed the snapshot boundary"
+    );
+    anyhow::ensure!(
+        fs_err::read(root.join("open-handle"))? == b"PHASE5-HANDLE-BEFORE",
+        "phase-5 source completed a post-snapshot filesystem write"
+    );
+    openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    fs_err::write(root.join("directory").join("late-entry"), b"late")?;
+
+    let mut missing_mount_args = phase_2_args(hypervisor);
+    missing_mount_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+    ]);
+    let missing_mount = OpenvmmTestProcess::launch(openvmm.get(), &missing_mount_args)?;
+    let (status, output) = missing_mount.wait()?;
+    anyhow::ensure!(
+        !status.success() && contains_bytes(&output, b"requires a fresh --mount attachment"),
+        "phase-5 restore without a mount was not rejected: {}",
+        output_tail(&output)
+    );
+
+    let replacement_root = temp_dir.path().join("replacement-root");
+    fs_err::create_dir(&replacement_root)?;
+    let mut replacement_args = phase_2_args(hypervisor);
+    replacement_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--mount".into(),
+        format!("/mnt/share,{},rw", replacement_root.display()).into(),
+    ]);
+    let replacement = OpenvmmTestProcess::launch(openvmm.get(), &replacement_args)?;
+    let (status, output) = replacement.wait()?;
+    anyhow::ensure!(
+        !status.success() && contains_bytes(&output, b"root identity does not match"),
+        "phase-5 restore accepted a replacement root: {}",
+        output_tail(&output)
+    );
+
+    let original = root.join("open-handle");
+    let saved_original = root.join("saved-open-handle");
+    fs_err::rename(&original, &saved_original)?;
+    fs_err::write(&original, b"replacement")?;
+    let mut replaced_object_args = phase_2_args(hypervisor);
+    replaced_object_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--mount".into(),
+        format!("/mnt/share,{},rw", root.display()).into(),
+    ]);
+    let replaced_object = OpenvmmTestProcess::launch(openvmm.get(), &replaced_object_args)?;
+    let (status, output) = replaced_object.wait()?;
+    anyhow::ensure!(
+        !status.success(),
+        "phase-5 restore accepted a replaced open object: {}",
+        output_tail(&output)
+    );
+    fs_err::remove_file(&original)?;
+    fs_err::rename(&saved_original, &original)?;
+
+    for restore_index in 0..2 {
+        let mut restore_args = phase_2_args(hypervisor);
+        restore_args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--restore-entropy".into(),
+            "--mount".into(),
+            format!("/mnt/share,{},rw", root.display()).into(),
+        ]);
+        let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        restore.wait_for_output_line(AFTER_MARKER)?;
+        let (status, output) = restore.wait()?;
+        anyhow::ensure!(
+            status.code() == Some(37),
+            "phase-5 restore {restore_index} exited with {status}: {}",
+            output_tail(&output)
+        );
+        anyhow::ensure!(
+            count_output_lines(&output, AFTER_MARKER) == 1,
+            "phase-5 restore {restore_index} did not complete exactly once"
+        );
+        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
+            .with_context(|| format!("phase-5 restore {restore_index} modified the snapshot"))?;
+    }
+
+    Ok(())
+}
+
 #[openvmm_test_no_agent(ignore(
     reason = "requires a published microVM PVH kernel and initramfs",
     microvm_pvh_x64
@@ -962,7 +1178,7 @@ exit 37
                     panic!("microVM test did not produce PVH load mode");
                 };
                 cmdline.push_str(" nvx_exec=/microvm-block-test.sh");
-                append_microvm_virtio_discovery(cmdline, None, false, true).unwrap();
+                append_microvm_virtio_discovery(cmdline, None, None, false, true).unwrap();
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
                     VirtioBlkHandle {
@@ -1068,6 +1284,7 @@ exit 37
                 append_microvm_virtio_discovery(
                     cmdline,
                     Some((&network, irq, cfg!(windows))),
+                    None,
                     false,
                     false,
                 )

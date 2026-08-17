@@ -813,6 +813,17 @@ options:
     #[clap(long, value_name = "BUS", default_value = "auto")]
     pub virtio_fs_bus: VirtioBusCli,
 
+    /// attach the microVM ABI-v1 virtio-fs device
+    ///
+    /// The guest target and access mode are snapshot-authoritative. Restore
+    /// requires a fresh attachment whose target and mode match the snapshot.
+    #[clap(
+        long = "mount",
+        value_name = "GUEST_TARGET,HOST_PATH[,ro|rw]",
+        conflicts_with_all = ["virtio_fs", "virtio_fs_shmem"]
+    )]
+    pub microvm_mount: Option<MicrovmMountCli>,
+
     /// virtio PMEM device
     ///
     /// Prefix with `pcie_port=<port_name>:` to expose the device over
@@ -1454,8 +1465,9 @@ impl Options {
                 self.net_tap.is_none()
                     && self.allow_host.is_empty()
                     && self.block_host.is_empty()
-                    && self.allow_endpoint.is_empty(),
-                "--net-tap and microVM egress policy require --machine microvm"
+                    && self.allow_endpoint.is_empty()
+                    && self.microvm_mount.is_none(),
+                "--net-tap, --mount, and microVM egress policy require --machine microvm"
             );
             return Ok(());
         }
@@ -1741,6 +1753,43 @@ pub struct FsArgsWithOptions {
     pub options: String,
     /// Optional PCIe port name.
     pub pcie_port: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmMountCli {
+    /// Absolute guest mount target.
+    pub guest_target: String,
+    /// Live host directory supplied for this run.
+    pub host_path: PathBuf,
+    /// Snapshot-authoritative access policy.
+    pub access: openvmm_defs::config::MicrovmFilesystemAccess,
+}
+
+impl FromStr for MicrovmMountCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut fields = value.splitn(3, ',');
+        let guest_target = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
+        let host_path = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
+        let access = match fields.next().unwrap_or("ro") {
+            "ro" => openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+            "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
+            mode => anyhow::bail!("invalid microVM mount mode '{mode}'; expected ro or rw"),
+        };
+        openvmm_defs::config::MicrovmFilesystemConfig::new(guest_target.to_owned(), access)?;
+        Ok(Self {
+            guest_target: guest_target.to_owned(),
+            host_path: PathBuf::from(host_path),
+            access,
+        })
+    }
 }
 
 impl FromStr for FsArgsWithOptions {
@@ -4118,6 +4167,26 @@ mod tests {
     }
 
     #[test]
+    fn test_microvm_mount_from_str() {
+        let read_only = MicrovmMountCli::from_str("/mnt/share,host").unwrap();
+        assert_eq!(read_only.guest_target, "/mnt/share");
+        assert_eq!(read_only.host_path, PathBuf::from("host"));
+        assert_eq!(
+            read_only.access,
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+        );
+
+        let read_write = MicrovmMountCli::from_str("/srv/data,host,rw").unwrap();
+        assert_eq!(
+            read_write.access,
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+        );
+        assert!(MicrovmMountCli::from_str("relative,host").is_err());
+        assert!(MicrovmMountCli::from_str("/mnt/../escape,host").is_err());
+        assert!(MicrovmMountCli::from_str("/mnt/share,host,write").is_err());
+    }
+
+    #[test]
     fn test_serial_config_from_str() {
         assert_eq!(
             SerialConfigCli::from_str("none").unwrap(),
@@ -5283,7 +5352,7 @@ mod tests {
         );
 
         let mut with_devices = build_microvm_command_line(&[], true).unwrap();
-        append_microvm_virtio_discovery(&mut with_devices, None, true, true).unwrap();
+        append_microvm_virtio_discovery(&mut with_devices, None, None, true, true).unwrap();
         assert_eq!(
             with_devices,
             format!(
@@ -5300,6 +5369,7 @@ mod tests {
                 openvmm_defs::config::MICROVM_VIRTIO_NET_KVM_IRQ,
                 false,
             )),
+            None,
             false,
             false,
         )
@@ -5318,11 +5388,33 @@ mod tests {
                 openvmm_defs::config::MICROVM_VIRTIO_NET_WHP_IRQ,
                 true,
             )),
+            None,
             false,
             false,
         )
         .unwrap();
         assert!(with_whp_network.ends_with("virtnet_dns=10.0.0.1"));
+
+        let filesystem = openvmm_defs::config::MicrovmFilesystemConfig::new(
+            "/mnt/share".to_owned(),
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+        )
+        .unwrap();
+        let mut with_filesystem = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_filesystem,
+            None,
+            Some(&filesystem),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            with_filesystem,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0001000:6 virtfs_dir=/mnt/share virtfs_tag=microvm virtfs_mode=ro"
+            )
+        );
 
         for reserved in [
             "earlycon=uart",
@@ -5332,6 +5424,9 @@ mod tests {
             "virtnet_mask=255.255.255.0",
             "virtnet_gw=10.0.0.1",
             "virtnet_dns=10.0.0.1",
+            "virtfs_dir=/other",
+            "virtfs_tag=other",
+            "virtfs_mode=rw",
         ] {
             assert!(build_microvm_command_line(&[reserved.into()], false).is_err());
         }
@@ -5359,6 +5454,15 @@ mod tests {
             Options::try_parse_from(["openvmm", "--machine", "microvm", "--net", "10.0.0.2/24"])
                 .unwrap();
         valid_network.validate_microvm_options().unwrap();
+        let valid_filesystem = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--mount",
+            "/mnt/share,host,ro",
+        ])
+        .unwrap();
+        valid_filesystem.validate_microvm_options().unwrap();
 
         for args in [
             vec!["openvmm", "--machine", "microvm", "--processors", "2"],

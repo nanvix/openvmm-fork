@@ -10,6 +10,7 @@ use virtio::resolve::ResolvedVirtioDevice;
 use virtio::resolve::VirtioResolveInput;
 use virtio_resources::fs::VirtioFsBackend;
 use virtio_resources::fs::VirtioFsHandle;
+use virtio_resources::fs::VirtioFsProfile;
 use vm_resource::ResolveResource;
 use vm_resource::declare_static_resolver;
 use vm_resource::kind::VirtioDeviceHandle;
@@ -31,53 +32,182 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
         resource: VirtioFsHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let device = match &resource.fs {
-            VirtioFsBackend::HostFs {
-                root_path,
-                mount_options,
-            } => VirtioFsDevice::new(
-                input.driver_source,
-                &resource.tag,
-                VirtioFs::new(
+        let device = match resource.profile {
+            VirtioFsProfile::Standard => match &resource.fs {
+                VirtioFsBackend::HostFs {
                     root_path,
-                    Some(&LxVolumeOptions::from_option_string(mount_options)),
-                )?,
-                0,
-                None,
-            ),
-            #[cfg(windows)]
-            VirtioFsBackend::SectionFs { root_path } => {
-                VirtioFsDevice::new(
+                    mount_options,
+                } => VirtioFsDevice::new(
+                    input.driver_source,
+                    &resource.tag,
+                    VirtioFs::new(
+                        root_path,
+                        Some(&LxVolumeOptions::from_option_string(mount_options)),
+                    )?,
+                    0,
+                    None,
+                ),
+                #[cfg(windows)]
+                VirtioFsBackend::SectionFs { root_path } => VirtioFsDevice::new(
                     input.driver_source,
                     &resource.tag,
                     crate::SectionFs::new(root_path)?,
                     8 * 1024 * 1024 * 1024, // 8GB of shared memory,
                     None,
-                )
-            }
-            #[cfg(not(windows))]
-            VirtioFsBackend::SectionFs { .. } => {
-                anyhow::bail!("section fs not supported on this platform")
-            }
-            VirtioFsBackend::Aggregate { children } => {
-                let fs = VirtioFs::new_aggregate();
-                for child in children {
-                    fs.add_child(
-                        &child.name,
-                        &child.root_path,
-                        Some(&LxVolumeOptions::from_option_string(&child.mount_options)),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to add virtiofs aggregate child '{}' (root_path='{}'): {e}",
-                            child.name,
-                            child.root_path
-                        )
-                    })?;
+                ),
+                #[cfg(not(windows))]
+                VirtioFsBackend::SectionFs { .. } => {
+                    anyhow::bail!("section fs not supported on this platform")
                 }
-                VirtioFsDevice::new(input.driver_source, &resource.tag, fs, 0, None)
+                VirtioFsBackend::Aggregate { children } => {
+                    let fs = VirtioFs::new_aggregate();
+                    for child in children {
+                        fs.add_child(
+                            &child.name,
+                            &child.root_path,
+                            Some(&LxVolumeOptions::from_option_string(&child.mount_options)),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to add virtiofs aggregate child '{}' (root_path='{}'): {e}",
+                                child.name,
+                                child.root_path
+                            )
+                        })?;
+                    }
+                    VirtioFsDevice::new(input.driver_source, &resource.tag, fs, 0, None)
+                }
+            },
+            VirtioFsProfile::MicrovmV1 {
+                stable_id,
+                root_identity,
+                read_only,
+            } => {
+                anyhow::ensure!(
+                    resource.tag == crate::profile::MICROVM_MOUNT_TAG,
+                    "microVM virtio-fs tag must be '{}'",
+                    crate::profile::MICROVM_MOUNT_TAG
+                );
+                let VirtioFsBackend::HostFs {
+                    root_path,
+                    mount_options,
+                } = resource.fs
+                else {
+                    anyhow::bail!("microVM virtio-fs requires a HostFs backend");
+                };
+                anyhow::ensure!(
+                    mount_options.is_empty(),
+                    "microVM virtio-fs does not accept HostFs mount options"
+                );
+                VirtioFsDevice::new_microvm_hostfs(
+                    input.driver_source,
+                    stable_id,
+                    root_identity,
+                    read_only,
+                    root_path,
+                    None,
+                )?
             }
         };
         Ok(device.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::MICROVM_ATTACHMENT_ID;
+    use crate::profile::MICROVM_MOUNT_TAG;
+    use crate::profile::microvm_root_identity;
+    use pal_async::DefaultDriver;
+    use pal_async::async_test;
+    use virtio_resources::fs::VirtioFsAggregateChild;
+    use vmcore::vm_task::SingleDriverBackend;
+    use vmcore::vm_task::VmTaskDriverSource;
+
+    fn resolve(
+        driver: DefaultDriver,
+        tag: &str,
+        fs: VirtioFsBackend,
+    ) -> anyhow::Result<ResolvedVirtioDevice> {
+        let root_path = match &fs {
+            VirtioFsBackend::HostFs { root_path, .. } => Some(root_path),
+            _ => None,
+        };
+        let root_identity = root_path
+            .map(microvm_root_identity)
+            .transpose()?
+            .unwrap_or_else(|| vec![1]);
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        VirtioFsResolver.resolve(
+            VirtioFsHandle {
+                tag: tag.to_owned(),
+                fs,
+                profile: VirtioFsProfile::MicrovmV1 {
+                    stable_id: MICROVM_ATTACHMENT_ID.to_owned(),
+                    root_identity,
+                    read_only: true,
+                },
+            },
+            VirtioResolveInput {
+                driver_source: &driver_source,
+            },
+        )
+    }
+
+    #[async_test]
+    async fn microvm_profile_rejects_non_fixed_tag(driver: DefaultDriver) {
+        let root = tempfile::tempdir().unwrap();
+        let result = resolve(
+            driver,
+            "other",
+            VirtioFsBackend::HostFs {
+                root_path: root.path().to_string_lossy().into_owned(),
+                mount_options: String::new(),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[async_test]
+    async fn microvm_profile_rejects_mount_options(driver: DefaultDriver) {
+        let root = tempfile::tempdir().unwrap();
+        let result = resolve(
+            driver,
+            MICROVM_MOUNT_TAG,
+            VirtioFsBackend::HostFs {
+                root_path: root.path().to_string_lossy().into_owned(),
+                mount_options: "ro".to_owned(),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[async_test]
+    async fn microvm_profile_rejects_non_host_backends(driver: DefaultDriver) {
+        let result = resolve(
+            driver,
+            MICROVM_MOUNT_TAG,
+            VirtioFsBackend::Aggregate {
+                children: vec![VirtioFsAggregateChild {
+                    name: "child".to_owned(),
+                    root_path: ".".to_owned(),
+                    mount_options: String::new(),
+                }],
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[async_test]
+    async fn microvm_profile_rejects_section_backend(driver: DefaultDriver) {
+        let result = resolve(
+            driver,
+            MICROVM_MOUNT_TAG,
+            VirtioFsBackend::SectionFs {
+                root_path: ".".to_owned(),
+            },
+        );
+        assert!(result.is_err());
     }
 }

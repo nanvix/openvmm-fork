@@ -2882,11 +2882,14 @@ impl InitializedVm {
                         cfg.machine_profile,
                         MachineProfile::Microvm { .. }
                     ) {
-                        const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
                         let (start, irq) = match id.as_str() {
                             "virtio-net" => (
                                 openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
                                 openvmm_defs::config::microvm_virtio_net_irq(None)?,
+                            ),
+                            "virtiofs" => (
+                                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                                openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
                             ),
                             "virtio-console" => (
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
@@ -2908,10 +2911,10 @@ impl InitializedVm {
                                     .is_some_and(|end| end <= chipset_mmio.low.end()),
                             "microVM virtio slot for '{id}' is outside the fixed low-MMIO aperture"
                         );
-                        let disabled_features = if id == "virtio-net" {
-                            !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES
-                        } else {
-                            VIRTIO_F_RING_PACKED
+                        let disabled_features = match id.as_str() {
+                            "virtio-net" => !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES,
+                            "virtiofs" => !openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES,
+                            _ => 1 << 34,
                         };
                         (start, len, irq, disabled_features)
                     } else {

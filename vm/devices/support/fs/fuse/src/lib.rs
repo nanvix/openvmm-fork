@@ -24,6 +24,9 @@ pub use request::RequestReader;
 pub use request::check_name;
 pub use session::Session;
 pub use session::SessionInfo;
+pub use session::SessionInfoState;
+pub use session::SessionState;
+pub use session::SessionStateError;
 
 use lx::LxStr;
 use lx::LxString;

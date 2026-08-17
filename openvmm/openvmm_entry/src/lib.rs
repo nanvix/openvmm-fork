@@ -203,6 +203,8 @@ struct VmResources {
     microvm_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
     microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+    microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    microvm_filesystem_root_path: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     microvm_managed_tap: Option<MicrovmManagedTap>,
     /// Receives dirty rectangles from the synthetic video device for the VNC worker.
@@ -218,11 +220,19 @@ struct ConsoleState<'a> {
 
 const MICROVM_CONSOLE_STABLE_ID: &str = "console:microvm-virtio0";
 const MICROVM_NETWORK_STABLE_ID: &str = "net:microvm0";
+const MICROVM_FILESYSTEM_STABLE_ID: &str = "fs:microvm0";
 
 #[derive(Clone)]
 struct EffectiveMicrovmNetwork {
     config: openvmm_defs::config::MicrovmNetworkConfig,
     policy: net_backend_resources::egress::EgressPolicy,
+    attachment: openvmm_helpers::snapshot::SnapshotAttachment,
+}
+
+#[derive(Clone)]
+struct EffectiveMicrovmFilesystem {
+    config: openvmm_defs::config::MicrovmFilesystemConfig,
+    root_path: String,
     attachment: openvmm_helpers::snapshot::SnapshotAttachment,
 }
 
@@ -806,6 +816,269 @@ fn effective_microvm_network(
     }))
 }
 
+fn canonical_microvm_filesystem_root(
+    path: &Path,
+) -> anyhow::Result<(PathBuf, &'static str, Vec<u8>)> {
+    anyhow::ensure!(
+        !path.as_os_str().is_empty(),
+        "microVM filesystem host path is empty"
+    );
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory for microVM filesystem")?
+            .join(path)
+    };
+
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                current.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("microVM filesystem host path contains a parent component")
+            }
+            Component::Normal(_) => {
+                current.push(component.as_os_str());
+                let metadata = fs_err::symlink_metadata(&current).with_context(|| {
+                    format!(
+                        "failed to inspect microVM filesystem path component {}",
+                        current.display()
+                    )
+                })?;
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "microVM filesystem path component is a symbolic link: {}",
+                    current.display()
+                );
+                #[cfg(windows)]
+                anyhow::ensure!(
+                    std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x400 == 0,
+                    "microVM filesystem path component is a reparse point: {}",
+                    current.display()
+                );
+            }
+        }
+    }
+
+    let canonical = fs_err::canonicalize(&absolute).with_context(|| {
+        format!(
+            "failed to canonicalize microVM filesystem root {}",
+            absolute.display()
+        )
+    })?;
+    let metadata = fs_err::symlink_metadata(&canonical).with_context(|| {
+        format!(
+            "failed to inspect microVM filesystem root {}",
+            canonical.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "microVM filesystem root is not a plain directory: {}",
+        canonical.display()
+    );
+
+    #[cfg(unix)]
+    let (identity_kind, identity) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut identity = b"openvmm-microvm-fs-unix-v1\0".to_vec();
+        identity.extend_from_slice(&metadata.dev().to_le_bytes());
+        identity.extend_from_slice(&metadata.ino().to_le_bytes());
+        ("unix-device-inode-v1", identity)
+    };
+    #[cfg(windows)]
+    let (identity_kind, identity) = {
+        use std::os::windows::ffi::OsStrExt as _;
+        let stat = pal::windows::fs::query_stat_lx_by_name(&canonical)
+            .context("failed to query the microVM filesystem root identity")?;
+        anyhow::ensure!(
+            stat.FileId != 0,
+            "microVM filesystem root has no stable file identity"
+        );
+        let volume = canonical
+            .components()
+            .next()
+            .and_then(|component| match component {
+                std::path::Component::Prefix(prefix) => Some(prefix.as_os_str()),
+                _ => None,
+            })
+            .context("microVM filesystem root has no volume prefix")?;
+        let volume = volume.encode_wide().collect::<Vec<_>>();
+        let volume_bytes = u32::try_from(volume.len())
+            .context("microVM filesystem volume identity is too long")?
+            .to_le_bytes();
+        let mut identity = b"openvmm-microvm-fs-windows-v1\0".to_vec();
+        identity.extend_from_slice(&volume_bytes);
+        identity.extend(volume.into_iter().flat_map(u16::to_le_bytes));
+        identity.extend_from_slice(&stat.FileId.to_le_bytes());
+        ("windows-volume-file-id-v1", identity)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let (identity_kind, identity) =
+        { anyhow::bail!("microVM virtio-fs requires Linux/KVM or Windows/WHP") };
+    anyhow::ensure!(
+        !identity.is_empty() && identity.len() <= 4096,
+        "microVM filesystem root identity is empty or exceeds 4096 bytes"
+    );
+
+    Ok((canonical, identity_kind, identity))
+}
+
+pub(crate) fn microvm_filesystem_attachment(
+    host_path: &Path,
+) -> anyhow::Result<(String, openvmm_helpers::snapshot::SnapshotAttachment)> {
+    let (canonical, identity_kind, identity) = canonical_microvm_filesystem_root(host_path)?;
+    let root_path = canonical
+        .to_str()
+        .context("microVM filesystem host path is not valid UTF-8")?
+        .to_owned();
+    Ok((
+        root_path,
+        openvmm_helpers::snapshot::SnapshotAttachment {
+            stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
+            kind: "virtio-fs".to_owned(),
+            required: true,
+            reconnect_policy: "live-revalidate".to_owned(),
+            identity_kind: identity_kind.to_owned(),
+            identity,
+            length: 0,
+            reconnect_timeout_ms: 0,
+        },
+    ))
+}
+
+pub(crate) fn validate_microvm_filesystem_private_storage(
+    root_path: &Path,
+    snapshot_destination: Option<&Path>,
+    restore_snapshot: Option<&Path>,
+    memory_backing_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    let root_path = fs_err::canonicalize(root_path).with_context(|| {
+        format!(
+            "failed to canonicalize microVM filesystem export root {}",
+            root_path.display()
+        )
+    })?;
+    let ensure_outside = |path: &Path, description: &str| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !path.starts_with(&root_path),
+            "{description} must be outside the microVM filesystem export root {}",
+            root_path.display()
+        );
+        Ok(())
+    };
+
+    if let Some(destination) = snapshot_destination {
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent = fs_err::canonicalize(parent).with_context(|| {
+            format!(
+                "failed to canonicalize snapshot destination parent {}",
+                parent.display()
+            )
+        })?;
+        ensure_outside(&parent, "snapshot destination")?;
+    }
+    if let Some(snapshot) = restore_snapshot {
+        let snapshot = fs_err::canonicalize(snapshot).with_context(|| {
+            format!(
+                "failed to canonicalize restore snapshot {}",
+                snapshot.display()
+            )
+        })?;
+        ensure_outside(&snapshot, "restore snapshot")?;
+    }
+    if let Some(memory) = memory_backing_file {
+        let memory = fs_err::canonicalize(memory).with_context(|| {
+            format!(
+                "failed to canonicalize guest memory backing file {}",
+                memory.display()
+            )
+        })?;
+        ensure_outside(&memory, "guest memory backing file")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn microvm_filesystem_from_snapshot(
+    saved: &openvmm_helpers::snapshot::SnapshotMicrovmFilesystem,
+) -> anyhow::Result<openvmm_defs::config::MicrovmFilesystemConfig> {
+    let access = match saved.access_mode.as_str() {
+        "ro" => openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+        "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
+        mode => anyhow::bail!("snapshot microVM filesystem access mode '{mode}' is unsupported"),
+    };
+    openvmm_defs::config::MicrovmFilesystemConfig::new(saved.guest_mount_target.clone(), access)
+        .context("snapshot microVM filesystem policy is invalid")
+}
+
+fn effective_microvm_filesystem(
+    requested: Option<&cli_args::MicrovmMountCli>,
+    restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
+) -> anyhow::Result<Option<EffectiveMicrovmFilesystem>> {
+    let Some(restore) = restore else {
+        return requested
+            .map(|requested| {
+                let config = openvmm_defs::config::MicrovmFilesystemConfig::new(
+                    requested.guest_target.clone(),
+                    requested.access,
+                )?;
+                let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
+                Ok(EffectiveMicrovmFilesystem {
+                    config,
+                    root_path,
+                    attachment,
+                })
+            })
+            .transpose();
+    };
+
+    let has_device = restore
+        .devices
+        .iter()
+        .any(|device| device.stable_id == MICROVM_FILESYSTEM_STABLE_ID);
+    let saved_attachment = restore
+        .attachments
+        .iter()
+        .find(|attachment| attachment.stable_id == MICROVM_FILESYSTEM_STABLE_ID);
+    anyhow::ensure!(
+        has_device == restore.microvm_filesystem.is_some()
+            && has_device == saved_attachment.is_some(),
+        "snapshot microVM filesystem device, policy, and attachment inventories disagree"
+    );
+    let Some(saved) = restore.microvm_filesystem.as_ref() else {
+        anyhow::ensure!(
+            requested.is_none(),
+            "a restore-time mount cannot be added to a snapshot without virtio-fs"
+        );
+        return Ok(None);
+    };
+    let requested = requested
+        .context("snapshot restore requires a fresh --mount attachment for fs:microvm0")?;
+    let config = microvm_filesystem_from_snapshot(saved)?;
+    anyhow::ensure!(
+        requested.guest_target == config.guest_mount_target && requested.access == config.access,
+        "restore-time mount target or access mode does not match the snapshot contract"
+    );
+    let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
+    anyhow::ensure!(
+        Some(&attachment) == saved_attachment,
+        "restore-time filesystem root identity does not match the snapshot attachment"
+    );
+    Ok(Some(EffectiveMicrovmFilesystem {
+        config,
+        root_path,
+        attachment,
+    }))
+}
+
 /// Build a flat list of switches with their parent port assignments.
 ///
 /// This function converts hierarchical CLI switch definitions into a flat list
@@ -969,6 +1242,7 @@ mod microvm_console_attachment_tests {
         openvmm_defs::config::append_microvm_virtio_discovery(
             &mut command_line,
             Some((&network, irq, false)),
+            None,
             false,
             false,
         )
@@ -977,6 +1251,7 @@ mod microvm_console_attachment_tests {
             source_hypervisor,
             command_line,
             Some((&network, &policy, microvm_network_attachment(None).unwrap())),
+            None,
             None,
             1024,
             [
@@ -1054,6 +1329,171 @@ mod microvm_console_attachment_tests {
         assert!(effective_microvm_network(&options, Some(&contract)).is_err());
     }
 
+    fn filesystem_contract(root: &Path) -> openvmm_helpers::snapshot::SnapshotMachineContract {
+        let filesystem = openvmm_defs::config::MicrovmFilesystemConfig::new(
+            "/mnt/share".to_owned(),
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+        )
+        .unwrap();
+        let (_, attachment) = microvm_filesystem_attachment(root).unwrap();
+        let mut command_line = build_microvm_command_line(&[], false).unwrap();
+        openvmm_defs::config::append_microvm_virtio_discovery(
+            &mut command_line,
+            None,
+            Some(&filesystem),
+            false,
+            false,
+        )
+        .unwrap();
+        openvmm_helpers::snapshot::microvm_v1_machine_contract(
+            if cfg!(windows) { "whp" } else { "kvm" },
+            command_line,
+            None,
+            Some((&filesystem, attachment)),
+            None,
+            1024,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtiofs-3489665024",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    fn restore_mount_options(root: &Path, mode: &str) -> Options {
+        Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--mount",
+            &format!("/mnt/share,{},{}", root.display(), mode),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn filesystem_restore_requires_same_live_root_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let contract = filesystem_contract(root.path());
+        let options = restore_mount_options(root.path(), "ro");
+        let restored =
+            effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract))
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored.config.guest_mount_target, "/mnt/share");
+        assert_eq!(restored.attachment, contract.attachments[0]);
+
+        let replacement = tempfile::tempdir().unwrap();
+        let replacement_options = restore_mount_options(replacement.path(), "ro");
+        assert!(
+            effective_microvm_filesystem(
+                replacement_options.microvm_mount.as_ref(),
+                Some(&contract)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filesystem_restore_accepts_same_root_at_a_new_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("original");
+        let moved = parent.path().join("moved");
+        fs_err::create_dir(&original).unwrap();
+        let contract = filesystem_contract(&original);
+        fs_err::rename(&original, &moved).unwrap();
+
+        let options = restore_mount_options(&moved, "ro");
+        let restored =
+            effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            restored.root_path,
+            fs_err::canonicalize(&moved).unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn filesystem_restore_rejects_missing_or_changed_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let contract = filesystem_contract(root.path());
+        assert!(effective_microvm_filesystem(None, Some(&contract)).is_err());
+
+        let changed_mode = restore_mount_options(root.path(), "rw");
+        assert!(
+            effective_microvm_filesystem(changed_mode.microvm_mount.as_ref(), Some(&contract))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn filesystem_root_rejects_parent_components() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(canonical_microvm_filesystem_root(&root.path().join("child").join("..")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_rejects_symbolic_link_components() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs_err::create_dir(&target).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(canonical_microvm_filesystem_root(&link).is_err());
+    }
+
+    #[test]
+    fn filesystem_export_rejects_snapshot_and_memory_storage() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("share");
+        fs_err::create_dir(&root).unwrap();
+        let memory = root.join("memory.bin");
+        fs_err::write(&memory, b"memory").unwrap();
+        let restore = root.join("restore");
+        fs_err::create_dir(&restore).unwrap();
+
+        assert!(
+            validate_microvm_filesystem_private_storage(
+                &root,
+                Some(&root.join("snapshot")),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_microvm_filesystem_private_storage(&root, None, Some(&restore), None,)
+                .is_err()
+        );
+        assert!(
+            validate_microvm_filesystem_private_storage(&root, None, None, Some(&memory),).is_err()
+        );
+        validate_microvm_filesystem_private_storage(
+            &root,
+            Some(&parent.path().join("snapshot")),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn microvm_tap_address_requires_exact_prefix() {
         let output = b"7: microvm0 inet 10.0.0.1/8 brd 10.255.255.255 scope global microvm0\n\
@@ -1110,6 +1550,26 @@ async fn vm_config_from_command_line(
     let microvm_network_attachment = effective_microvm_network
         .as_ref()
         .map(|network| network.attachment.clone());
+    let effective_microvm_filesystem = if is_microvm {
+        effective_microvm_filesystem(opt.microvm_mount.as_ref(), restore_machine_contract)?
+    } else {
+        None
+    };
+    let microvm_filesystem = effective_microvm_filesystem
+        .as_ref()
+        .map(|filesystem| filesystem.config.clone());
+    let microvm_filesystem_attachment = effective_microvm_filesystem
+        .as_ref()
+        .map(|filesystem| filesystem.attachment.clone());
+    if let Some(filesystem) = &effective_microvm_filesystem
+        && opt.snapshot_destination.is_some()
+    {
+        tracing::warn!(
+            stable_id = MICROVM_FILESYSTEM_STABLE_ID,
+            access_mode = filesystem.config.access.as_str(),
+            "microVM snapshot excludes live host filesystem contents; restore revalidates the external directory and may fail after host changes"
+        );
+    }
     let microvm_gateway_dns = cfg!(windows)
         && microvm_egress_policy
             .as_ref()
@@ -1431,6 +1891,10 @@ async fn vm_config_from_command_line(
         microvm_console_socket_cleanup,
         microvm_network_attachment,
         microvm_egress_policy: microvm_egress_policy.clone(),
+        microvm_filesystem_attachment,
+        microvm_filesystem_root_path: effective_microvm_filesystem
+            .as_ref()
+            .map(|filesystem| PathBuf::from(&filesystem.root_path)),
         ..Default::default()
     };
     let mut console_str = "";
@@ -2807,6 +3271,25 @@ async fn vm_config_from_command_line(
         );
     }
 
+    if let Some(filesystem) = &effective_microvm_filesystem {
+        add_virtio_device(
+            VirtioBusCli::Mmio,
+            virtio_resources::fs::VirtioFsHandle {
+                tag: "microvm".to_owned(),
+                fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                    root_path: filesystem.root_path.clone(),
+                    mount_options: String::new(),
+                },
+                profile: virtio_resources::fs::VirtioFsProfile::MicrovmV1 {
+                    stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
+                    root_identity: filesystem.attachment.identity.clone(),
+                    read_only: filesystem.config.access.is_read_only(),
+                },
+            }
+            .into_resource(),
+        );
+    }
+
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
             anyhow::bail!("use --net uh:[...] to add underhill NICs")
@@ -2839,6 +3322,7 @@ async fn vm_config_from_command_line(
                 root_path: args.path.clone(),
                 mount_options: args.options.clone(),
             },
+            profile: virtio_resources::fs::VirtioFsProfile::Standard,
         }
         .into_resource();
         if let Some(pcie_port) = &args.pcie_port {
@@ -2857,6 +3341,7 @@ async fn vm_config_from_command_line(
             fs: virtio_resources::fs::VirtioFsBackend::SectionFs {
                 root_path: args.path.clone(),
             },
+            profile: virtio_resources::fs::VirtioFsProfile::Standard,
         }
         .into_resource();
         if let Some(pcie_port) = &args.pcie_port {
@@ -3172,6 +3657,7 @@ async fn vm_config_from_command_line(
         debugger_rpc: None,
         rtc_delta_milliseconds: 0,
         microvm_network,
+        microvm_filesystem,
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
@@ -3204,6 +3690,7 @@ async fn vm_config_from_command_line(
                 .as_ref()
                 .zip(network_irq)
                 .map(|(network, irq)| (network, irq, microvm_gateway_dns)),
+            cfg.microvm_filesystem.as_ref(),
             has_console,
             has_block,
         )?;
@@ -3797,6 +4284,10 @@ fn prepare_snapshot_restore(
         &net_backend_resources::egress::EgressPolicy,
         &openvmm_helpers::snapshot::SnapshotAttachment,
     )>,
+    filesystem: Option<(
+        &openvmm_defs::config::MicrovmFilesystemConfig,
+        &openvmm_helpers::snapshot::SnapshotAttachment,
+    )>,
     console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
@@ -3813,6 +4304,7 @@ fn prepare_snapshot_restore(
             effective_command_line
                 .context("microVM restore requires an effective PVH command line")?,
             network,
+            filesystem,
             console_attachment,
         ))
     } else {
@@ -3847,6 +4339,10 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             &net_backend_resources::egress::EgressPolicy,
             &openvmm_helpers::snapshot::SnapshotAttachment,
         )>,
+        Option<(
+            &openvmm_defs::config::MicrovmFilesystemConfig,
+            &openvmm_helpers::snapshot::SnapshotAttachment,
+        )>,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
     )>,
     memory_verification: openvmm_helpers::snapshot::SnapshotMemoryVerification,
@@ -3870,48 +4366,53 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         expected_vp_count,
         system_page_size(),
     )?;
-    let restore_time =
-        if let Some((expected_hypervisor, effective_command_line, network, console_attachment)) =
-            expected_microvm_contract
-        {
-            let saved_contract = manifest
-                .machine_contract
-                .as_ref()
-                .context("microVM snapshot is missing its authoritative machine contract")?;
-            let expected_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
-                expected_hypervisor,
-                effective_command_line.to_owned(),
-                network.map(|(config, policy, attachment)| (config, policy, attachment.clone())),
-                console_attachment.cloned(),
-                expected_memory_size,
-                saved_contract.state_unit_names.clone(),
-                saved_contract.capture_wall_clock,
-                saved_contract.tsc_frequency_hz,
-                saved_contract.cpu_contract.clone(),
-            )?;
-            openvmm_helpers::snapshot::validate_microvm_machine_contract(
-                &manifest,
-                &expected_contract,
-            )?;
-            let capture_time: std::time::SystemTime = saved_contract
-                .capture_wall_clock
-                .try_into()
-                .context("snapshot capture wall clock is invalid")?;
-            let downtime = std::time::SystemTime::now()
-                .duration_since(capture_time)
-                .context("destination wall clock is before snapshot capture time")?;
-            anyhow::ensure!(
-                downtime <= Duration::from_secs(30 * 24 * 60 * 60),
-                "snapshot host downtime exceeds the supported 30-day bound"
-            );
-            Some((
-                downtime,
-                saved_contract.tsc_frequency_hz,
-                saved_contract.cpu_contract.clone(),
-            ))
-        } else {
-            None
-        };
+    let restore_time = if let Some((
+        expected_hypervisor,
+        effective_command_line,
+        network,
+        filesystem,
+        console_attachment,
+    )) = expected_microvm_contract
+    {
+        let saved_contract = manifest
+            .machine_contract
+            .as_ref()
+            .context("microVM snapshot is missing its authoritative machine contract")?;
+        let expected_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
+            expected_hypervisor,
+            effective_command_line.to_owned(),
+            network.map(|(config, policy, attachment)| (config, policy, attachment.clone())),
+            filesystem.map(|(config, attachment)| (config, attachment.clone())),
+            console_attachment.cloned(),
+            expected_memory_size,
+            saved_contract.state_unit_names.clone(),
+            saved_contract.capture_wall_clock,
+            saved_contract.tsc_frequency_hz,
+            saved_contract.cpu_contract.clone(),
+        )?;
+        openvmm_helpers::snapshot::validate_microvm_machine_contract(
+            &manifest,
+            &expected_contract,
+        )?;
+        let capture_time: std::time::SystemTime = saved_contract
+            .capture_wall_clock
+            .try_into()
+            .context("snapshot capture wall clock is invalid")?;
+        let downtime = std::time::SystemTime::now()
+            .duration_since(capture_time)
+            .context("destination wall clock is before snapshot capture time")?;
+        anyhow::ensure!(
+            downtime <= Duration::from_secs(30 * 24 * 60 * 60),
+            "snapshot host downtime exceeds the supported 30-day bound"
+        );
+        Some((
+            downtime,
+            saved_contract.tsc_frequency_hz,
+            saved_contract.cpu_contract.clone(),
+        ))
+    } else {
+        None
+    };
 
     // Map the exact handle that was hashed above. The worker uses a writable
     // copy-on-write view so the reusable artifact remains immutable.
@@ -4089,6 +4590,8 @@ async fn run_control_inner(
     let microvm_network = vm_config.microvm_network.clone();
     let microvm_network_attachment = resources.microvm_network_attachment.clone();
     let microvm_egress_policy = resources.microvm_egress_policy.clone();
+    let microvm_filesystem = vm_config.microvm_filesystem.clone();
+    let microvm_filesystem_attachment = resources.microvm_filesystem_attachment.clone();
 
     let snapshot_destination = opt.snapshot_destination.as_ref().map(|path| {
         if path.is_absolute() {
@@ -4097,6 +4600,14 @@ async fn run_control_inner(
             std::env::current_dir().unwrap_or_default().join(path)
         }
     });
+    if let Some(root_path) = resources.microvm_filesystem_root_path.as_deref() {
+        validate_microvm_filesystem_private_storage(
+            root_path,
+            snapshot_destination.as_deref(),
+            opt.restore_snapshot.as_deref(),
+            opt.memory_backing_file().map(PathBuf::as_path),
+        )?;
+    }
     let snapshot_memory_file = if let Some(destination) = &snapshot_destination
         && opt.memory_backing_file().is_none()
     {
@@ -4297,6 +4808,9 @@ async fn run_control_inner(
                         .zip(microvm_egress_policy.as_ref())
                         .zip(microvm_network_attachment.as_ref())
                         .map(|((network, policy), attachment)| (network, policy, attachment)),
+                    microvm_filesystem
+                        .as_ref()
+                        .zip(microvm_filesystem_attachment.as_ref()),
                     microvm_console_attachment.as_ref(),
                 )?;
                 (Some(fd), Some(state_msg), true, restore_time)
@@ -4408,6 +4922,8 @@ async fn run_control_inner(
         microvm_network,
         microvm_network_attachment,
         microvm_egress_policy,
+        microvm_filesystem,
+        microvm_filesystem_attachment,
         microvm_console_socket_cleanup: resources.microvm_console_socket_cleanup.take(),
         #[cfg(target_os = "linux")]
         _microvm_managed_tap: resources.microvm_managed_tap.take(),

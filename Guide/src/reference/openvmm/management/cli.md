@@ -27,11 +27,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
   MMIO gap from 3 to 4 GiB and exposes only PIC/IOAPIC, PIT, binary UTC RTC,
   the microVM portb console, lifecycle ports, and the optional fixed virtio
   devices described below. User arguments cannot override `earlycon=`,
-  `console=`, `virtio_mmio.device=`, or `virtnet_*=`.
+  `console=`, `virtio_mmio.device=`, `virtnet_*=`, or `virtfs_*=`.
 
-  One optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
-  IRQ 7, and one optional `--virtio-blk <DISK>` is exposed at MMIO
-  `0xd0003000`, IRQ 4. Both use split rings. Firmware, ACPI, SMBIOS, PCI,
+  One optional `--mount` HostFs device is exposed at MMIO `0xd0001000`, IRQ 6;
+  one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
+  IRQ 7; and one optional `--virtio-blk <DISK>` is exposed at MMIO
+  `0xd0003000`, IRQ 4. All use split rings. Firmware, ACPI, SMBIOS, PCI,
   VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
   are rejected. Host-driven save/restore, pulse-save/restore, and worker
   restart remain unavailable.
@@ -76,6 +77,30 @@ as well as the generated CLI help (via `cargo run -- --help`).
   TAP descriptors, Consomme sockets, NAT flow tables, and remote peer state
   are not serialized, so existing proxied TCP or UDP sessions may reconnect
   or reset after restore.
+* `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
+  one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
+  The default mode is read-only; `rw` must be explicit. The guest target must
+  be an absolute, non-root Linux path without dot, parent, empty, whitespace,
+  backslash, or `=` components.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm \
+    --kernel path/to/vmlinux --initrd path/to/initramfs.cpio.gz \
+    --mount /mnt/share,path/to/share,ro
+  ```
+
+  The device has one high-priority queue, one request queue, direct-I/O file
+  behavior, zero entry and attribute cache lifetimes, and no shared-memory
+  window. `--mount` conflicts with `--virtio-fs` and
+  `--virtio-fs-shmem`; those standard-machine options cannot select the
+  microVM filesystem profile.
+
+  Filesystem snapshots contain guest-visible FUSE and queue state, not host
+  directory contents or native handles. Restore requires `--mount` again.
+  Its guest target and access mode must match the snapshot, and the supplied
+  live root and every saved object identity are revalidated before vCPUs
+  start. Host changes can be visible after restore or can make restore fail.
+  See [virtio-fs](../../devices/virtio/virtio-fs.md).
 * `--snapshot-destination <DIR>`: Publish a microVM snapshot when the guest
   writes to PMIO port `0x605`. The destination must not exist and its parent
   must already be a directory. OpenVMM automatically creates file-backed RAM
@@ -92,6 +117,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   of a partially forwarded guest transmit descriptor. An attached microVM
   virtio-net device saves its static identity, queue progress, drained packet
   ownership, endpoint generation, and policy requirement.
+  An attached microVM virtio-fs device drains accepted requests and saves its
+  negotiated FUSE policy, namespace and handle identifiers, aliases, and
+  directory cookies. The host tree remains external live state.
 
   ```bash
   openvmm --machine microvm --hypervisor kvm --memory 128M \
@@ -112,6 +140,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
   fails before any vCPU starts when a required attachment cannot be rebuilt.
   A listener peer may connect after restore; guest transmit descriptors remain
   pending while no peer is connected.
+
+  When the snapshot contains virtio-fs, restore also requires a fresh
+  `--mount`. The manifest supplies the guest target and `ro`/`rw` mode; the
+  argument must reproduce them while supplying a live host root with the same
+  saved identity.
 
   ```bash
   openvmm --machine microvm --hypervisor kvm \

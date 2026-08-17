@@ -49,6 +49,17 @@ pub mod fs {
     pub struct VirtioFsHandle {
         pub tag: String,
         pub fs: VirtioFsBackend,
+        pub profile: VirtioFsProfile,
+    }
+
+    #[derive(MeshPayload)]
+    pub enum VirtioFsProfile {
+        Standard,
+        MicrovmV1 {
+            stable_id: String,
+            root_identity: Vec<u8>,
+            read_only: bool,
+        },
     }
 
     #[derive(MeshPayload)]

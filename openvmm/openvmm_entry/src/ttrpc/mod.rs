@@ -790,6 +790,7 @@ impl VmService {
         };
 
         let mut restore_console_config = None;
+        let mut restore_filesystem_config = None;
         let mut req_config = if authoritative_restore.is_some() {
             let requested = requested_config.unwrap_or_else(|| vmservice::VmConfig {
                 machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
@@ -815,11 +816,12 @@ impl VmService {
                         && devices.vpmem_disks.is_empty()
                         && devices.nic_config.is_empty()
                         && devices.windows_device.is_empty()
-                        && devices.virtiofs_config.is_empty()
+                        && devices.virtiofs_config.len() <= 1
                         && devices.virtio_blk.is_none(),
-                    "restore devices_config may contain only a virtio-console attachment"
+                    "restore devices_config may contain only one virtio-fs and one virtio-console attachment"
                 );
                 restore_console_config = devices.virtio_console.clone();
+                restore_filesystem_config = devices.virtiofs_config.first().cloned();
             }
             vmservice::VmConfig {
                 serial_config: requested.serial_config,
@@ -861,10 +863,61 @@ impl VmService {
                 source_hypervisor
             );
         }
+        let restored_microvm_filesystem = if let Some(restore) = &authoritative_restore {
+            let has_device = restore
+                .machine_contract
+                .devices
+                .iter()
+                .any(|device| device.stable_id == "fs:microvm0");
+            let saved_policy = restore.machine_contract.microvm_filesystem.as_ref();
+            let saved_attachment = restore
+                .machine_contract
+                .attachments
+                .iter()
+                .find(|attachment| attachment.stable_id == "fs:microvm0");
+            anyhow::ensure!(
+                has_device == saved_policy.is_some() && has_device == saved_attachment.is_some(),
+                "snapshot microVM filesystem device, policy, and attachment inventories disagree"
+            );
+            match (saved_policy, saved_attachment) {
+                (Some(saved_policy), Some(saved_attachment)) => {
+                    let requested = restore_filesystem_config.as_ref().context(
+                        "snapshot restore requires a fresh virtiofs_config attachment for fs:microvm0",
+                    )?;
+                    let config = crate::microvm_filesystem_from_snapshot(saved_policy)?;
+                    anyhow::ensure!(
+                        requested.tag == "microvm"
+                            && requested.guest_mount_target == config.guest_mount_target
+                            && requested.read_write != config.access.is_read_only()
+                            && !requested.root_path.is_empty(),
+                        "restore-time virtiofs_config does not match the snapshot policy"
+                    );
+                    let (root_path, attachment) =
+                        crate::microvm_filesystem_attachment(Path::new(&requested.root_path))?;
+                    anyhow::ensure!(
+                        &attachment == saved_attachment,
+                        "restore-time filesystem root identity does not match the snapshot attachment"
+                    );
+                    Some((config, root_path, attachment))
+                }
+                (None, None) => {
+                    anyhow::ensure!(
+                        restore_filesystem_config.is_none(),
+                        "a restore-time virtiofs_config cannot be added to a snapshot without virtio-fs"
+                    );
+                    None
+                }
+                _ => anyhow::bail!(
+                    "snapshot microVM filesystem policy and attachment inventories disagree"
+                ),
+            }
+        } else {
+            None
+        };
         let prepared_restore = if let Some(restore) = &authoritative_restore {
             anyhow::ensure!(
                 restore.machine_contract.microvm_network.is_none(),
-                "ttrpc restore does not yet expose microVM network policy or endpoint attachments"
+                "ttrpc restore does not yet expose microVM network attachments"
             );
             let (fd, state, restore_time) = crate::prepare_snapshot_restore_for_config(
                 &restore.path,
@@ -874,6 +927,9 @@ impl VmService {
                     &source_hypervisor,
                     &restore.machine_contract.effective_command_line,
                     None,
+                    restored_microvm_filesystem
+                        .as_ref()
+                        .map(|(config, _, attachment)| (config, attachment)),
                     restore
                         .machine_contract
                         .attachments
@@ -956,9 +1012,23 @@ impl VmService {
                         && devices.vpmem_disks.is_empty()
                         && devices.nic_config.is_empty()
                         && devices.windows_device.is_empty()
-                        && devices.virtiofs_config.is_empty(),
-                    "microVM ABI version 1 supports only fixed virtio-console and optional virtio-blk devices"
+                        && devices.virtiofs_config.len() <= 1,
+                    "microVM ABI version 1 supports only one fixed virtio-fs, one fixed virtio-console, and optional virtio-blk devices"
                 );
+                if let Some(filesystem) = devices.virtiofs_config.first() {
+                    anyhow::ensure!(
+                        filesystem.tag == "microvm" && !filesystem.root_path.is_empty(),
+                        "microVM virtio-fs requires tag 'microvm' and a host root path"
+                    );
+                    openvmm_defs::config::MicrovmFilesystemConfig::new(
+                        filesystem.guest_mount_target.clone(),
+                        if filesystem.read_write {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+                        } else {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+                        },
+                    )?;
+                }
                 if let Some(console) = &devices.virtio_console {
                     anyhow::ensure!(
                         !console.socket_path.is_empty(),
@@ -1337,6 +1407,7 @@ impl VmService {
             layout: layout_config,
             rtc_delta_milliseconds: 0,
             microvm_network: None,
+            microvm_filesystem: None,
         };
 
         let guest_power_actions = {
@@ -1364,6 +1435,29 @@ impl VmService {
         let mut consomme_rpc = None;
         let mut microvm_console_attachment = None;
         let mut microvm_console_socket_cleanup = None;
+        let mut microvm_filesystem_attachment = None;
+        let mut microvm_filesystem_root_path = None;
+        if let Some((filesystem, root_path, attachment)) = restored_microvm_filesystem {
+            microvm_filesystem_root_path = Some(PathBuf::from(&root_path));
+            config.microvm_filesystem = Some(filesystem.clone());
+            config.virtio_devices.push((
+                VirtioBus::Mmio,
+                virtio_resources::fs::VirtioFsHandle {
+                    tag: "microvm".to_owned(),
+                    fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                        root_path,
+                        mount_options: String::new(),
+                    },
+                    profile: virtio_resources::fs::VirtioFsProfile::MicrovmV1 {
+                        stable_id: "fs:microvm0".to_owned(),
+                        root_identity: attachment.identity.clone(),
+                        read_only: filesystem.access.is_read_only(),
+                    },
+                }
+                .into_resource(),
+            ));
+            microvm_filesystem_attachment = Some(attachment);
+        }
         if let Some(restore) = &authoritative_restore {
             let has_console = restore
                 .machine_contract
@@ -1510,25 +1604,73 @@ impl VmService {
             }
 
             for virtiofs in devices_config.virtiofs_config {
-                let resource = virtio_resources::fs::VirtioFsHandle {
-                    tag: virtiofs.tag,
-                    fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                        root_path: virtiofs.root_path,
-                        mount_options: String::new(),
-                    },
-                }
-                .into_resource();
-                // Use VPCI when possible (currently only on Windows and macOS due
-                // to KVM backend limitations).
-                if cfg!(windows) || cfg!(target_os = "macos") {
-                    config.vpci_devices.push(VpciDeviceConfig {
-                        vtl: DeviceVtl::Vtl0,
-                        instance_id: Guid::new_random(),
-                        resource: VirtioPciDeviceHandle(resource).into_resource(),
-                        vnode: None,
-                    });
-                } else {
+                if is_microvm {
+                    anyhow::ensure!(
+                        config.microvm_filesystem.is_none()
+                            && virtiofs.tag == "microvm"
+                            && !virtiofs.root_path.is_empty(),
+                        "microVM ABI version 1 permits one virtio-fs attachment with tag 'microvm'"
+                    );
+                    let filesystem = openvmm_defs::config::MicrovmFilesystemConfig::new(
+                        virtiofs.guest_mount_target,
+                        if virtiofs.read_write {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+                        } else {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+                        },
+                    )?;
+                    let (root_path, attachment) =
+                        crate::microvm_filesystem_attachment(Path::new(&virtiofs.root_path))?;
+                    microvm_filesystem_root_path = Some(PathBuf::from(&root_path));
+                    let resource = virtio_resources::fs::VirtioFsHandle {
+                        tag: "microvm".to_owned(),
+                        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                            root_path,
+                            mount_options: String::new(),
+                        },
+                        profile: virtio_resources::fs::VirtioFsProfile::MicrovmV1 {
+                            stable_id: "fs:microvm0".to_owned(),
+                            root_identity: attachment.identity.clone(),
+                            read_only: filesystem.access.is_read_only(),
+                        },
+                    }
+                    .into_resource();
+                    if snapshot_destination.is_some() {
+                        tracing::warn!(
+                            stable_id = "fs:microvm0",
+                            access_mode = filesystem.access.as_str(),
+                            "microVM snapshot excludes live host filesystem contents; restore revalidates the external directory and may fail after host changes"
+                        );
+                    }
+                    config.microvm_filesystem = Some(filesystem);
+                    microvm_filesystem_attachment = Some(attachment);
                     config.virtio_devices.push((VirtioBus::Mmio, resource));
+                } else {
+                    anyhow::ensure!(
+                        virtiofs.guest_mount_target.is_empty() && !virtiofs.read_write,
+                        "guest_mount_target and read_write require the microVM profile"
+                    );
+                    let resource = virtio_resources::fs::VirtioFsHandle {
+                        tag: virtiofs.tag,
+                        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                            root_path: virtiofs.root_path,
+                            mount_options: String::new(),
+                        },
+                        profile: virtio_resources::fs::VirtioFsProfile::Standard,
+                    }
+                    .into_resource();
+                    // Use VPCI when possible (currently only on Windows and macOS due
+                    // to KVM backend limitations).
+                    if cfg!(windows) || cfg!(target_os = "macos") {
+                        config.vpci_devices.push(VpciDeviceConfig {
+                            vtl: DeviceVtl::Vtl0,
+                            instance_id: Guid::new_random(),
+                            resource: VirtioPciDeviceHandle(resource).into_resource(),
+                            vnode: None,
+                        });
+                    } else {
+                        config.virtio_devices.push((VirtioBus::Mmio, resource));
+                    }
                 }
             }
 
@@ -1636,6 +1778,7 @@ impl VmService {
             openvmm_defs::config::append_microvm_virtio_discovery(
                 cmdline,
                 None,
+                config.microvm_filesystem.as_ref(),
                 has_console,
                 has_block,
             )?;
@@ -1662,6 +1805,17 @@ impl VmService {
             .virtio_devices
             .iter()
             .any(|(_, device)| device.id() == "virtio-blk");
+        let microvm_filesystem = config.microvm_filesystem.clone();
+        if let Some(root_path) = microvm_filesystem_root_path.as_deref() {
+            crate::validate_microvm_filesystem_private_storage(
+                root_path,
+                snapshot_destination.as_deref(),
+                authoritative_restore
+                    .as_ref()
+                    .map(|restore| restore.path.as_path()),
+                None,
+            )?;
+        }
         let snapshot_memory_file = if let Some(destination) = &snapshot_destination {
             let parent = destination
                 .parent()
@@ -1784,6 +1938,8 @@ impl VmService {
             microvm_network: None,
             microvm_network_attachment: None,
             microvm_egress_policy: None,
+            microvm_filesystem,
+            microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
             #[cfg(target_os = "linux")]
             _microvm_managed_tap: None,

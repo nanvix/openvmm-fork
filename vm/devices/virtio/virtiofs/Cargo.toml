@@ -18,12 +18,15 @@ fuse.workspace = true
 inspect.workspace = true
 lx.workspace = true
 lxutil.workspace = true
+mesh.workspace = true
 task_control.workspace = true
 
 anyhow.workspace = true
 futures.workspace = true
 pal_async.workspace = true
 parking_lot.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
 [target.'cfg(windows)'.dependencies]

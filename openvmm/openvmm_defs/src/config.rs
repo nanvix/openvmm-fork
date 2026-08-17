@@ -64,6 +64,8 @@ pub struct Config {
     pub machine_profile: MachineProfile,
     /// Static identity for the optional microVM virtio-net device.
     pub microvm_network: Option<MicrovmNetworkConfig>,
+    /// Guest-visible policy for the optional microVM virtio-fs device.
+    pub microvm_filesystem: Option<MicrovmFilesystemConfig>,
 }
 
 /// The initial microVM guest ABI version.
@@ -88,12 +90,17 @@ pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 pub const MICROVM_VIRTIO_BLK_IRQ: u32 = 4;
 /// Fixed ABI-v1 virtio-console interrupt.
 pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
+/// Fixed ABI-v1 virtio-fs interrupt.
+pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
 /// Fixed ABI-v1 virtio-net interrupt on KVM.
 pub const MICROVM_VIRTIO_NET_KVM_IRQ: u32 = 10;
 /// Fixed ABI-v1 virtio-net interrupt on WHP.
 pub const MICROVM_VIRTIO_NET_WHP_IRQ: u32 = 5;
 /// Exact ABI-v1 virtio-net feature mask: MAC and virtio version 1.
 pub const MICROVM_VIRTIO_NET_FEATURES: u64 = (1 << 5) | (1 << 32);
+/// Exact ABI-v1 virtio-fs feature mask: indirect descriptors, event index,
+/// virtio version 1, and access-platform.
+pub const MICROVM_VIRTIO_FS_FEATURES: u64 = (1 << 28) | (1 << 29) | (1 << 32) | (1 << 33);
 /// ABI-v1 client console reconnect timeout.
 pub const MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS: u64 = 5_000;
 /// ABI-v1 virtio MMIO reservations in stable device order.
@@ -112,6 +119,87 @@ pub struct MicrovmNetworkConfig {
     pub derived_gateway_ipv4: std::net::Ipv4Addr,
     pub guest_mac: MacAddress,
     pub gateway_mac: MacAddress,
+}
+
+/// Access policy for the microVM ABI-v1 host filesystem.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmFilesystemAccess {
+    /// Reject guest mutations before invoking host filesystem operations.
+    ReadOnly,
+    /// Permit the common cross-platform mutation contract.
+    ReadWrite,
+}
+
+impl MicrovmFilesystemAccess {
+    /// Returns the command-line spelling of this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "ro",
+            Self::ReadWrite => "rw",
+        }
+    }
+
+    /// Returns whether host filesystem mutations are allowed.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
+/// Guest-visible configuration for the microVM ABI-v1 virtio-fs device.
+#[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmFilesystemConfig {
+    /// Absolute guest path at which the initramfs mounts the filesystem.
+    pub guest_mount_target: String,
+    /// Snapshot-authoritative access policy.
+    pub access: MicrovmFilesystemAccess,
+}
+
+impl MicrovmFilesystemConfig {
+    /// Validates and constructs the ABI-v1 filesystem configuration.
+    pub fn new(
+        guest_mount_target: String,
+        access: MicrovmFilesystemAccess,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        if guest_mount_target.is_empty()
+            || !guest_mount_target.starts_with('/')
+            || guest_mount_target == "/"
+            || guest_mount_target.len() > 4096
+            || guest_mount_target.chars().any(|character| {
+                character.is_whitespace() || matches!(character, '\0' | '\\' | '=')
+            })
+            || guest_mount_target
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(InvalidMicrovmFilesystemConfig::InvalidGuestTarget(
+                guest_mount_target,
+            ));
+        }
+        Ok(Self {
+            guest_mount_target,
+            access,
+        })
+    }
+
+    /// Returns the pinned guest bootstrap command-line tokens.
+    pub fn command_line_fragment(&self) -> String {
+        format!(
+            "virtfs_dir={} virtfs_tag=microvm virtfs_mode={}",
+            self.guest_mount_target,
+            self.access.as_str()
+        )
+    }
+}
+
+/// Error returned for an invalid microVM filesystem specification.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidMicrovmFilesystemConfig {
+    /// The guest mount target is not a canonical absolute Linux path.
+    #[error(
+        "invalid guest mount target '{0}': expected an absolute non-root Linux path without empty, dot, parent, whitespace, backslash, or '=' components"
+    )]
+    InvalidGuestTarget(String),
 }
 
 impl MicrovmNetworkConfig {
@@ -242,6 +330,7 @@ fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
 pub fn append_microvm_virtio_discovery(
     cmdline: &mut String,
     network: Option<(&MicrovmNetworkConfig, u32, bool)>,
+    filesystem: Option<&MicrovmFilesystemConfig>,
     has_console: bool,
     has_block: bool,
 ) -> anyhow::Result<()> {
@@ -262,6 +351,12 @@ pub fn append_microvm_virtio_discovery(
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
         )?;
     }
+    if filesystem.is_some() {
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
+        )?;
+    }
     if has_console {
         write!(
             cmdline,
@@ -280,6 +375,9 @@ pub fn append_microvm_virtio_discovery(
             " {}",
             network.command_line_fragment_with_dns(gateway_dns)
         )?;
+    }
+    if let Some(filesystem) = filesystem {
+        write!(cmdline, " {}", filesystem.command_line_fragment())?;
     }
     anyhow::ensure!(
         cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
@@ -317,9 +415,17 @@ fn validate_microvm_command_line(
         .virtio_devices
         .iter()
         .any(|(_, device)| device.id() == "virtio-net");
+    let has_filesystem = config
+        .virtio_devices
+        .iter()
+        .any(|(_, device)| device.id() == "virtiofs");
     anyhow::ensure!(
         has_network == config.microvm_network.is_some(),
         "microVM virtio-net device and static network identity must be configured together"
+    );
+    anyhow::ensure!(
+        has_filesystem == config.microvm_filesystem.is_some(),
+        "microVM virtio-fs device and filesystem policy must be configured together"
     );
     let base_tokens = if has_console {
         MICROVM_CONSOLE_COMMAND_LINE
@@ -339,6 +445,9 @@ fn validate_microvm_command_line(
         "virtnet_ip=",
         "virtnet_mask=",
         "virtnet_gw=",
+        "virtfs_dir=",
+        "virtfs_tag=",
+        "virtfs_mode=",
     ] {
         let count = tokens
             .iter()
@@ -347,6 +456,7 @@ fn validate_microvm_command_line(
         let expected = match prefix {
             "virtio_mmio.device=" => config.virtio_devices.len(),
             "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => usize::from(has_network),
+            "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => usize::from(has_filesystem),
             _ => 1,
         };
         anyhow::ensure!(
@@ -381,6 +491,11 @@ fn validate_microvm_command_line(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
         ));
     }
+    if has_filesystem {
+        expected_discovery.push(format!(
+            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
+        ));
+    }
     if has_console {
         expected_discovery.push(format!(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
@@ -395,6 +510,14 @@ fn validate_microvm_command_line(
         expected_discovery.extend(
             network
                 .command_line_fragment_with_dns(!dns_tokens.is_empty())
+                .split_ascii_whitespace()
+                .map(str::to_owned),
+        );
+    }
+    if let Some(filesystem) = &config.microvm_filesystem {
+        expected_discovery.extend(
+            filesystem
+                .command_line_fragment()
                 .split_ascii_whitespace()
                 .map(str::to_owned),
         );
@@ -431,6 +554,9 @@ pub fn build_microvm_command_line(
                 "virtnet_mask=",
                 "virtnet_gw=",
                 "virtnet_dns=",
+                "virtfs_dir=",
+                "virtfs_tag=",
+                "virtfs_mode=",
             ]
             .iter()
             .any(|reserved| token.starts_with(reserved))
@@ -477,6 +603,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         anyhow::ensure!(
             config.microvm_network.is_none(),
             "static microVM network identity requires the microVM profile"
+        );
+        anyhow::ensure!(
+            config.microvm_filesystem.is_none(),
+            "microVM filesystem policy requires the microVM profile"
         );
         return Ok(());
     };
@@ -604,10 +734,11 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     );
 
     anyhow::ensure!(
-        config.virtio_devices.len() <= 3,
-        "microVM ABI version 1 permits at most one virtio-net, one virtio-console, and one virtio-blk device"
+        config.virtio_devices.len() <= 4,
+        "microVM ABI version 1 permits at most one virtio-net, one virtio-fs, one virtio-console, and one virtio-blk device"
     );
     let mut has_network = false;
+    let mut has_filesystem = false;
     let mut has_console = false;
     let mut has_block = false;
     for (bus, device) in &config.virtio_devices {
@@ -619,6 +750,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             "virtio-net" => anyhow::ensure!(
                 !std::mem::replace(&mut has_network, true),
                 "microVM ABI version 1 permits only one virtio-net device"
+            ),
+            "virtiofs" => anyhow::ensure!(
+                !std::mem::replace(&mut has_filesystem, true),
+                "microVM ABI version 1 permits only one virtio-fs device"
             ),
             "virtio-console" => anyhow::ensure!(
                 !std::mem::replace(&mut has_console, true),
@@ -634,6 +769,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     anyhow::ensure!(
         has_network == config.microvm_network.is_some(),
         "microVM virtio-net device and static network identity must be configured together"
+    );
+    anyhow::ensure!(
+        has_filesystem == config.microvm_filesystem.is_some(),
+        "microVM virtio-fs device and filesystem policy must be configured together"
     );
     anyhow::ensure!(
         config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024

@@ -745,6 +745,12 @@ message WindowsPCIDevice {
 message VirtioFSConfig {
     string tag = 1;
     string root_path = 2;
+    // Absolute guest target for the microVM ABI-v1 fixed HostFs device.
+    // Must be empty for a standard-machine virtio-fs device.
+    string guest_mount_target = 3;
+    // Enable the microVM common read-write contract. False selects read-only.
+    // Must be false for a standard-machine virtio-fs device.
+    bool read_write = 4;
 }
 
 message VirtioConsoleConfig {
