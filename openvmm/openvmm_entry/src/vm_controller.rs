@@ -137,7 +137,12 @@ pub struct VmController {
     pub(crate) effective_command_line: Option<String>,
     pub(crate) has_microvm_block: bool,
     pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
+    pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
+    #[cfg(target_os = "linux")]
+    pub(crate) _microvm_managed_tap: Option<crate::MicrovmManagedTap>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     pub(crate) guest_power_actions: GuestPowerActions,
 }
@@ -665,6 +670,11 @@ impl VmController {
             let machine_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
                 &self.source_hypervisor,
                 command_line,
+                self.microvm_network
+                    .as_ref()
+                    .zip(self.microvm_egress_policy.as_ref())
+                    .zip(self.microvm_network_attachment.clone())
+                    .map(|((network, policy), attachment)| (network, policy, attachment)),
                 self.microvm_console_attachment.clone(),
                 self.memory,
                 response.state_unit_names,

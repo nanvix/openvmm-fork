@@ -35,6 +35,7 @@ use net_backend::TxSegmentType;
 use net_backend_resources::consomme::ConsommeRequest;
 use net_backend_resources::consomme::HostPortConfig;
 use net_backend_resources::consomme::HostPortProtocol;
+use net_backend_resources::egress::EgressPolicy;
 use pal_async::driver::Driver;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -112,6 +113,7 @@ struct EndpointState {
     recv: Option<mesh::Receiver<ConsommeMessage>>,
     port_recv: Option<mesh::Receiver<ConsommeRequest>>,
     port_forwards: Vec<PortForwardConfig>,
+    egress_policy: Option<EgressPolicy>,
 }
 
 impl ConsommeEndpoint {
@@ -122,6 +124,7 @@ impl ConsommeEndpoint {
                 recv: None,
                 port_recv: None,
                 port_forwards: Vec::new(),
+                egress_policy: None,
             }))),
         }
     }
@@ -134,6 +137,7 @@ impl ConsommeEndpoint {
                 recv: None,
                 port_recv: None,
                 port_forwards: ports,
+                egress_policy: None,
             }))),
         }
     }
@@ -148,6 +152,7 @@ impl ConsommeEndpoint {
                     recv: Some(recv),
                     port_recv: None,
                     port_forwards: Vec::new(),
+                    egress_policy: None,
                 }))),
             },
             ConsommeControl { send },
@@ -167,6 +172,7 @@ impl ConsommeEndpoint {
                 recv: None,
                 port_recv: Some(port_recv),
                 port_forwards: ports,
+                egress_policy: None,
             }))),
         }
     }
@@ -378,6 +384,7 @@ impl net_backend::Endpoint for ConsommeEndpoint {
             },
             stats: Default::default(),
             driver: config.driver,
+            input_quiesced: false,
         });
         let port_forwards =
             std::mem::take(&mut queue.endpoint_state.as_mut().unwrap().port_forwards);
@@ -418,6 +425,15 @@ impl net_backend::Endpoint for ConsommeEndpoint {
         Ok(())
     }
 
+    fn set_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        self.endpoint_state
+            .lock()
+            .as_mut()
+            .context("cannot configure Consomme egress policy while a queue is active")?
+            .egress_policy = Some(policy);
+        Ok(())
+    }
+
     async fn stop(&mut self) {
         assert!(self.endpoint_state.lock().is_some());
     }
@@ -443,6 +459,7 @@ pub struct ConsommeQueue {
     state: QueueState,
     stats: Stats,
     driver: Box<dyn Driver>,
+    input_quiesced: bool,
 }
 
 impl InspectMut for ConsommeQueue {
@@ -464,6 +481,95 @@ impl Drop for ConsommeQueue {
 }
 
 impl ConsommeQueue {
+    fn process_tx(&mut self, pool: &mut dyn BufferAccess) {
+        while let Some(head) = self.state.tx_avail.front() {
+            let TxSegmentType::Head(metadata) = &head.ty else {
+                unreachable!()
+            };
+            let tx_id = metadata.id;
+            let checksum = ChecksumState {
+                ipv4: metadata.flags.offload_ip_header_checksum(),
+                tcp: metadata.flags.offload_tcp_checksum(),
+                udp: metadata.flags.offload_udp_checksum(),
+                tso: metadata
+                    .flags
+                    .offload_tcp_segmentation()
+                    .then_some(metadata.max_segment_size),
+                gso: metadata
+                    .flags
+                    .offload_udp_segmentation()
+                    .then_some(metadata.max_segment_size),
+            };
+            let segment_count = metadata.segment_count as usize;
+            let packet_len = metadata.len as usize;
+
+            let mut buffer = std::mem::take(&mut self.state.tx_scratch);
+            buffer.clear();
+            buffer.resize(packet_len, 0);
+            let guest_memory = pool.guest_memory();
+            let mut offset = 0usize;
+            for segment in self.state.tx_avail.drain(..segment_count) {
+                let Some(end) = offset.checked_add(segment.len as usize) else {
+                    tracing::error!("network TX segment length overflow");
+                    break;
+                };
+                let Some(destination) = buffer.get_mut(offset..end) else {
+                    tracing::error!(packet_len, end, "network TX segments exceed packet length");
+                    break;
+                };
+                if let Err(error) = guest_memory.read_at(segment.gpa, destination) {
+                    tracing::error!(
+                        error = &error as &dyn std::error::Error,
+                        "network TX guest-memory read failure"
+                    );
+                }
+                offset = end;
+            }
+
+            let policy_result = (offset == packet_len)
+                .then(|| {
+                    self.endpoint_state
+                        .as_ref()
+                        .and_then(|state| state.egress_policy.as_ref())
+                        .map(|policy| policy.authorize_frame(&buffer, buffer.len()))
+                })
+                .flatten();
+            if policy_result.is_some_and(|result| result.is_err()) {
+                self.stats.tx_dropped.increment();
+            } else if offset == packet_len
+                && let Err(error) =
+                    self.with_consomme(pool, |consomme| consomme.send(&buffer, &checksum))
+            {
+                tracing::debug!(
+                    error = &error as &dyn std::error::Error,
+                    "tx packet ignored"
+                );
+                match error {
+                    consomme::DropReason::SendBufferFull
+                    | consomme::DropReason::DestinationNotAllowed => {
+                        self.stats.tx_dropped.increment()
+                    }
+                    consomme::DropReason::UnsupportedEthertype(_)
+                    | consomme::DropReason::UnsupportedIpProtocol(_)
+                    | consomme::DropReason::UnsupportedIcmpv6(_)
+                    | consomme::DropReason::UnsupportedDhcp(_)
+                    | consomme::DropReason::UnsupportedArp
+                    | consomme::DropReason::UnsupportedDhcpv6(_)
+                    | consomme::DropReason::UnsupportedNdp(_) => self.stats.tx_unknown.increment(),
+                    consomme::DropReason::Packet(_)
+                    | consomme::DropReason::Ipv4Checksum
+                    | consomme::DropReason::Io(_)
+                    | consomme::DropReason::BadTcpState(_)
+                    | consomme::DropReason::FragmentedPacket
+                    | consomme::DropReason::IpLengthMismatch
+                    | consomme::DropReason::MalformedPacket => self.stats.tx_errors.increment(),
+                }
+            }
+            self.state.tx_scratch = buffer;
+            self.state.tx_ready.push_back(tx_id);
+        }
+    }
+
     fn with_consomme_no_pool<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut consomme::Access<'_, ClientNoPool<'_>>) -> R,
@@ -679,88 +785,19 @@ fn process_message(
     }
 }
 
+#[async_trait]
 impl net_backend::Queue for ConsommeQueue {
     fn poll_ready(&mut self, cx: &mut Context<'_>, pool: &mut dyn BufferAccess) -> Poll<()> {
-        while let Some(head) = self.state.tx_avail.front() {
-            let TxSegmentType::Head(meta) = &head.ty else {
-                unreachable!()
-            };
-            let tx_id = meta.id;
-            let checksum = ChecksumState {
-                ipv4: meta.flags.offload_ip_header_checksum(),
-                tcp: meta.flags.offload_tcp_checksum(),
-                udp: meta.flags.offload_udp_checksum(),
-                tso: meta
-                    .flags
-                    .offload_tcp_segmentation()
-                    .then_some(meta.max_segment_size),
-                gso: meta
-                    .flags
-                    .offload_udp_segmentation()
-                    .then_some(meta.max_segment_size),
-            };
-
-            // Reuse the scratch buffer to avoid per-packet heap allocation.
-            // TSO caps the assembled packet at 64 KiB; assert so a buggy
-            // upstream caller can't permanently inflate the scratch buffer
-            // (and thus the queue's steady-state memory) by feeding an
-            // oversized `meta.len`.
-            debug_assert!(
-                meta.len as usize <= 64 * 1024,
-                "tx packet len {} exceeds 64 KiB TSO bound",
-                meta.len
-            );
-            let mut buf = std::mem::take(&mut self.state.tx_scratch);
-            buf.clear();
-            buf.resize(meta.len as usize, 0);
-            let gm = pool.guest_memory();
-            let mut offset = 0;
-            for segment in self.state.tx_avail.drain(..meta.segment_count as usize) {
-                let dest = &mut buf[offset..offset + segment.len as usize];
-                if let Err(err) = gm.read_at(segment.gpa, dest) {
-                    tracing::error!(
-                        error = &err as &dyn std::error::Error,
-                        "memory write failure"
-                    );
-                }
-                offset += segment.len as usize;
-            }
-
-            if let Err(err) = self.with_consomme(pool, |c| c.send(&buf, &checksum)) {
-                tracing::debug!(error = &err as &dyn std::error::Error, "tx packet ignored");
-                match err {
-                    consomme::DropReason::SendBufferFull
-                    | consomme::DropReason::DestinationNotAllowed => {
-                        self.stats.tx_dropped.increment()
-                    }
-                    consomme::DropReason::UnsupportedEthertype(_)
-                    | consomme::DropReason::UnsupportedIpProtocol(_)
-                    | consomme::DropReason::UnsupportedIcmpv6(_)
-                    | consomme::DropReason::UnsupportedDhcp(_)
-                    | consomme::DropReason::UnsupportedArp
-                    | consomme::DropReason::UnsupportedDhcpv6(_)
-                    | consomme::DropReason::UnsupportedNdp(_) => self.stats.tx_unknown.increment(),
-                    consomme::DropReason::Packet(_)
-                    | consomme::DropReason::Ipv4Checksum
-                    | consomme::DropReason::Io(_)
-                    | consomme::DropReason::BadTcpState(_)
-                    | consomme::DropReason::FragmentedPacket
-                    | consomme::DropReason::IpLengthMismatch
-                    | consomme::DropReason::MalformedPacket => self.stats.tx_errors.increment(),
-                }
-            }
-            self.state.tx_scratch = buf;
-
-            self.state.tx_ready.push_back(tx_id);
-        }
+        self.process_tx(pool);
 
         // TODO: handle messages asynchronously from any queue processing, since
         // there is no guarantee the queue will be processed at all (e.g., if
         // the guest stops processing traffic). This will probably require adding
         // a lock around the consomme state.
-        self.poll_message(cx, pool);
-
-        self.with_consomme(pool, |c| c.poll(cx));
+        if !self.input_quiesced {
+            self.poll_message(cx, pool);
+            self.with_consomme(pool, |consomme| consomme.poll(cx));
+        }
 
         if !self.state.tx_ready.is_empty() || !self.state.rx_ready.is_empty() {
             Poll::Ready(())
@@ -770,7 +807,9 @@ impl net_backend::Queue for ConsommeQueue {
     }
 
     fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
-        self.state.rx_avail.extend(done);
+        if !self.input_quiesced {
+            self.state.rx_avail.extend(done);
+        }
     }
 
     fn rx_poll(
@@ -804,6 +843,24 @@ impl net_backend::Queue for ConsommeQueue {
             *x = y;
         }
         Ok(n)
+    }
+
+    async fn quiesce(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+    ) -> anyhow::Result<net_backend::QueueQuiesceResult> {
+        self.input_quiesced = true;
+        self.process_tx(pool);
+        self.state.rx_avail.clear();
+        Ok(net_backend::QueueQuiesceResult {
+            rx_ready: self.state.rx_ready.len(),
+            tx_ready: self.state.tx_ready.len(),
+        })
+    }
+
+    fn resume(&mut self) -> anyhow::Result<()> {
+        self.input_quiesced = false;
+        Ok(())
     }
 }
 

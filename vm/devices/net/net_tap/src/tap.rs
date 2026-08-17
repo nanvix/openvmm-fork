@@ -8,6 +8,7 @@
 
 use crate::VirtioNetHdr;
 use futures::AsyncRead;
+use futures::AsyncWrite;
 use linux_net_bindings::gen_if;
 use linux_net_bindings::gen_if_tun;
 use linux_net_bindings::tun_get_iff;
@@ -190,6 +191,32 @@ impl AsyncRead for PolledTap {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.tap).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PolledTap {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.tap).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tap).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tap).poll_close(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.tap).poll_write_vectored(cx, bufs)
     }
 }
 

@@ -9,14 +9,17 @@
 pub mod resolver;
 pub mod tap;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::io::AsyncRead;
+use futures::io::AsyncWrite;
 use inspect::InspectMut;
 use net_backend::BufferAccess;
 use net_backend::Endpoint;
 use net_backend::L4Protocol;
 use net_backend::Queue;
 use net_backend::QueueConfig;
+use net_backend::QueueQuiesceResult;
 use net_backend::RssConfig;
 use net_backend::RxChecksumState;
 use net_backend::RxId;
@@ -28,6 +31,7 @@ use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::linearize;
 use net_backend::next_packet;
+use net_backend_resources::egress::EgressPolicy;
 use pal_async::driver::Driver;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -112,6 +116,7 @@ pub use vnet_hdr::*;
 /// An endpoint based on a TAP interface.
 pub struct TapEndpoint {
     tap: Arc<Mutex<Option<tap::Tap>>>,
+    egress_policy: Option<EgressPolicy>,
 }
 
 impl TapEndpoint {
@@ -138,6 +143,7 @@ impl TapEndpoint {
 
         Ok(Self {
             tap: Arc::new(Mutex::new(Some(tap))),
+            egress_policy: None,
         })
     }
 }
@@ -166,7 +172,13 @@ impl Endpoint for TapEndpoint {
         queues.push(Box::new(TapQueue::new(
             config.driver.as_ref(),
             self.tap.clone(),
+            self.egress_policy.clone(),
         )?));
+        Ok(())
+    }
+
+    fn set_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        self.egress_policy = Some(policy);
         Ok(())
     }
 
@@ -197,6 +209,17 @@ struct TapQueue {
     tap: Option<tap::PolledTap>,
     inner: Inner,
     buffer: Box<[u8]>,
+    pending_tx: Option<PendingTx>,
+    tx_ready: VecDeque<TxId>,
+    tx_error: Option<std::io::Error>,
+    input_quiesced: bool,
+    egress_policy: Option<EgressPolicy>,
+}
+
+struct PendingTx {
+    id: TxId,
+    header: VirtioNetHdr,
+    packet: Vec<u8>,
 }
 
 struct Inner {
@@ -219,7 +242,11 @@ impl Drop for TapQueue {
 }
 
 impl TapQueue {
-    fn new(driver: &dyn Driver, slot: Arc<Mutex<Option<tap::Tap>>>) -> anyhow::Result<Self> {
+    fn new(
+        driver: &dyn Driver,
+        slot: Arc<Mutex<Option<tap::Tap>>>,
+        egress_policy: Option<EgressPolicy>,
+    ) -> anyhow::Result<Self> {
         let tap = slot.lock().take().expect("queue is already in use");
         let tap = tap.polled(driver)?;
         Ok(Self {
@@ -230,22 +257,65 @@ impl TapQueue {
                 rx_ready: VecDeque::new(),
             },
             buffer: vec![0; 65535 + size_of::<VirtioNetHdr>()].into_boxed_slice(),
+            pending_tx: None,
+            tx_ready: VecDeque::new(),
+            tx_error: None,
+            input_quiesced: false,
+            egress_policy,
         })
+    }
+
+    fn poll_pending_tx(&mut self, cx: &mut Context<'_>) {
+        let Some(pending) = self.pending_tx.as_ref() else {
+            return;
+        };
+        let Some(tap) = self.tap.as_mut() else {
+            return;
+        };
+        let header = pending.header.as_bytes();
+        let bufs = [
+            std::io::IoSlice::new(header),
+            std::io::IoSlice::new(&pending.packet),
+        ];
+        match Pin::new(tap).poll_write_vectored(cx, &bufs) {
+            Poll::Ready(Ok(bytes_written))
+                if bytes_written == header.len() + pending.packet.len() =>
+            {
+                let pending = self.pending_tx.take().unwrap();
+                self.tx_ready.push_back(pending.id);
+            }
+            Poll::Ready(Ok(bytes_written)) => {
+                self.tx_error = Some(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    format!(
+                        "partial TAP packet write: wrote {bytes_written} of {} bytes",
+                        header.len() + pending.packet.len()
+                    ),
+                ));
+            }
+            Poll::Ready(Err(error)) => self.tx_error = Some(error),
+            Poll::Pending => {}
+        }
     }
 }
 
+#[async_trait]
 impl Queue for TapQueue {
     fn poll_ready(&mut self, cx: &mut Context<'_>, pool: &mut dyn BufferAccess) -> Poll<()> {
+        self.poll_pending_tx(cx);
+        if !self.tx_ready.is_empty() || self.tx_error.is_some() {
+            return Poll::Ready(());
+        }
         if !self.inner.rx_ready.is_empty() {
             return Poll::Ready(());
         }
 
-        let tap = if let Some(tap) = self.tap.as_mut() {
-            tap
-        } else {
+        if self.input_quiesced {
+            return Poll::Pending;
+        }
+        let Some(tap) = self.tap.as_mut() else {
             return Poll::Pending;
         };
-
         while let Some(&rx) = self.inner.rx_free.front() {
             match Pin::new(&mut *tap).poll_read(cx, &mut self.buffer) {
                 Poll::Ready(Ok(read_len)) => {
@@ -253,26 +323,25 @@ impl Queue for TapQueue {
                         tracing::warn!(read_len, "tap read too short for vnet header");
                         break;
                     }
-                    let (hdr, _) =
+                    let (header, _) =
                         VirtioNetHdr::read_from_prefix(&self.buffer[..read_len]).unwrap();
-                    let rx_meta = parse_vnet_hdr(&hdr);
+                    let rx_metadata = parse_vnet_hdr(&header);
                     let frame_start = size_of::<VirtioNetHdr>();
-                    let frame_len = read_len - size_of::<VirtioNetHdr>();
+                    let frame_len = read_len - frame_start;
                     pool.write_packet(
                         rx,
                         &RxMetadata {
                             offset: 0,
                             len: frame_len,
-                            ..rx_meta
+                            ..rx_metadata
                         },
                         &self.buffer[frame_start..read_len],
                     );
-
                     self.inner.rx_ready.push_back(rx);
                     self.inner.rx_free.pop_front();
                 }
-                Poll::Ready(Err(err)) => {
-                    tracing::warn!(error = &err as &dyn std::error::Error, "tap rx error");
+                Poll::Ready(Err(error)) => {
+                    tracing::warn!(error = &error as &dyn std::error::Error, "tap rx error");
                     break;
                 }
                 Poll::Pending => break,
@@ -287,7 +356,9 @@ impl Queue for TapQueue {
     }
 
     fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
-        self.inner.rx_free.extend(done);
+        if !self.input_quiesced {
+            self.inner.rx_free.extend(done);
+        }
     }
 
     fn rx_poll(
@@ -295,12 +366,11 @@ impl Queue for TapQueue {
         _pool: &mut dyn BufferAccess,
         packets: &mut [RxId],
     ) -> anyhow::Result<usize> {
-        // Send to the guest any packets that might have been read during poll_ready().
-        let n = std::cmp::min(self.inner.rx_ready.len(), packets.len());
-        for (done, id) in packets[..n].iter_mut().zip(self.inner.rx_ready.drain(..n)) {
-            *done = id;
+        let count = self.inner.rx_ready.len().min(packets.len());
+        for (destination, id) in packets.iter_mut().zip(self.inner.rx_ready.drain(..count)) {
+            *destination = id;
         }
-        Ok(n)
+        Ok(count)
     }
 
     fn tx_avail(
@@ -308,78 +378,92 @@ impl Queue for TapQueue {
         pool: &mut dyn BufferAccess,
         mut segments: &[TxSegment],
     ) -> anyhow::Result<(bool, usize)> {
-        let n = segments.len();
-        // Synchronously send packets received from the guest to host's network.
-        if let Some(tap) = self.tap.as_mut() {
-            while !segments.is_empty() {
-                let (meta, _segs, _rest) = next_packet(segments);
-                let hdr = build_vnet_hdr(meta);
-                let hdr_bytes = hdr.as_bytes();
-                let mut packet = linearize(pool, &mut segments)?;
-
-                // Fix up the IPv4 header checksum when the frontend
-                // requested IPv4 header checksum offload.
-                //
-                // The virtio vnet header has no mechanism for IPv4 header
-                // checksum offload, so we compute it in software. This
-                // also covers NDIS/netvsp LSO packets, where the guest
-                // driver zeroes ip_check (NDIS convention); the kernel's
-                // TAP GSO engine requires a valid checksum to segment
-                // the packet correctly.
-                // Same NDIS/LSO convention for IPv6: the guest zeroes the IPv6
-                // payload-length field on segmentation-offload frames. IPv6 has
-                // no header checksum (so the IPv4 fixup above never runs for it);
-                // fix the length here so the kernel TAP GSO engine can segment.
-                if meta.flags.offload_ip_header_checksum() && meta.flags.is_ipv4() {
-                    fixup_ipv4_header_checksum(&mut packet, meta.l2_len as usize);
-                }
-                if meta.flags.offload_tcp_segmentation() && meta.flags.is_ipv6() {
-                    fixup_ipv6_payload_length(&mut packet, meta.l2_len as usize);
-                }
-
-                let bufs = [
-                    std::io::IoSlice::new(hdr_bytes),
-                    std::io::IoSlice::new(&packet),
-                ];
-                match tap.write_vectored(&bufs) {
-                    Ok(bytes_written) => {
-                        assert_eq!(
-                            bytes_written,
-                            hdr_bytes.len() + packet.len(),
-                            "TAP should never partial write"
-                        );
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        // dropped packet: buffer is full
-
-                        // TODO: return partial transmit here. This relies on
-                        // remembering this condition and polling for POLLOUT in
-                        // poll_ready().
-                    }
-                    Err(err) if err.raw_os_error() == Some(libc::EIO) => {
-                        // dropped packet: interface is not up
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = &err as &dyn std::error::Error,
-                            "write to TAP interface failed"
-                        );
-                    }
-                }
-            }
+        if segments.is_empty() || self.pending_tx.is_some() {
+            return Ok((false, 0));
         }
-        let completed_synchronously = true;
-        Ok((completed_synchronously, n))
+
+        let (metadata, packet_segments, _) = next_packet(segments);
+        let segment_count = packet_segments.len();
+        let id = metadata.id;
+        let header = build_vnet_hdr(metadata);
+        let mut packet = linearize(pool, &mut segments)?;
+        if metadata.flags.offload_ip_header_checksum() && metadata.flags.is_ipv4() {
+            fixup_ipv4_header_checksum(&mut packet, metadata.l2_len as usize);
+        }
+        if metadata.flags.offload_tcp_segmentation() && metadata.flags.is_ipv6() {
+            fixup_ipv6_payload_length(&mut packet, metadata.l2_len as usize);
+        }
+        if let Some(policy) = &self.egress_policy
+            && policy.authorize_frame(&packet, packet.len()).is_err()
+        {
+            return Ok((true, segment_count));
+        }
+
+        let tap = self.tap.as_mut().context("TAP queue is unavailable")?;
+        let header_bytes = header.as_bytes();
+        let bufs = [
+            std::io::IoSlice::new(header_bytes),
+            std::io::IoSlice::new(&packet),
+        ];
+        match tap.write_vectored(&bufs) {
+            Ok(bytes_written) if bytes_written == header_bytes.len() + packet.len() => {
+                Ok((true, segment_count))
+            }
+            Ok(bytes_written) => anyhow::bail!(
+                "partial TAP packet write: wrote {bytes_written} of {} bytes",
+                header_bytes.len() + packet.len()
+            ),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                self.pending_tx = Some(PendingTx { id, header, packet });
+                Ok((false, segment_count))
+            }
+            Err(error) => Err(error).context("failed to write TAP packet"),
+        }
     }
 
     fn tx_poll(
         &mut self,
         _pool: &mut dyn BufferAccess,
-        _done: &mut [TxId],
+        done: &mut [TxId],
     ) -> Result<usize, TxError> {
-        // Packets are sent synchronously so there is no no need to check here if
-        // sending has been completed.
-        Ok(0)
+        if let Some(error) = self.tx_error.take() {
+            return Err(TxError::Fatal(error.into()));
+        }
+        let count = done.len().min(self.tx_ready.len());
+        for (destination, id) in done.iter_mut().zip(self.tx_ready.drain(..count)) {
+            *destination = id;
+        }
+        Ok(count)
+    }
+
+    async fn quiesce(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+    ) -> anyhow::Result<QueueQuiesceResult> {
+        self.input_quiesced = true;
+        self.inner.rx_free.clear();
+        std::future::poll_fn(|cx| {
+            self.poll_pending_tx(cx);
+            if self.pending_tx.is_none() || self.tx_error.is_some() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        if let Some(error) = self.tx_error.take() {
+            self.inner.rx_ready.clear();
+            return Err(error).context("failed to quiesce TAP transmit queue");
+        }
+        Ok(QueueQuiesceResult {
+            rx_ready: self.inner.rx_ready.len(),
+            tx_ready: self.tx_ready.len(),
+        })
+    }
+
+    fn resume(&mut self) -> anyhow::Result<()> {
+        self.input_quiesced = false;
+        Ok(())
     }
 }
 

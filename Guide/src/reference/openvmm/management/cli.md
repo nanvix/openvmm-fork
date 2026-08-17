@@ -27,7 +27,7 @@ as well as the generated CLI help (via `cargo run -- --help`).
   MMIO gap from 3 to 4 GiB and exposes only PIC/IOAPIC, PIT, binary UTC RTC,
   the microVM portb console, lifecycle ports, and the optional fixed virtio
   devices described below. User arguments cannot override `earlycon=`,
-  `console=`, or `virtio_mmio.device=`.
+  `console=`, `virtio_mmio.device=`, or `virtnet_*=`.
 
   One optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
   IRQ 7, and one optional `--virtio-blk <DISK>` is exposed at MMIO
@@ -40,6 +40,42 @@ as well as the generated CLI help (via `cargo run -- --help`).
   the no-block ABI-v1 machine on Linux/KVM and Windows/WHP, including an
   active virtio console. Capture with the optional virtio-blk device is
   rejected until immutable media identity is implemented.
+* `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
+  at MMIO `0xd0000000`. KVM uses IRQ 10 and WHP uses IRQ 5. Prefixes `/1`
+  through `/30` are accepted. The first usable subnet address becomes the
+  gateway; network, broadcast, and gateway addresses cannot be assigned to
+  the guest. Guest and gateway MAC addresses are derived as
+  `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses.
+
+  ```bash
+  openvmm --machine microvm --hypervisor whp \
+    --kernel vmlinux --initrd initramfs.cpio.gz \
+    --net 10.0.0.2/24
+  ```
+
+  On Linux/KVM, OpenVMM creates, addresses, and removes a managed TAP. This
+  requires root or non-interactive `sudo ip` access. `--net-tap <NAME>` uses
+  an existing TAP instead; its link state, gateway address, and gateway MAC
+  are validated, and OpenVMM does not remove it. Forwarding or NAT beyond the
+  host is operator policy. On Windows/WHP, OpenVMM uses an in-process
+  Consomme endpoint and advertises the gateway DNS proxy when policy permits
+  it.
+
+  `--allow-host <IPv4[/PREFIX]>`, `--block-host <IPv4[/PREFIX]>`, and
+  `--allow-endpoint <IPv4:TCP-PORT>` are repeatable, mutually exclusive
+  egress modes. Filtering runs before TAP transmission or host socket
+  creation. Active policy fails closed for malformed packets, non-IPv4
+  traffic, and IPv4 options. Exact endpoint mode also rejects UDP, ICMP, VLAN,
+  fragments, and every TCP destination not listed. No implicit DNS exception
+  is added.
+
+  Networked snapshots drain accepted TX and endpoint-ready RX at the capture
+  boundary, rewind unused guest RX descriptors, save the static identity and
+  completion cursors, and recreate the host endpoint on restore. An active
+  egress policy must be supplied again with the same canonical rules. Native
+  TAP descriptors, Consomme sockets, NAT flow tables, and remote peer state
+  are not serialized, so existing proxied TCP or UDP sessions may reconnect
+  or reset after restore.
 * `--snapshot-destination <DIR>`: Publish a microVM snapshot when the guest
   writes to PMIO port `0x605`. The destination must not exist and its parent
   must already be a directory. OpenVMM automatically creates file-backed RAM
@@ -53,7 +89,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   ignored and the guest continues. Capture currently requires microVM ABI v1,
   one vCPU, KVM or WHP, shared file-backed RAM, and no virtio-blk device. An
   attached virtio console saves accepted but undelivered input and the offset
-  of a partially forwarded guest transmit descriptor.
+  of a partially forwarded guest transmit descriptor. An attached microVM
+  virtio-net device saves its static identity, queue progress, drained packet
+  ownership, endpoint generation, and policy requirement.
 
   ```bash
   openvmm --machine microvm --hypervisor kvm --memory 128M \

@@ -62,6 +62,8 @@ pub struct Config {
     pub rtc_delta_milliseconds: i64,
     /// The versioned guest-visible machine contract.
     pub machine_profile: MachineProfile,
+    /// Static identity for the optional microVM virtio-net device.
+    pub microvm_network: Option<MicrovmNetworkConfig>,
 }
 
 /// The initial microVM guest ABI version.
@@ -86,6 +88,12 @@ pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 pub const MICROVM_VIRTIO_BLK_IRQ: u32 = 4;
 /// Fixed ABI-v1 virtio-console interrupt.
 pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
+/// Fixed ABI-v1 virtio-net interrupt on KVM.
+pub const MICROVM_VIRTIO_NET_KVM_IRQ: u32 = 10;
+/// Fixed ABI-v1 virtio-net interrupt on WHP.
+pub const MICROVM_VIRTIO_NET_WHP_IRQ: u32 = 5;
+/// Exact ABI-v1 virtio-net feature mask: MAC and virtio version 1.
+pub const MICROVM_VIRTIO_NET_FEATURES: u64 = (1 << 5) | (1 << 32);
 /// ABI-v1 client console reconnect timeout.
 pub const MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS: u64 = 5_000;
 /// ABI-v1 virtio MMIO reservations in stable device order.
@@ -95,6 +103,124 @@ pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 4] = [
     MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
     MICROVM_VIRTIO_BLK_MMIO_BASE,
 ];
+
+/// Static guest-visible network identity for the microVM ABI-v1 NIC.
+#[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmNetworkConfig {
+    pub guest_ipv4: std::net::Ipv4Addr,
+    pub prefix_length: u8,
+    pub derived_gateway_ipv4: std::net::Ipv4Addr,
+    pub guest_mac: MacAddress,
+    pub gateway_mac: MacAddress,
+}
+
+impl MicrovmNetworkConfig {
+    /// Returns the subnet mask derived from `prefix_length`.
+    pub fn netmask(&self) -> std::net::Ipv4Addr {
+        std::net::Ipv4Addr::from(u32::MAX << (32 - self.prefix_length))
+    }
+
+    /// Returns the pinned NVX guest-bootstrap command-line tokens.
+    pub fn command_line_fragment(&self) -> String {
+        self.command_line_fragment_with_dns(false)
+    }
+
+    /// Returns the pinned bootstrap tokens, optionally including gateway DNS.
+    pub fn command_line_fragment_with_dns(&self, gateway_dns: bool) -> String {
+        let dns = if gateway_dns {
+            format!(" virtnet_dns={}", self.derived_gateway_ipv4)
+        } else {
+            String::new()
+        };
+        format!(
+            "virtnet_ip={} virtnet_mask={} virtnet_gw={}{}",
+            self.guest_ipv4,
+            self.netmask(),
+            self.derived_gateway_ipv4,
+            dns,
+        )
+    }
+
+    fn derive_mac(address: std::net::Ipv4Addr) -> MacAddress {
+        let [_, second, third, fourth] = address.octets();
+        MacAddress::new([0x52, 0x54, 0x00, second, third, fourth])
+    }
+}
+
+/// Error returned for an invalid microVM static network specification.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidMicrovmNetworkConfig {
+    #[error("expected <IPv4>/<prefix>, for example 10.0.0.2/24")]
+    InvalidFormat,
+    #[error("invalid IPv4 address '{0}'")]
+    InvalidAddress(String),
+    #[error("invalid IPv4 prefix '{0}'")]
+    InvalidPrefix(String),
+    #[error("IPv4 prefix /{0} is outside the supported range /1 through /30")]
+    PrefixOutOfRange(u8),
+    #[error("guest IPv4 address {0} is the subnet network address")]
+    NetworkAddress(std::net::Ipv4Addr),
+    #[error("guest IPv4 address {0} is the subnet broadcast address")]
+    BroadcastAddress(std::net::Ipv4Addr),
+    #[error("guest IPv4 address {0} collides with the derived gateway")]
+    GatewayCollision(std::net::Ipv4Addr),
+}
+
+impl std::str::FromStr for MicrovmNetworkConfig {
+    type Err = InvalidMicrovmNetworkConfig;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let (address, prefix) = spec
+            .split_once('/')
+            .filter(|(_, prefix)| !prefix.contains('/'))
+            .ok_or(InvalidMicrovmNetworkConfig::InvalidFormat)?;
+        let guest_ipv4 = address
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|_| InvalidMicrovmNetworkConfig::InvalidAddress(address.to_owned()))?;
+        let prefix_length = prefix
+            .parse::<u8>()
+            .map_err(|_| InvalidMicrovmNetworkConfig::InvalidPrefix(prefix.to_owned()))?;
+        if !(1..=30).contains(&prefix_length) {
+            return Err(InvalidMicrovmNetworkConfig::PrefixOutOfRange(prefix_length));
+        }
+
+        let mask = u32::MAX << (32 - prefix_length);
+        let guest = u32::from(guest_ipv4);
+        let network = guest & mask;
+        let broadcast = network | !mask;
+        if guest == network {
+            return Err(InvalidMicrovmNetworkConfig::NetworkAddress(guest_ipv4));
+        }
+        if guest == broadcast {
+            return Err(InvalidMicrovmNetworkConfig::BroadcastAddress(guest_ipv4));
+        }
+
+        let derived_gateway_ipv4 = std::net::Ipv4Addr::from(network + 1);
+        if guest_ipv4 == derived_gateway_ipv4 {
+            return Err(InvalidMicrovmNetworkConfig::GatewayCollision(guest_ipv4));
+        }
+
+        Ok(Self {
+            guest_ipv4,
+            prefix_length,
+            derived_gateway_ipv4,
+            guest_mac: Self::derive_mac(guest_ipv4),
+            gateway_mac: Self::derive_mac(derived_gateway_ipv4),
+        })
+    }
+}
+
+/// Returns the pinned virtio-net IRQ for the selected microVM backend.
+pub fn microvm_virtio_net_irq(hypervisor_id: Option<&str>) -> anyhow::Result<u32> {
+    match hypervisor_id {
+        Some("kvm") => Ok(MICROVM_VIRTIO_NET_KVM_IRQ),
+        Some("whp") => Ok(MICROVM_VIRTIO_NET_WHP_IRQ),
+        Some(other) => anyhow::bail!("microVM virtio-net does not support hypervisor '{other}'"),
+        None if cfg!(target_os = "linux") => Ok(MICROVM_VIRTIO_NET_KVM_IRQ),
+        None if cfg!(windows) => Ok(MICROVM_VIRTIO_NET_WHP_IRQ),
+        None => anyhow::bail!("microVM virtio-net requires an explicit KVM or WHP hypervisor"),
+    }
+}
 
 fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
     for (index, base) in MICROVM_VIRTIO_MMIO_BASES.iter().copied().enumerate() {
@@ -115,6 +241,7 @@ fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
 /// Appends present virtio devices in fixed-address order.
 pub fn append_microvm_virtio_discovery(
     cmdline: &mut String,
+    network: Option<(&MicrovmNetworkConfig, u32, bool)>,
     has_console: bool,
     has_block: bool,
 ) -> anyhow::Result<()> {
@@ -125,6 +252,16 @@ pub fn append_microvm_virtio_discovery(
         "microVM command line already contains virtio-mmio discovery"
     );
     use std::fmt::Write as _;
+    if let Some((_, irq, _)) = network {
+        anyhow::ensure!(
+            matches!(irq, MICROVM_VIRTIO_NET_KVM_IRQ | MICROVM_VIRTIO_NET_WHP_IRQ),
+            "microVM virtio-net IRQ {irq} is not part of ABI version 1"
+        );
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
+        )?;
+    }
     if has_console {
         write!(
             cmdline,
@@ -137,6 +274,13 @@ pub fn append_microvm_virtio_discovery(
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
         )?;
     }
+    if let Some((network, _, gateway_dns)) = network {
+        write!(
+            cmdline,
+            " {}",
+            network.command_line_fragment_with_dns(gateway_dns)
+        )?;
+    }
     anyhow::ensure!(
         cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
         "microVM kernel command line exceeds the 64-KiB ABI limit after device discovery"
@@ -144,7 +288,10 @@ pub fn append_microvm_virtio_discovery(
     Ok(())
 }
 
-fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
+fn validate_microvm_command_line(
+    config: &Config,
+    hypervisor_id: Option<&str>,
+) -> anyhow::Result<()> {
     let LoadMode::Pvh { cmdline, .. } = &config.load_mode else {
         anyhow::bail!("microVM ABI version 1 requires PVH load mode");
     };
@@ -166,6 +313,14 @@ fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
         .virtio_devices
         .iter()
         .any(|(_, device)| device.id() == "virtio-blk");
+    let has_network = config
+        .virtio_devices
+        .iter()
+        .any(|(_, device)| device.id() == "virtio-net");
+    anyhow::ensure!(
+        has_network == config.microvm_network.is_some(),
+        "microVM virtio-net device and static network identity must be configured together"
+    );
     let base_tokens = if has_console {
         MICROVM_CONSOLE_COMMAND_LINE
     } else {
@@ -177,22 +332,55 @@ fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
         tokens.starts_with(&base_tokens),
         "microVM command line does not begin with the ABI-v1 base tokens"
     );
-    for prefix in ["earlycon=", "console=", "virtio_mmio.device="] {
+    for prefix in [
+        "earlycon=",
+        "console=",
+        "virtio_mmio.device=",
+        "virtnet_ip=",
+        "virtnet_mask=",
+        "virtnet_gw=",
+    ] {
         let count = tokens
             .iter()
             .filter(|token| token.starts_with(prefix))
             .count();
-        let expected = if prefix == "virtio_mmio.device=" {
-            config.virtio_devices.len()
-        } else {
-            1
+        let expected = match prefix {
+            "virtio_mmio.device=" => config.virtio_devices.len(),
+            "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => usize::from(has_network),
+            _ => 1,
         };
         anyhow::ensure!(
             count == expected,
             "microVM command line has an invalid number of {prefix} tokens"
         );
     }
+    let dns_tokens = tokens
+        .iter()
+        .filter(|token| token.starts_with("virtnet_dns="))
+        .copied()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        dns_tokens.len() <= 1,
+        "microVM command line has an invalid number of virtnet_dns= tokens"
+    );
+    if let Some(dns) = dns_tokens.first() {
+        let network = config
+            .microvm_network
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("microVM DNS bootstrap requires virtio-net"))?;
+        anyhow::ensure!(
+            microvm_virtio_net_irq(hypervisor_id)? == MICROVM_VIRTIO_NET_WHP_IRQ
+                && **dns == format!("virtnet_dns={}", network.derived_gateway_ipv4),
+            "microVM DNS bootstrap does not match the WHP gateway"
+        );
+    }
     let mut expected_discovery = Vec::new();
+    if has_network {
+        let irq = microvm_virtio_net_irq(hypervisor_id)?;
+        expected_discovery.push(format!(
+            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
+        ));
+    }
     if has_console {
         expected_discovery.push(format!(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
@@ -202,6 +390,14 @@ fn validate_microvm_command_line(config: &Config) -> anyhow::Result<()> {
         expected_discovery.push(format!(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
         ));
+    }
+    if let Some(network) = &config.microvm_network {
+        expected_discovery.extend(
+            network
+                .command_line_fragment_with_dns(!dns_tokens.is_empty())
+                .split_ascii_whitespace()
+                .map(str::to_owned),
+        );
     }
     if !expected_discovery.is_empty() {
         anyhow::ensure!(
@@ -227,12 +423,20 @@ pub fn build_microvm_command_line(
             anyhow::bail!("microVM kernel command line contains an embedded NUL");
         }
         if arg.split_ascii_whitespace().any(|token| {
-            ["earlycon=", "console=", "virtio_mmio.device="]
-                .iter()
-                .any(|reserved| token.starts_with(reserved))
+            [
+                "earlycon=",
+                "console=",
+                "virtio_mmio.device=",
+                "virtnet_ip=",
+                "virtnet_mask=",
+                "virtnet_gw=",
+                "virtnet_dns=",
+            ]
+            .iter()
+            .any(|reserved| token.starts_with(reserved))
         }) {
             anyhow::bail!(
-                "microVM kernel command line cannot override earlycon, console, or virtio-mmio discovery"
+                "microVM kernel command line cannot override console, virtio discovery, or static network configuration"
             );
         }
     }
@@ -270,6 +474,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             !matches!(config.load_mode, LoadMode::Pvh { .. }),
             "PVH load mode requires the microVM profile"
         );
+        anyhow::ensure!(
+            config.microvm_network.is_none(),
+            "static microVM network identity requires the microVM profile"
+        );
         return Ok(());
     };
 
@@ -278,7 +486,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "unsupported microVM ABI version {abi_version}"
     );
     validate_microvm_virtio_reservations()?;
-    validate_microvm_command_line(config)?;
+    validate_microvm_command_line(config, hypervisor_id)?;
     anyhow::ensure!(
         matches!(config.load_mode, LoadMode::Pvh { .. }),
         "microVM ABI version 1 requires PVH load mode"
@@ -396,9 +604,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     );
 
     anyhow::ensure!(
-        config.virtio_devices.len() <= 2,
-        "microVM ABI version 1 permits at most one virtio-console and one virtio-blk device"
+        config.virtio_devices.len() <= 3,
+        "microVM ABI version 1 permits at most one virtio-net, one virtio-console, and one virtio-blk device"
     );
+    let mut has_network = false;
     let mut has_console = false;
     let mut has_block = false;
     for (bus, device) in &config.virtio_devices {
@@ -407,6 +616,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             "microVM ABI version 1 permits only virtio-mmio devices"
         );
         match device.id() {
+            "virtio-net" => anyhow::ensure!(
+                !std::mem::replace(&mut has_network, true),
+                "microVM ABI version 1 permits only one virtio-net device"
+            ),
             "virtio-console" => anyhow::ensure!(
                 !std::mem::replace(&mut has_console, true),
                 "microVM ABI version 1 permits only one virtio-console device"
@@ -418,6 +631,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             id => anyhow::bail!("microVM ABI version 1 does not permit virtio device '{id}'"),
         }
     }
+    anyhow::ensure!(
+        has_network == config.microvm_network.is_some(),
+        "microVM virtio-net device and static network identity must be configured together"
+    );
     anyhow::ensure!(
         config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024
             && config.layout.chipset_high_mmio_size == 0

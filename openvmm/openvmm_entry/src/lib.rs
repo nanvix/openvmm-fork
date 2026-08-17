@@ -201,6 +201,10 @@ struct VmResources {
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
+    microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+    #[cfg(target_os = "linux")]
+    microvm_managed_tap: Option<MicrovmManagedTap>,
     /// Receives dirty rectangles from the synthetic video device for the VNC worker.
     dirty_rect_recv: Option<mesh::Receiver<Vec<video_core::DirtyRect>>>,
     #[cfg(windows)]
@@ -213,6 +217,28 @@ struct ConsoleState<'a> {
 }
 
 const MICROVM_CONSOLE_STABLE_ID: &str = "console:microvm-virtio0";
+const MICROVM_NETWORK_STABLE_ID: &str = "net:microvm0";
+
+#[derive(Clone)]
+struct EffectiveMicrovmNetwork {
+    config: openvmm_defs::config::MicrovmNetworkConfig,
+    policy: net_backend_resources::egress::EgressPolicy,
+    attachment: openvmm_helpers::snapshot::SnapshotAttachment,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct MicrovmManagedTap {
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MicrovmManagedTap {
+    fn drop(&mut self) {
+        if let Err(error) = run_microvm_ip(&["tuntap", "del", "dev", &self.name, "mode", "tap"]) {
+            tracing::warn!(tap = %self.name, error = %error, "failed to remove managed microVM TAP");
+        }
+    }
+}
 
 pub(crate) struct MicrovmConsoleSocketCleanup {
     #[cfg(unix)]
@@ -644,6 +670,142 @@ fn effective_microvm_console(
     )?))
 }
 
+fn microvm_network_attachment(
+    net_tap: Option<&str>,
+) -> anyhow::Result<openvmm_helpers::snapshot::SnapshotAttachment> {
+    #[cfg(target_os = "linux")]
+    let (required, reconnect_policy, identity_kind, identity) = match net_tap {
+        Some(name) => {
+            validate_microvm_tap_name(name)?;
+            (
+                true,
+                "require-inherited-attachment",
+                "tap-name",
+                name.as_bytes().to_vec(),
+            )
+        }
+        None => (
+            false,
+            "recreate-endpoint",
+            "managed-tap",
+            b"managed".to_vec(),
+        ),
+    };
+    #[cfg(windows)]
+    let (required, reconnect_policy, identity_kind, identity) = {
+        anyhow::ensure!(net_tap.is_none(), "--net-tap is unavailable with WHP");
+        (
+            false,
+            "recreate-endpoint",
+            "user-mode-nat",
+            b"consomme".to_vec(),
+        )
+    };
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let (required, reconnect_policy, identity_kind, identity) = {
+        let _ = net_tap;
+        anyhow::bail!("microVM networking requires Linux/KVM or Windows/WHP")
+    };
+
+    Ok(openvmm_helpers::snapshot::SnapshotAttachment {
+        stable_id: MICROVM_NETWORK_STABLE_ID.to_owned(),
+        kind: "virtio-net".to_owned(),
+        required,
+        reconnect_policy: reconnect_policy.to_owned(),
+        identity_kind: identity_kind.to_owned(),
+        identity,
+        length: 0,
+        reconnect_timeout_ms: 0,
+    })
+}
+
+fn microvm_network_from_snapshot(
+    saved: &openvmm_helpers::snapshot::SnapshotMicrovmNetwork,
+) -> anyhow::Result<openvmm_defs::config::MicrovmNetworkConfig> {
+    let prefix_length =
+        u8::try_from(saved.prefix_length).context("snapshot network prefix does not fit in u8")?;
+    let config = format!(
+        "{}/{}",
+        std::net::Ipv4Addr::from(saved.guest_ipv4),
+        prefix_length
+    )
+    .parse::<openvmm_defs::config::MicrovmNetworkConfig>()
+    .context("snapshot static network identity is invalid")?;
+    anyhow::ensure!(
+        saved.gateway_ipv4 == u32::from(config.derived_gateway_ipv4)
+            && saved.guest_mac == config.guest_mac.to_bytes()
+            && saved.gateway_mac == config.gateway_mac.to_bytes(),
+        "snapshot static network identity is not canonical"
+    );
+    Ok(config)
+}
+
+fn effective_microvm_network(
+    opt: &Options,
+    restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
+) -> anyhow::Result<Option<EffectiveMicrovmNetwork>> {
+    let requested = match opt.net.as_slice() {
+        [] => None,
+        [network] => match &network.endpoint {
+            EndpointConfigCli::Microvm(config) => Some(config.clone()),
+            _ => anyhow::bail!("microVM --net was not validated as a static IPv4 identity"),
+        },
+        _ => anyhow::bail!("microVM ABI version 1 permits at most one virtio-net device"),
+    };
+    let Some(restore) = restore else {
+        return requested
+            .map(|config| {
+                let policy = opt.microvm_egress_policy(&config);
+                Ok(EffectiveMicrovmNetwork {
+                    config,
+                    policy,
+                    attachment: microvm_network_attachment(opt.net_tap.as_deref())?,
+                })
+            })
+            .transpose();
+    };
+    anyhow::ensure!(
+        requested.is_none(),
+        "restore takes microVM network addressing from saved state"
+    );
+
+    let has_device = restore
+        .devices
+        .iter()
+        .any(|device| device.stable_id == MICROVM_NETWORK_STABLE_ID);
+    let saved_attachment = restore
+        .attachments
+        .iter()
+        .find(|attachment| attachment.stable_id == MICROVM_NETWORK_STABLE_ID);
+    anyhow::ensure!(
+        has_device == restore.microvm_network.is_some() && has_device == saved_attachment.is_some(),
+        "snapshot microVM network device, identity, and attachment inventories disagree"
+    );
+    let Some(saved) = restore.microvm_network.as_ref() else {
+        anyhow::ensure!(
+            opt.net_tap.is_none()
+                && opt.allow_host.is_empty()
+                && opt.block_host.is_empty()
+                && opt.allow_endpoint.is_empty(),
+            "restore-time network resources cannot be added to a snapshot without a NIC"
+        );
+        return Ok(None);
+    };
+    let config = microvm_network_from_snapshot(saved)?;
+    let policy = opt.microvm_egress_policy(&config);
+    openvmm_helpers::snapshot::validate_microvm_network_policy(saved, &policy)?;
+    let attachment = microvm_network_attachment(opt.net_tap.as_deref())?;
+    anyhow::ensure!(
+        Some(&attachment) == saved_attachment,
+        "restore-time network endpoint does not match the snapshot attachment"
+    );
+    Ok(Some(EffectiveMicrovmNetwork {
+        config,
+        policy,
+        attachment,
+    }))
+}
+
 /// Build a flat list of switches with their parent port assignments.
 ///
 /// This function converts hierarchical CLI switch definitions into a flat list
@@ -671,6 +833,7 @@ fn build_switch_list(all_switches: &[cli_args::GenericPcieSwitchCli]) -> Vec<Pci
 #[cfg(test)]
 mod microvm_console_attachment_tests {
     use super::*;
+    use clap::Parser as _;
 
     fn socket_attachment(path: &Path) -> openvmm_helpers::snapshot::SnapshotAttachment {
         openvmm_helpers::snapshot::SnapshotAttachment {
@@ -791,6 +954,114 @@ mod microvm_console_attachment_tests {
         assert_eq!(restored_snapshot, snapshot);
     }
 
+    fn network_contract() -> openvmm_helpers::snapshot::SnapshotMachineContract {
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = net_backend_resources::egress::EgressPolicy::new(
+            network.guest_ipv4,
+            network.derived_gateway_ipv4,
+            net_backend_resources::egress::EgressPolicyMode::AllowList(vec![
+                "192.0.2.0/24".parse().unwrap(),
+            ]),
+        );
+        let source_hypervisor = if cfg!(windows) { "whp" } else { "kvm" };
+        let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
+        let mut command_line = build_microvm_command_line(&[], false).unwrap();
+        openvmm_defs::config::append_microvm_virtio_discovery(
+            &mut command_line,
+            Some((&network, irq, false)),
+            false,
+            false,
+        )
+        .unwrap();
+        openvmm_helpers::snapshot::microvm_v1_machine_contract(
+            source_hypervisor,
+            command_line,
+            Some((&network, &policy, microvm_network_attachment(None).unwrap())),
+            None,
+            1024,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtio-net-3489660928",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn network_restore_uses_saved_identity_and_requires_policy() {
+        let contract = network_contract();
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--allow-host",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        let restored = effective_microvm_network(&options, Some(&contract))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.config.guest_ipv4,
+            std::net::Ipv4Addr::new(10, 0, 0, 2)
+        );
+
+        let missing_policy = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+        ])
+        .unwrap();
+        assert!(effective_microvm_network(&missing_policy, Some(&contract)).is_err());
+    }
+
+    #[test]
+    fn network_restore_rejects_attachment_identity_change() {
+        let mut contract = network_contract();
+        let attachment = contract
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.stable_id == MICROVM_NETWORK_STABLE_ID)
+            .unwrap();
+        attachment.identity.push(b'x');
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--allow-host",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        assert!(effective_microvm_network(&options, Some(&contract)).is_err());
+    }
+
+    #[test]
+    fn microvm_tap_address_requires_exact_prefix() {
+        let output = b"7: microvm0 inet 10.0.0.1/8 brd 10.255.255.255 scope global microvm0\n\
+                       7: microvm0 inet 192.0.2.1/24 scope global secondary microvm0\n";
+        assert!(!microvm_tap_has_exact_ipv4_cidr(output, "10.0.0.1/24").unwrap());
+        assert!(microvm_tap_has_exact_ipv4_cidr(output, "192.0.2.1/24").unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn restore_bind_does_not_unlink_existing_socket() {
@@ -825,6 +1096,24 @@ async fn vm_config_from_command_line(
 ) -> anyhow::Result<(Config, VmResources)> {
     let is_microvm = opt.machine == MachineProfileCli::Microvm;
     opt.validate_microvm_options()?;
+    let effective_microvm_network = if is_microvm {
+        effective_microvm_network(opt, restore_machine_contract)?
+    } else {
+        None
+    };
+    let microvm_network = effective_microvm_network
+        .as_ref()
+        .map(|network| network.config.clone());
+    let microvm_egress_policy = effective_microvm_network
+        .as_ref()
+        .map(|network| network.policy.clone());
+    let microvm_network_attachment = effective_microvm_network
+        .as_ref()
+        .map(|network| network.attachment.clone());
+    let microvm_gateway_dns = cfg!(windows)
+        && microvm_egress_policy
+            .as_ref()
+            .is_some_and(|policy| policy.allows_gateway_dns());
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
 
@@ -1140,6 +1429,8 @@ async fn vm_config_from_command_line(
             .as_ref()
             .map(|(_, _, attachment)| attachment.clone()),
         microvm_console_socket_cleanup,
+        microvm_network_attachment,
+        microvm_egress_policy: microvm_egress_policy.clone(),
         ..Default::default()
     };
     let mut console_str = "";
@@ -1396,6 +1687,9 @@ async fn vm_config_from_command_line(
 
     let mut nic_index = 0;
     for cli_cfg in &opt.net {
+        if is_microvm {
+            continue;
+        }
         if cli_cfg.pcie_port.is_some() {
             anyhow::bail!("`--net` does not support PCIe");
         }
@@ -2491,6 +2785,28 @@ async fn vm_config_from_command_line(
         }
     };
 
+    if let Some(network) = &microvm_network {
+        let endpoint = microvm_network_endpoint(network, opt.net_tap.as_deref(), &mut resources)?;
+        add_virtio_device(
+            VirtioBusCli::Mmio,
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: Some(1),
+                mac_address: network.guest_mac,
+                endpoint,
+                egress_policy: microvm_egress_policy.clone(),
+                save_restore: true,
+                static_ipv4: Some(net_backend_resources::consomme::StaticIpv4Config {
+                    guest_ipv4: network.guest_ipv4,
+                    prefix_length: network.prefix_length,
+                    gateway_ipv4: network.derived_gateway_ipv4,
+                    gateway_mac: network.gateway_mac,
+                }),
+                effective_features: Some(openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES),
+            }
+            .into_resource(),
+        );
+    }
+
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
             anyhow::bail!("use --net uh:[...] to add underhill NICs")
@@ -2500,6 +2816,10 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
+            egress_policy: None,
+            save_restore: false,
+            static_ipv4: None,
+            effective_features: None,
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -2851,9 +3171,14 @@ async fn vm_config_from_command_line(
         firmware_event_send: None,
         debugger_rpc: None,
         rtc_delta_milliseconds: 0,
+        microvm_network,
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
+    let requested_hypervisor = opt
+        .hypervisor
+        .as_deref()
+        .and_then(|spec| spec.split(':').next());
     if matches!(cfg.machine_profile, MachineProfile::Microvm { .. })
         && restore_machine_contract.is_none()
     {
@@ -2868,12 +3193,21 @@ async fn vm_config_from_command_line(
             .virtio_devices
             .iter()
             .any(|(_, device)| device.id() == "virtio-blk");
-        openvmm_defs::config::append_microvm_virtio_discovery(cmdline, has_console, has_block)?;
+        let network_irq = cfg
+            .microvm_network
+            .as_ref()
+            .map(|_| openvmm_defs::config::microvm_virtio_net_irq(requested_hypervisor))
+            .transpose()?;
+        openvmm_defs::config::append_microvm_virtio_discovery(
+            cmdline,
+            cfg.microvm_network
+                .as_ref()
+                .zip(network_irq)
+                .map(|(network, irq)| (network, irq, microvm_gateway_dns)),
+            has_console,
+            has_block,
+        )?;
     }
-    let requested_hypervisor = opt
-        .hypervisor
-        .as_deref()
-        .and_then(|spec| spec.split(':').next());
     openvmm_defs::config::validate_machine_config(&cfg, requested_hypervisor)?;
     resources.serial_driver = Some(serial_driver);
     Ok((cfg, resources))
@@ -2963,6 +3297,7 @@ fn parse_endpoint(
             };
             net_backend_resources::consomme::ConsommeHandle {
                 cidr: cidr.clone(),
+                static_ipv4: None,
                 ports,
                 recv,
             }
@@ -3003,6 +3338,9 @@ fn parse_endpoint(
                 bail!("TAP backend is only supported on Linux")
             }
         }
+        EndpointConfigCli::Microvm(_) => {
+            bail!("a bare IPv4/prefix --net is only supported by the microVM profile")
+        }
     };
 
     // Pick a random MAC address.
@@ -3025,6 +3363,192 @@ fn parse_endpoint(
         max_queues: cli_cfg.max_queues,
         pcie_port: cli_cfg.pcie_port.clone(),
     })
+}
+
+#[cfg(windows)]
+fn microvm_network_endpoint(
+    network: &openvmm_defs::config::MicrovmNetworkConfig,
+    net_tap: Option<&str>,
+    _resources: &mut VmResources,
+) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
+    anyhow::ensure!(
+        net_tap.is_none(),
+        "--net-tap is unavailable with the WHP microVM backend"
+    );
+    Ok(net_backend_resources::consomme::ConsommeHandle {
+        cidr: None,
+        static_ipv4: Some(net_backend_resources::consomme::StaticIpv4Config {
+            guest_ipv4: network.guest_ipv4,
+            prefix_length: network.prefix_length,
+            gateway_ipv4: network.derived_gateway_ipv4,
+            gateway_mac: network.gateway_mac,
+        }),
+        ports: Vec::new(),
+        recv: None,
+    }
+    .into_resource())
+}
+
+#[cfg(target_os = "linux")]
+fn microvm_network_endpoint(
+    network: &openvmm_defs::config::MicrovmNetworkConfig,
+    net_tap: Option<&str>,
+    resources: &mut VmResources,
+) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
+    let fd = if let Some(name) = net_tap {
+        validate_microvm_tap(name, network)?;
+        net_tap::tap::open_tap(name)
+            .with_context(|| format!("failed to open supplied microVM TAP '{name}'"))?
+    } else {
+        let name = format!("ovm{}", std::process::id());
+        validate_microvm_tap_name(&name)?;
+        let user = current_user_name()?;
+        run_microvm_ip(&["tuntap", "add", "dev", &name, "mode", "tap", "user", &user])
+            .with_context(|| format!("failed to create managed microVM TAP '{name}'"))?;
+        let cleanup = MicrovmManagedTap { name: name.clone() };
+        let gateway_mac = format_mac(network.gateway_mac);
+        let gateway_cidr = format!("{}/{}", network.derived_gateway_ipv4, network.prefix_length);
+        run_microvm_ip(&["link", "set", "dev", &name, "address", &gateway_mac])
+            .with_context(|| format!("failed to set managed microVM TAP '{name}' MAC"))?;
+        run_microvm_ip(&["addr", "add", &gateway_cidr, "dev", &name])
+            .with_context(|| format!("failed to address managed microVM TAP '{name}'"))?;
+        run_microvm_ip(&["link", "set", "dev", &name, "up"])
+            .with_context(|| format!("failed to bring up managed microVM TAP '{name}'"))?;
+        let fd = net_tap::tap::open_tap(&name)
+            .with_context(|| format!("failed to open managed microVM TAP '{name}'"))?;
+        resources.microvm_managed_tap = Some(cleanup);
+        fd
+    };
+    Ok(net_backend_resources::tap::TapHandle { fd }.into_resource())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn microvm_network_endpoint(
+    _network: &openvmm_defs::config::MicrovmNetworkConfig,
+    _net_tap: Option<&str>,
+    _resources: &mut VmResources,
+) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
+    anyhow::bail!("microVM virtio-net requires Linux/KVM or Windows/WHP")
+}
+
+#[cfg(target_os = "linux")]
+fn validate_microvm_tap_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 15
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
+        "invalid TAP name '{name}'"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn current_user_name() -> anyhow::Result<String> {
+    let output = std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .context("failed to query the current user with `id -un`")?;
+    anyhow::ensure!(output.status.success(), "`id -un` failed");
+    let user = String::from_utf8(output.stdout)
+        .context("`id -un` returned a non-UTF-8 user name")?
+        .trim()
+        .to_owned();
+    anyhow::ensure!(!user.is_empty(), "`id -un` returned an empty user name");
+    Ok(user)
+}
+
+#[cfg(target_os = "linux")]
+fn run_microvm_ip(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let identity = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .context("failed to query effective user ID with `id -u`")?;
+    anyhow::ensure!(identity.status.success(), "`id -u` failed");
+    let is_root = identity.stdout == b"0\n" || identity.stdout == b"0\r\n";
+    let mut command = if is_root {
+        std::process::Command::new("ip")
+    } else {
+        let mut command = std::process::Command::new("sudo");
+        command.arg("-n").arg("ip");
+        command
+    };
+    let output = command
+        .args(args)
+        .output()
+        .context("failed to execute iproute2")?;
+    let command_name = if is_root { "ip" } else { "sudo -n ip" };
+    anyhow::ensure!(
+        output.status.success(),
+        "`{command_name} {}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+fn query_microvm_ip(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let output = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .context("failed to execute iproute2")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`ip {}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+fn format_mac(mac: MacAddress) -> String {
+    let bytes = mac.to_bytes();
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn microvm_tap_has_exact_ipv4_cidr(output: &[u8], expected_cidr: &str) -> anyhow::Result<bool> {
+    let output = std::str::from_utf8(output).context("iproute2 returned non-UTF-8 address data")?;
+    Ok(output.lines().any(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        matches!(
+            (fields.next(), fields.next(), fields.next(), fields.next()),
+            (Some(_), Some(_), Some("inet"), Some(cidr)) if cidr == expected_cidr
+        )
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_microvm_tap(
+    name: &str,
+    network: &openvmm_defs::config::MicrovmNetworkConfig,
+) -> anyhow::Result<()> {
+    validate_microvm_tap_name(name)?;
+    let link = query_microvm_ip(&["link", "show", "dev", name, "up"])?;
+    anyhow::ensure!(!link.stdout.is_empty(), "supplied TAP '{name}' is not up");
+
+    let expected_cidr = format!("{}/{}", network.derived_gateway_ipv4, network.prefix_length);
+    let address = query_microvm_ip(&["-4", "-o", "address", "show", "dev", name])?;
+    anyhow::ensure!(
+        microvm_tap_has_exact_ipv4_cidr(&address.stdout, &expected_cidr)?,
+        "supplied TAP '{name}' does not have gateway address {expected_cidr}"
+    );
+
+    let actual_mac = fs_err::read_to_string(format!("/sys/class/net/{name}/address"))
+        .with_context(|| format!("failed to read supplied TAP '{name}' MAC"))?;
+    let expected_mac = format_mac(network.gateway_mac);
+    anyhow::ensure!(
+        actual_mac.trim().eq_ignore_ascii_case(&expected_mac),
+        "supplied TAP '{name}' has MAC {}, expected {expected_mac}",
+        actual_mac.trim()
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3268,6 +3792,11 @@ fn prepare_snapshot_restore(
     opt: &Options,
     expected_hypervisor: &str,
     effective_command_line: Option<&str>,
+    network: Option<(
+        &openvmm_defs::config::MicrovmNetworkConfig,
+        &net_backend_resources::egress::EgressPolicy,
+        &openvmm_helpers::snapshot::SnapshotAttachment,
+    )>,
     console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
@@ -3283,6 +3812,7 @@ fn prepare_snapshot_restore(
             expected_hypervisor,
             effective_command_line
                 .context("microVM restore requires an effective PVH command line")?,
+            network,
             console_attachment,
         ))
     } else {
@@ -3312,6 +3842,11 @@ pub(crate) fn prepare_snapshot_restore_for_config(
     expected_microvm_contract: Option<(
         &str,
         &str,
+        Option<(
+            &openvmm_defs::config::MicrovmNetworkConfig,
+            &net_backend_resources::egress::EgressPolicy,
+            &openvmm_helpers::snapshot::SnapshotAttachment,
+        )>,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
     )>,
     memory_verification: openvmm_helpers::snapshot::SnapshotMemoryVerification,
@@ -3336,7 +3871,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         system_page_size(),
     )?;
     let restore_time =
-        if let Some((expected_hypervisor, effective_command_line, console_attachment)) =
+        if let Some((expected_hypervisor, effective_command_line, network, console_attachment)) =
             expected_microvm_contract
         {
             let saved_contract = manifest
@@ -3346,6 +3881,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             let expected_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
                 expected_hypervisor,
                 effective_command_line.to_owned(),
+                network.map(|(config, policy, attachment)| (config, policy, attachment.clone())),
                 console_attachment.cloned(),
                 expected_memory_size,
                 saved_contract.state_unit_names.clone(),
@@ -3550,6 +4086,9 @@ async fn run_control_inner(
         .iter()
         .any(|(_, device)| device.id() == "virtio-blk");
     let microvm_console_attachment = resources.microvm_console_attachment.clone();
+    let microvm_network = vm_config.microvm_network.clone();
+    let microvm_network_attachment = resources.microvm_network_attachment.clone();
+    let microvm_egress_policy = resources.microvm_egress_policy.clone();
 
     let snapshot_destination = opt.snapshot_destination.as_ref().map(|path| {
         if path.is_absolute() {
@@ -3753,6 +4292,11 @@ async fn run_control_inner(
                     &opt,
                     &source_hypervisor,
                     effective_command_line.as_deref(),
+                    microvm_network
+                        .as_ref()
+                        .zip(microvm_egress_policy.as_ref())
+                        .zip(microvm_network_attachment.as_ref())
+                        .map(|((network, policy), attachment)| (network, policy, attachment)),
                     microvm_console_attachment.as_ref(),
                 )?;
                 (Some(fd), Some(state_msg), true, restore_time)
@@ -3861,7 +4405,12 @@ async fn run_control_inner(
         effective_command_line,
         has_microvm_block,
         microvm_console_attachment,
+        microvm_network,
+        microvm_network_attachment,
+        microvm_egress_policy,
         microvm_console_socket_cleanup: resources.microvm_console_socket_cleanup.take(),
+        #[cfg(target_os = "linux")]
+        _microvm_managed_tap: resources.microvm_managed_tap.take(),
         snapshot_memory_file,
         guest_power_actions: vm_controller::GuestPowerActions {
             shutdown: opt.guest_shutdown_action,

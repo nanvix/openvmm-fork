@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod egress;
 pub mod mac_address;
 
 /// Null backend.
@@ -27,6 +28,7 @@ pub mod null {
 
 /// Consomme backend.
 pub mod consomme {
+    use crate::mac_address::MacAddress;
     use mesh::MeshPayload;
     use vm_resource::ResourceId;
     use vm_resource::kind::NetEndpointHandleKind;
@@ -90,6 +92,19 @@ pub mod consomme {
         pub guest_port: u16,
     }
 
+    /// Exact static IPv4 identity used by the microVM network profile.
+    #[derive(Clone, Debug, MeshPayload)]
+    pub struct StaticIpv4Config {
+        /// Guest IPv4 address.
+        pub guest_ipv4: std::net::Ipv4Addr,
+        /// IPv4 subnet prefix length.
+        pub prefix_length: u8,
+        /// Host gateway IPv4 address.
+        pub gateway_ipv4: std::net::Ipv4Addr,
+        /// Host gateway Ethernet address.
+        pub gateway_mac: MacAddress,
+    }
+
     /// A runtime request to bind or unbind a port on a running Consomme endpoint.
     #[derive(MeshPayload)]
     pub enum ConsommeRequest {
@@ -108,6 +123,8 @@ pub mod consomme {
         pub ports: Vec<HostPortConfig>,
         /// Optional channel for runtime port bind/unbind after the endpoint starts.
         pub recv: Option<mesh::Receiver<ConsommeRequest>>,
+        /// Optional exact static identity, mutually exclusive with `cidr`.
+        pub static_ipv4: Option<StaticIpv4Config>,
     }
 
     impl ResourceId<NetEndpointHandleKind> for ConsommeHandle {

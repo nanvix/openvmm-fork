@@ -346,6 +346,62 @@ async fn ipv4_normal_destination_not_blocked(driver: DefaultDriver) {
 }
 
 #[test]
+fn static_ipv4_identity_is_exact_and_disables_ipv6_advertisement() {
+    let mut params = ConsommeParams::new().unwrap();
+    params
+        .set_static_ipv4(
+            Ipv4Addr::new(192, 168, 5, 37),
+            28,
+            Ipv4Addr::new(192, 168, 5, 33),
+            [0x52, 0x54, 0, 168, 5, 33],
+        )
+        .unwrap();
+
+    assert_eq!(params.client_ip, Ipv4Address::new(192, 168, 5, 37));
+    assert_eq!(params.gateway_ip, Ipv4Address::new(192, 168, 5, 33));
+    assert_eq!(params.net_mask, Ipv4Address::new(255, 255, 255, 240));
+    assert_eq!(
+        params.gateway_mac,
+        EthernetAddress([0x52, 0x54, 0, 168, 5, 33])
+    );
+    assert!(!params.advertise_routable_ipv6);
+    assert!(params.map_gateway_to_host_loopback);
+
+    let consomme = Consomme::new(params);
+    assert_eq!(
+        consomme
+            .state
+            .resolve_destination(&"192.168.5.33:8080".parse().unwrap()),
+        "127.0.0.1:8080".parse().unwrap()
+    );
+}
+
+#[test]
+fn static_ipv4_identity_rejects_inconsistent_values() {
+    let mut params = ConsommeParams::new().unwrap();
+    assert!(
+        params
+            .set_static_ipv4(
+                Ipv4Addr::new(10, 0, 0, 2),
+                31,
+                Ipv4Addr::new(10, 0, 0, 1),
+                [0x52, 0x54, 0, 0, 0, 1],
+            )
+            .is_err()
+    );
+    assert!(
+        params
+            .set_static_ipv4(
+                Ipv4Addr::new(10, 0, 0, 2),
+                24,
+                Ipv4Addr::new(10, 0, 0, 9),
+                [0x52, 0x54, 0, 0, 0, 9],
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn test_is_same_ipv6_subnet_basic() {
     let a = Ipv6Address::new(0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1);
     let b = Ipv6Address::new(0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 2);

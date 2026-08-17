@@ -767,6 +767,154 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     Ok(())
 }
 
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    requires(microvm_pvh),
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
+async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const BEFORE_MARKER: &[u8] = b"PHASE4-HTTP-BEFORE";
+    const AFTER_MARKER: &[u8] = b"PHASE4-HTTP-AFTER";
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("phase-4 test requires direct-boot Linux artifacts")?;
+    let hypervisor = if cfg!(windows) {
+        "whp"
+    } else if cfg!(target_os = "linux") {
+        "kvm"
+    } else {
+        anyhow::bail!("microVM phase-4 restore requires Windows/WHP or Linux/KVM");
+    };
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-phase4-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create phase-4 test directory")?;
+    let snapshot_dir = temp_dir.path().join("snapshot");
+
+    let listener = TcpListener::bind("0.0.0.0:0")?;
+    let http_port = listener.local_addr()?.port();
+    let (request_send, request_recv) = mpsc::channel();
+    let server = thread::spawn(move || -> anyhow::Result<()> {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(PHASE_2_TIMEOUT))?;
+            let mut request = [0u8; 4096];
+            let count = stream.read(&mut request)?;
+            anyhow::ensure!(
+                request[..count].starts_with(b"GET / HTTP/1."),
+                "unexpected phase-4 HTTP request"
+            );
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nPHASE4-HTTP-OK",
+            )?;
+            stream.flush()?;
+            request_send.send(()).ok();
+        }
+        Ok(())
+    });
+
+    let endpoint = format!("10.0.0.1:{http_port}");
+    let mut capture_args = phase_2_args(hypervisor);
+    capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--net".into(),
+        "10.0.0.2/24".into(),
+        "--allow-endpoint".into(),
+        endpoint.clone().into(),
+    ]);
+    let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.send_line(&format!(
+        "set -eu; \
+         [ \"$(wget -qO- http://10.0.0.1:{http_port}/)\" = PHASE4-HTTP-OK ]; \
+         echo PHASE4-HTTP-BEFORE; nvx-snapshot; \
+         [ \"$(wget -qO- http://10.0.0.1:{http_port}/)\" = PHASE4-HTTP-OK ]; \
+         echo PHASE4-HTTP-AFTER; nvx-exit 37"
+    ))?;
+    let (status, source_output) = source.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "phase-4 snapshot source exited with {status}; output: {}",
+        output_tail(&source_output)
+    );
+    anyhow::ensure!(
+        count_output_lines(&source_output, BEFORE_MARKER) == 1
+            && count_output_lines(&source_output, AFTER_MARKER) == 0,
+        "phase-4 source crossed the snapshot boundary"
+    );
+    request_recv
+        .recv_timeout(PHASE_2_TIMEOUT)
+        .context("phase-4 pre-snapshot HTTP request was not observed")?;
+    openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+
+    let mut missing_policy_args = phase_2_args(hypervisor);
+    missing_policy_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+    ]);
+    let missing_policy = OpenvmmTestProcess::launch(openvmm.get(), &missing_policy_args)?;
+    let (status, output) = missing_policy.wait()?;
+    anyhow::ensure!(
+        !status.success() && contains_bytes(&output, b"restore-time egress policy does not match"),
+        "phase-4 restore without policy was not rejected: {}",
+        output_tail(&output)
+    );
+
+    for restore_index in 0..2 {
+        let mut restore_args = phase_2_args(hypervisor);
+        restore_args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--restore-entropy".into(),
+            "--allow-endpoint".into(),
+            endpoint.clone().into(),
+        ]);
+        let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        restore.wait_for_output_line(AFTER_MARKER)?;
+        let (status, output) = restore.wait()?;
+        anyhow::ensure!(
+            status.code() == Some(37),
+            "phase-4 restore {restore_index} exited with {status}; output: {}",
+            output_tail(&output)
+        );
+        anyhow::ensure!(
+            count_output_lines(&output, AFTER_MARKER) == 1,
+            "phase-4 restore {restore_index} did not complete HTTP exactly once"
+        );
+        request_recv
+            .recv_timeout(PHASE_2_TIMEOUT)
+            .with_context(|| {
+                format!("phase-4 restore {restore_index} HTTP request was not observed")
+            })?;
+        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
+            .with_context(|| format!("phase-4 restore {restore_index} modified the snapshot"))?;
+    }
+    server
+        .join()
+        .map_err(|_| anyhow::anyhow!("phase-4 HTTP server panicked"))??;
+    Ok(())
+}
+
 #[openvmm_test_no_agent(ignore(
     reason = "requires a published microVM PVH kernel and initramfs",
     microvm_pvh_x64
@@ -814,7 +962,7 @@ exit 37
                     panic!("microVM test did not produce PVH load mode");
                 };
                 cmdline.push_str(" nvx_exec=/microvm-block-test.sh");
-                append_microvm_virtio_discovery(cmdline, false, true).unwrap();
+                append_microvm_virtio_discovery(cmdline, None, false, true).unwrap();
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
                     VirtioBlkHandle {
@@ -840,5 +988,119 @@ exit 37
         halt.detail
     );
 
+    vm.teardown().await
+}
+
+#[vmm_test_with(openvmm, noagent, requires(microvm_pvh), configs(microvm_pvh_x64))]
+async fn phase_4_virtio_net(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    use net_backend_resources::consomme::ConsommeHandle;
+    use net_backend_resources::consomme::StaticIpv4Config;
+    use net_backend_resources::egress::EgressPolicy;
+    use net_backend_resources::egress::EgressPolicyMode;
+    use openvmm_defs::config::LoadMode;
+    use openvmm_defs::config::MicrovmNetworkConfig;
+    use openvmm_defs::config::VirtioBus;
+    use openvmm_defs::config::append_microvm_virtio_discovery;
+    use openvmm_defs::config::microvm_virtio_net_irq;
+    use virtio_resources::net::VirtioNetHandle;
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const WORKLOAD: &[u8] = br#"#!/bin/sh
+set -eu
+tries=0
+device=
+while [ -z "$device" ] && [ "$tries" -lt 200 ]; do
+    for path in /sys/class/net/*; do
+        [ -e "$path" ] || continue
+        candidate=${path##*/}
+        [ "$candidate" = lo ] && continue
+        device=$candidate
+        break
+    done
+    [ -n "$device" ] || sleep 0.05
+    tries=$((tries + 1))
+done
+[ -n "$device" ] || exit 20
+grep -q 'virtio_mmio.device=0x1000@0xd0000000:' /proc/cmdline || exit 21
+grep -q 'virtnet_ip=10.0.0.2' /proc/cmdline || exit 22
+grep -q 'virtnet_mask=255.255.255.0' /proc/cmdline || exit 23
+grep -q 'virtnet_gw=10.0.0.1' /proc/cmdline || exit 24
+[ "$(cat /sys/class/net/$device/address)" = '52:54:00:00:00:02' ] || exit 25
+grep -qi 'd0000000-d0000fff.*virtio' /proc/iomem || exit 26
+ifconfig "$device" 10.0.0.2 netmask 255.255.255.0 up || exit 27
+route add default gw 10.0.0.1 dev "$device" 2>/dev/null || true
+ping -c 1 -W 5 10.0.0.1 >/dev/null || exit 28
+exit 37
+"#;
+
+    let modified_initrd =
+        config.prepare_initrd_with_file("microvm-net-test.sh", WORKLOAD, 0o100755)?;
+    let network: MicrovmNetworkConfig = "10.0.0.2/24".parse()?;
+    let static_ipv4 = StaticIpv4Config {
+        guest_ipv4: network.guest_ipv4,
+        prefix_length: network.prefix_length,
+        gateway_ipv4: network.derived_gateway_ipv4,
+        gateway_mac: network.gateway_mac,
+    };
+    let endpoint = ConsommeHandle {
+        cidr: None,
+        ports: Vec::new(),
+        recv: None,
+        static_ipv4: Some(static_ipv4.clone()),
+    }
+    .into_resource();
+    let policy = EgressPolicy::new(
+        network.guest_ipv4,
+        network.derived_gateway_ipv4,
+        EgressPolicyMode::AllowAll,
+    );
+    let irq = microvm_virtio_net_irq(None)?;
+
+    let mut vm = config
+        .with_prebuilt_initrd(modified_initrd.to_path_buf())
+        .with_microvm_machine()
+        .modify_backend(move |backend| {
+            backend.with_custom_config(|config| {
+                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
+                    panic!("microVM test did not produce PVH load mode");
+                };
+                cmdline.push_str(" nvx_exec=/microvm-net-test.sh");
+                append_microvm_virtio_discovery(
+                    cmdline,
+                    Some((&network, irq, cfg!(windows))),
+                    false,
+                    false,
+                )
+                .unwrap();
+                config.microvm_network = Some(network.clone());
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
+                    VirtioNetHandle {
+                        max_queues: Some(1),
+                        mac_address: network.guest_mac,
+                        endpoint,
+                        egress_policy: Some(policy),
+                        save_restore: true,
+                        static_ipv4: Some(static_ipv4),
+                        effective_features: Some(openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES),
+                    }
+                    .into_resource(),
+                ));
+            })
+        })
+        .run_without_agent()
+        .await?;
+
+    let halt = CancelContext::new()
+        .with_timeout(TIMEOUT)
+        .until_cancelled(vm.wait_for_halt())
+        .await
+        .context("timed out waiting for microVM network workload")??;
+    assert_eq!(halt.reason, PetriHaltReason::PowerOff);
+    assert!(
+        halt.detail.contains("code: 37"),
+        "microVM network workload failed: {}",
+        halt.detail
+    );
     vm.teardown().await
 }

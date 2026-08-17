@@ -862,6 +862,10 @@ impl VmService {
             );
         }
         let prepared_restore = if let Some(restore) = &authoritative_restore {
+            anyhow::ensure!(
+                restore.machine_contract.microvm_network.is_none(),
+                "ttrpc restore does not yet expose microVM network policy or endpoint attachments"
+            );
             let (fd, state, restore_time) = crate::prepare_snapshot_restore_for_config(
                 &restore.path,
                 restore.memory_size,
@@ -869,6 +873,7 @@ impl VmService {
                 Some((
                     &source_hypervisor,
                     &restore.machine_contract.effective_command_line,
+                    None,
                     restore
                         .machine_contract
                         .attachments
@@ -1331,6 +1336,7 @@ impl VmService {
             chipset_capabilities: chipset.capabilities,
             layout: layout_config,
             rtc_delta_milliseconds: 0,
+            microvm_network: None,
         };
 
         let guest_power_actions = {
@@ -1627,7 +1633,12 @@ impl VmService {
             let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
                 unreachable!("microVM was validated with pvh_boot");
             };
-            openvmm_defs::config::append_microvm_virtio_discovery(cmdline, has_console, has_block)?;
+            openvmm_defs::config::append_microvm_virtio_discovery(
+                cmdline,
+                None,
+                has_console,
+                has_block,
+            )?;
         }
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
@@ -1770,7 +1781,12 @@ impl VmService {
             effective_command_line,
             has_microvm_block,
             microvm_console_attachment,
+            microvm_network: None,
+            microvm_network_attachment: None,
+            microvm_egress_policy: None,
             microvm_console_socket_cleanup,
+            #[cfg(target_os = "linux")]
+            _microvm_managed_tap: None,
             snapshot_memory_file,
             guest_power_actions,
         };
@@ -2150,6 +2166,7 @@ fn parse_nic_config(
             } else {
                 Some(consomme.cidr)
             },
+            static_ipv4: None,
             ports: consomme
                 .ports
                 .into_iter()
@@ -2597,6 +2614,10 @@ async fn build_virtio_device(
                     .parse::<MacAddress>()
                     .context("invalid mac address")?,
                 endpoint,
+                egress_policy: None,
+                save_restore: false,
+                static_ipv4: None,
+                effective_features: None,
             }
             .into_resource()
         }
@@ -2657,6 +2678,7 @@ fn build_nic_backend(
         Kind::Consomme(vmservice::ConsommeBackend { cidr, ports }) => {
             net_backend_resources::consomme::ConsommeHandle {
                 cidr: (!cidr.is_empty()).then_some(cidr),
+                static_ipv4: None,
                 ports: ports
                     .into_iter()
                     .map(parse_port_config)

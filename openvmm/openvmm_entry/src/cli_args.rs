@@ -625,6 +625,22 @@ options:
     #[clap(long)]
     pub net: Vec<NicConfigCli>,
 
+    /// Attach the microVM NIC to a preconfigured Linux TAP instead of creating one.
+    #[clap(long, value_name = "NAME")]
+    pub net_tap: Option<String>,
+
+    /// Permit only these IPv4 destinations or CIDRs from the microVM guest.
+    #[clap(long, value_name = "IPv4[/PREFIX]", conflicts_with_all = ["block_host", "allow_endpoint"])]
+    pub allow_host: Vec<net_backend_resources::egress::Ipv4Cidr>,
+
+    /// Permit IPv4 except for these destinations or CIDRs from the microVM guest.
+    #[clap(long, value_name = "IPv4[/PREFIX]", conflicts_with_all = ["allow_host", "allow_endpoint"])]
+    pub block_host: Vec<net_backend_resources::egress::Ipv4Cidr>,
+
+    /// Permit only these exact IPv4 TCP destinations from the microVM guest.
+    #[clap(long, value_name = "IPv4:TCP-PORT", conflicts_with_all = ["allow_host", "block_host"])]
+    pub allow_endpoint: Vec<net_backend_resources::egress::TcpEndpoint>,
+
     /// expose a virtual NIC using the Windows kernel-mode vmswitch.
     ///
     /// Specify the switch ID or "default" for the default switch.
@@ -1434,6 +1450,13 @@ impl Options {
     /// Rejects unsupported microVM combinations before opening host resources.
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
         if self.machine != MachineProfileCli::Microvm {
+            anyhow::ensure!(
+                self.net_tap.is_none()
+                    && self.allow_host.is_empty()
+                    && self.block_host.is_empty()
+                    && self.allow_endpoint.is_empty(),
+                "--net-tap and microVM egress policy require --machine microvm"
+            );
             return Ok(());
         }
 
@@ -1474,6 +1497,12 @@ impl Options {
                 "microVM snapshot capture with virtio-blk is unavailable until immutable media identity is implemented"
             );
         }
+        if self.restore_snapshot.is_some() {
+            anyhow::ensure!(
+                self.net.is_empty(),
+                "microVM restore takes network addressing from saved state; do not pass --net"
+            );
+        }
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
             "microVM ABI version 1 requires Xen PVH direct boot"
@@ -1510,8 +1539,8 @@ impl Options {
         if let Some(hypervisor) = self.hypervisor.as_deref() {
             let name = hypervisor.split(':').next().unwrap_or(hypervisor);
             anyhow::ensure!(
-                matches!(name, "kvm" | "whp"),
-                "microVM ABI version 1 requires KVM or WHP"
+                (cfg!(target_os = "linux") && name == "kvm") || (cfg!(windows) && name == "whp"),
+                "microVM ABI version 1 requires KVM on Linux or WHP on Windows"
             );
         }
 
@@ -1588,7 +1617,6 @@ impl Options {
         );
         anyhow::ensure!(
             !self.nic
-                && self.net.is_empty()
                 && self.mana.is_empty()
                 && !self.gfx
                 && !self.vtl2_gfx
@@ -1598,7 +1626,38 @@ impl Options {
                 && self.imc.is_none()
                 && !self.battery
                 && self.vmgs.is_none(),
-            "microVM ABI version 1 does not expose network, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
+            "microVM ABI version 1 does not expose legacy NIC, MANA, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
+        );
+        anyhow::ensure!(
+            self.net.len() <= 1,
+            "microVM ABI version 1 permits at most one virtio-net device"
+        );
+        anyhow::ensure!(
+            self.net.iter().all(|network| {
+                matches!(network.endpoint, EndpointConfigCli::Microvm(_))
+                    && network.vtl == DeviceVtl::Vtl0
+                    && network.max_queues.is_none()
+                    && !network.underhill
+                    && network.pcie_port.is_none()
+            }),
+            "microVM --net requires a bare IPv4/prefix and does not permit queue, VTL, Underhill, or PCIe modifiers"
+        );
+        anyhow::ensure!(
+            self.net_tap.is_none() || !self.net.is_empty() || self.restore_snapshot.is_some(),
+            "--net-tap requires --net on cold boot or a networked snapshot restore"
+        );
+        anyhow::ensure!(
+            (self.allow_host.is_empty()
+                && self.block_host.is_empty()
+                && self.allow_endpoint.is_empty())
+                || !self.net.is_empty()
+                || self.restore_snapshot.is_some(),
+            "--allow-host, --block-host, and --allow-endpoint require --net or a networked snapshot restore"
+        );
+        #[cfg(not(target_os = "linux"))]
+        anyhow::ensure!(
+            self.net_tap.is_none(),
+            "--net-tap is available only with the Linux/KVM microVM backend"
         );
         anyhow::ensure!(
             self.cxl_test.is_empty()
@@ -1623,6 +1682,28 @@ impl Options {
         );
 
         Ok(())
+    }
+
+    pub(crate) fn microvm_egress_policy(
+        &self,
+        network: &openvmm_defs::config::MicrovmNetworkConfig,
+    ) -> net_backend_resources::egress::EgressPolicy {
+        use net_backend_resources::egress::EgressPolicyMode;
+
+        let mode = if !self.allow_host.is_empty() {
+            EgressPolicyMode::AllowList(self.allow_host.clone())
+        } else if !self.block_host.is_empty() {
+            EgressPolicyMode::BlockList(self.block_host.clone())
+        } else if !self.allow_endpoint.is_empty() {
+            EgressPolicyMode::TcpEndpoints(self.allow_endpoint.clone())
+        } else {
+            EgressPolicyMode::AllowAll
+        };
+        net_backend_resources::egress::EgressPolicy::new(
+            network.guest_ipv4,
+            network.derived_gateway_ipv4,
+            mode,
+        )
     }
 }
 
@@ -2740,6 +2821,7 @@ pub enum EndpointConfigCli {
     Tap {
         name: String,
     },
+    Microvm(openvmm_defs::config::MicrovmNetworkConfig),
 }
 
 /// Parsed host port forwarding configuration from the CLI.
@@ -2837,6 +2919,12 @@ impl FromStr for EndpointConfigCli {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('/') && !s.contains(':') {
+            return s
+                .parse()
+                .map(EndpointConfigCli::Microvm)
+                .map_err(|error| format!("invalid microVM network: {error}"));
+        }
         let ret = match s.split(':').collect::<Vec<_>>().as_slice() {
             ["none"] => EndpointConfigCli::None,
             ["consomme", rest @ ..] => {
@@ -4267,6 +4355,32 @@ mod tests {
             _ => panic!("Expected Tap variant"),
         }
 
+        match EndpointConfigCli::from_str("10.0.0.2/24").unwrap() {
+            EndpointConfigCli::Microvm(network) => {
+                assert_eq!(network.guest_ipv4, std::net::Ipv4Addr::new(10, 0, 0, 2));
+                assert_eq!(network.prefix_length, 24);
+                assert_eq!(network.netmask(), std::net::Ipv4Addr::new(255, 255, 255, 0));
+                assert_eq!(
+                    network.derived_gateway_ipv4,
+                    std::net::Ipv4Addr::new(10, 0, 0, 1)
+                );
+                assert_eq!(network.guest_mac.to_bytes(), [0x52, 0x54, 0, 0, 0, 2]);
+                assert_eq!(network.gateway_mac.to_bytes(), [0x52, 0x54, 0, 0, 0, 1]);
+            }
+            _ => panic!("Expected microVM network variant"),
+        }
+        for invalid in [
+            "10.0.0.2",
+            "10.0.0.2/0",
+            "10.0.0.2/31",
+            "10.0.0.0/24",
+            "10.0.0.1/24",
+            "10.0.0.255/24",
+            "fd00::2/64",
+        ] {
+            assert!(EndpointConfigCli::from_str(invalid).is_err(), "{invalid}");
+        }
+
         // Test error case
         assert!(EndpointConfigCli::from_str("invalid").is_err());
     }
@@ -5169,7 +5283,7 @@ mod tests {
         );
 
         let mut with_devices = build_microvm_command_line(&[], true).unwrap();
-        append_microvm_virtio_discovery(&mut with_devices, true, true).unwrap();
+        append_microvm_virtio_discovery(&mut with_devices, None, true, true).unwrap();
         assert_eq!(
             with_devices,
             format!(
@@ -5177,7 +5291,48 @@ mod tests {
             )
         );
 
-        for reserved in ["earlycon=uart", "console=ttyS0", "virtio_mmio.device=bad"] {
+        let network = "10.0.0.2/24".parse().unwrap();
+        let mut with_network = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_network,
+            Some((
+                &network,
+                openvmm_defs::config::MICROVM_VIRTIO_NET_KVM_IRQ,
+                false,
+            )),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            with_network,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0000000:10 virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1"
+            )
+        );
+        let mut with_whp_network = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_whp_network,
+            Some((
+                &network,
+                openvmm_defs::config::MICROVM_VIRTIO_NET_WHP_IRQ,
+                true,
+            )),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(with_whp_network.ends_with("virtnet_dns=10.0.0.1"));
+
+        for reserved in [
+            "earlycon=uart",
+            "console=ttyS0",
+            "virtio_mmio.device=bad",
+            "virtnet_ip=10.0.0.3",
+            "virtnet_mask=255.255.255.0",
+            "virtnet_gw=10.0.0.1",
+            "virtnet_dns=10.0.0.1",
+        ] {
             assert!(build_microvm_command_line(&[reserved.into()], false).is_err());
         }
         assert!(build_microvm_command_line(&["foo=bar\0baz".into()], false).is_err());
@@ -5200,6 +5355,10 @@ mod tests {
         ])
         .unwrap();
         valid_console.validate_microvm_options().unwrap();
+        let valid_network =
+            Options::try_parse_from(["openvmm", "--machine", "microvm", "--net", "10.0.0.2/24"])
+                .unwrap();
+        valid_network.validate_microvm_options().unwrap();
 
         for args in [
             vec!["openvmm", "--machine", "microvm", "--processors", "2"],
@@ -5223,10 +5382,95 @@ mod tests {
                 "--virtio-console-pcie-port",
                 "port0",
             ],
+            vec!["openvmm", "--machine", "microvm", "--net", "consomme"],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--net",
+                "10.0.1.2/24",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "queues=1:10.0.0.2/24",
+            ],
         ] {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
+    }
+
+    #[test]
+    fn test_microvm_egress_policy_is_typed_and_canonical() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--allow-host",
+            "192.168.1.9/24",
+            "--allow-host",
+            "10.0.0.1",
+            "--allow-host",
+            "192.168.1.0/24",
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = options.microvm_egress_policy(&network);
+        let net_backend_resources::egress::EgressPolicyMode::AllowList(rules) = policy.mode()
+        else {
+            panic!("expected allow-list policy")
+        };
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].network(), std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(rules[1].network(), std::net::Ipv4Addr::new(192, 168, 1, 0));
+        assert!(policy.allows_gateway_dns());
+
+        let endpoint = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--allow-endpoint",
+            "192.0.2.7:443",
+        ])
+        .unwrap();
+        endpoint.validate_microvm_options().unwrap();
+
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--allow-host",
+                "192.0.2.0/24",
+                "--block-host",
+                "198.51.100.1",
+            ])
+            .is_err()
+        );
+        let missing_network = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--allow-host",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        assert!(missing_network.validate_microvm_options().is_err());
+        let standard =
+            Options::try_parse_from(["openvmm", "--allow-endpoint", "192.0.2.7:443"]).unwrap();
+        assert!(standard.validate_microvm_options().is_err());
     }
 
     #[test]

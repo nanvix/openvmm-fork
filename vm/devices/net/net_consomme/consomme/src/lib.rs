@@ -185,6 +185,8 @@ pub struct ConsommeParams {
     /// If true, allow guest traffic destined for host-local addresses
     /// (loopback, unspecified, link-local).
     pub allow_host_local_access: bool,
+    /// If true, translate guest traffic to the IPv4 gateway onto host loopback.
+    pub map_gateway_to_host_loopback: bool,
     /// Per-connection TCP receive ring buffer bounds (guest-to-host).
     pub tcp_rx_buffer: TcpBufferBounds,
     /// Per-connection TCP transmit ring buffer bounds (host-to-guest).
@@ -222,6 +224,11 @@ impl TcpBufferBounds {
 #[error("invalid CIDR")]
 pub struct InvalidCidr;
 
+/// An error indicating that a static IPv4 identity is internally inconsistent.
+#[derive(Debug, Error)]
+#[error("invalid static IPv4 identity")]
+pub struct InvalidStaticIpv4;
+
 impl ConsommeParams {
     /// Create default dynamic network state. The default state is
     ///     IP address: 10.0.0.2 / 24
@@ -250,6 +257,7 @@ impl ConsommeParams {
             udp_timeout: Duration::from_secs(300),
             skip_ipv6_checks: false,
             allow_host_local_access: false,
+            map_gateway_to_host_loopback: false,
             tcp_rx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
             tcp_tx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
         })
@@ -269,6 +277,35 @@ impl ConsommeParams {
         client_octets[3] += 2;
         self.client_ip = Ipv4Address::from(client_octets);
         self.net_mask = cidr.netmask();
+        Ok(())
+    }
+
+    /// Sets an exact static IPv4 client and gateway identity.
+    pub fn set_static_ipv4(
+        &mut self,
+        guest_ipv4: Ipv4Addr,
+        prefix_length: u8,
+        gateway_ipv4: Ipv4Addr,
+        gateway_mac: [u8; 6],
+    ) -> Result<(), InvalidStaticIpv4> {
+        if !(1..=30).contains(&prefix_length) {
+            return Err(InvalidStaticIpv4);
+        }
+        let mask = u32::MAX << (32 - prefix_length);
+        let guest = u32::from(guest_ipv4);
+        let gateway = u32::from(gateway_ipv4);
+        let network = guest & mask;
+        let broadcast = network | !mask;
+        if guest == network || guest == broadcast || gateway != network + 1 || guest == gateway {
+            return Err(InvalidStaticIpv4);
+        }
+
+        self.client_ip = Ipv4Address::from(guest_ipv4.octets());
+        self.gateway_ip = Ipv4Address::from(gateway_ipv4.octets());
+        self.net_mask = Ipv4Address::from(Ipv4Addr::from(mask).octets());
+        self.gateway_mac = EthernetAddress(gateway_mac);
+        self.advertise_routable_ipv6 = false;
+        self.map_gateway_to_host_loopback = true;
         Ok(())
     }
 
@@ -491,6 +528,12 @@ impl ConsommeState {
     /// virtual mapped address, return the real host address. Otherwise return
     /// the address unchanged.
     fn resolve_destination(&self, addr: &SocketAddr) -> SocketAddr {
+        if self.params.map_gateway_to_host_loopback
+            && let SocketAddr::V4(address) = addr
+            && *address.ip() == self.params.gateway_ip
+        {
+            return SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()));
+        }
         let ip = addr.ip();
         if let Some(real_ip) = self.local_addr_map.resolve_virtual(&ip) {
             SocketAddr::new(real_ip, addr.port())
