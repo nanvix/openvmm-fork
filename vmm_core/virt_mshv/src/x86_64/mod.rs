@@ -358,6 +358,31 @@ impl virt::Partition for MshvPartition {
         virt::x86::CpuCompatibilityContract::new(&self.inner.caps, &self.inner.cpuid)
     }
 
+    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(
+            self.inner
+                .vmfd
+                .get_partition_property(HvPartitionPropertyCode::ProcessorClockFrequency.0)
+                .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?,
+        ))
+    }
+
+    fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
+        let destination = self
+            .inner
+            .vmfd
+            .get_partition_property(HvPartitionPropertyCode::ProcessorClockFrequency.0)
+            .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?;
+        if frequency_hz != destination {
+            return Err(ErrorInner::TscFrequencyMismatch {
+                saved: frequency_hz,
+                destination,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
         Some(self)
     }
@@ -406,8 +431,26 @@ impl virt::X86Partition for MshvPartition {
     }
 
     fn pulse_lint(&self, vp_index: VpIndex, vtl: Vtl, lint: u8) {
-        // TODO
-        tracelimit::warn_ratelimited!(?vp_index, ?vtl, lint, "ignored lint pulse");
+        if vtl != Vtl::Vtl0 || lint != 0 {
+            tracelimit::warn_ratelimited!(?vp_index, ?vtl, lint, "unsupported lint pulse");
+            return;
+        }
+        let Some(vp) = self.inner.vps.get(vp_index.index() as usize) else {
+            tracelimit::warn_ratelimited!(?vp_index, "lint pulse for invalid VP");
+            return;
+        };
+        vp.extint_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(waker) = &*vp.waker.read() {
+            waker.wake_by_ref();
+        }
+        if let Some(thread) = *vp.thread.read()
+            && thread != Pthread::current()
+        {
+            thread
+                .signal(libc::SIGRTMIN())
+                .expect("thread interrupt signal failed");
+        }
     }
 }
 
@@ -624,11 +667,52 @@ impl MshvProcessor<'_> {
                 let msg = exit.as_message::<hvdef::HvX64ApicEoiMessage>();
                 dev.handle_eoi(msg.interrupt_vector);
             }
+            HvMessageType::HvMessageTypeX64InterruptionDeliverable => {
+                self.handle_interrupt_deliverable(exit, dev);
+            }
             exit_type => {
                 panic!("Unhandled vcpu exit code {exit_type:?}");
             }
         }
         Ok(())
+    }
+
+    fn handle_interrupt_deliverable(&mut self, message: &HvMessage, dev: &impl CpuIo) {
+        let message = message.as_message::<hvdef::HvX64InterruptionDeliverableMessage>();
+        if message.deliverable_type != hvdef::HvX64PendingInterruptionType::HV_X64_PENDING_INTERRUPT
+        {
+            tracelimit::warn_ratelimited!(
+                deliverable_type = ?message.deliverable_type,
+                "unsupported interruption deliverability notification"
+            );
+            return;
+        }
+
+        self.inner
+            .extint_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        let notifications = self
+            .deliverability_notifications
+            .with_interrupt_notification(false);
+        self.partition
+            .vmfd
+            .register_deliverabilty_notifications(self.vpindex.index(), u64::from(notifications))
+            .expect("requesting deliverability is not a fallible operation");
+        self.deliverability_notifications = notifications;
+
+        if let Some(vector) = dev.acknowledge_pic_interrupt() {
+            let event = hvdef::HvX64PendingExtIntEvent::new()
+                .with_event_pending(true)
+                .with_event_type(hvdef::HV_X64_PENDING_EVENT_EXT_INT)
+                .with_vector(vector);
+            self.runner
+                .vcpufd
+                .set_hvdef_regs(&[HvRegisterAssoc::from((
+                    HvX64RegisterName::PendingEvent0,
+                    u128::from(event),
+                ))])
+                .expect("setting a pending ExtINT event is not a fallible operation");
+        }
     }
 
     async fn handle_io_port_intercept(

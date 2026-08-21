@@ -412,8 +412,8 @@ pub fn microvm_v1_machine_contract(
     cpu_contract: Vec<u8>,
 ) -> anyhow::Result<SnapshotMachineContract> {
     anyhow::ensure!(
-        matches!(source_hypervisor, "kvm" | "whp"),
-        "microVM snapshots require the KVM or WHP hypervisor"
+        matches!(source_hypervisor, "kvm" | "mshv" | "whp"),
+        "microVM snapshots require the KVM, MSHV, or WHP hypervisor"
     );
     const LOW_RAM_END: u64 = 3 * 1024 * 1024 * 1024;
     const HIGH_RAM_START: u64 = 4 * 1024 * 1024 * 1024;
@@ -518,7 +518,7 @@ pub fn microvm_v1_machine_contract(
     let mut attachments = Vec::new();
     let microvm_network = if let Some((network, egress_policy, attachment)) = network {
         let policy_is_valid = match source_hypervisor {
-            "kvm" => match attachment.reconnect_policy.as_str() {
+            "kvm" | "mshv" => match attachment.reconnect_policy.as_str() {
                 "recreate-endpoint" => {
                     !attachment.required
                         && attachment.identity_kind == "managed-tap"
@@ -597,7 +597,7 @@ pub fn microvm_v1_machine_contract(
                 && attachment.required
                 && attachment.reconnect_policy == "live-revalidate"
                 && match source_hypervisor {
-                    "kvm" => attachment.identity_kind == "unix-device-inode-v1",
+                    "kvm" | "mshv" => attachment.identity_kind == "unix-device-inode-v1",
                     "whp" => attachment.identity_kind == "windows-volume-file-id-v1",
                     _ => false,
                 }
@@ -1965,7 +1965,7 @@ mod tests {
 
     fn microvm_network_attachment(source_hypervisor: &str) -> SnapshotAttachment {
         let (identity_kind, identity) = match source_hypervisor {
-            "kvm" => ("managed-tap", b"managed".as_slice()),
+            "kvm" | "mshv" => ("managed-tap", b"managed".as_slice()),
             "whp" => ("user-mode-nat", b"consomme".as_slice()),
             _ => unreachable!(),
         };
@@ -1988,7 +1988,7 @@ mod tests {
             required: true,
             reconnect_policy: "live-revalidate".to_owned(),
             identity_kind: match source_hypervisor {
-                "kvm" => "unix-device-inode-v1",
+                "kvm" | "mshv" => "unix-device-inode-v1",
                 "whp" => "windows-volume-file-id-v1",
                 _ => unreachable!(),
             }
@@ -2133,7 +2133,7 @@ mod tests {
 
     #[test]
     fn generated_microvm_network_contract_has_backend_specific_fixed_abi() {
-        for (source_hypervisor, irq) in [("kvm", 10), ("whp", 5)] {
+        for (source_hypervisor, irq) in [("kvm", 10), ("mshv", 10), ("whp", 5)] {
             let contract = generated_network_contract(source_hypervisor);
             let network_device = contract.devices.last().unwrap();
             assert_eq!(network_device.stable_id, "net:microvm0");
@@ -2170,7 +2170,7 @@ mod tests {
 
     #[test]
     fn generated_microvm_filesystem_contract_has_fixed_abi() {
-        for source_hypervisor in ["kvm", "whp"] {
+        for source_hypervisor in ["kvm", "mshv", "whp"] {
             let contract = generated_filesystem_contract(source_hypervisor);
             let filesystem_device = contract.devices.last().unwrap();
             assert_eq!(filesystem_device.stable_id, "fs:microvm0");

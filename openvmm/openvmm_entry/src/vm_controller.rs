@@ -584,8 +584,8 @@ impl VmController {
                 "guest-requested snapshot capture requires microVM ABI version 1"
             );
             anyhow::ensure!(
-                matches!(self.source_hypervisor.as_str(), "kvm" | "whp"),
-                "microVM snapshot source backend must be KVM or WHP"
+                matches!(self.source_hypervisor.as_str(), "kvm" | "mshv" | "whp"),
+                "microVM snapshot source backend must be KVM, MSHV, or WHP"
             );
             anyhow::ensure!(
                 !self.has_microvm_block,

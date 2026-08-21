@@ -31,6 +31,20 @@ const MICROVM_BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
 const PHASE_2_TIMEOUT: Duration = Duration::from_secs(60);
 const PHASE_3_TX_COUNT: usize = 10_000;
 
+fn microvm_hypervisor() -> anyhow::Result<&'static str> {
+    if cfg!(windows) {
+        Ok("whp")
+    } else if cfg!(target_os = "linux") {
+        Ok(if Path::new("/dev/mshv").exists() {
+            "mshv"
+        } else {
+            "kvm"
+        })
+    } else {
+        anyhow::bail!("microVM tests require Windows/WHP or Linux/KVM/MSHV")
+    }
+}
+
 struct OpenvmmTestProcess {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -436,13 +450,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     let initrd = config
         .prepare_initrd_with_file("openvmm-reseed", &reseed_helper, 0o100755)
         .context("failed to inject the guest reseed helper")?;
-    let hypervisor = if cfg!(windows) {
-        "whp"
-    } else if cfg!(target_os = "linux") {
-        "kvm"
-    } else {
-        anyhow::bail!("microVM phase-2 restore requires Windows/WHP or Linux/KVM");
-    };
+    let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
             .prefix("openvmm-phase2-")
@@ -646,13 +654,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     let (kernel, initrd) = config
         .linux_direct_boot_files()
         .context("phase-3 test requires direct-boot Linux artifacts")?;
-    let hypervisor = if cfg!(windows) {
-        "whp"
-    } else if cfg!(target_os = "linux") {
-        "kvm"
-    } else {
-        anyhow::bail!("microVM phase-3 restore requires Windows/WHP or Linux/KVM");
-    };
+    let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
             .prefix("openvmm-phase3-")
@@ -787,13 +789,7 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
     let (kernel, initrd) = config
         .linux_direct_boot_files()
         .context("phase-4 test requires direct-boot Linux artifacts")?;
-    let hypervisor = if cfg!(windows) {
-        "whp"
-    } else if cfg!(target_os = "linux") {
-        "kvm"
-    } else {
-        anyhow::bail!("microVM phase-4 restore requires Windows/WHP or Linux/KVM");
-    };
+    let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
             .prefix("openvmm-phase4-")
@@ -935,13 +931,7 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
     let (kernel, initrd) = config
         .linux_direct_boot_files()
         .context("phase-5 test requires direct-boot Linux artifacts")?;
-    let hypervisor = if cfg!(windows) {
-        "whp"
-    } else if cfg!(target_os = "linux") {
-        "kvm"
-    } else {
-        anyhow::bail!("microVM phase-5 restore requires Windows/WHP or Linux/KVM");
-    };
+    let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
             .prefix("openvmm-phase5-")

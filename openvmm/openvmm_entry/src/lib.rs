@@ -714,7 +714,7 @@ fn microvm_network_attachment(
     #[cfg(not(any(target_os = "linux", windows)))]
     let (required, reconnect_policy, identity_kind, identity) = {
         let _ = net_tap;
-        anyhow::bail!("microVM networking requires Linux/KVM or Windows/WHP")
+        anyhow::bail!("microVM networking requires Linux KVM/MSHV or Windows WHP")
     };
 
     Ok(openvmm_helpers::snapshot::SnapshotAttachment {
@@ -920,7 +920,7 @@ fn canonical_microvm_filesystem_root(
     };
     #[cfg(not(any(unix, windows)))]
     let (identity_kind, identity) =
-        { anyhow::bail!("microVM virtio-fs requires Linux/KVM or Windows/WHP") };
+        { anyhow::bail!("microVM virtio-fs requires Linux KVM/MSHV or Windows WHP") };
     anyhow::ensure!(
         !identity.is_empty() && identity.len() <= 4096,
         "microVM filesystem root identity is empty or exceeds 4096 bytes"
@@ -3915,7 +3915,7 @@ fn microvm_network_endpoint(
     _net_tap: Option<&str>,
     _resources: &mut VmResources,
 ) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
-    anyhow::bail!("microVM virtio-net requires Linux/KVM or Windows/WHP")
+    anyhow::bail!("microVM virtio-net requires Linux KVM/MSHV or Windows WHP")
 }
 
 #[cfg(target_os = "linux")]
