@@ -358,6 +358,31 @@ impl virt::Partition for MshvPartition {
         virt::x86::CpuCompatibilityContract::new(&self.inner.caps, &self.inner.cpuid)
     }
 
+    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(
+            self.inner
+                .vmfd
+                .get_partition_property(HvPartitionPropertyCode::ProcessorClockFrequency.0)
+                .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?,
+        ))
+    }
+
+    fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
+        let destination = self
+            .inner
+            .vmfd
+            .get_partition_property(HvPartitionPropertyCode::ProcessorClockFrequency.0)
+            .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?;
+        if frequency_hz != destination {
+            return Err(ErrorInner::TscFrequencyMismatch {
+                saved: frequency_hz,
+                destination,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
         Some(self)
     }
