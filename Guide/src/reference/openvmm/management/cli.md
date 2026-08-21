@@ -11,10 +11,14 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
 * `--machine <PROFILE>`: Select the guest-visible machine contract. The
   default is `standard`. `microvm` selects microVM ABI version 1, an x86-64
-  Xen PVH machine that runs on KVM or WHP with exactly one vCPU:
+  Xen PVH machine that runs on KVM, MSHV, or WHP with exactly one vCPU. On
+  Linux, auto-detection prefers MSHV when `/dev/mshv` is available and falls
+  back to KVM:
 
   ```bash
   openvmm --machine microvm --hypervisor kvm \
+    --kernel vmlinux --initrd initramfs.cpio.gz
+  openvmm --machine microvm --hypervisor mshv \
     --kernel vmlinux --initrd initramfs.cpio.gz
   openvmm --machine microvm --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz
@@ -38,14 +42,14 @@ as well as the generated CLI help (via `cargo run -- --help`).
   restart remain unavailable.
 
   Guest-requested snapshot capture and new-process restore are available for
-  the no-block ABI-v1 machine on Linux/KVM and Windows/WHP, including an
-  active virtio console. Capture with the optional virtio-blk device is
-  rejected until immutable media identity is implemented.
+  the no-block ABI-v1 machine on Linux/KVM, Linux/MSHV, and Windows/WHP,
+  including an active virtio console. Capture with the optional virtio-blk
+  device is rejected until immutable media identity is implemented.
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
-  at MMIO `0xd0000000`. KVM uses IRQ 10 and WHP uses IRQ 5. Prefixes `/1`
-  through `/30` are accepted. The first usable subnet address becomes the
-  gateway; network, broadcast, and gateway addresses cannot be assigned to
-  the guest. Guest and gateway MAC addresses are derived as
+  at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
+  `/1` through `/30` are accepted. The first usable subnet address becomes
+  the gateway; network, broadcast, and gateway addresses cannot be assigned
+  to the guest. Guest and gateway MAC addresses are derived as
   `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses.
 
   ```bash
@@ -54,11 +58,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
     --net 10.0.0.2/24
   ```
 
-  On Linux/KVM, OpenVMM creates, addresses, and removes a managed TAP. This
-  requires root or non-interactive `sudo ip` access. `--net-tap <NAME>` uses
-  an existing TAP instead; its link state, gateway address, and gateway MAC
-  are validated, and OpenVMM does not remove it. Forwarding or NAT beyond the
-  host is operator policy. On Windows/WHP, OpenVMM uses an in-process
+  On Linux/KVM or MSHV, OpenVMM creates, addresses, and removes a managed TAP.
+  This requires root or non-interactive `sudo ip` access. `--net-tap <NAME>`
+  uses an existing TAP instead; its link state, gateway address, and gateway
+  MAC are validated, and OpenVMM does not remove it. Forwarding or NAT beyond
+  the host is operator policy. On Windows/WHP, OpenVMM uses an in-process
   Consomme endpoint and advertises the gateway DNS proxy when policy permits
   it.
 
@@ -112,8 +116,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
   timeout and defaults to 5000. A request with no configured destination is
   ignored and the guest continues. Capture currently requires microVM ABI v1,
-  one vCPU, KVM or WHP, shared file-backed RAM, and no virtio-blk device. An
-  attached virtio console saves accepted but undelivered input and the offset
+  one vCPU, KVM, MSHV, or WHP, shared file-backed RAM, and no virtio-blk
+  device. An attached virtio console saves accepted but undelivered input and the offset
   of a partially forwarded guest transmit descriptor. An attached microVM
   virtio-net device saves its static identity, queue progress, drained packet
   ownership, endpoint generation, and policy requirement.

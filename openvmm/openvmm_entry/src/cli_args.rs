@@ -1551,8 +1551,9 @@ impl Options {
         if let Some(hypervisor) = self.hypervisor.as_deref() {
             let name = hypervisor.split(':').next().unwrap_or(hypervisor);
             anyhow::ensure!(
-                (cfg!(target_os = "linux") && name == "kvm") || (cfg!(windows) && name == "whp"),
-                "microVM ABI version 1 requires KVM on Linux or WHP on Windows"
+                (cfg!(target_os = "linux") && matches!(name, "kvm" | "mshv"))
+                    || (cfg!(windows) && name == "whp"),
+                "microVM ABI version 1 requires KVM or MSHV on Linux, or WHP on Windows"
             );
         }
 
@@ -5441,6 +5442,17 @@ mod tests {
     fn test_microvm_preflight_rejects_unsupported_combinations() {
         let valid = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
         valid.validate_microvm_options().unwrap();
+        if cfg!(target_os = "linux") {
+            let valid_mshv = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--hypervisor",
+                "mshv",
+            ])
+            .unwrap();
+            valid_mshv.validate_microvm_options().unwrap();
+        }
         let valid_console = Options::try_parse_from([
             "openvmm",
             "--machine",
@@ -5467,7 +5479,7 @@ mod tests {
         for args in [
             vec!["openvmm", "--machine", "microvm", "--processors", "2"],
             vec!["openvmm", "--machine", "microvm", "--uefi"],
-            vec!["openvmm", "--machine", "microvm", "--hypervisor", "mshv"],
+            vec!["openvmm", "--machine", "microvm", "--hypervisor", "unknown"],
             vec!["openvmm", "--machine", "microvm", "--virtio-rng"],
             vec!["openvmm", "--machine", "microvm", "--com1", "none"],
             vec![
