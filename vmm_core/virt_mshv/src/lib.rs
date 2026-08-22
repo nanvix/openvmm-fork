@@ -728,6 +728,9 @@ enum ErrorInner {
     )]
     TscFrequencyMismatch { saved: u64, destination: u64 },
     #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    TscFrequencyCpuid(#[from] virt::x86::TscFrequencyCpuidError),
+    #[cfg(guest_arch = "x86_64")]
     #[error("failed to create virtual device")]
     NewDevice(#[source] virt::x86::apic_software_device::DeviceIdInUse),
 }

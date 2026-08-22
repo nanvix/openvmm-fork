@@ -45,6 +45,7 @@ guest-visible configuration:
 | DAX window | None |
 | Cache policy | Zero entry and attribute lifetimes |
 | File policy | Direct I/O |
+| Maximum write | 1 MiB payload plus protocol headers |
 
 The profile adds `virtfs_dir`, `virtfs_tag`, and `virtfs_mode` bootstrap
 tokens to the kernel command line. These values, the fixed transport, and the

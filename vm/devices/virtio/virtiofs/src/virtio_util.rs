@@ -9,7 +9,10 @@ use std::io::Write;
 use virtio::VirtioQueueCallbackWork;
 use virtio::queue::VirtioQueuePayload;
 
-pub(crate) const MAX_FUSE_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_FUSE_REQUEST_HEADER_BYTES: usize = 4096;
+pub(crate) const MAX_FUSE_REQUEST_BYTES: usize =
+    crate::profile::MICROVM_FUSE_MAX_WRITE as usize + MAX_FUSE_REQUEST_HEADER_BYTES;
+const _: () = assert!(MAX_FUSE_REQUEST_BYTES > crate::profile::MICROVM_FUSE_MAX_WRITE as usize);
 
 /// An implementation of `Read` that allows reading data from a virtio payload that may use
 /// multiple buffers.

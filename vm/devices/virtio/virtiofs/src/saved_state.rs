@@ -10,7 +10,7 @@
 use mesh::payload::Protobuf;
 use vmcore::save_restore::SavedStateRoot;
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 pub(crate) const MAX_INODES: usize = 4096;
 pub(crate) const MAX_HANDLES: usize = 4096;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;

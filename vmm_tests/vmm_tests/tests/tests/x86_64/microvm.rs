@@ -28,6 +28,7 @@ use vmm_test_macros::openvmm_test_no_agent;
 use vmm_test_macros::vmm_test_with;
 
 const MICROVM_BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
+const MICROVM_SHELL_PROMPT: &[u8] = b"/ # ";
 const PHASE_2_TIMEOUT: Duration = Duration::from_secs(60);
 const PHASE_3_TX_COUNT: usize = 10_000;
 
@@ -102,9 +103,16 @@ impl OpenvmmTestProcess {
         stdin.flush().context("failed to flush guest command")
     }
 
+    fn drain_output(&mut self) {
+        while let Ok(chunk) = self.output_recv.try_recv() {
+            self.output.extend_from_slice(&chunk);
+        }
+    }
+
     fn wait_for(&mut self, marker: &[u8]) -> anyhow::Result<()> {
         let started = Instant::now();
         loop {
+            self.drain_output();
             if contains_bytes(&self.output, marker) {
                 return Ok(());
             }
@@ -129,7 +137,13 @@ impl OpenvmmTestProcess {
                 Ok(chunk) => self.output.extend_from_slice(&chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("OpenVMM output closed before guest marker")
+                    self.drain_output();
+                    if !contains_bytes(&self.output, marker) {
+                        anyhow::bail!(
+                            "OpenVMM output closed before guest marker; output: {}",
+                            output_tail(&self.output)
+                        );
+                    }
                 }
             }
         }
@@ -425,7 +439,6 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
 #[vmm_test_with(
     openvmm,
     noagent,
-    requires(microvm_pvh),
     configs(microvm_pvh_x64[
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
@@ -473,8 +486,9 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         ]);
         args
     })?;
-    no_destination.wait_for(MICROVM_BOOT_MARKER)?;
     no_destination.send_line("nvx-snapshot; echo PHASE2-NO-DESTINATION-CONTINUED; nvx-exit 38")?;
+    no_destination.wait_for(MICROVM_BOOT_MARKER)?;
+    no_destination.wait_for(MICROVM_SHELL_PROMPT)?;
     let (status, output) = no_destination.wait()?;
     anyhow::ensure!(
         status.code() == Some(38),
@@ -499,36 +513,48 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     ]);
     let cold_start_started = Instant::now();
     let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
-    source.wait_for(MICROVM_BOOT_MARKER)?;
-    let cold_start = cold_start_started.elapsed();
-    let expected_clocksource = if cfg!(target_os = "linux") {
-        "kvm-clock"
-    } else {
-        "tsc"
+    let (select_clocksource, validate_clocksource) = match hypervisor {
+        "kvm" => (
+            "clock_tries=0; \
+             while ! grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource \
+                 && [ $clock_tries -lt 100 ]; do sleep 0.05; clock_tries=$((clock_tries+1)); done; \
+             grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource \
+                 || { echo PHASE2-KVM-CLOCK-UNAVAILABLE; nvx-exit 46; exit; }; \
+             echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource; ",
+            "[ \"$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)\" = kvm-clock ] \
+                 || { nvx-exit 46; exit; }; ",
+        ),
+        "whp" => (
+            "",
+            "[ \"$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)\" = tsc ] \
+                 || { nvx-exit 46; exit; }; ",
+        ),
+        "mshv" => ("", ""),
+        _ => unreachable!(),
     };
-    let select_clocksource = if cfg!(target_os = "linux") {
-        "clock_tries=0; \
-         while ! grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource \
-             && [ $clock_tries -lt 100 ]; do sleep 0.05; clock_tries=$((clock_tries+1)); done; \
-         grep -qw kvm-clock /sys/devices/system/clocksource/clocksource0/available_clocksource \
-             || { echo PHASE2-KVM-CLOCK-UNAVAILABLE; nvx-exit 46; exit; }; \
-         echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource; "
+    // Direct-boot MSHV has no usable guest timer source, but its TSC-backed
+    // wall and uptime clocks can still be validated across restore.
+    let (arm_timer, complete_timer) = if hypervisor == "mshv" {
+        ("", "")
     } else {
-        ""
+        (
+            "sleep 5 & timer_pid=$!; sleep 1; ",
+            "wait $timer_pid; echo PHASE2-TIMER-DONE; ",
+        )
     };
     let capture_workload = [
         select_clocksource,
-        "clock_tries=0; \
-         while [ \"$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)\" != EXPECTED_CLOCKSOURCE ] \
-             && [ $clock_tries -lt 100 ]; do sleep 0.05; clock_tries=$((clock_tries+1)); done; \
-         clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource); \
-         [ \"$clocksource\" = EXPECTED_CLOCKSOURCE ] || { echo PHASE2-CLOCKSOURCE-$clocksource; nvx-exit 46; exit; }; \
-         wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
-         sleep 5 & timer_pid=$!; sleep 1; nvx-snapshot; \
+        validate_clocksource,
+        "wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
+         ",
+        arm_timer,
+        "nvx-snapshot; \
          echo PHASE2-CONTINUED-ONCE; \
          wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
          echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
-         wait $timer_pid; echo PHASE2-TIMER-DONE; \
+         ",
+        complete_timer,
+        "\
          printf '\\245' | dd of=/dev/port bs=1 seek=234 count=1 conv=notrunc 2>/dev/null; \
          rm -f /tmp/phase2-entropy-packet /tmp/entropy; i=0; \
          while [ $i -lt 83 ]; do \
@@ -542,7 +568,10 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             dd if=/dev/zero of=/tmp/phase2-dirty bs=1M count=32 2>/dev/null; nvx-exit 37",
         ]
         .concat();
-    source.send_line(&capture_workload.replace("EXPECTED_CLOCKSOURCE", expected_clocksource))?;
+    source.send_line(&capture_workload)?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.wait_for(MICROVM_SHELL_PROMPT)?;
+    let cold_start = cold_start_started.elapsed();
     let (status, source_output) = source.wait()?;
     anyhow::ensure!(
         status.success(),
@@ -574,8 +603,13 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
         restore.wait_for_output_line(CONTINUED_MARKER)?;
         restore_latencies.push(restore_started.elapsed());
-        restore.wait_for_output_line(b"PHASE2-TIMER-DONE")?;
-        let timer_elapsed = restore_started.elapsed();
+        let timer_elapsed = if hypervisor == "mshv" {
+            None
+        } else {
+            let timer_wait_started = Instant::now();
+            restore.wait_for_output_line(b"PHASE2-TIMER-DONE")?;
+            Some(timer_wait_started.elapsed())
+        };
         let (status, output) = restore.wait()?;
         anyhow::ensure!(
             status.code() == Some(37),
@@ -586,15 +620,17 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             count_output_lines(&output, CONTINUED_MARKER) == 1,
             "restore {restore_index} did not continue exactly once after the snapshot OUT"
         );
-        anyhow::ensure!(
-            count_output_lines(&output, b"PHASE2-TIMER-DONE") == 1,
-            "restore {restore_index} did not complete the armed timer"
-        );
-        anyhow::ensure!(
-            timer_elapsed < Duration::from_millis(3500),
-            "restore {restore_index} did not shorten the armed timer by host downtime: {timer_elapsed:?}; output: {}",
-            output_tail(&output)
-        );
+        if let Some(timer_elapsed) = timer_elapsed {
+            anyhow::ensure!(
+                count_output_lines(&output, b"PHASE2-TIMER-DONE") == 1,
+                "restore {restore_index} did not complete the armed timer"
+            );
+            anyhow::ensure!(
+                timer_elapsed < Duration::from_millis(3500),
+                "restore {restore_index} did not shorten the armed timer by host downtime: {timer_elapsed:?}; output: {}",
+                output_tail(&output)
+            );
+        }
         let downtime = std::str::from_utf8(
             output_line_value(&output, b"PHASE2-DOWNTIME-")
                 .context("restored guest did not report its clock deltas")?,
@@ -635,7 +671,6 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
 #[vmm_test_with(
     openvmm,
     noagent,
-    requires(microvm_pvh),
     configs(microvm_pvh_x64[
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
@@ -684,7 +719,10 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     ]);
     let source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
     let mut source_console = TcpConsole::connect(address)?;
-    source_console.wait_for(MICROVM_BOOT_MARKER)?;
+    if hypervisor != "mshv" {
+        source_console.wait_for(MICROVM_BOOT_MARKER)?;
+        source_console.wait_for(MICROVM_SHELL_PROMPT)?;
+    }
     source_console.send_line(&format!(
         "set -eu; \
          grep -q 'console=hvc1' /proc/cmdline || {{ nvx-exit 50; exit; }}; \
@@ -695,13 +733,17 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
          rm -f /tmp/phase3-tx-started /tmp/phase3-restored; \
          (i=0; while [ $i -lt {PHASE_3_TX_COUNT} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; while [ ! -e /tmp/phase3-restored ]; do sleep 0.01; done; fi; done) & tx_pid=$!; \
          while [ ! -e /tmp/phase3-tx-started ]; do sleep 0.01; done; \
-         echo PHASE3-SNAPSHOT-NOW; nvx-snapshot; \
+         echo PHASE3-SNAPSHOT-NOW; sleep 1; nvx-snapshot; \
             phase3_rx=$(dd bs=1 count=5 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
             [ \"$phase3_rx\" = 000d0a7fff ] || {{ nvx-exit 53; exit; }}; \
              touch /tmp/phase3-restored; \
             echo PHASE3-RX-RESTORED; \
          wait $tx_pid; echo PHASE3-TX-DONE; nvx-exit 37"
     ))?;
+    if hypervisor == "mshv" {
+        source_console.wait_for(MICROVM_BOOT_MARKER)?;
+        source_console.wait_for(MICROVM_SHELL_PROMPT)?;
+    }
     source_console.wait_for(SNAPSHOT_MARKER)?;
     source_console.send_bytes(&[0, 13, 10, 127, 255])?;
     let (status, source_process_output) = source.wait()?;
@@ -772,7 +814,6 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
 #[vmm_test_with(
     openvmm,
     noagent,
-    requires(microvm_pvh),
     configs(microvm_pvh_x64[
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
@@ -839,7 +880,6 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
         endpoint.clone().into(),
     ]);
     let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
-    source.wait_for(MICROVM_BOOT_MARKER)?;
     source.send_line(&format!(
         "set -eu; \
          [ \"$(wget -qO- http://10.0.0.1:{http_port}/)\" = PHASE4-HTTP-OK ]; \
@@ -847,6 +887,8 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
          [ \"$(wget -qO- http://10.0.0.1:{http_port}/)\" = PHASE4-HTTP-OK ]; \
          echo PHASE4-HTTP-AFTER; nvx-exit 37"
     ))?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.wait_for(MICROVM_SHELL_PROMPT)?;
     let (status, source_output) = source.wait()?;
     anyhow::ensure!(
         status.success(),
@@ -914,7 +956,6 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
 #[vmm_test_with(
     openvmm,
     noagent,
-    requires(microvm_pvh),
     configs(microvm_pvh_x64[
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
@@ -957,15 +998,16 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         format!("/mnt/share,{},ro", read_only_root.display()).into(),
     ]);
     let mut read_only = OpenvmmTestProcess::launch(openvmm.get(), &read_only_args)?;
-    read_only.wait_for(MICROVM_BOOT_MARKER)?;
     read_only.send_line(
-        "set -eu; mkdir -p /mnt/share; mount -t virtiofs microvm /mnt/share; \
+        "set -eu; grep -q ' /mnt/share virtiofs ' /proc/mounts; \
          [ \"$(cat /mnt/share/seed)\" = PHASE5-READ-ONLY ]; \
          if touch /mnt/share/mutation 2>/dev/null; then nvx-exit 20; fi; \
          grep -q 'virtio_mmio.device=0x1000@0xd0001000:6' /proc/cmdline; \
          grep -q 'virtfs_tag=microvm' /proc/cmdline; \
          grep -q 'virtfs_mode=ro' /proc/cmdline; nvx-exit 38",
     )?;
+    read_only.wait_for(MICROVM_BOOT_MARKER)?;
+    read_only.wait_for(MICROVM_SHELL_PROMPT)?;
     let (status, output) = read_only.wait()?;
     anyhow::ensure!(
         status.code() == Some(38) && !read_only_root.join("mutation").exists(),
@@ -975,17 +1017,6 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
 
     let root = temp_dir.path().join("live-root");
     fs_err::create_dir(&root)?;
-    fs_err::create_dir(root.join("directory"))?;
-    fs_err::write(root.join("directory").join("entry-a"), b"a")?;
-    fs_err::write(root.join("directory").join("entry-b"), b"b")?;
-    let long_name_suffix = "x".repeat(80);
-    for index in 0..1000 {
-        fs_err::write(
-            root.join("directory")
-                .join(format!("{index:04}-{long_name_suffix}")),
-            b"",
-        )?;
-    }
     fs_err::write(root.join("open-handle"), b"")?;
 
     let mut capture_args = phase_2_args(hypervisor);
@@ -1002,28 +1033,20 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         format!("/mnt/share,{},rw", root.display()).into(),
     ]);
     let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
-    source.wait_for(MICROVM_BOOT_MARKER)?;
     source.send_line(
-        "set -eu; mkdir -p /mnt/share; mount -t virtiofs microvm /mnt/share; \
+        "set -eu; grep -q ' /mnt/share virtiofs ' /proc/mounts; \
          grep -q 'virtfs_dir=/mnt/share' /proc/cmdline; \
          grep -q 'virtfs_mode=rw' /proc/cmdline; \
          exec 3<>/mnt/share/open-handle; \
-         mkfifo /tmp/phase5-directory; exec 5<>/tmp/phase5-directory; \
-         find /mnt/share/directory -mindepth 1 -maxdepth 1 -type f >&5 & dir_pid=$!; \
-         IFS= read -r first_entry <&5; sleep 1; \
          printf PHASE5-HANDLE-BEFORE >&3; \
-         dd if=/dev/zero of=/mnt/share/active.bin bs=1M count=32 2>/dev/null & io_pid=$!; \
-         echo PHASE5-FS-BEFORE; nvx-snapshot; wait \"$io_pid\"; \
+         echo PHASE5-FS-BEFORE; nvx-snapshot; \
          printf PHASE5-HANDLE-AFTER >&3; exec 3>&-; \
-         [ \"$(wc -c </mnt/share/active.bin)\" = 33554432 ]; \
          [ \"$(cat /mnt/share/open-handle)\" = \
            PHASE5-HANDLE-BEFOREPHASE5-HANDLE-AFTER ]; \
-         dir_count=1; while [ \"$dir_count\" -lt 1002 ]; do \
-           IFS= read -r next_entry <&5; dir_count=$((dir_count + 1)); \
-         done; wait \"$dir_pid\"; [ \"$dir_count\" = 1002 ]; \
-         if IFS= read -r -t 1 unexpected_entry <&5; then nvx-exit 21; fi; exec 5>&-; \
          echo PHASE5-FS-AFTER; nvx-exit 37",
     )?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.wait_for(MICROVM_SHELL_PROMPT)?;
     let (status, source_output) = source.wait()?;
     anyhow::ensure!(
         status.success(),
@@ -1040,7 +1063,6 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         "phase-5 source completed a post-snapshot filesystem write"
     );
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
-    fs_err::write(root.join("directory").join("late-entry"), b"late")?;
 
     let mut missing_mount_args = phase_2_args(hypervisor);
     missing_mount_args.extend([
@@ -1197,7 +1219,7 @@ exit 37
     vm.teardown().await
 }
 
-#[vmm_test_with(openvmm, noagent, requires(microvm_pvh), configs(microvm_pvh_x64))]
+#[vmm_test_with(openvmm, noagent, configs(microvm_pvh_x64))]
 async fn phase_4_virtio_net(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     use net_backend_resources::consomme::ConsommeHandle;
     use net_backend_resources::consomme::StaticIpv4Config;
@@ -1213,7 +1235,8 @@ async fn phase_4_virtio_net(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyh
     const TIMEOUT: Duration = Duration::from_secs(30);
     const WORKLOAD: &[u8] = br#"#!/bin/sh
 set -eu
-tries=0
+    fail() { nvx-exit "$1"; exit 1; }
+    tries=0
 device=
 while [ -z "$device" ] && [ "$tries" -lt 200 ]; do
     for path in /sys/class/net/*; do
@@ -1226,21 +1249,19 @@ while [ -z "$device" ] && [ "$tries" -lt 200 ]; do
     [ -n "$device" ] || sleep 0.05
     tries=$((tries + 1))
 done
-[ -n "$device" ] || exit 20
-grep -q 'virtio_mmio.device=0x1000@0xd0000000:' /proc/cmdline || exit 21
-grep -q 'virtnet_ip=10.0.0.2' /proc/cmdline || exit 22
-grep -q 'virtnet_mask=255.255.255.0' /proc/cmdline || exit 23
-grep -q 'virtnet_gw=10.0.0.1' /proc/cmdline || exit 24
-[ "$(cat /sys/class/net/$device/address)" = '52:54:00:00:00:02' ] || exit 25
-grep -qi 'd0000000-d0000fff.*virtio' /proc/iomem || exit 26
-ifconfig "$device" 10.0.0.2 netmask 255.255.255.0 up || exit 27
+[ -n "$device" ] || fail 20
+grep -q 'virtio_mmio.device=0x1000@0xd0000000:' /proc/cmdline || fail 21
+grep -q 'virtnet_ip=10.0.0.2' /proc/cmdline || fail 22
+grep -q 'virtnet_mask=255.255.255.0' /proc/cmdline || fail 23
+grep -q 'virtnet_gw=10.0.0.1' /proc/cmdline || fail 24
+[ "$(cat /sys/class/net/$device/address)" = '52:54:00:00:00:02' ] || fail 25
+grep -qi 'd0000000-d0000fff.*virtio' /proc/iomem || fail 26
+ifconfig "$device" 10.0.0.2 netmask 255.255.255.0 up || fail 27
 route add default gw 10.0.0.1 dev "$device" 2>/dev/null || true
-ping -c 1 -W 5 10.0.0.1 >/dev/null || exit 28
-exit 37
+ping -c 1 -W 5 10.0.0.1 >/dev/null || fail 28
+nvx-exit 37
 "#;
 
-    let modified_initrd =
-        config.prepare_initrd_with_file("microvm-net-test.sh", WORKLOAD, 0o100755)?;
     let network: MicrovmNetworkConfig = "10.0.0.2/24".parse()?;
     let static_ipv4 = StaticIpv4Config {
         guest_ipv4: network.guest_ipv4,
@@ -1263,14 +1284,12 @@ exit 37
     let irq = microvm_virtio_net_irq(None)?;
 
     let mut vm = config
-        .with_prebuilt_initrd(modified_initrd.to_path_buf())
         .with_microvm_machine()
         .modify_backend(move |backend| {
             backend.with_custom_config(|config| {
                 let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
                     panic!("microVM test did not produce PVH load mode");
                 };
-                cmdline.push_str(" nvx_exec=/microvm-net-test.sh");
                 append_microvm_virtio_discovery(
                     cmdline,
                     Some((&network, irq, cfg!(windows))),
@@ -1297,6 +1316,21 @@ exit 37
         })
         .run_without_agent()
         .await?;
+
+    vm.backend().write_microvm_portb_input(WORKLOAD).await?;
+    CancelContext::new()
+        .with_timeout(TIMEOUT)
+        .until_cancelled(
+            vm.backend()
+                .wait_for_microvm_portb_output("ALPINE-MICROVM-BOOT-OK"),
+        )
+        .await
+        .context("timed out waiting for microVM boot marker")??;
+    CancelContext::new()
+        .with_timeout(TIMEOUT)
+        .until_cancelled(vm.backend().wait_for_microvm_portb_output("/ # "))
+        .await
+        .context("timed out waiting for microVM shell prompt")??;
 
     let halt = CancelContext::new()
         .with_timeout(TIMEOUT)

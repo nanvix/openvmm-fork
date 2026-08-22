@@ -60,6 +60,7 @@ use virt_support_x86emu::translate::TranslationRegisters;
 use vmcore::reference_time::ReferenceTimeSource;
 use x86defs::RFlags;
 use x86defs::SegmentRegister;
+use x86defs::cpuid::CpuidFunction;
 
 impl virt::Hypervisor for LinuxMshv {
     type ProtoPartition<'a> = MshvProtoPartition<'a>;
@@ -241,6 +242,18 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         let cpuid = virt::CpuidLeafSet::new(config.cpuid.to_vec());
+        let tsc_frequency_hz = self
+            .vmfd
+            .get_partition_property(HvPartitionPropertyCode::ProcessorClockFrequency.0)
+            .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?;
+        let current_max_basic_leaf =
+            cpuid.result(CpuidFunction::VendorAndMaxFunction.0, 0, &[0; 4])[0];
+        let mut cpuid = cpuid.into_leaves();
+        cpuid.extend(virt::x86::tsc_frequency_cpuid_leaves(
+            tsc_frequency_hz,
+            current_max_basic_leaf,
+        )?);
+        let cpuid = virt::CpuidLeafSet::new(cpuid);
 
         // Apply CPUID overrides partition-wide.
         for leaf in cpuid.leaves().iter() {
@@ -279,7 +292,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 .hvcall(&mut args)
                 .map_err(|e| ErrorInner::RegisterCpuid(e.into()))?;
         }
-
         let caps = {
             let mut caps = match self.bsp.get_cpuid_values(0, 0, 0, 0) {
                 Ok(_) => virt::PartitionCapabilities::from_cpuid(
@@ -300,7 +312,8 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 }
             };
             caps.xsaves_state_bv_broken = true;
-            caps.can_freeze_time = true;
+            // TimeFreeze stops reference time but not the virtual TSC.
+            caps.can_freeze_time = false;
             caps
         };
 
@@ -517,7 +530,8 @@ impl MshvPartitionInner {
             long_mode: false,
         };
 
-        if let Err(err) = self.vmfd.request_virtual_interrupt(&mshv_req) {
+        let result = self.vmfd.request_virtual_interrupt(&mshv_req);
+        if let Err(err) = result {
             tracelimit::warn_ratelimited!(
                 address = request.address,
                 data = request.data,
