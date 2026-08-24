@@ -143,8 +143,6 @@ pub struct VmController {
     pub(crate) microvm_filesystem: Option<openvmm_defs::config::MicrovmFilesystemConfig>,
     pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
-    #[cfg(target_os = "linux")]
-    pub(crate) _microvm_managed_tap: Option<crate::MicrovmManagedTap>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     pub(crate) guest_power_actions: GuestPowerActions,
 }

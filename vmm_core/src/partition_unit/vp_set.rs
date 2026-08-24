@@ -199,7 +199,7 @@ where
         let cycles = u64::try_from(cycles).context("TSC downtime adjustment exceeds u64")?;
         let mut access = self.vp.access_state(Vtl::Vtl0);
         let mut tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
-        let tsc_deadline = access
+        let mut tsc_deadline = access
             .tsc_deadline()
             .context("failed to read stopped vCPU TSC deadline")?;
         let mut apic = apic_frequency_hz
@@ -213,17 +213,23 @@ where
             .transpose()?;
         let previous_tsc = tsc.value;
         tsc.value = tsc.value.wrapping_add(cycles);
+        if tsc_deadline.value != 0 && tsc_deadline.value.wrapping_sub(previous_tsc) <= cycles {
+            // Some hypervisors do not inject an interrupt when a deadline is
+            // reprogrammed in the past. Rearm it just ahead of the advanced
+            // TSC so that it expires promptly after the VP starts.
+            tsc_deadline.value = tsc.value.wrapping_add((frequency_hz / 1000).max(1));
+        }
         access
             .set_tsc(&tsc)
             .context("failed to adjust stopped vCPU TSC")?;
-        access
-            .set_tsc_deadline(&tsc_deadline)
-            .context("failed to reprogram stopped vCPU TSC deadline")?;
         if let Some(apic) = apic.take() {
             access
                 .set_apic(&apic)
                 .context("failed to reprogram stopped LAPIC timer")?;
         }
+        access
+            .set_tsc_deadline(&tsc_deadline)
+            .context("failed to reprogram stopped vCPU TSC deadline")?;
         access
             .commit()
             .context("failed to commit adjusted vCPU TSC")?;

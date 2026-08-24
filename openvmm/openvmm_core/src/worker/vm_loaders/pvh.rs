@@ -15,6 +15,7 @@ pub struct KernelConfig<'a> {
     pub initrd: &'a Option<std::fs::File>,
     pub cmdline: &'a str,
     pub mem_layout: &'a MemoryLayout,
+    pub acpi_tables: loader::pvh::AcpiTables,
 }
 
 #[derive(Debug, Error)]
@@ -51,6 +52,7 @@ pub fn load_pvh(
         initrd,
         cfg.cmdline,
         cfg.mem_layout,
+        Some(&cfg.acpi_tables),
     )
     .map_err(Error::Loader)?;
     Ok(loader.initial_regs_and_page_imports())

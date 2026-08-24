@@ -29,11 +29,17 @@ use zerocopy::KnownLayout;
 const LE: LittleEndian = LittleEndian {};
 const FOUR_GB: u64 = 0x1_0000_0000;
 const HIMEM_START: u64 = 0x10_0000;
+const MP_FLOATING_POINTER_ADDR: usize = 0;
+const MP_CONFIG_TABLE_ADDR: usize = 0x400;
+const MP_IRQ_FLAGS_LEVEL_HIGH: u16 = 0x000d;
 const BOOT_GDT_ADDR: u64 = 0x500;
 const BOOT_IDT_ADDR: u64 = 0x520;
 const START_INFO_ADDR: u64 = 0x6000;
 const MODLIST_ADDR: u64 = 0x6040;
 const MEMMAP_ADDR: u64 = 0x7000;
+/// Fixed RSDP address in the PVH boot metadata region.
+pub const ACPI_RSDP_ADDR: u64 = 0x8000;
+const ACPI_TABLES_ADDR: u64 = ACPI_RSDP_ADDR + HV_PAGE_SIZE;
 const CMDLINE_ADDR: u64 = 0x2_0000;
 const CMDLINE_MAX_SIZE: usize = 64 * 1024;
 const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18;
@@ -84,6 +90,15 @@ pub struct InitrdConfig<'a, R: Read + Seek> {
     pub image: &'a mut R,
     /// Initramfs size in bytes.
     pub size: u64,
+}
+
+/// ACPI tables to expose through Xen PVH start info.
+#[derive(Debug)]
+pub struct AcpiTables {
+    /// The RSDP, which must fit in one page.
+    pub rsdp: Vec<u8>,
+    /// The tables referenced by the RSDP.
+    pub tables: Vec<u8>,
 }
 
 /// Guest placement selected by the loader.
@@ -139,6 +154,8 @@ pub enum Error {
     CommandLineTooLong,
     #[error("PVH memory map does not fit in its reserved page")]
     MemoryMapTooLarge,
+    #[error("PVH ACPI data does not fit in its reserved boot metadata region")]
+    AcpiTablesTooLarge,
     #[error("initramfs is empty")]
     EmptyInitrd,
     #[error("initramfs does not fit above the kernel in low RAM")]
@@ -193,6 +210,7 @@ pub fn load<F, R>(
     initrd: Option<InitrdConfig<'_, R>>,
     cmdline: &str,
     memory_layout: &MemoryLayout,
+    acpi_tables: Option<&AcpiTables>,
 ) -> Result<LoadInfo, Error>
 where
     F: Read + Seek,
@@ -259,7 +277,7 @@ where
         None => None,
     };
 
-    import_boot_structures(importer, cmdline, memory_layout, initrd)?;
+    import_boot_structures(importer, cmdline, memory_layout, initrd, acpi_tables)?;
     import_registers(importer, entrypoint)?;
 
     Ok(LoadInfo { entrypoint, initrd })
@@ -469,8 +487,10 @@ fn import_boot_structures(
     cmdline: &str,
     memory_layout: &MemoryLayout,
     initrd: Option<(u64, u64)>,
+    acpi_tables: Option<&AcpiTables>,
 ) -> Result<(), Error> {
     let mut boot_page = [0u8; HV_PAGE_SIZE as usize];
+    write_mp_tables(&mut boot_page);
     let gdt = [
         0,
         gdt_entry(SEG_ATTR_CODE, 0, 0x000f_ffff),
@@ -532,7 +552,11 @@ fn import_boot_structures(
         nr_modules: u32::from(initrd.is_some()),
         modlist_paddr: if initrd.is_some() { MODLIST_ADDR } else { 0 },
         cmdline_paddr: CMDLINE_ADDR,
-        rsdp_paddr: 0,
+        rsdp_paddr: if acpi_tables.is_some() {
+            ACPI_RSDP_ADDR
+        } else {
+            0
+        },
         memmap_paddr: MEMMAP_ADDR,
         memmap_entries,
         reserved: 0,
@@ -545,6 +569,37 @@ fn import_boot_structures(
         "pvh-start-info",
         &start_page,
     )?;
+
+    if let Some(acpi_tables) = acpi_tables {
+        if acpi_tables.rsdp.len() > HV_PAGE_SIZE as usize
+            || ACPI_TABLES_ADDR
+                .checked_add(acpi_tables.tables.len() as u64)
+                .is_none_or(|end| end > CMDLINE_ADDR)
+        {
+            return Err(Error::AcpiTablesTooLarge);
+        }
+
+        let mut rsdp_page = [0; HV_PAGE_SIZE as usize];
+        rsdp_page[..acpi_tables.rsdp.len()].copy_from_slice(&acpi_tables.rsdp);
+        import_pages(
+            importer,
+            ACPI_RSDP_ADDR / HV_PAGE_SIZE,
+            1,
+            "pvh-acpi-rsdp",
+            &rsdp_page,
+        )?;
+
+        let table_pages = (acpi_tables.tables.len() as u64).div_ceil(HV_PAGE_SIZE);
+        let mut table_data = vec![0; (table_pages * HV_PAGE_SIZE) as usize];
+        table_data[..acpi_tables.tables.len()].copy_from_slice(&acpi_tables.tables);
+        import_pages(
+            importer,
+            ACPI_TABLES_ADDR / HV_PAGE_SIZE,
+            table_pages,
+            "pvh-acpi-tables",
+            &table_data,
+        )?;
+    }
 
     let cmdline_size = cmdline.len().checked_add(1).ok_or(Error::AddressOverflow)?;
     let cmdline_pages = (cmdline_size as u64).div_ceil(HV_PAGE_SIZE);
@@ -559,6 +614,74 @@ fn import_boot_structures(
     )?;
 
     Ok(())
+}
+
+fn write_mp_tables(page: &mut [u8; HV_PAGE_SIZE as usize]) {
+    const MP_CONFIG_HEADER_SIZE: usize = 44;
+    const MP_PROCESSOR_SIZE: usize = 20;
+    const MP_ENTRY_COUNT: u16 = 18;
+
+    let mut table = Vec::with_capacity(200);
+    table.extend_from_slice(b"PCMP");
+    table.extend_from_slice(&0u16.to_le_bytes());
+    table.push(4);
+    table.push(0);
+    table.extend_from_slice(b"OPENVMM ");
+    table.extend_from_slice(b"MICROVM     ");
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(&0u16.to_le_bytes());
+    table.extend_from_slice(&MP_ENTRY_COUNT.to_le_bytes());
+    table.extend_from_slice(&0xfee0_0000u32.to_le_bytes());
+    table.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(table.len(), MP_CONFIG_HEADER_SIZE);
+
+    table.extend_from_slice(&[0, 0, 0x14, 3]);
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(&[0; 8]);
+    assert_eq!(table.len(), MP_CONFIG_HEADER_SIZE + MP_PROCESSOR_SIZE);
+
+    table.extend_from_slice(&[1, 0]);
+    table.extend_from_slice(b"ISA   ");
+    table.extend_from_slice(&[2, 0, 0x11, 1]);
+    table.extend_from_slice(&0xfec0_0000u32.to_le_bytes());
+
+    for irq in (0u8..16).filter(|irq| *irq != 2) {
+        let pin = if irq == 0 { 2 } else { irq };
+        let flags = if matches!(irq, 4 | 5 | 6 | 7 | 10) {
+            MP_IRQ_FLAGS_LEVEL_HIGH
+        } else {
+            0
+        };
+        table.extend_from_slice(&[3, 0]);
+        table.extend_from_slice(&flags.to_le_bytes());
+        table.extend_from_slice(&[0, irq, 0, pin]);
+    }
+
+    let table_len = u16::try_from(table.len()).expect("MP table fits in one page");
+    table[4..6].copy_from_slice(&table_len.to_le_bytes());
+    table[7] = checksum(&table);
+    let table_end = MP_CONFIG_TABLE_ADDR + table.len();
+    assert!(table_end <= BOOT_GDT_ADDR as usize);
+    page[MP_CONFIG_TABLE_ADDR..table_end].copy_from_slice(&table);
+
+    let mut floating_pointer = [0u8; 16];
+    floating_pointer[..4].copy_from_slice(b"_MP_");
+    floating_pointer[4..8].copy_from_slice(&(MP_CONFIG_TABLE_ADDR as u32).to_le_bytes());
+    floating_pointer[8] = 1;
+    floating_pointer[9] = 4;
+    floating_pointer[10] = checksum(&floating_pointer);
+    page[MP_FLOATING_POINTER_ADDR..MP_FLOATING_POINTER_ADDR + floating_pointer.len()]
+        .copy_from_slice(&floating_pointer);
+}
+
+fn checksum(bytes: &[u8]) -> u8 {
+    0u8.wrapping_sub(
+        bytes
+            .iter()
+            .copied()
+            .fold(0u8, |sum, byte| sum.wrapping_add(byte)),
+    )
 }
 
 fn import_registers(
@@ -865,6 +988,7 @@ mod tests {
             }),
             "earlycon=xe9",
             &make_layout(),
+            None,
         )
         .unwrap();
 
@@ -884,6 +1008,97 @@ mod tests {
         );
         assert!(importer.registers.contains(&X86Register::Rip(0x10_0000)));
         assert!(importer.registers.contains(&X86Register::Cr0(1)));
+    }
+
+    #[test]
+    fn exposes_platform_tables() {
+        let mut kernel = Cursor::new(test_elf());
+        let mut importer = RecordingImporter::default();
+        let acpi_tables = AcpiTables {
+            rsdp: vec![0x5a; 36],
+            tables: vec![0xa5; 17],
+        };
+        load::<_, Cursor<Vec<u8>>>(
+            &mut importer,
+            &mut kernel,
+            None,
+            "",
+            &make_layout(),
+            Some(&acpi_tables),
+        )
+        .unwrap();
+
+        let start_info = &importer
+            .pages
+            .iter()
+            .find(|(tag, ..)| *tag == "pvh-start-info")
+            .unwrap()
+            .3;
+        assert_eq!(
+            u64::from_le_bytes(start_info[32..40].try_into().unwrap()),
+            ACPI_RSDP_ADDR
+        );
+
+        let rsdp = importer
+            .pages
+            .iter()
+            .find(|(tag, ..)| *tag == "pvh-acpi-rsdp")
+            .unwrap();
+        assert_eq!(rsdp.1, ACPI_RSDP_ADDR / HV_PAGE_SIZE);
+        assert_eq!(&rsdp.3[..36], &[0x5a; 36]);
+
+        let tables = importer
+            .pages
+            .iter()
+            .find(|(tag, ..)| *tag == "pvh-acpi-tables")
+            .unwrap();
+        assert_eq!(tables.1, ACPI_TABLES_ADDR / HV_PAGE_SIZE);
+        assert_eq!(&tables.3[..17], &[0xa5; 17]);
+
+        let boot_tables = &importer
+            .pages
+            .iter()
+            .find(|(tag, ..)| *tag == "pvh-boot-tables")
+            .unwrap()
+            .3;
+        let floating_pointer = &boot_tables[..16];
+        assert_eq!(&floating_pointer[..4], b"_MP_");
+        assert_eq!(
+            u32::from_le_bytes(floating_pointer[4..8].try_into().unwrap()),
+            MP_CONFIG_TABLE_ADDR as u32
+        );
+        assert_eq!(
+            floating_pointer
+                .iter()
+                .copied()
+                .fold(0u8, |sum, byte| sum.wrapping_add(byte)),
+            0
+        );
+
+        let table_length = u16::from_le_bytes(
+            boot_tables[MP_CONFIG_TABLE_ADDR + 4..MP_CONFIG_TABLE_ADDR + 6]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let mp_table = &boot_tables[MP_CONFIG_TABLE_ADDR..MP_CONFIG_TABLE_ADDR + table_length];
+        assert_eq!(&mp_table[..4], b"PCMP");
+        assert_eq!(
+            mp_table
+                .iter()
+                .copied()
+                .fold(0u8, |sum, byte| sum.wrapping_add(byte)),
+            0
+        );
+        for irq in [4, 5, 6, 7, 10] {
+            let entry = mp_table[80..]
+                .chunks_exact(8)
+                .find(|entry| entry[0] == 3 && entry[5] == irq)
+                .unwrap();
+            assert_eq!(
+                u16::from_le_bytes(entry[2..4].try_into().unwrap()),
+                MP_IRQ_FLAGS_LEVEL_HIGH
+            );
+        }
     }
 
     #[test]
@@ -915,6 +1130,7 @@ mod tests {
             None,
             &"x".repeat(CMDLINE_MAX_SIZE),
             &make_layout(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, Error::CommandLineTooLong));
@@ -927,6 +1143,7 @@ mod tests {
             None,
             "bad\0command-line",
             &make_layout(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, Error::CommandLineNul));
@@ -981,6 +1198,7 @@ mod tests {
             }),
             "",
             &make_layout(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, Error::InitrdDoesNotFit));

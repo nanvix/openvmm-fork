@@ -1658,6 +1658,11 @@ impl StateElement<X86PartitionCapabilities, X86VpInfo> for TscDeadline {
     fn at_reset(_caps: &X86PartitionCapabilities, _vp_info: &X86VpInfo) -> Self {
         Self { value: 0 }
     }
+
+    fn can_compare(_caps: &X86PartitionCapabilities) -> bool {
+        // A deadline can expire between restoring it and reading it back.
+        false
+    }
 }
 
 impl HvRegisterState<HvX64RegisterName, 1> for Tsc {

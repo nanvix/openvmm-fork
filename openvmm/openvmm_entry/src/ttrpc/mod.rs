@@ -1941,8 +1941,6 @@ impl VmService {
             microvm_filesystem,
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
-            #[cfg(target_os = "linux")]
-            _microvm_managed_tap: None,
             snapshot_memory_file,
             guest_power_actions,
         };

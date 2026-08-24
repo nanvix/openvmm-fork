@@ -1594,6 +1594,7 @@ impl InitializedVm {
                                 with_psp: cfg.chipset.with_generic_psp,
                                 pm_base: PM_BASE,
                                 acpi_irq: SYSTEM_IRQ_ACPI,
+                                level_triggered_irqs: &[],
                                 iommu: None,
                             },
                         };
@@ -3210,6 +3211,20 @@ impl LoadedVmInner {
                 with_pit: self.chipset_capabilities.with_pit,
                 pm_base: PM_BASE,
                 acpi_irq: SYSTEM_IRQ_ACPI,
+                level_triggered_irqs: if matches!(
+                    self.machine_profile,
+                    MachineProfile::Microvm { .. }
+                ) {
+                    &[
+                        openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
+                        openvmm_defs::config::MICROVM_VIRTIO_NET_WHP_IRQ,
+                        openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
+                        openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
+                        openvmm_defs::config::MICROVM_VIRTIO_NET_KVM_IRQ,
+                    ]
+                } else {
+                    &[]
+                },
                 iommu: match &self.iommu_devices {
                     IommuDevices::AmdVi(devices) => {
                         Some(vmm_core::acpi_builder::X86IommuAcpiConfig::AmdVi(
@@ -3263,15 +3278,34 @@ impl LoadedVmInner {
                 kernel,
                 initrd,
                 cmdline,
-            } => super::vm_loaders::pvh::load_pvh(
-                &super::vm_loaders::pvh::KernelConfig {
-                    kernel,
-                    initrd,
-                    cmdline,
-                    mem_layout: &self.mem_layout,
-                },
-                &self.gm,
-            )?,
+            } => {
+                let tables = acpi_builder.build_acpi_tables(loader::pvh::ACPI_RSDP_ADDR, |dsdt| {
+                    add_devices_to_dsdt_x64(
+                        dsdt,
+                        &self.chipset_cfg,
+                        &self.chipset_capabilities,
+                        false,
+                        false,
+                        &self.chipset_mmio,
+                        self.virtio_mmio_region,
+                        self.virtio_mmio_irq,
+                        &self.pci_legacy_interrupts,
+                    )
+                });
+                super::vm_loaders::pvh::load_pvh(
+                    &super::vm_loaders::pvh::KernelConfig {
+                        kernel,
+                        initrd,
+                        cmdline,
+                        mem_layout: &self.mem_layout,
+                        acpi_tables: loader::pvh::AcpiTables {
+                            rsdp: tables.rsdp,
+                            tables: tables.tables,
+                        },
+                    },
+                    &self.gm,
+                )?
+            }
             #[cfg(guest_arch = "x86_64")]
             &LoadMode::Linux {
                 ref kernel,

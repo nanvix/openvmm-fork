@@ -205,8 +205,6 @@ struct VmResources {
     microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
     microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_filesystem_root_path: Option<PathBuf>,
-    #[cfg(target_os = "linux")]
-    microvm_managed_tap: Option<MicrovmManagedTap>,
     /// Receives dirty rectangles from the synthetic video device for the VNC worker.
     dirty_rect_recv: Option<mesh::Receiver<Vec<video_core::DirtyRect>>>,
     #[cfg(windows)]
@@ -239,12 +237,15 @@ struct EffectiveMicrovmFilesystem {
 #[cfg(target_os = "linux")]
 pub(crate) struct MicrovmManagedTap {
     name: String,
+    armed: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for MicrovmManagedTap {
     fn drop(&mut self) {
-        if let Err(error) = run_microvm_ip(&["tuntap", "del", "dev", &self.name, "mode", "tap"]) {
+        if self.armed
+            && let Err(error) = run_microvm_ip(&["tuntap", "del", "dev", &self.name, "mode", "tap"])
+        {
             tracing::warn!(tap = %self.name, error = %error, "failed to remove managed microVM TAP");
         }
     }
@@ -3880,7 +3881,7 @@ fn microvm_network_endpoint(
 fn microvm_network_endpoint(
     network: &openvmm_defs::config::MicrovmNetworkConfig,
     net_tap: Option<&str>,
-    resources: &mut VmResources,
+    _resources: &mut VmResources,
 ) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
     let fd = if let Some(name) = net_tap {
         validate_microvm_tap(name, network)?;
@@ -3892,7 +3893,15 @@ fn microvm_network_endpoint(
         let user = current_user_name()?;
         run_microvm_ip(&["tuntap", "add", "dev", &name, "mode", "tap", "user", &user])
             .with_context(|| format!("failed to create managed microVM TAP '{name}'"))?;
-        let cleanup = MicrovmManagedTap { name: name.clone() };
+        let mut cleanup = MicrovmManagedTap {
+            name: name.clone(),
+            armed: true,
+        };
+        let fd = net_tap::tap::open_tap(&name)
+            .with_context(|| format!("failed to open managed microVM TAP '{name}'"))?;
+        net_tap::tap::set_persistent(&fd, false)
+            .with_context(|| format!("failed to make managed microVM TAP '{name}' transient"))?;
+        cleanup.armed = false;
         let gateway_mac = format_mac(network.gateway_mac);
         let gateway_cidr = format!("{}/{}", network.derived_gateway_ipv4, network.prefix_length);
         run_microvm_ip(&["link", "set", "dev", &name, "address", &gateway_mac])
@@ -3901,9 +3910,6 @@ fn microvm_network_endpoint(
             .with_context(|| format!("failed to address managed microVM TAP '{name}'"))?;
         run_microvm_ip(&["link", "set", "dev", &name, "up"])
             .with_context(|| format!("failed to bring up managed microVM TAP '{name}'"))?;
-        let fd = net_tap::tap::open_tap(&name)
-            .with_context(|| format!("failed to open managed microVM TAP '{name}'"))?;
-        resources.microvm_managed_tap = Some(cleanup);
         fd
     };
     Ok(net_backend_resources::tap::TapHandle { fd }.into_resource())
@@ -4925,8 +4931,6 @@ async fn run_control_inner(
         microvm_filesystem,
         microvm_filesystem_attachment,
         microvm_console_socket_cleanup: resources.microvm_console_socket_cleanup.take(),
-        #[cfg(target_os = "linux")]
-        _microvm_managed_tap: resources.microvm_managed_tap.take(),
         snapshot_memory_file,
         guest_power_actions: vm_controller::GuestPowerActions {
             shutdown: opt.guest_shutdown_action,
