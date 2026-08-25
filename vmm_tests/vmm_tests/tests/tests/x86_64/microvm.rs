@@ -1242,10 +1242,7 @@ exit 37
     vm.teardown().await
 }
 
-#[openvmm_test_no_agent(ignore(
-    reason = "requires a published microVM PVH kernel and initramfs",
-    microvm_pvh_x64
-))]
+#[openvmm_test_no_agent(microvm_pvh_x64)]
 async fn microvm_v2_sandbox_blocks(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
 ) -> anyhow::Result<()> {
@@ -1282,7 +1279,8 @@ grep -q 'virtio_mmio.device=0x1000@0xd0006000:11' /proc/cmdline || exit 24
 [ "$(cat /sys/block/vdd/ro)" = 0 ] || exit 28
 printf MICROVM-V2-SCRATCH-OK | dd of=/dev/vdd bs=512 count=1 conv=sync,notrunc 2>/dev/null
 [ "$(dd if=/dev/vdd bs=512 count=1 2>/dev/null | head -c 22)" = MICROVM-V2-SCRATCH-OK ] || exit 29
-exit 37
+/sbin/nvx-exit 37
+while :; do sleep 3600; done
 "#;
 
     let modified_initrd =
