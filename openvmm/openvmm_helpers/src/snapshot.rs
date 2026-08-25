@@ -18,9 +18,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 /// Current manifest format version. Bump when making incompatible changes.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 /// Magic identifying the OpenVMM snapshot manifest format.
-pub const SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V2\0";
+pub const SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V3\0";
+const LEGACY_MANIFEST_VERSION: u32 = 2;
+const LEGACY_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V2\0";
 /// Saved-state schema version used by the VM worker envelope.
 pub const SAVED_STATE_SCHEMA_VERSION: u32 = 1;
 /// Protobuf root type stored in `state.bin`.
@@ -47,15 +49,6 @@ const MAX_COMMAND_LINE_BYTES: usize = 64 * 1024;
 const MAX_CPU_CONTRACT_BYTES: usize = 1024 * 1024;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Controls whether restore verifies the contents of `memory.bin`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SnapshotMemoryVerification {
-    /// Verify the complete memory image against the manifest's SHA-256 digest.
-    Sha256,
-    /// Trust the memory contents after validating the file type and exact length.
-    SkipSha256,
-}
 
 /// Error publishing a snapshot.
 #[derive(Debug, thiserror::Error)]
@@ -779,10 +772,10 @@ pub struct SnapshotManifest {
     /// Length of `state.bin` in bytes.
     #[mesh(8)]
     pub state_size_bytes: u64,
-    /// SHA-256 digest of `state.bin`.
+    /// Legacy v2 SHA-256 digest of `state.bin`; empty in v3.
     #[mesh(9)]
     pub state_sha256: Vec<u8>,
-    /// SHA-256 digest of `memory.bin`.
+    /// Legacy v2 SHA-256 digest of `memory.bin`; empty in v3.
     #[mesh(10)]
     pub memory_sha256: Vec<u8>,
     /// Authoritative machine composition for versioned machine profiles.
@@ -867,13 +860,13 @@ fn stage_snapshot(
     let memory_path = staging.path().join(MEMORY_FILE_NAME);
     let manifest_path = staging.path().join(MANIFEST_FILE_NAME);
 
-    let state_digest = write_bytes(&state_path, saved_state_bytes, "saved state")?;
-    let memory_digest = copy_and_hash(memory_file, &memory_path, manifest.memory_size_bytes)?;
+    write_bytes(&state_path, saved_state_bytes, "saved state")?;
+    copy_exact(memory_file, &memory_path, manifest.memory_size_bytes)?;
 
     let mut published_manifest = manifest.clone();
     published_manifest.state_size_bytes = saved_state_bytes.len() as u64;
-    published_manifest.state_sha256 = state_digest.to_vec();
-    published_manifest.memory_sha256 = memory_digest.to_vec();
+    published_manifest.state_sha256.clear();
+    published_manifest.memory_sha256.clear();
 
     let manifest_bytes = mesh::payload::encode(published_manifest);
     anyhow::ensure!(
@@ -888,8 +881,8 @@ fn stage_snapshot(
 
 /// Read a snapshot from the given directory.
 ///
-/// Returns the decoded manifest and the raw saved-state bytes after verifying
-/// all three artifacts. `expected_memory_size` bounds memory verification.
+/// Returns the decoded manifest and raw saved-state bytes after structurally
+/// validating all three artifacts. `expected_memory_size` bounds memory.
 pub fn read_snapshot(
     dir: &Path,
     expected_memory_size: u64,
@@ -901,7 +894,7 @@ pub fn read_snapshot(
 /// Reads and structurally validates only `manifest.bin`.
 ///
 /// Restore uses this before machine composition; all artifacts are opened and
-/// cryptographically verified again before partition creation.
+/// structurally validated again before partition creation.
 pub fn read_snapshot_manifest(dir: &Path) -> anyhow::Result<SnapshotManifest> {
     validate_snapshot_directory(dir)?;
     let manifest_bytes = read_bounded_file(
@@ -912,43 +905,20 @@ pub fn read_snapshot_manifest(dir: &Path) -> anyhow::Result<SnapshotManifest> {
     let manifest: SnapshotManifest =
         mesh::payload::decode(&manifest_bytes).context("failed to decode snapshot manifest")?;
     validate_manifest_header(&manifest)?;
-    anyhow::ensure!(
-        manifest.version == MANIFEST_VERSION,
-        "snapshot manifest version {} is not supported (expected {})",
-        manifest.version,
-        MANIFEST_VERSION,
-    );
+    validate_manifest_version(&manifest)?;
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
     Ok(manifest)
 }
 
-/// Read and verify a snapshot, returning the exact verified memory handle.
+/// Read and structurally validate a snapshot, returning its exact memory handle.
 ///
 /// The returned file is positioned at offset zero and must be used directly
-/// for restore so a path replacement cannot substitute unverified memory.
+/// for restore so a path replacement cannot substitute different memory.
 pub fn read_snapshot_with_memory(
     dir: &Path,
     expected_memory_size: u64,
-) -> anyhow::Result<(SnapshotManifest, Vec<u8>, std::fs::File)> {
-    read_snapshot_with_memory_verification(
-        dir,
-        expected_memory_size,
-        SnapshotMemoryVerification::Sha256,
-    )
-}
-
-/// Read a snapshot using the requested memory-content verification policy.
-///
-/// Manifest and saved-state validation always remain enabled. Selecting
-/// [`SnapshotMemoryVerification::SkipSha256`] weakens snapshot integrity and
-/// is appropriate only when the caller independently guarantees that the
-/// memory artifact is trusted and immutable.
-pub fn read_snapshot_with_memory_verification(
-    dir: &Path,
-    expected_memory_size: u64,
-    memory_verification: SnapshotMemoryVerification,
 ) -> anyhow::Result<(SnapshotManifest, Vec<u8>, std::fs::File)> {
     validate_snapshot_directory(dir)?;
 
@@ -960,14 +930,7 @@ pub fn read_snapshot_with_memory_verification(
     let manifest: SnapshotManifest =
         mesh::payload::decode(&manifest_bytes).context("failed to decode snapshot manifest")?;
     validate_manifest_header(&manifest)?;
-    anyhow::ensure!(
-        manifest.version == MANIFEST_VERSION,
-        "snapshot manifest version {} is not supported (expected {})",
-        manifest.version,
-        MANIFEST_VERSION,
-    );
-    validate_sha256(&manifest.state_sha256, "state.bin")?;
-    validate_sha256(&manifest.memory_sha256, "memory.bin")?;
+    validate_manifest_version(&manifest)?;
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
@@ -988,25 +951,13 @@ pub fn read_snapshot_with_memory_verification(
         state_bytes.len(),
         manifest.state_size_bytes,
     );
-    verify_digest(&state_bytes, &manifest.state_sha256, STATE_FILE_NAME)?;
-
     anyhow::ensure!(
         manifest.memory_size_bytes == expected_memory_size,
         "memory.bin size in the manifest ({} bytes) doesn't match expected ({expected_memory_size} bytes)",
         manifest.memory_size_bytes,
     );
     let memory_path = dir.join(MEMORY_FILE_NAME);
-    let memory_file = match memory_verification {
-        SnapshotMemoryVerification::Sha256 => open_and_verify_file(
-            &memory_path,
-            expected_memory_size,
-            &manifest.memory_sha256,
-            MEMORY_FILE_NAME,
-        )?,
-        SnapshotMemoryVerification::SkipSha256 => {
-            open_file_with_length(&memory_path, expected_memory_size, MEMORY_FILE_NAME)?
-        }
-    };
+    let memory_file = open_file_with_length(&memory_path, expected_memory_size, MEMORY_FILE_NAME)?;
 
     Ok((manifest, state_bytes, memory_file))
 }
@@ -1184,20 +1135,20 @@ fn create_file(path: &Path, description: &str) -> anyhow::Result<std::fs::File> 
         .with_context(|| format!("failed to create {description} at {}", path.display()));
 }
 
-fn write_bytes(path: &Path, bytes: &[u8], description: &str) -> anyhow::Result<[u8; 32]> {
+fn write_bytes(path: &Path, bytes: &[u8], description: &str) -> anyhow::Result<()> {
     let mut file = create_file(path, description)?;
     file.write_all(bytes)
         .with_context(|| format!("failed to write {description}"))?;
     file.sync_all()
         .with_context(|| format!("failed to flush {description}"))?;
-    Ok(sha2::Sha256::digest(bytes).into())
+    Ok(())
 }
 
-fn copy_and_hash(
+fn copy_exact(
     source_file: &std::fs::File,
     destination_path: &Path,
     expected_length: u64,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<()> {
     let source_metadata = source_file
         .metadata()
         .context("failed to inspect memory backing file")?;
@@ -1220,7 +1171,6 @@ fn copy_and_hash(
         "memory backing file size ({source_length} bytes) doesn't match manifest ({expected_length} bytes)",
     );
     let mut destination = create_file(destination_path, "snapshot memory")?;
-    let mut hasher = sha2::Sha256::new();
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
     let limit = expected_length
@@ -1238,7 +1188,6 @@ fn copy_and_hash(
         destination
             .write_all(&buffer[..count])
             .context("failed to write snapshot memory")?;
-        hasher.update(&buffer[..count]);
         total = total
             .checked_add(count as u64)
             .context("memory backing file length overflowed u64")?;
@@ -1252,7 +1201,7 @@ fn copy_and_hash(
     destination
         .sync_all()
         .context("failed to flush snapshot memory")?;
-    Ok(hasher.finalize().into())
+    Ok(())
 }
 
 fn validate_snapshot_directory(dir: &Path) -> anyhow::Result<()> {
@@ -1340,64 +1289,22 @@ fn read_bounded_file(path: &Path, maximum_size: u64, description: &str) -> anyho
     Ok(bytes)
 }
 
-fn validate_sha256(digest: &[u8], artifact_name: &str) -> anyhow::Result<()> {
+fn validate_sha256(digest: &[u8], description: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         digest.len() == SHA256_SIZE,
-        "{artifact_name} SHA-256 digest has invalid length {}",
+        "{description} SHA-256 digest has invalid length {}",
         digest.len(),
     );
     Ok(())
 }
 
-fn verify_digest(bytes: &[u8], expected: &[u8], artifact_name: &str) -> anyhow::Result<()> {
+fn verify_digest(bytes: &[u8], expected: &[u8], description: &str) -> anyhow::Result<()> {
     let actual: [u8; 32] = sha2::Sha256::digest(bytes).into();
     anyhow::ensure!(
         actual.as_slice() == expected,
-        "{artifact_name} SHA-256 digest mismatch",
+        "{description} SHA-256 digest mismatch",
     );
     Ok(())
-}
-
-fn open_and_verify_file(
-    path: &Path,
-    expected_length: u64,
-    expected_digest: &[u8],
-    artifact_name: &str,
-) -> anyhow::Result<std::fs::File> {
-    let mut file = open_file_with_length(path, expected_length, artifact_name)?;
-    let length = expected_length;
-
-    let mut hasher = sha2::Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-    let limit = expected_length
-        .checked_add(1)
-        .context("memory artifact length cannot be bounded")?;
-    let mut reader = Read::by_ref(&mut file).take(limit);
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read {artifact_name}"))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-        total = total
-            .checked_add(count as u64)
-            .context("artifact length overflowed u64")?;
-    }
-    anyhow::ensure!(
-        total == length,
-        "{artifact_name} changed while it was being read",
-    );
-    let actual: [u8; 32] = hasher.finalize().into();
-    anyhow::ensure!(
-        actual.as_slice() == expected_digest,
-        "{artifact_name} SHA-256 digest mismatch",
-    );
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to rewind {artifact_name}"))?;
-    Ok(file)
 }
 
 fn open_file_with_length(
@@ -1446,13 +1353,7 @@ pub fn validate_manifest(
     expected_page_size: u32,
 ) -> anyhow::Result<()> {
     validate_manifest_header(manifest)?;
-    if manifest.version != MANIFEST_VERSION {
-        anyhow::bail!(
-            "snapshot manifest version {} is not supported (expected {})",
-            manifest.version,
-            MANIFEST_VERSION,
-        );
-    }
+    validate_manifest_version(manifest)?;
 
     if manifest.architecture != expected_arch {
         anyhow::bail!(
@@ -1839,8 +1740,15 @@ fn validate_machine_contract_shape(
 }
 
 fn validate_manifest_header(manifest: &SnapshotManifest) -> anyhow::Result<()> {
+    let expected_magic = match manifest.version {
+        LEGACY_MANIFEST_VERSION => LEGACY_SNAPSHOT_FORMAT_MAGIC,
+        MANIFEST_VERSION => SNAPSHOT_FORMAT_MAGIC,
+        version => anyhow::bail!(
+            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION} or {MANIFEST_VERSION})"
+        ),
+    };
     anyhow::ensure!(
-        manifest.format_magic == SNAPSHOT_FORMAT_MAGIC,
+        manifest.format_magic == expected_magic,
         "snapshot format magic is invalid"
     );
     anyhow::ensure!(
@@ -1853,6 +1761,33 @@ fn validate_manifest_header(manifest: &SnapshotManifest) -> anyhow::Result<()> {
         "snapshot saved-state root type '{}' is unsupported",
         manifest.saved_state_root_type
     );
+    Ok(())
+}
+
+fn validate_manifest_version(manifest: &SnapshotManifest) -> anyhow::Result<()> {
+    match manifest.version {
+        LEGACY_MANIFEST_VERSION => {
+            anyhow::ensure!(
+                manifest.state_sha256.len() == SHA256_SIZE,
+                "legacy state.bin SHA-256 digest has invalid length {}",
+                manifest.state_sha256.len(),
+            );
+            anyhow::ensure!(
+                manifest.memory_sha256.len() == SHA256_SIZE,
+                "legacy memory.bin SHA-256 digest has invalid length {}",
+                manifest.memory_sha256.len(),
+            );
+        }
+        MANIFEST_VERSION => {
+            anyhow::ensure!(
+                manifest.state_sha256.is_empty() && manifest.memory_sha256.is_empty(),
+                "snapshot manifest version {MANIFEST_VERSION} must not contain legacy artifact digests",
+            );
+        }
+        version => anyhow::bail!(
+            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION} or {MANIFEST_VERSION})"
+        ),
+    }
     Ok(())
 }
 
@@ -2474,8 +2409,8 @@ mod tests {
         assert_eq!(read_manifest.vp_count, manifest.vp_count);
         assert_eq!(read_manifest.architecture, manifest.architecture);
         assert_eq!(read_manifest.state_size_bytes, state.len() as u64);
-        assert_eq!(read_manifest.state_sha256.len(), SHA256_SIZE);
-        assert_eq!(read_manifest.memory_sha256.len(), SHA256_SIZE);
+        assert!(read_manifest.state_sha256.is_empty());
+        assert!(read_manifest.memory_sha256.is_empty());
         assert_eq!(read_state, state);
 
         // memory.bin should exist in the snapshot directory.
@@ -2598,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn read_snapshot_rejects_corrupt_state() {
+    fn read_snapshot_accepts_same_length_state_change_without_legacy_checksum_validation() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
         let mem_path = dir.path().join("memory.bin");
@@ -2606,12 +2541,12 @@ mod tests {
         write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
         std::fs::write(snap_dir.join(STATE_FILE_NAME), b"other").unwrap();
 
-        let err = read_snapshot(&snap_dir, 1024).err().unwrap();
-        assert!(err.to_string().contains("digest mismatch"));
+        let (_, state) = read_snapshot(&snap_dir, 1024).unwrap();
+        assert_eq!(state, b"other");
     }
 
     #[test]
-    fn read_snapshot_rejects_corrupt_memory() {
+    fn read_snapshot_accepts_same_length_memory_change_without_legacy_checksum_validation() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
         let mem_path = dir.path().join("memory.bin");
@@ -2619,29 +2554,70 @@ mod tests {
         write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
         std::fs::write(snap_dir.join(MEMORY_FILE_NAME), vec![1_u8; 1024]).unwrap();
 
-        let err = read_snapshot(&snap_dir, 1024).err().unwrap();
-        assert!(err.to_string().contains("digest mismatch"));
+        let (_, _, mut memory) = read_snapshot_with_memory(&snap_dir, 1024).unwrap();
+        let mut bytes = Vec::new();
+        memory.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vec![1_u8; 1024]);
     }
 
     #[test]
-    fn read_snapshot_can_skip_corrupt_memory_digest() {
+    fn read_snapshot_accepts_legacy_v2_manifest_without_verifying_digests() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
         let mem_path = dir.path().join("memory.bin");
         std::fs::write(&mem_path, vec![0_u8; 1024]).unwrap();
         write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
-        std::fs::write(snap_dir.join(MEMORY_FILE_NAME), vec![1_u8; 1024]).unwrap();
-
-        read_snapshot_with_memory_verification(
-            &snap_dir,
-            1024,
-            SnapshotMemoryVerification::SkipSha256,
+        let mut manifest = read_snapshot_manifest(&snap_dir).unwrap();
+        manifest.version = LEGACY_MANIFEST_VERSION;
+        manifest.format_magic = LEGACY_SNAPSHOT_FORMAT_MAGIC.to_vec();
+        manifest.state_sha256 = vec![0xa5; SHA256_SIZE];
+        manifest.memory_sha256 = vec![0x5a; SHA256_SIZE];
+        std::fs::write(
+            snap_dir.join(MANIFEST_FILE_NAME),
+            mesh::payload::encode(manifest),
         )
         .unwrap();
+        std::fs::write(snap_dir.join(STATE_FILE_NAME), b"other").unwrap();
+        std::fs::write(snap_dir.join(MEMORY_FILE_NAME), vec![1_u8; 1024]).unwrap();
+
+        let (manifest, state) = read_snapshot(&snap_dir, 1024).unwrap();
+        assert_eq!(manifest.version, LEGACY_MANIFEST_VERSION);
+        assert_eq!(state, b"other");
     }
 
     #[test]
-    fn skipped_memory_digest_still_requires_exact_length() {
+    fn read_snapshot_rejects_malformed_legacy_digest_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let mem_path = dir.path().join("memory.bin");
+        std::fs::write(&mem_path, vec![0_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
+        let mut manifest = read_snapshot_manifest(&snap_dir).unwrap();
+        manifest.version = LEGACY_MANIFEST_VERSION;
+        manifest.format_magic = LEGACY_SNAPSHOT_FORMAT_MAGIC.to_vec();
+        manifest.state_sha256 = vec![0; SHA256_SIZE - 1];
+        manifest.memory_sha256 = vec![0; SHA256_SIZE];
+        std::fs::write(
+            snap_dir.join(MANIFEST_FILE_NAME),
+            mesh::payload::encode(manifest.clone()),
+        )
+        .unwrap();
+        let error = read_snapshot(&snap_dir, 1024).err().unwrap();
+        assert!(error.to_string().contains("state.bin SHA-256 digest"));
+
+        manifest.state_sha256 = vec![0; SHA256_SIZE];
+        manifest.memory_sha256 = vec![0; SHA256_SIZE + 1];
+        std::fs::write(
+            snap_dir.join(MANIFEST_FILE_NAME),
+            mesh::payload::encode(manifest),
+        )
+        .unwrap();
+        let error = read_snapshot(&snap_dir, 1024).err().unwrap();
+        assert!(error.to_string().contains("memory.bin SHA-256 digest"));
+    }
+
+    #[test]
+    fn read_snapshot_still_requires_exact_memory_length() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
         let mem_path = dir.path().join("memory.bin");
@@ -2649,33 +2625,16 @@ mod tests {
         write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
         std::fs::write(snap_dir.join(MEMORY_FILE_NAME), vec![1_u8; 1023]).unwrap();
 
-        let error = read_snapshot_with_memory_verification(
-            &snap_dir,
-            1024,
-            SnapshotMemoryVerification::SkipSha256,
-        )
-        .err()
-        .unwrap();
+        let error = read_snapshot(&snap_dir, 1024).err().unwrap();
         assert!(error.to_string().contains("memory.bin size"));
     }
 
     #[test]
-    fn skipped_memory_digest_still_verifies_saved_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_dir = dir.path().join("snap");
-        let mem_path = dir.path().join("memory.bin");
-        std::fs::write(&mem_path, vec![0_u8; 1024]).unwrap();
-        write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
-        std::fs::write(snap_dir.join(STATE_FILE_NAME), b"other").unwrap();
-
-        let error = read_snapshot_with_memory_verification(
-            &snap_dir,
-            1024,
-            SnapshotMemoryVerification::SkipSha256,
-        )
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("digest mismatch"));
+    fn read_snapshot_rejects_legacy_digests_in_v3_manifest() {
+        let mut manifest = test_manifest();
+        manifest.state_sha256 = vec![0; SHA256_SIZE];
+        let error = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
+        assert!(error.to_string().contains("legacy artifact digests"));
     }
 
     #[test]
@@ -2777,21 +2736,21 @@ mod tests {
     }
 
     #[test]
-    fn verified_memory_handle_survives_path_replacement() {
+    fn opened_memory_handle_survives_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
         let mem_path = dir.path().join("memory.bin");
         std::fs::write(&mem_path, vec![0x5a_u8; 1024]).unwrap();
         write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
 
-        let (_, _, mut verified_memory) = read_snapshot_with_memory(&snap_dir, 1024).unwrap();
+        let (_, _, mut opened_memory) = read_snapshot_with_memory(&snap_dir, 1024).unwrap();
         let original_path = snap_dir.join(MEMORY_FILE_NAME);
-        let moved_path = snap_dir.join("verified-memory.bin");
+        let moved_path = snap_dir.join("opened-memory.bin");
         std::fs::rename(&original_path, &moved_path).unwrap();
         std::fs::write(&original_path, vec![0xa5_u8; 1024]).unwrap();
 
         let mut bytes = Vec::new();
-        verified_memory.read_to_end(&mut bytes).unwrap();
+        opened_memory.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, vec![0x5a_u8; 1024]);
     }
 

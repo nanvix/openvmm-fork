@@ -303,11 +303,6 @@ Examples:
     #[clap(long, requires = "restore_snapshot")]
     pub restore_entropy: bool,
 
-    /// Skip SHA-256 verification of snapshot memory during restore. This trusts
-    /// memory.bin after checking only its file type and exact length.
-    #[clap(long, requires = "restore_snapshot")]
-    pub unsafe_skip_snapshot_memory_verification: bool,
-
     /// Capture a microVM snapshot to this directory when the guest writes PMIO 0x605.
     #[clap(long, value_name = "DIR", conflicts_with = "restore_snapshot")]
     pub snapshot_destination: Option<PathBuf>,
@@ -5500,23 +5495,6 @@ mod tests {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
-    }
-
-    #[test]
-    fn test_snapshot_memory_verification_bypass_requires_restore() {
-        assert!(
-            Options::try_parse_from(["openvmm", "--unsafe-skip-snapshot-memory-verification",])
-                .is_err()
-        );
-
-        let opt = Options::try_parse_from([
-            "openvmm",
-            "--restore-snapshot",
-            "snapshot",
-            "--unsafe-skip-snapshot-memory-verification",
-        ])
-        .unwrap();
-        assert!(opt.unsafe_skip_snapshot_memory_verification);
     }
 
     #[test]

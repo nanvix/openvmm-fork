@@ -8,6 +8,7 @@ use petri::PetriHaltReason;
 use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
 use std::ffi::OsString;
+use std::hash::Hasher;
 use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -31,6 +32,30 @@ const MICROVM_BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
 const MICROVM_SHELL_PROMPT: &[u8] = b"/ # ";
 const PHASE_2_TIMEOUT: Duration = Duration::from_secs(60);
 const PHASE_3_TX_COUNT: usize = 10_000;
+
+fn snapshot_payload_fingerprint(snapshot_dir: &Path) -> anyhow::Result<(u64, u64)> {
+    fn file_fingerprint(path: &Path) -> anyhow::Result<u64> {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open snapshot payload {}", path.display()))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read snapshot payload {}", path.display()))?;
+            if count == 0 {
+                break;
+            }
+            hasher.write(&buffer[..count]);
+        }
+        Ok(hasher.finish())
+    }
+
+    Ok((
+        file_fingerprint(&snapshot_dir.join("state.bin"))?,
+        file_fingerprint(&snapshot_dir.join("memory.bin"))?,
+    ))
+}
 
 fn microvm_hypervisor() -> anyhow::Result<&'static str> {
     if cfg!(windows) {
@@ -586,8 +611,15 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         snapshot_dir.is_dir(),
         "snapshot directory was not published"
     );
-    openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-        .context("published snapshot failed verification")?;
+    let (manifest, _) = openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
+        .context("published snapshot failed structural validation")?;
+    anyhow::ensure!(
+        manifest.version == openvmm_helpers::snapshot::MANIFEST_VERSION
+            && manifest.state_sha256.is_empty()
+            && manifest.memory_sha256.is_empty(),
+        "new microVM snapshot contains legacy artifact digests"
+    );
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut rng_hashes = Vec::new();
     let mut restore_latencies = Vec::new();
@@ -658,8 +690,10 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             "restore {restore_index} reported a malformed RNG digest"
         );
         rng_hashes.push(rng_hash.to_vec());
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("restore {restore_index} modified snapshot artifacts"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "restore {restore_index} modified snapshot payloads"
+        );
     }
     anyhow::ensure!(
         rng_hashes[0] != rng_hashes[1],
@@ -792,6 +826,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     );
     anyhow::ensure!(snapshot_dir.is_dir(), "phase-3 snapshot was not published");
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     for restore_index in 0..2 {
         let mut restore_args = phase_2_args(hypervisor);
@@ -836,8 +871,10 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
                 "phase-3 restore {restore_index} did not preserve queued RX exactly once"
             );
         }
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("phase-3 restore {restore_index} modified the snapshot"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-3 restore {restore_index} modified snapshot payloads"
+        );
     }
 
     Ok(())
@@ -936,6 +973,7 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
         .recv_timeout(PHASE_2_TIMEOUT)
         .context("phase-4 pre-snapshot HTTP request was not observed")?;
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut missing_policy_args = phase_2_args(hypervisor);
     missing_policy_args.extend([
@@ -976,8 +1014,10 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
             .with_context(|| {
                 format!("phase-4 restore {restore_index} HTTP request was not observed")
             })?;
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("phase-4 restore {restore_index} modified the snapshot"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-4 restore {restore_index} modified snapshot payloads"
+        );
     }
     server
         .join()
@@ -1095,6 +1135,7 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         "phase-5 source completed a post-snapshot filesystem write"
     );
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut missing_mount_args = phase_2_args(hypervisor);
     missing_mount_args.extend([
@@ -1163,8 +1204,10 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
             "phase-5 restore {restore_index} exited with {status}: {}",
             output_tail(&output)
         );
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("phase-5 restore {restore_index} modified the snapshot"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-5 restore {restore_index} modified snapshot payloads"
+        );
     }
 
     Ok(())

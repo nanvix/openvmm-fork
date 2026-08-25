@@ -80,22 +80,13 @@ directory, so `file=...` should not be specified in `--memory` (the two options
 are mutually exclusive). Guest writes use a private copy-on-write mapping and
 do not modify the snapshot artifact.
 
-For controlled benchmarks or an independently protected immutable artifact,
-you can skip only the full `memory.bin` digest scan:
-
-```bash
-cargo run -- \
-  --restore-snapshot path/to/snapshot-dir \
-  --unsafe-skip-snapshot-memory-verification
-```
-
-```admonish danger
-`--unsafe-skip-snapshot-memory-verification` allows same-length modifications
-of guest RAM to reach the restored VM undetected. Manifest validation,
-`state.bin` SHA-256 verification, regular-file checks, and the exact memory
-length check remain enabled, but they do not protect the contents of
-`memory.bin`. Do not use this option for an artifact that another process or
-user can modify.
+```admonish warning
+Version 3 snapshots do not contain or validate embedded checksums for
+`state.bin` or `memory.bin`. Restore still requires regular files, bounded
+manifest and state decoding, exact artifact lengths, and a compatible machine
+contract, but same-length payload changes are not detected. Protect snapshot
+directories with host access controls. Integrity or authentication for export
+and transport must be supplied outside the default snapshot format.
 ```
 
 ```admonish note

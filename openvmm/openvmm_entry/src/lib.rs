@@ -4389,20 +4389,11 @@ fn prepare_snapshot_restore(
     } else {
         None
     };
-    let memory_verification = if opt.unsafe_skip_snapshot_memory_verification {
-        tracing::warn!(
-            "snapshot memory SHA-256 verification is disabled; memory.bin integrity is not checked"
-        );
-        openvmm_helpers::snapshot::SnapshotMemoryVerification::SkipSha256
-    } else {
-        openvmm_helpers::snapshot::SnapshotMemoryVerification::Sha256
-    };
     prepare_snapshot_restore_for_config(
         snapshot_dir,
         opt.memory_size(),
         opt.processors,
         expected_microvm_contract,
-        memory_verification,
     )
 }
 
@@ -4440,18 +4431,13 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         )>,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
     )>,
-    memory_verification: openvmm_helpers::snapshot::SnapshotMemoryVerification,
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
     mesh::payload::message::ProtobufMessage,
     Option<(Duration, u64, Option<u64>, Vec<u8>)>,
 )> {
     let (manifest, state_bytes, memory_file) =
-        openvmm_helpers::snapshot::read_snapshot_with_memory_verification(
-            snapshot_dir,
-            expected_memory_size,
-            memory_verification,
-        )?;
+        openvmm_helpers::snapshot::read_snapshot_with_memory(snapshot_dir, expected_memory_size)?;
 
     // Validate manifest against current VM config.
     openvmm_helpers::snapshot::validate_manifest(
