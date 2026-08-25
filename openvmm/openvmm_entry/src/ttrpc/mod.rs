@@ -1408,6 +1408,7 @@ impl VmService {
             rtc_delta_milliseconds: 0,
             microvm_network: None,
             microvm_filesystem: None,
+            microvm_sandbox_blocks: Vec::new(),
         };
 
         let guest_power_actions = {

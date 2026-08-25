@@ -1535,7 +1535,10 @@ async fn vm_config_from_command_line(
     opt: &Options,
     restore_machine_contract: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
 ) -> anyhow::Result<(Config, VmResources)> {
-    let is_microvm = opt.machine == MachineProfileCli::Microvm;
+    let is_microvm = matches!(
+        opt.machine,
+        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+    );
     opt.validate_microvm_options()?;
     let effective_microvm_network = if is_microvm {
         effective_microvm_network(opt, restore_machine_contract)?
@@ -2031,6 +2034,24 @@ async fn vm_config_from_command_line(
                 is_dvd,
                 read_only,
             )
+            .await?;
+    }
+
+    for block in &opt.microvm_sandbox_block {
+        let disk = &block.disk;
+        anyhow::ensure!(
+            disk.vtl == DeviceVtl::Vtl0
+                && !disk.is_dvd
+                && disk.underhill.is_none()
+                && disk.pcie_port.is_none()
+                && disk.controller.is_none()
+                && disk.nsid.is_none()
+                && disk.lun.is_none()
+                && disk.relay.is_none(),
+            "--microvm-sandbox-block accepts only a plain VTL0 disk backend"
+        );
+        storage
+            .add_microvm_sandbox_block(block.role, &disk.kind, disk.read_only)
             .await?;
     }
 
@@ -3659,6 +3680,7 @@ async fn vm_config_from_command_line(
         rtc_delta_milliseconds: 0,
         microvm_network,
         microvm_filesystem,
+        microvm_sandbox_blocks: Vec::new(),
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
@@ -3676,25 +3698,39 @@ async fn vm_config_from_command_line(
             .virtio_devices
             .iter()
             .any(|(_, device)| device.id() == "virtio-console");
-        let has_block = cfg
-            .virtio_devices
-            .iter()
-            .any(|(_, device)| device.id() == "virtio-blk");
         let network_irq = cfg
             .microvm_network
             .as_ref()
             .map(|_| openvmm_defs::config::microvm_virtio_net_irq(requested_hypervisor))
             .transpose()?;
-        openvmm_defs::config::append_microvm_virtio_discovery(
-            cmdline,
-            cfg.microvm_network
-                .as_ref()
-                .zip(network_irq)
-                .map(|(network, irq)| (network, irq, microvm_gateway_dns)),
-            cfg.microvm_filesystem.as_ref(),
-            has_console,
-            has_block,
-        )?;
+        let network = cfg
+            .microvm_network
+            .as_ref()
+            .zip(network_irq)
+            .map(|(network, irq)| (network, irq, microvm_gateway_dns));
+        match cfg.machine_profile {
+            MachineProfile::Microvm {
+                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
+            } => openvmm_defs::config::append_microvm_virtio_discovery(
+                cmdline,
+                network,
+                cfg.microvm_filesystem.as_ref(),
+                has_console,
+                cfg.virtio_devices
+                    .iter()
+                    .any(|(_, device)| device.id() == "virtio-blk"),
+            )?,
+            MachineProfile::Microvm {
+                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            } => openvmm_defs::config::append_microvm_v2_virtio_discovery(
+                cmdline,
+                network,
+                cfg.microvm_filesystem.as_ref(),
+                has_console,
+                &cfg.microvm_sandbox_blocks,
+            )?,
+            _ => unreachable!("microVM profile has an unsupported ABI version"),
+        }
     }
     openvmm_defs::config::validate_machine_config(&cfg, requested_hypervisor)?;
     resources.serial_driver = Some(serial_driver);
@@ -4793,7 +4829,11 @@ async fn run_control_inner(
     };
     let hypervisor = match &opt.hypervisor {
         Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
-        None if opt.machine == MachineProfileCli::Microvm => {
+        None if matches!(
+            opt.machine,
+            MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+        ) =>
+        {
             openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
         }
         None => openvmm_helpers::hypervisor::choose_hypervisor()?,

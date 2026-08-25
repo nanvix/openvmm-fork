@@ -220,6 +220,7 @@ impl Manifest {
             chipset_capabilities: config.chipset_capabilities,
             layout: config.layout,
             rtc_delta_milliseconds: config.rtc_delta_milliseconds,
+            microvm_sandbox_blocks: config.microvm_sandbox_blocks,
         }
     }
 }
@@ -264,6 +265,7 @@ pub struct Manifest {
     layout: vmm_core_defs::LayoutConfig,
     rtc_delta_milliseconds: i64,
     machine_profile: MachineProfile,
+    microvm_sandbox_blocks: Vec<openvmm_defs::config::MicrovmSandboxBlockConfig>,
 }
 
 async fn open_simple_disk(
@@ -2854,6 +2856,7 @@ impl InitializedVm {
         // allocation indexed by the order of VirtioBus::Mmio devices.
         let mut pci_device_number = 10;
         let mut virtio_mmio_index = 0;
+        let mut microvm_sandbox_blocks = cfg.microvm_sandbox_blocks.iter();
 
         // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
         // configure the line as level-triggered in the MADT (necessary for
@@ -2896,10 +2899,25 @@ impl InitializedVm {
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
                             ),
-                            "virtio-blk" => (
-                                openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
-                                openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
-                            ),
+                            "virtio-blk" => match cfg.machine_profile {
+                                MachineProfile::Microvm {
+                                    abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
+                                } => (
+                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
+                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
+                                ),
+                                MachineProfile::Microvm {
+                                    abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
+                                } => {
+                                    let block = microvm_sandbox_blocks.next().context(
+                                        "microVM ABI version 2 virtio-blk device has no sandbox role",
+                                    )?;
+                                    (block.role.mmio_base(), block.role.irq())
+                                }
+                                _ => anyhow::bail!(
+                                    "unsupported microVM ABI reached worker construction"
+                                ),
+                            },
                             _ => anyhow::bail!(
                                 "unsupported microVM virtio device '{id}' reached worker construction"
                             ),
@@ -3196,6 +3214,12 @@ impl LoadedVmInner {
                 }
             })
             .collect();
+        let microvm_level_triggered_irqs = match self.machine_profile {
+            MachineProfile::Microvm { abi_version } => {
+                openvmm_defs::config::microvm_level_triggered_irqs(abi_version)?
+            }
+            MachineProfile::Standard => &[],
+        };
         let acpi_builder = AcpiTablesBuilder {
             processor_topology: &self.processor_topology,
             mem_layout: &self.mem_layout,
@@ -3211,20 +3235,7 @@ impl LoadedVmInner {
                 with_pit: self.chipset_capabilities.with_pit,
                 pm_base: PM_BASE,
                 acpi_irq: SYSTEM_IRQ_ACPI,
-                level_triggered_irqs: if matches!(
-                    self.machine_profile,
-                    MachineProfile::Microvm { .. }
-                ) {
-                    &[
-                        openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
-                        openvmm_defs::config::MICROVM_VIRTIO_NET_WHP_IRQ,
-                        openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
-                        openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
-                        openvmm_defs::config::MICROVM_VIRTIO_NET_KVM_IRQ,
-                    ]
-                } else {
-                    &[]
-                },
+                level_triggered_irqs: microvm_level_triggered_irqs,
                 iommu: match &self.iommu_devices {
                     IommuDevices::AmdVi(devices) => {
                         Some(vmm_core::acpi_builder::X86IommuAcpiConfig::AmdVi(
@@ -4373,7 +4384,8 @@ impl LoadedVm {
                 chipset_high_mmio_size: 0,
                 vtl2_chipset_mmio_size: 0,
             }, // TODO
-            rtc_delta_milliseconds: 0, // TODO
+            rtc_delta_milliseconds: 0,      // TODO
+            microvm_sandbox_blocks: vec![], // TODO
         };
         #[expect(unreachable_code, reason = "TODO")]
         RestartState {

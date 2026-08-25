@@ -1242,6 +1242,122 @@ exit 37
     vm.teardown().await
 }
 
+#[openvmm_test_no_agent(ignore(
+    reason = "requires a published microVM PVH kernel and initramfs",
+    microvm_pvh_x64
+))]
+async fn microvm_v2_sandbox_blocks(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    use disk_backend_resources::LayeredDiskHandle;
+    use disk_backend_resources::layer::RamDiskLayerHandle;
+    use openvmm_defs::config::LoadMode;
+    use openvmm_defs::config::MICROVM_ABI_VERSION_2;
+    use openvmm_defs::config::MachineProfile;
+    use openvmm_defs::config::MicrovmSandboxBlockConfig;
+    use openvmm_defs::config::MicrovmSandboxBlockRole;
+    use openvmm_defs::config::VirtioBus;
+    use openvmm_defs::config::append_microvm_v2_virtio_discovery;
+    use virtio_resources::blk::VirtioBlkHandle;
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const DISK_SIZE: u64 = 8 * 1024 * 1024;
+    const WORKLOAD: &[u8] = br#"#!/bin/sh
+set -eu
+for name in vda vdb vdc vdd; do
+    tries=0
+    while [ ! -b "/dev/$name" ] && [ "$tries" -lt 200 ]; do
+        sleep 0.05
+        tries=$((tries + 1))
+    done
+    [ -b "/dev/$name" ] || exit 20
+done
+grep -q 'virtio_mmio.device=0x1000@0xd0003000:4' /proc/cmdline || exit 21
+grep -q 'virtio_mmio.device=0x1000@0xd0004000:12' /proc/cmdline || exit 22
+grep -q 'virtio_mmio.device=0x1000@0xd0005000:9' /proc/cmdline || exit 23
+grep -q 'virtio_mmio.device=0x1000@0xd0006000:11' /proc/cmdline || exit 24
+[ "$(cat /sys/block/vda/ro)" = 1 ] || exit 25
+[ "$(cat /sys/block/vdb/ro)" = 1 ] || exit 26
+[ "$(cat /sys/block/vdc/ro)" = 1 ] || exit 27
+[ "$(cat /sys/block/vdd/ro)" = 0 ] || exit 28
+printf MICROVM-V2-SCRATCH-OK | dd of=/dev/vdd bs=512 count=1 conv=sync,notrunc 2>/dev/null
+[ "$(dd if=/dev/vdd bs=512 count=1 2>/dev/null | head -c 22)" = MICROVM-V2-SCRATCH-OK ] || exit 29
+exit 37
+"#;
+
+    let modified_initrd =
+        config.prepare_initrd_with_file("microvm-v2-sandbox-blocks.sh", WORKLOAD, 0o100755)?;
+    let roles = [
+        MicrovmSandboxBlockConfig {
+            role: MicrovmSandboxBlockRole::Distro,
+            read_only: true,
+        },
+        MicrovmSandboxBlockConfig {
+            role: MicrovmSandboxBlockRole::Runtime,
+            read_only: true,
+        },
+        MicrovmSandboxBlockConfig {
+            role: MicrovmSandboxBlockRole::Custom,
+            read_only: true,
+        },
+        MicrovmSandboxBlockConfig {
+            role: MicrovmSandboxBlockRole::Scratch,
+            read_only: false,
+        },
+    ];
+    let disks = roles.map(|_| {
+        LayeredDiskHandle::single_layer(RamDiskLayerHandle {
+            len: Some(DISK_SIZE),
+            sector_size: None,
+        })
+        .into_resource()
+    });
+
+    let mut vm = config
+        .with_prebuilt_initrd(modified_initrd.to_path_buf())
+        .with_microvm_machine()
+        .modify_backend(move |backend| {
+            backend.with_custom_config(|config| {
+                config.machine_profile = MachineProfile::Microvm {
+                    abi_version: MICROVM_ABI_VERSION_2,
+                };
+                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
+                    panic!("microVM test did not produce PVH load mode");
+                };
+                cmdline.push_str(" nvx_exec=/microvm-v2-sandbox-blocks.sh");
+                append_microvm_v2_virtio_discovery(cmdline, None, None, false, &roles).unwrap();
+                config.microvm_sandbox_blocks = roles.to_vec();
+                config
+                    .virtio_devices
+                    .extend(roles.into_iter().zip(disks).map(|(block, disk)| {
+                        (
+                            VirtioBus::Mmio,
+                            VirtioBlkHandle {
+                                disk,
+                                read_only: block.read_only,
+                            }
+                            .into_resource(),
+                        )
+                    }));
+            })
+        })
+        .run_without_agent()
+        .await?;
+
+    let halt = CancelContext::new()
+        .with_timeout(TIMEOUT)
+        .until_cancelled(vm.wait_for_halt())
+        .await
+        .context("timed out waiting for microVM v2 sandbox-block workload")??;
+    assert_eq!(halt.reason, PetriHaltReason::PowerOff);
+    assert!(
+        halt.detail.contains("code: 37"),
+        "microVM v2 sandbox-block workload failed: {}",
+        halt.detail
+    );
+    vm.teardown().await
+}
+
 #[vmm_test_with(openvmm, noagent, configs(microvm_pvh_x64))]
 async fn phase_4_virtio_net(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     use net_backend_resources::consomme::ConsommeHandle;

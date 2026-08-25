@@ -779,6 +779,7 @@ impl PetriVmConfigOpenVmm {
             rtc_delta_milliseconds: 0,
             microvm_network: None,
             microvm_filesystem: None,
+            microvm_sandbox_blocks: Vec::new(),
         };
 
         openvmm_defs::config::validate_machine_config(&config, None)?;

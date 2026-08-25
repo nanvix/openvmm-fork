@@ -26,6 +26,7 @@ use guid::Guid;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::MICROVM_ABI_VERSION_1;
+use openvmm_defs::config::MICROVM_ABI_VERSION_2;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_BASE_COMMAND_LINE;
 #[cfg(test)]
@@ -33,6 +34,7 @@ use openvmm_defs::config::MICROVM_COMMAND_LINE_MAX_SIZE;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_CONSOLE_COMMAND_LINE;
 use openvmm_defs::config::MachineProfile;
+use openvmm_defs::config::MicrovmSandboxBlockRole;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::X2ApicConfig;
@@ -157,6 +159,8 @@ pub enum MachineProfileCli {
     Standard,
     /// The microVM ABI version 1 machine.
     Microvm,
+    /// The microVM ABI version 2 sandbox-block machine.
+    MicrovmV2,
 }
 
 impl From<MachineProfileCli> for MachineProfile {
@@ -165,6 +169,9 @@ impl From<MachineProfileCli> for MachineProfile {
             MachineProfileCli::Standard => Self::Standard,
             MachineProfileCli::Microvm => Self::Microvm {
                 abi_version: MICROVM_ABI_VERSION_1,
+            },
+            MachineProfileCli::MicrovmV2 => Self::Microvm {
+                abi_version: MICROVM_ABI_VERSION_2,
             },
         }
     }
@@ -574,6 +581,15 @@ options:
 "#)]
     #[clap(long = "virtio-blk")]
     pub virtio_blk: Vec<DiskCli>,
+
+    /// Attach a fixed-role microVM ABI-v2 sandbox block device.
+    ///
+    /// The value is `<role>:<disk>`, where the roles are `distro`, `runtime`,
+    /// `custom`, and `scratch`. Lower-layer roles must use `,ro`; `scratch`
+    /// must be writable. The profile assigns each role a fixed virtio-mmio
+    /// address and IRQ independent of option order.
+    #[clap(long, value_name = "ROLE:DISK")]
+    pub microvm_sandbox_block: Vec<MicrovmSandboxBlockCli>,
 
     /// Attach a vhost-user device via a Unix socket.
     ///
@@ -1460,21 +1476,30 @@ impl Options {
 
     /// Rejects unsupported microVM combinations before opening host resources.
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
-        if self.machine != MachineProfileCli::Microvm {
+        if !matches!(
+            self.machine,
+            MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+        ) {
             anyhow::ensure!(
                 self.net_tap.is_none()
                     && self.allow_host.is_empty()
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
-                    && self.microvm_mount.is_none(),
-                "--net-tap, --mount, and microVM egress policy require --machine microvm"
+                    && self.microvm_mount.is_none()
+                    && self.microvm_sandbox_block.is_empty(),
+                "--net-tap, --mount, --microvm-sandbox-block, and microVM egress policy require a microVM machine"
             );
             return Ok(());
         }
 
+        let abi_version = match self.machine {
+            MachineProfileCli::Microvm => MICROVM_ABI_VERSION_1,
+            MachineProfileCli::MicrovmV2 => MICROVM_ABI_VERSION_2,
+            MachineProfileCli::Standard => unreachable!("non-microVM profile returned above"),
+        };
         anyhow::ensure!(
             cfg!(guest_arch = "x86_64"),
-            "the microVM machine requires an x86-64 guest"
+            "microVM ABI version {abi_version} requires an x86-64 guest"
         );
         anyhow::ensure!(
             self.processors == 1,
@@ -1505,11 +1530,17 @@ impl Options {
                 "microVM snapshot quiesce timeout must be nonzero"
             );
             anyhow::ensure!(
-                self.virtio_blk.is_empty(),
+                abi_version == MICROVM_ABI_VERSION_1
+                    && self.virtio_blk.is_empty()
+                    && self.microvm_sandbox_block.is_empty(),
                 "microVM snapshot capture with virtio-blk is unavailable until immutable media identity is implemented"
             );
         }
         if self.restore_snapshot.is_some() {
+            anyhow::ensure!(
+                abi_version == MICROVM_ABI_VERSION_1,
+                "microVM ABI version 2 snapshot restore is not implemented"
+            );
             anyhow::ensure!(
                 self.net.is_empty(),
                 "microVM restore takes network addressing from saved state; do not pass --net"
@@ -1600,14 +1631,58 @@ impl Options {
                 && self.floppy.is_empty(),
             "microVM ABI version 1 supports only the optional virtio-blk extension"
         );
-        anyhow::ensure!(
-            self.virtio_blk.len() <= 1,
-            "microVM ABI version 1 permits at most one virtio-blk device"
-        );
-        anyhow::ensure!(
-            self.virtio_blk.iter().all(|disk| disk.pcie_port.is_none()),
-            "microVM virtio-blk cannot use PCIe"
-        );
+        if abi_version == MICROVM_ABI_VERSION_1 {
+            anyhow::ensure!(
+                self.microvm_sandbox_block.is_empty(),
+                "--microvm-sandbox-block requires --machine microvm-v2"
+            );
+            anyhow::ensure!(
+                self.virtio_blk.len() <= 1,
+                "microVM ABI version 1 permits at most one virtio-blk device"
+            );
+            anyhow::ensure!(
+                self.virtio_blk.iter().all(|disk| disk.pcie_port.is_none()),
+                "microVM virtio-blk cannot use PCIe"
+            );
+        } else {
+            anyhow::ensure!(
+                self.virtio_blk.is_empty(),
+                "microVM ABI version 2 requires --microvm-sandbox-block instead of --virtio-blk"
+            );
+            anyhow::ensure!(
+                self.microvm_sandbox_block.len() <= 4,
+                "microVM ABI version 2 permits at most three read-only layers and one writable scratch device"
+            );
+            for (index, block) in self.microvm_sandbox_block.iter().enumerate() {
+                anyhow::ensure!(
+                    block.disk.read_only == block.role.is_read_only(),
+                    "microVM sandbox block role {:?} must be {}",
+                    block.role,
+                    if block.role.is_read_only() {
+                        "read-only"
+                    } else {
+                        "writable"
+                    }
+                );
+                if let Some(previous) = index
+                    .checked_sub(1)
+                    .and_then(|index| self.microvm_sandbox_block.get(index))
+                {
+                    anyhow::ensure!(
+                        previous.role < block.role,
+                        "microVM sandbox block roles must be unique and in fixed order"
+                    );
+                }
+            }
+            if !self.microvm_sandbox_block.is_empty() {
+                anyhow::ensure!(
+                    self.microvm_sandbox_block
+                        .last()
+                        .is_some_and(|block| block.role == MicrovmSandboxBlockRole::Scratch),
+                    "microVM sandbox block topology requires a writable scratch device"
+                );
+            }
+        }
         anyhow::ensure!(
             self.virtio_9p.is_empty()
                 && self.virtio_fs.is_empty()
@@ -2385,6 +2460,38 @@ pub struct DiskCli {
     pub nsid: Option<u32>,
     pub lun: Option<u8>,
     pub relay: Option<(String, Option<u32>)>,
+}
+
+/// A fixed-role microVM ABI-v2 sandbox block-device CLI argument.
+#[derive(Clone)]
+pub struct MicrovmSandboxBlockCli {
+    /// The stable guest-visible role.
+    pub role: MicrovmSandboxBlockRole,
+    /// The generic disk backend and access mode.
+    pub disk: DiskCli,
+}
+
+impl FromStr for MicrovmSandboxBlockCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        let (role, disk) = value
+            .split_once(':')
+            .context("expected ROLE:DISK for --microvm-sandbox-block")?;
+        let role = match role {
+            "distro" => MicrovmSandboxBlockRole::Distro,
+            "runtime" => MicrovmSandboxBlockRole::Runtime,
+            "custom" => MicrovmSandboxBlockRole::Custom,
+            "scratch" => MicrovmSandboxBlockRole::Scratch,
+            _ => anyhow::bail!(
+                "unknown microVM sandbox block role '{role}'; expected distro, runtime, custom, or scratch"
+            ),
+        };
+        Ok(Self {
+            role,
+            disk: disk.parse()?,
+        })
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -5316,8 +5423,83 @@ mod tests {
             }
         );
 
+        let opt = Options::try_parse_from(["openvmm", "--machine", "microvm-v2"]).unwrap();
+        assert_eq!(opt.machine, MachineProfileCli::MicrovmV2);
+        assert_eq!(
+            MachineProfile::from(opt.machine),
+            MachineProfile::Microvm {
+                abi_version: MICROVM_ABI_VERSION_2
+            }
+        );
+
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn test_microvm_v2_sandbox_block_parser_and_validation() {
+        let valid = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm-v2",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "runtime:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "custom:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        valid.validate_microvm_options().unwrap();
+
+        for args in [
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--microvm-sandbox-block",
+                "distro:mem:1M",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M,ro",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--virtio-blk",
+                "mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
     }
 
     #[test]

@@ -19,6 +19,8 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MachineProfile;
+use openvmm_defs::config::MicrovmSandboxBlockConfig;
+use openvmm_defs::config::MicrovmSandboxBlockRole;
 use openvmm_defs::config::PcieDeviceConfig;
 use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VpciDeviceConfig;
@@ -141,6 +143,7 @@ pub(super) struct StorageBuilder {
 struct VirtioBlkDisk {
     disk: Resource<DiskHandleKind>,
     read_only: bool,
+    microvm_sandbox_role: Option<MicrovmSandboxBlockRole>,
 }
 
 #[derive(Clone)]
@@ -216,6 +219,21 @@ impl StorageBuilder {
                             && !nvme.namespaces.is_empty()
                 )
             })
+    }
+
+    /// Adds a fixed-role microVM ABI-v2 sandbox block device.
+    pub async fn add_microvm_sandbox_block(
+        &mut self,
+        role: MicrovmSandboxBlockRole,
+        kind: &DiskCliKind,
+        read_only: bool,
+    ) -> anyhow::Result<()> {
+        self.vtl0_virtio_blk_disks.push(VirtioBlkDisk {
+            disk: disk_open(kind, read_only).await?,
+            read_only,
+            microvm_sandbox_role: Some(role),
+        });
+        Ok(())
     }
 
     /// Register a named NVMe controller.
@@ -515,7 +533,11 @@ impl StorageBuilder {
                 if is_dvd {
                     anyhow::bail!("dvd not supported with virtio-blk");
                 }
-                let vblk = VirtioBlkDisk { disk, read_only };
+                let vblk = VirtioBlkDisk {
+                    disk,
+                    read_only,
+                    microvm_sandbox_role: None,
+                };
                 if let Some(port) = pcie_port {
                     self.pcie_virtio_blk_disks.push((port, vblk));
                 } else {
@@ -882,13 +904,34 @@ impl StorageBuilder {
             resources.nvme_vtl2_rpc = Some(send);
         }
 
-        let vtl0_virtio_blk_disks = std::mem::take(&mut self.vtl0_virtio_blk_disks);
-        if matches!(config.machine_profile, MachineProfile::Microvm { .. }) {
-            anyhow::ensure!(
-                vtl0_virtio_blk_disks.len() <= 1,
-                "microVM ABI version 1 permits at most one virtio-blk device"
-            );
+        let mut vtl0_virtio_blk_disks = std::mem::take(&mut self.vtl0_virtio_blk_disks);
+        if let MachineProfile::Microvm { abi_version } = config.machine_profile {
+            if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_1 {
+                anyhow::ensure!(
+                    vtl0_virtio_blk_disks.len() <= 1
+                        && vtl0_virtio_blk_disks
+                            .iter()
+                            .all(|disk| disk.microvm_sandbox_role.is_none()),
+                    "microVM ABI version 1 permits at most one unroled virtio-blk device"
+                );
+            } else {
+                anyhow::ensure!(
+                    vtl0_virtio_blk_disks
+                        .iter()
+                        .all(|disk| disk.microvm_sandbox_role.is_some()),
+                    "microVM ABI version 2 requires roles for every virtio-blk device"
+                );
+                vtl0_virtio_blk_disks.sort_by_key(|disk| disk.microvm_sandbox_role);
+            }
             for vblk in vtl0_virtio_blk_disks {
+                if let Some(role) = vblk.microvm_sandbox_role {
+                    config
+                        .microvm_sandbox_blocks
+                        .push(MicrovmSandboxBlockConfig {
+                            role,
+                            read_only: vblk.read_only,
+                        });
+                }
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
                     VirtioBlkHandle {

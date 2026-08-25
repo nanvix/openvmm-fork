@@ -66,10 +66,16 @@ pub struct Config {
     pub microvm_network: Option<MicrovmNetworkConfig>,
     /// Guest-visible policy for the optional microVM virtio-fs device.
     pub microvm_filesystem: Option<MicrovmFilesystemConfig>,
+    /// Stable sandbox block-device roles for microVM ABI version 2.
+    ///
+    /// This list is in virtio-blk device order and is empty for ABI version 1.
+    pub microvm_sandbox_blocks: Vec<MicrovmSandboxBlockConfig>,
 }
 
 /// The initial microVM guest ABI version.
 pub const MICROVM_ABI_VERSION_1: u32 = 1;
+/// The microVM ABI version with fixed sandbox block-device roles.
+pub const MICROVM_ABI_VERSION_2: u32 = 2;
 /// ABI-v1 command line owned by the microVM profile.
 pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
 /// ABI-v1 command line when the virtio console is present.
@@ -88,6 +94,14 @@ pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
 pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 /// Fixed ABI-v1 virtio-blk interrupt.
 pub const MICROVM_VIRTIO_BLK_IRQ: u32 = 4;
+/// Fixed ABI-v2 virtio-blk interrupt for the runtime lower layer.
+///
+/// IRQ 8 is exclusively owned by the microVM RTC.
+pub const MICROVM_VIRTIO_RUNTIME_BLK_IRQ: u32 = 12;
+/// Fixed ABI-v2 virtio-blk interrupt for the custom lower layer.
+pub const MICROVM_VIRTIO_CUSTOM_BLK_IRQ: u32 = 9;
+/// Fixed ABI-v2 virtio-blk interrupt for the writable scratch layer.
+pub const MICROVM_VIRTIO_SCRATCH_BLK_IRQ: u32 = 11;
 /// Fixed ABI-v1 virtio-console interrupt.
 pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
 /// Fixed ABI-v1 virtio-fs interrupt.
@@ -110,6 +124,95 @@ pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 4] = [
     MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
     MICROVM_VIRTIO_BLK_MMIO_BASE,
 ];
+/// ABI-v2 fixed sandbox virtio-blk MMIO slots in layer order.
+pub const MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES: [u64; 4] = [
+    MICROVM_VIRTIO_BLK_MMIO_BASE,
+    0xd000_4000,
+    0xd000_5000,
+    0xd000_6000,
+];
+/// Level-triggered ISA IRQs published in the ABI-v1 MADT.
+pub const MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS: [u32; 5] = [
+    MICROVM_VIRTIO_BLK_IRQ,
+    MICROVM_VIRTIO_NET_WHP_IRQ,
+    MICROVM_VIRTIO_FS_IRQ,
+    MICROVM_VIRTIO_CONSOLE_IRQ,
+    MICROVM_VIRTIO_NET_KVM_IRQ,
+];
+/// Level-triggered ISA IRQs published in the ABI-v2 MADT.
+pub const MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS: [u32; 8] = [
+    MICROVM_VIRTIO_BLK_IRQ,
+    MICROVM_VIRTIO_NET_WHP_IRQ,
+    MICROVM_VIRTIO_FS_IRQ,
+    MICROVM_VIRTIO_CONSOLE_IRQ,
+    MICROVM_VIRTIO_CUSTOM_BLK_IRQ,
+    MICROVM_VIRTIO_NET_KVM_IRQ,
+    MICROVM_VIRTIO_SCRATCH_BLK_IRQ,
+    MICROVM_VIRTIO_RUNTIME_BLK_IRQ,
+];
+
+/// The stable role of a microVM ABI-v2 sandbox block device.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MicrovmSandboxBlockRole {
+    /// The lowest, widest-shared read-only layer.
+    Distro,
+    /// The read-only runtime layer above the distro layer.
+    Runtime,
+    /// The optional read-only customer layer above the runtime layer.
+    Custom,
+    /// The writable overlayfs upper and work directories.
+    Scratch,
+}
+
+impl MicrovmSandboxBlockRole {
+    /// Returns the role's fixed ABI-v2 virtio-mmio address.
+    pub const fn mmio_base(self) -> u64 {
+        MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[self.index()]
+    }
+
+    /// Returns the role's fixed ABI-v2 interrupt.
+    pub const fn irq(self) -> u32 {
+        match self {
+            Self::Distro => MICROVM_VIRTIO_BLK_IRQ,
+            Self::Runtime => MICROVM_VIRTIO_RUNTIME_BLK_IRQ,
+            Self::Custom => MICROVM_VIRTIO_CUSTOM_BLK_IRQ,
+            Self::Scratch => MICROVM_VIRTIO_SCRATCH_BLK_IRQ,
+        }
+    }
+
+    /// Returns whether the role must be read-only.
+    pub const fn is_read_only(self) -> bool {
+        !matches!(self, Self::Scratch)
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Distro => 0,
+            Self::Runtime => 1,
+            Self::Custom => 2,
+            Self::Scratch => 3,
+        }
+    }
+}
+
+/// Returns the IRQs that must be described as level-triggered in a microVM
+/// ABI's x86 MADT.
+pub fn microvm_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static [u32]> {
+    match abi_version {
+        MICROVM_ABI_VERSION_1 => Ok(&MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS),
+        MICROVM_ABI_VERSION_2 => Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS),
+        _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+    }
+}
+
+/// The immutable role and access mode of a microVM ABI-v2 sandbox block device.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MicrovmSandboxBlockConfig {
+    /// The fixed guest-visible role and transport location.
+    pub role: MicrovmSandboxBlockRole,
+    /// Whether writes are rejected by the VMM.
+    pub read_only: bool,
+}
 
 /// Static guest-visible network identity for the microVM ABI-v1 NIC.
 #[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
@@ -312,8 +415,21 @@ pub fn microvm_virtio_net_irq(hypervisor_id: Option<&str>) -> anyhow::Result<u32
     }
 }
 
-fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
-    for (index, base) in MICROVM_VIRTIO_MMIO_BASES.iter().copied().enumerate() {
+fn validate_microvm_virtio_reservations(abi_version: u32) -> anyhow::Result<()> {
+    let bases: &[u64] = match abi_version {
+        MICROVM_ABI_VERSION_1 => &MICROVM_VIRTIO_MMIO_BASES,
+        MICROVM_ABI_VERSION_2 => &[
+            MICROVM_VIRTIO_NET_MMIO_BASE,
+            MICROVM_VIRTIO_FS_MMIO_BASE,
+            MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+            MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[0],
+            MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[1],
+            MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[2],
+            MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[3],
+        ],
+        _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+    };
+    for (index, base) in bases.iter().copied().enumerate() {
         let end = base
             .checked_add(MICROVM_VIRTIO_MMIO_LEN)
             .ok_or_else(|| anyhow::anyhow!("microVM virtio MMIO reservation overflows"))?;
@@ -321,9 +437,43 @@ fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
             base >= 0xc000_0000 && end <= 0x1_0000_0000,
             "microVM virtio MMIO reservation {index} is outside the fixed aperture"
         );
-        if let Some(next) = MICROVM_VIRTIO_MMIO_BASES.get(index + 1) {
+        if let Some(next) = bases.get(index + 1) {
             anyhow::ensure!(end <= *next, "microVM virtio MMIO reservations overlap");
         }
+    }
+    Ok(())
+}
+
+fn validate_microvm_sandbox_blocks(blocks: &[MicrovmSandboxBlockConfig]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        blocks.len() <= MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES.len(),
+        "microVM ABI version 2 permits at most three read-only layers and one writable scratch device"
+    );
+    for (index, block) in blocks.iter().enumerate() {
+        anyhow::ensure!(
+            block.read_only == block.role.is_read_only(),
+            "microVM sandbox block role {:?} must be {}",
+            block.role,
+            if block.role.is_read_only() {
+                "read-only"
+            } else {
+                "writable"
+            }
+        );
+        if let Some(previous) = index.checked_sub(1).and_then(|index| blocks.get(index)) {
+            anyhow::ensure!(
+                previous.role < block.role,
+                "microVM sandbox block roles must be unique and in fixed order"
+            );
+        }
+    }
+    if !blocks.is_empty() {
+        anyhow::ensure!(
+            blocks
+                .last()
+                .is_some_and(|block| block.role == MicrovmSandboxBlockRole::Scratch),
+            "microVM sandbox block topology requires a writable scratch device"
+        );
     }
     Ok(())
 }
@@ -353,6 +503,7 @@ pub fn append_microvm_virtio_discovery(
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
         )?;
     }
+
     if filesystem.is_some() {
         write!(
             cmdline,
@@ -388,12 +539,79 @@ pub fn append_microvm_virtio_discovery(
     Ok(())
 }
 
+/// Appends ABI-v2 sandbox virtio devices in fixed-address order.
+pub fn append_microvm_v2_virtio_discovery(
+    cmdline: &mut String,
+    network: Option<(&MicrovmNetworkConfig, u32, bool)>,
+    filesystem: Option<&MicrovmFilesystemConfig>,
+    has_console: bool,
+    blocks: &[MicrovmSandboxBlockConfig],
+) -> anyhow::Result<()> {
+    validate_microvm_sandbox_blocks(blocks)?;
+    anyhow::ensure!(
+        !cmdline
+            .split_ascii_whitespace()
+            .any(|token| token.starts_with("virtio_mmio.device=")),
+        "microVM command line already contains virtio-mmio discovery"
+    );
+
+    use std::fmt::Write as _;
+    if let Some((_, irq, _)) = network {
+        anyhow::ensure!(
+            matches!(irq, MICROVM_VIRTIO_NET_KVM_IRQ | MICROVM_VIRTIO_NET_WHP_IRQ),
+            "microVM virtio-net IRQ {irq} is not part of ABI version 2"
+        );
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
+        )?;
+    }
+    if filesystem.is_some() {
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
+        )?;
+    }
+    if has_console {
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
+        )?;
+    }
+    for block in blocks {
+        write!(
+            cmdline,
+            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
+            block.role.mmio_base(),
+            block.role.irq()
+        )?;
+    }
+    if let Some((network, _, gateway_dns)) = network {
+        write!(
+            cmdline,
+            " {}",
+            network.command_line_fragment_with_dns(gateway_dns)
+        )?;
+    }
+    if let Some(filesystem) = filesystem {
+        write!(cmdline, " {}", filesystem.command_line_fragment())?;
+    }
+    anyhow::ensure!(
+        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
+        "microVM kernel command line exceeds the 64-KiB ABI limit after device discovery"
+    );
+    Ok(())
+}
+
 fn validate_microvm_command_line(
     config: &Config,
     hypervisor_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let MachineProfile::Microvm { abi_version } = config.machine_profile else {
+        unreachable!("microVM command-line validation requires the microVM profile");
+    };
     let LoadMode::Pvh { cmdline, .. } = &config.load_mode else {
-        anyhow::bail!("microVM ABI version 1 requires PVH load mode");
+        anyhow::bail!("microVM ABI version {abi_version} requires PVH load mode");
     };
     anyhow::ensure!(
         !cmdline.contains('\0'),
@@ -409,10 +627,12 @@ fn validate_microvm_command_line(
         .virtio_devices
         .iter()
         .any(|(_, device)| device.id() == "virtio-console");
-    let has_block = config
+    let block_count = config
         .virtio_devices
         .iter()
-        .any(|(_, device)| device.id() == "virtio-blk");
+        .filter(|(_, device)| device.id() == "virtio-blk")
+        .count();
+    let has_block = block_count != 0;
     let has_network = config
         .virtio_devices
         .iter()
@@ -429,6 +649,20 @@ fn validate_microvm_command_line(
         has_filesystem == config.microvm_filesystem.is_some(),
         "microVM virtio-fs device and filesystem policy must be configured together"
     );
+    match abi_version {
+        MICROVM_ABI_VERSION_1 => anyhow::ensure!(
+            config.microvm_sandbox_blocks.is_empty() && block_count <= 1,
+            "microVM ABI version 1 permits at most one unroled virtio-blk device"
+        ),
+        MICROVM_ABI_VERSION_2 => {
+            validate_microvm_sandbox_blocks(&config.microvm_sandbox_blocks)?;
+            anyhow::ensure!(
+                block_count == config.microvm_sandbox_blocks.len(),
+                "microVM ABI version 2 sandbox block roles do not match the virtio-blk device inventory"
+            );
+        }
+        _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+    }
     let base_tokens = if has_console {
         MICROVM_CONSOLE_COMMAND_LINE
     } else {
@@ -438,7 +672,7 @@ fn validate_microvm_command_line(
     .collect::<Vec<_>>();
     anyhow::ensure!(
         tokens.starts_with(&base_tokens),
-        "microVM command line does not begin with the ABI-v1 base tokens"
+        "microVM command line does not begin with the ABI base tokens"
     );
     for prefix in [
         "earlycon=",
@@ -503,10 +737,22 @@ fn validate_microvm_command_line(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
         ));
     }
-    if has_block {
-        expected_discovery.push(format!(
-            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
-        ));
+    match abi_version {
+        MICROVM_ABI_VERSION_1 if has_block => {
+            expected_discovery.push(format!(
+                "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
+            ));
+        }
+        MICROVM_ABI_VERSION_2 => {
+            expected_discovery.extend(config.microvm_sandbox_blocks.iter().map(|block| {
+                format!(
+                    "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
+                    block.role.mmio_base(),
+                    block.role.irq()
+                )
+            }));
+        }
+        _ => {}
     }
     if let Some(network) = &config.microvm_network {
         expected_discovery.extend(
@@ -610,14 +856,18 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             config.microvm_filesystem.is_none(),
             "microVM filesystem policy requires the microVM profile"
         );
+        anyhow::ensure!(
+            config.microvm_sandbox_blocks.is_empty(),
+            "microVM sandbox block roles require the microVM profile"
+        );
         return Ok(());
     };
 
     anyhow::ensure!(
-        abi_version == MICROVM_ABI_VERSION_1,
+        matches!(abi_version, MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2),
         "unsupported microVM ABI version {abi_version}"
     );
-    validate_microvm_virtio_reservations()?;
+    validate_microvm_virtio_reservations(abi_version)?;
     validate_microvm_command_line(config, hypervisor_id)?;
     anyhow::ensure!(
         matches!(config.load_mode, LoadMode::Pvh { .. }),
@@ -735,14 +985,19 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "microVM ABI version 1 does not support kernel NIC or VPCI resources"
     );
 
+    let max_virtio_devices = match abi_version {
+        MICROVM_ABI_VERSION_1 => 4,
+        MICROVM_ABI_VERSION_2 => 7,
+        _ => unreachable!("unsupported ABI was rejected above"),
+    };
     anyhow::ensure!(
-        config.virtio_devices.len() <= 4,
-        "microVM ABI version 1 permits at most one virtio-net, one virtio-fs, one virtio-console, and one virtio-blk device"
+        config.virtio_devices.len() <= max_virtio_devices,
+        "microVM ABI version {abi_version} has too many virtio devices"
     );
     let mut has_network = false;
     let mut has_filesystem = false;
     let mut has_console = false;
-    let mut has_block = false;
+    let mut block_count = 0;
     for (bus, device) in &config.virtio_devices {
         anyhow::ensure!(
             *bus == VirtioBus::Mmio,
@@ -761,12 +1016,23 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
                 !std::mem::replace(&mut has_console, true),
                 "microVM ABI version 1 permits only one virtio-console device"
             ),
-            "virtio-blk" => anyhow::ensure!(
-                !std::mem::replace(&mut has_block, true),
-                "microVM ABI version 1 permits only one virtio-blk device"
+            "virtio-blk" => block_count += 1,
+            id => anyhow::bail!(
+                "microVM ABI version {abi_version} does not permit virtio device '{id}'"
             ),
-            id => anyhow::bail!("microVM ABI version 1 does not permit virtio device '{id}'"),
         }
+    }
+    if abi_version == MICROVM_ABI_VERSION_1 {
+        anyhow::ensure!(
+            block_count <= 1 && config.microvm_sandbox_blocks.is_empty(),
+            "microVM ABI version 1 permits only one unroled virtio-blk device"
+        );
+    } else {
+        validate_microvm_sandbox_blocks(&config.microvm_sandbox_blocks)?;
+        anyhow::ensure!(
+            block_count == config.microvm_sandbox_blocks.len(),
+            "microVM ABI version 2 sandbox block roles do not match the virtio-blk device inventory"
+        );
     }
     anyhow::ensure!(
         has_network == config.microvm_network.is_some(),
@@ -1135,6 +1401,150 @@ pub enum GicConfig {
     V2(Option<GicV2Config>),
     /// GICv3 with optional address overrides.
     V3(Option<GicV3Config>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn microvm_v2_sandbox_block_slots_are_stable() {
+        let blocks = [
+            MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Distro,
+                read_only: true,
+            },
+            MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Runtime,
+                read_only: true,
+            },
+            MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Custom,
+                read_only: true,
+            },
+            MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Scratch,
+                read_only: false,
+            },
+        ];
+        validate_microvm_sandbox_blocks(&blocks).unwrap();
+
+        let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+        append_microvm_v2_virtio_discovery(&mut cmdline, None, None, false, &blocks).unwrap();
+        assert_eq!(
+            cmdline,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} \
+                 virtio_mmio.device=0x1000@0xd0003000:4 \
+                virtio_mmio.device=0x1000@0xd0004000:12 \
+                 virtio_mmio.device=0x1000@0xd0005000:9 \
+                 virtio_mmio.device=0x1000@0xd0006000:11"
+            )
+        );
+    }
+
+    #[test]
+    fn microvm_v2_block_irqs_avoid_rtc_and_are_level_triggered() {
+        assert_eq!(MICROVM_VIRTIO_RUNTIME_BLK_IRQ, 12);
+        assert!(
+            !microvm_level_triggered_irqs(MICROVM_ABI_VERSION_2)
+                .unwrap()
+                .contains(&8)
+        );
+        for role in [
+            MicrovmSandboxBlockRole::Distro,
+            MicrovmSandboxBlockRole::Runtime,
+            MicrovmSandboxBlockRole::Custom,
+            MicrovmSandboxBlockRole::Scratch,
+        ] {
+            assert!(
+                microvm_level_triggered_irqs(MICROVM_ABI_VERSION_2)
+                    .unwrap()
+                    .contains(&role.irq()),
+                "{role:?} IRQ must be level-triggered"
+            );
+        }
+        assert_eq!(
+            microvm_level_triggered_irqs(MICROVM_ABI_VERSION_1).unwrap(),
+            &[
+                MICROVM_VIRTIO_BLK_IRQ,
+                MICROVM_VIRTIO_NET_WHP_IRQ,
+                MICROVM_VIRTIO_FS_IRQ,
+                MICROVM_VIRTIO_CONSOLE_IRQ,
+                MICROVM_VIRTIO_NET_KVM_IRQ,
+            ]
+        );
+    }
+
+    #[test]
+    fn microvm_v2_sandbox_block_validation_rejects_invalid_layouts() {
+        assert!(
+            validate_microvm_sandbox_blocks(&[MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Scratch,
+                read_only: true,
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_microvm_sandbox_blocks(&[
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Runtime,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Distro,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Scratch,
+                    read_only: false,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_microvm_sandbox_blocks(&[
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Distro,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Distro,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Scratch,
+                    read_only: false,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_microvm_sandbox_blocks(&[
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Distro,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Runtime,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Custom,
+                    read_only: true,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Scratch,
+                    read_only: false,
+                },
+                MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Scratch,
+                    read_only: false,
+                },
+            ])
+            .is_err()
+        );
+    }
 }
 
 /// GICv2-specific address configuration.

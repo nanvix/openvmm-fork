@@ -37,6 +37,37 @@ To run these examples using a pre-compiled copy of OpenVMM, swap `cargo run
 --` with `/path/to/openvmm`.
 ```
 
+### microVM ABI v2 sandbox block devices
+
+`--machine microvm` remains the ABI-v1 profile and supports its original,
+single optional `--virtio-blk` device. `--machine microvm-v2` is a separate,
+incompatible guest ABI for single-sandbox workloads. It assigns up to three
+read-only lower layers and one writable scratch device to fixed virtio-mmio
+locations:
+
+| Role | Access | MMIO address | IRQ |
+| --- | --- | ---: | ---: |
+| `distro` | read-only | `0xd0003000` | 4 |
+| `runtime` | read-only | `0xd0004000` | 12 |
+| `custom` | read-only | `0xd0005000` | 9 |
+| `scratch` | writable | `0xd0006000` | 11 |
+
+Use `--microvm-sandbox-block ROLE:DISK`, in the order shown. Lower-layer
+roles require the normal disk `,ro` option and a non-empty topology must end
+with `scratch`; ordinary `--virtio-blk` is intentionally rejected for v2.
+For example:
+
+```shell
+openvmm --machine microvm-v2 --kernel vmlinux --initrd initramfs.cpio.gz \
+  --microvm-sandbox-block distro:file:distro.erofs,ro \
+  --microvm-sandbox-block runtime:file:runtime.erofs,ro \
+  --microvm-sandbox-block custom:file:custom.erofs,ro \
+  --microvm-sandbox-block scratch:file:scratch.img
+```
+
+ABI-v2 block snapshots are not implemented. Do not use `--snapshot-destination`
+or `--restore-snapshot` with this profile.
+
 ~~~admonish tip title="UEFI firmware required when running outside cargo"
 When running via `cargo run`, environment variables in `.cargo/config.toml`
 automatically point OpenVMM to the `mu_msvm` UEFI firmware (`MSVM.fd`)
