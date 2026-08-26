@@ -498,6 +498,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
     const CONTINUED_MARKER: &[u8] = b"PHASE2-CONTINUED-ONCE";
     const NO_DESTINATION_MARKER: &[u8] = b"PHASE2-NO-DESTINATION-CONTINUED";
+    const TIMER_WAIT_PREFIX: &[u8] = b"PHASE2-TIMER-WAIT-";
 
     let (openvmm,) = artifacts;
     let kernel = config
@@ -581,7 +582,15 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         _ => unreachable!(),
     };
     let arm_timer = "sleep 5 & timer_pid=$!; sleep 1; ";
-    let complete_timer = "wait $timer_pid; echo PHASE2-TIMER-DONE; ";
+    let complete_timer = "\
+        wait $timer_pid; \
+        timer_wait_after=$(cut -d. -f1 /proc/uptime); \
+        echo PHASE2-CONTINUED-ONCE; \
+        echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
+        echo PHASE2-CPU-$((process_cpu_restored-process_cpu_before))-$((thread_cpu_restored-thread_cpu_before)); \
+        echo PHASE2-TIMER-WAIT-$((timer_wait_after-timer_wait_before)); \
+        echo PHASE2-TIMER-DONE; \
+        ";
     let capture_workload = [
         select_clocksource,
         validate_clocksource,
@@ -591,12 +600,10 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
          thread_cpu_before=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
          ",
         "nvx-snapshot; \
-         echo PHASE2-CONTINUED-ONCE; \
          wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
-         echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
          process_cpu_restored=$(awk '{print $14+$15}' /proc/$$/stat); \
          thread_cpu_restored=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
-         echo PHASE2-CPU-$((process_cpu_restored-process_cpu_before))-$((thread_cpu_restored-thread_cpu_before)); \
+         timer_wait_before=$(cut -d. -f1 /proc/uptime); \
          ",
         complete_timer,
         "\
@@ -644,7 +651,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     let mut rng_hashes = Vec::new();
     let mut restore_latencies = Vec::new();
     for restore_index in 0..2 {
-        thread::sleep(Duration::from_secs(3));
+        thread::sleep(Duration::from_secs(5));
         let mut restore_args = phase_2_args(hypervisor);
         restore_args.extend([
             "--restore-snapshot".into(),
@@ -655,9 +662,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
         restore.wait_for_output_line(CONTINUED_MARKER)?;
         restore_latencies.push(restore_started.elapsed());
-        let timer_wait_started = Instant::now();
         restore.wait_for_output_line(b"PHASE2-TIMER-DONE")?;
-        let timer_elapsed = timer_wait_started.elapsed();
         let (status, output) = restore.wait()?;
         anyhow::ensure!(
             status.code() == Some(37),
@@ -672,9 +677,14 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             count_output_lines(&output, b"PHASE2-TIMER-DONE") == 1,
             "restore {restore_index} did not complete the armed timer"
         );
+        let timer_wait = std::str::from_utf8(
+            output_line_value(&output, TIMER_WAIT_PREFIX)
+                .context("restored guest did not report its timer wait")?,
+        )?
+        .parse::<u64>()?;
         anyhow::ensure!(
-            timer_elapsed < Duration::from_millis(3500),
-            "restore {restore_index} did not shorten the armed timer by host downtime: {timer_elapsed:?}; output: {}",
+            timer_wait <= 1,
+            "restore {restore_index} did not shorten the armed timer by host downtime: guest waited {timer_wait}s; output: {}",
             output_tail(&output)
         );
         let downtime = std::str::from_utf8(
@@ -687,7 +697,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let wall_delta = wall_delta.parse::<u64>()?;
         let uptime_delta = uptime_delta.parse::<u64>()?;
         anyhow::ensure!(
-            wall_delta >= 3 && uptime_delta >= 3 && wall_delta.abs_diff(uptime_delta) <= 1,
+            wall_delta >= 4 && uptime_delta >= 4 && wall_delta.abs_diff(uptime_delta) <= 1,
             "restore {restore_index} clocks did not advance coherently: wall={wall_delta}s uptime={uptime_delta}s"
         );
         let cpu = std::str::from_utf8(
