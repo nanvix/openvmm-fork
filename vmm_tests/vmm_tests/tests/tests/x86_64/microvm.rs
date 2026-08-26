@@ -791,12 +791,13 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
          [ -e /sys/class/tty/hvc1 ] || {{ nvx-exit 52; exit; }}; \
          stty -F /dev/hvc1 raw -echo; \
          printf '\\000\\015\\012\\177\\377PHASE3-BINARY\\n'; \
-         rm -f /tmp/phase3-tx-started /tmp/phase3-restored; \
-         (i=0; while [ $i -lt {tx_count} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; while [ ! -e /tmp/phase3-restored ]; do sleep 0.01; done; fi; done) & tx_pid=$!; \
+         rm -f /tmp/phase3-tx-started /tmp/phase3-resume; \
+         mkfifo /tmp/phase3-resume; \
+         (i=0; while [ $i -lt {tx_count} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; IFS= read -r phase3_resume < /tmp/phase3-resume; [ \"$phase3_resume\" = resume ]; fi; done) & tx_pid=$!; \
          while [ ! -e /tmp/phase3-tx-started ]; do sleep 0.01; done; \
          echo PHASE3-SNAPSHOT-NOW; sleep 1; nvx-snapshot; \
             {receive} \
-             touch /tmp/phase3-restored; \
+             printf 'resume\\n' > /tmp/phase3-resume; \
             {restored_marker} \
          {completion}"
     ))?;
