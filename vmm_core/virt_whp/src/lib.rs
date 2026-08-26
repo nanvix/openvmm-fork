@@ -1521,11 +1521,23 @@ impl VtlPartition {
         if config.versioned_cpu_contract {
             const VERSIONED_TSC_FREQUENCY_HZ: u64 = 1_000_000_000;
 
-            whp_config
-                .set_property(whp::PartitionProperty::ProcessorClockFrequency(
-                    VERSIONED_TSC_FREQUENCY_HZ,
-                ))
-                .for_op("set versioned CPU contract TSC frequency")?;
+            match whp_config.set_property(whp::PartitionProperty::ProcessorClockFrequency(
+                VERSIONED_TSC_FREQUENCY_HZ,
+            )) {
+                Ok(_) => {}
+                Err(
+                    err @ (whp::WHvError::ERROR_NOT_SUPPORTED
+                    | whp::WHvError::WHV_E_UNKNOWN_PROPERTY),
+                ) => {
+                    tracing::warn!(
+                        error = %err,
+                        "WHP cannot set the versioned TSC frequency; using the host frequency"
+                    );
+                }
+                Err(err) => {
+                    return Err(err).for_op("set versioned CPU contract TSC frequency");
+                }
+            }
             extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::X64CpuidExit;
             let cpuid_exit_list = [
                 x86defs::cpuid::CpuidFunction::VendorAndMaxFunction.0,
