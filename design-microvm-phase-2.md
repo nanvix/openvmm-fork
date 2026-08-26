@@ -420,11 +420,25 @@ Save and validate:
 - KVM paravirtual clock state when exposed; and
 - capture wall-clock metadata used to compute downtime.
 
-Apply one explicit policy on both hosts: advance guest time by nonnegative
-elapsed host wall time since capture, shorten or expire timer deadlines by the
-same duration, and keep TSC, RTC, paravirtual clock, and VM time coherent.
+Apply one explicit policy on KVM, MSHV, and WHP: advance guest time by
+nonnegative elapsed host wall time since capture, shorten or expire timer
+deadlines by the same duration, and keep TSC, RTC, paravirtual clock, and VM
+time coherent.
 Reject a destination clock that moves backwards or produces an elapsed value
 outside the supported bound rather than silently creating a time rollback.
+
+An elapsed one-shot deadline produces at most one pending interrupt when it was
+unmasked at expiry. An elapsed periodic timer preserves its phase at the
+destination time and coalesces any missed periods into at most one pending
+interrupt. A masked timer advances without manufacturing a pending interrupt.
+Interrupts already pending at capture remain pending and are not duplicated.
+PIT evaluates its restored counter state once against the advanced VM time;
+PIC's pending bit provides the same coalescing rule for repeated IRQ0 edges.
+
+Guest monotonic, boottime, and realtime clocks advance by the accepted downtime.
+Process and thread CPU clocks do not advance because no guest instructions ran.
+TSC, deadline, backend clock, and timer arithmetic is checked; overflow is a
+restore error rather than a saturated or wrapped clock value.
 
 Repeatable restore guarantees immutable memory and device state; it does not
 mean that two restores performed at different wall times observe identical
@@ -661,31 +675,31 @@ failed transaction. Never recursively remove an ambiguous destination.
 
 ## Acceptance gates
 
-Run each applicable test on Linux/KVM and Windows/WHP:
+Run each applicable test on Linux/KVM, Linux/MSHV, and Windows/WHP:
 
-| Test | KVM | WHP |
-|---|:---:|:---:|
-| Guest `out 0x605` captures and source PID exits | Required | Required |
-| New PID resumes at the instruction after `out` | Required | Required |
-| No destination leaves the guest running | Required | Required |
-| Repeated requests produce one transaction | Required | Required |
-| Portb output drains exactly once | Required | Required |
-| Pending portb input survives; host handles do not | Required | Required |
-| TSC, VM time, RTC, and timer deadlines advance coherently over downtime | Required | Required |
-| KVM paravirtual clock remains coherent with TSC and RTC | Required | N/A |
-| Pending/masked interrupt state remains coherent | Required | Required |
-| Active immutable block I/O completes exactly once, when configured | Required | Required |
-| Writable or changed configured media is rejected before capture/start | Required | Required |
-| Same snapshot restores twice after the first VM dirties all RAM | Required | Required |
-| `memory.bin` digest remains unchanged after both restores | Required | Required |
-| Restore-time entropy injection makes cloned guest RNG output diverge | Required | Required |
-| Corrupt, truncated, oversized, symlinked artifacts are rejected | Required | Required |
-| Invalid virtio queue state is rejected before workers run | Required | Required |
-| Added, removed, or reordered devices are rejected | Required | Required |
-| ABI, topology, and command-line mismatch are rejected | Required | Required |
-| CPU, XSTATE, MSR, and TSC mismatch are rejected | Required | Required |
-| KVM-to-WHP and WHP-to-KVM restore fail before partition creation | Required | Required |
-| Capture failure never exposes a final directory | Required | Required |
+| Test | KVM | MSHV | WHP |
+|---|:---:|:---:|:---:|
+| Guest `out 0x605` captures and source PID exits | Required | Required | Required |
+| New PID resumes at the instruction after `out` | Required | Required | Required |
+| No destination leaves the guest running | Required | Required | Required |
+| Repeated requests produce one transaction | Required | Required | Required |
+| Portb output drains exactly once | Required | Required | Required |
+| Pending portb input survives; host handles do not | Required | Required | Required |
+| TSC, VM time, RTC, and timer deadlines advance coherently over downtime | Required | Required | Required |
+| KVM paravirtual clock remains coherent with TSC and RTC | Required | N/A | N/A |
+| Pending/masked interrupt state remains coherent | Required | Required | Required |
+| Active immutable block I/O completes exactly once, when configured | Required | Required | Required |
+| Writable or changed configured media is rejected before capture/start | Required | Required | Required |
+| Same snapshot restores twice after the first VM dirties all RAM | Required | Required | Required |
+| `memory.bin` digest remains unchanged after both restores | Required | Required | Required |
+| Restore-time entropy injection makes cloned guest RNG output diverge | Required | Required | Required |
+| Corrupt, truncated, oversized, symlinked artifacts are rejected | Required | Required | Required |
+| Invalid virtio queue state is rejected before workers run | Required | Required | Required |
+| Added, removed, or reordered devices are rejected | Required | Required | Required |
+| ABI, topology, and command-line mismatch are rejected | Required | Required | Required |
+| CPU, XSTATE, MSR, and TSC mismatch are rejected | Required | Required | Required |
+| Cross-backend restore fails before partition creation | Required | Required | Required |
+| Capture failure never exposes a final directory | Required | Required | Required |
 
 The sequencing test should have the guest write a marker immediately after
 `out 0x605`. The marker must not be present in captured source state and must

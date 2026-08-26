@@ -65,6 +65,8 @@ pub struct SnapshotSaveResponse {
     pub state_unit_names: Vec<String>,
     /// Effective guest TSC frequency.
     pub tsc_frequency_hz: u64,
+    /// Effective local APIC timer frequency.
+    pub apic_frequency_hz: u64,
     /// Host wall time at the stopped capture boundary.
     pub capture_wall_clock: mesh::payload::Timestamp,
     /// Canonical effective CPU compatibility contract.

@@ -375,6 +375,9 @@ pub struct SnapshotMachineContract {
     /// Guest-visible policy of the optional microVM virtio-fs device.
     #[mesh(19)]
     pub microvm_filesystem: Option<SnapshotMicrovmFilesystem>,
+    /// Effective local APIC timer frequency.
+    #[mesh(20)]
+    pub apic_frequency_hz: Option<u64>,
 }
 
 impl SnapshotMachineContract {
@@ -409,6 +412,7 @@ pub fn microvm_v1_machine_contract(
     state_unit_names: Vec<String>,
     capture_wall_clock: Timestamp,
     tsc_frequency_hz: u64,
+    apic_frequency_hz: Option<u64>,
     cpu_contract: Vec<u8>,
 ) -> anyhow::Result<SnapshotMachineContract> {
     anyhow::ensure!(
@@ -739,6 +743,7 @@ pub fn microvm_v1_machine_contract(
         clock_policy: ADVANCE_BY_HOST_DOWNTIME.to_owned(),
         microvm_network,
         microvm_filesystem,
+        apic_frequency_hz,
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
@@ -1562,6 +1567,10 @@ pub fn validate_microvm_machine_contract(
         "snapshot TSC frequency contract doesn't match the destination"
     );
     anyhow::ensure!(
+        contract.apic_frequency_hz == expected.apic_frequency_hz,
+        "snapshot APIC frequency contract doesn't match the destination"
+    );
+    anyhow::ensure!(
         contract.cpu_contract == expected.cpu_contract,
         "snapshot CPU compatibility contract doesn't match the destination"
     );
@@ -1604,6 +1613,12 @@ fn validate_machine_contract_shape(
         contract.tsc_frequency_hz != 0,
         "snapshot TSC frequency must be nonzero"
     );
+    if let Some(apic_frequency_hz) = contract.apic_frequency_hz {
+        anyhow::ensure!(
+            apic_frequency_hz != 0,
+            "snapshot APIC frequency must be nonzero"
+        );
+    }
     anyhow::ensure!(
         !contract.cpu_contract.is_empty() && contract.cpu_contract.len() <= MAX_CPU_CONTRACT_BYTES,
         "snapshot CPU contract size is invalid"
@@ -1944,6 +1959,7 @@ mod tests {
             clock_policy: ADVANCE_BY_HOST_DOWNTIME.to_owned(),
             microvm_network: None,
             microvm_filesystem: None,
+            apic_frequency_hz: Some(1_000_000_000),
         };
         contract.set_effective_command_line("console=hvc0".to_owned());
         contract.set_cpu_compatibility_contract(vec![1, 2, 3]);
@@ -2040,6 +2056,7 @@ mod tests {
             .to_vec(),
             std::time::SystemTime::now().into(),
             1_000_000_000,
+            Some(1_000_000_000),
             vec![1, 2, 3],
         )
         .unwrap()
@@ -2070,6 +2087,7 @@ mod tests {
             .to_vec(),
             std::time::SystemTime::now().into(),
             1_000_000_000,
+            Some(1_000_000_000),
             vec![1, 2, 3],
         )
         .unwrap()
@@ -2111,6 +2129,7 @@ mod tests {
             .to_vec(),
             std::time::SystemTime::now().into(),
             1_000_000_000,
+            Some(1_000_000_000),
             vec![1, 2, 3],
         )
         .unwrap()
@@ -2315,6 +2334,27 @@ mod tests {
         expected.tsc_frequency_hz += 1;
         let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
         assert!(err.to_string().contains("TSC frequency"));
+    }
+
+    #[test]
+    fn validate_microvm_machine_contract_rejects_apic_frequency() {
+        let mut manifest = test_manifest();
+        let contract = test_machine_contract();
+        manifest.machine_contract = Some(contract.clone());
+        let mut expected = contract;
+        expected.apic_frequency_hz = expected.apic_frequency_hz.map(|frequency| frequency + 1);
+        let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
+        assert!(err.to_string().contains("APIC frequency"));
+    }
+
+    #[test]
+    fn validate_microvm_machine_contract_accepts_legacy_apic_frequency() {
+        let mut manifest = test_manifest();
+        let mut contract = test_machine_contract();
+        contract.apic_frequency_hz = None;
+        manifest.machine_contract = Some(contract.clone());
+
+        validate_microvm_machine_contract(&manifest, &contract).unwrap();
     }
 
     #[test]

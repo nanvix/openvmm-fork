@@ -535,26 +535,23 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         "mshv" => ("", ""),
         _ => unreachable!(),
     };
-    // Direct-boot MSHV has no usable guest timer source, but its TSC-backed
-    // wall and uptime clocks can still be validated across restore.
-    let (arm_timer, complete_timer) = if hypervisor == "mshv" {
-        ("", "")
-    } else {
-        (
-            "sleep 5 & timer_pid=$!; sleep 1; ",
-            "wait $timer_pid; echo PHASE2-TIMER-DONE; ",
-        )
-    };
+    let arm_timer = "sleep 5 & timer_pid=$!; sleep 1; ";
+    let complete_timer = "wait $timer_pid; echo PHASE2-TIMER-DONE; ";
     let capture_workload = [
         select_clocksource,
         validate_clocksource,
-        "wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
-         ",
         arm_timer,
+        "wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
+         process_cpu_before=$(awk '{print $14+$15}' /proc/$$/stat); \
+         thread_cpu_before=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
+         ",
         "nvx-snapshot; \
          echo PHASE2-CONTINUED-ONCE; \
          wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
          echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
+         process_cpu_restored=$(awk '{print $14+$15}' /proc/$$/stat); \
+         thread_cpu_restored=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
+         echo PHASE2-CPU-$((process_cpu_restored-process_cpu_before))-$((thread_cpu_restored-thread_cpu_before)); \
          ",
         complete_timer,
         "\
@@ -592,10 +589,10 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
         .context("published snapshot failed verification")?;
 
-    thread::sleep(Duration::from_secs(3));
     let mut rng_hashes = Vec::new();
     let mut restore_latencies = Vec::new();
     for restore_index in 0..2 {
+        thread::sleep(Duration::from_secs(3));
         let mut restore_args = phase_2_args(hypervisor);
         restore_args.extend([
             "--restore-snapshot".into(),
@@ -606,13 +603,9 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
         restore.wait_for_output_line(CONTINUED_MARKER)?;
         restore_latencies.push(restore_started.elapsed());
-        let timer_elapsed = if hypervisor == "mshv" {
-            None
-        } else {
-            let timer_wait_started = Instant::now();
-            restore.wait_for_output_line(b"PHASE2-TIMER-DONE")?;
-            Some(timer_wait_started.elapsed())
-        };
+        let timer_wait_started = Instant::now();
+        restore.wait_for_output_line(b"PHASE2-TIMER-DONE")?;
+        let timer_elapsed = timer_wait_started.elapsed();
         let (status, output) = restore.wait()?;
         anyhow::ensure!(
             status.code() == Some(37),
@@ -623,17 +616,15 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             count_output_lines(&output, CONTINUED_MARKER) == 1,
             "restore {restore_index} did not continue exactly once after the snapshot OUT"
         );
-        if let Some(timer_elapsed) = timer_elapsed {
-            anyhow::ensure!(
-                count_output_lines(&output, b"PHASE2-TIMER-DONE") == 1,
-                "restore {restore_index} did not complete the armed timer"
-            );
-            anyhow::ensure!(
-                timer_elapsed < Duration::from_millis(3500),
-                "restore {restore_index} did not shorten the armed timer by host downtime: {timer_elapsed:?}; output: {}",
-                output_tail(&output)
-            );
-        }
+        anyhow::ensure!(
+            count_output_lines(&output, b"PHASE2-TIMER-DONE") == 1,
+            "restore {restore_index} did not complete the armed timer"
+        );
+        anyhow::ensure!(
+            timer_elapsed < Duration::from_millis(3500),
+            "restore {restore_index} did not shorten the armed timer by host downtime: {timer_elapsed:?}; output: {}",
+            output_tail(&output)
+        );
         let downtime = std::str::from_utf8(
             output_line_value(&output, b"PHASE2-DOWNTIME-")
                 .context("restored guest did not report its clock deltas")?,
@@ -646,6 +637,19 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         anyhow::ensure!(
             wall_delta >= 3 && uptime_delta >= 3 && wall_delta.abs_diff(uptime_delta) <= 1,
             "restore {restore_index} clocks did not advance coherently: wall={wall_delta}s uptime={uptime_delta}s"
+        );
+        let cpu = std::str::from_utf8(
+            output_line_value(&output, b"PHASE2-CPU-")
+                .context("restored guest did not report its CPU clock deltas")?,
+        )?;
+        let (process_cpu_delta, thread_cpu_delta) = cpu
+            .split_once('-')
+            .context("restored guest reported malformed CPU clock deltas")?;
+        let process_cpu_delta = process_cpu_delta.parse::<u64>()?;
+        let thread_cpu_delta = thread_cpu_delta.parse::<u64>()?;
+        anyhow::ensure!(
+            process_cpu_delta <= 2 && thread_cpu_delta <= 2,
+            "restore {restore_index} CPU clocks advanced during downtime: process={process_cpu_delta} ticks thread={thread_cpu_delta} ticks"
         );
         let rng_hash = output_line_value(&output, b"PHASE2-RNG-")
             .context("restored guest did not report an RNG digest")?;

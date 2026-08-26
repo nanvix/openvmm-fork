@@ -55,6 +55,8 @@ pub enum KvmError {
     State(#[from] Box<StateError<KvmError>>),
     #[error("invalid state while restoring: {0}")]
     InvalidState(&'static str),
+    #[error("snapshot clock downtime adjustment overflows")]
+    SnapshotClockOverflow,
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
     #[error("cannot resize KVM guest_memfd memory slot")]
