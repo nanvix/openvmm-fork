@@ -660,10 +660,19 @@ impl Partition for KvmPartition {
         Ok(())
     }
 
+    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        // KVM's in-kernel local APIC uses a fixed one-nanosecond bus cycle.
+        Ok(Some(1_000_000_000))
+    }
+
     fn advance_snapshot_time(&self, duration: Duration) -> Result<(), Self::Error> {
         let clock = self.inner.kvm.get_clock_ns()?;
-        let delta = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        let requested_clock = clock.clock.saturating_add(delta);
+        let delta =
+            u64::try_from(duration.as_nanos()).map_err(|_| KvmError::SnapshotClockOverflow)?;
+        let requested_clock = clock
+            .clock
+            .checked_add(delta)
+            .ok_or(KvmError::SnapshotClockOverflow)?;
         self.inner.kvm.set_clock_ns(requested_clock)?;
         Ok(())
     }

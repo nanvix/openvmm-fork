@@ -1108,6 +1108,7 @@ fn build_switch_list(all_switches: &[cli_args::GenericPcieSwitchCli]) -> Vec<Pci
 mod microvm_console_attachment_tests {
     use super::*;
     use clap::Parser as _;
+    use test_with_tracing::test;
 
     fn socket_attachment(path: &Path) -> openvmm_helpers::snapshot::SnapshotAttachment {
         openvmm_helpers::snapshot::SnapshotAttachment {
@@ -1228,6 +1229,40 @@ mod microvm_console_attachment_tests {
         assert_eq!(restored_snapshot, snapshot);
     }
 
+    #[test]
+    fn snapshot_downtime_accepts_supported_elapsed_time() {
+        let capture = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+        assert_eq!(
+            calculate_snapshot_downtime(capture, capture).unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            calculate_snapshot_downtime(capture, capture + MAX_SNAPSHOT_DOWNTIME).unwrap(),
+            MAX_SNAPSHOT_DOWNTIME
+        );
+    }
+
+    #[test]
+    fn snapshot_downtime_rejects_rollback_and_excessive_elapsed_time() {
+        let capture = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+        let rollback =
+            calculate_snapshot_downtime(capture, std::time::SystemTime::UNIX_EPOCH).unwrap_err();
+        assert!(
+            rollback
+                .to_string()
+                .contains("before snapshot capture time")
+        );
+
+        let excessive = calculate_snapshot_downtime(
+            capture,
+            capture + MAX_SNAPSHOT_DOWNTIME + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(excessive.to_string().contains("exceeds the supported"));
+    }
+
     fn network_contract() -> openvmm_helpers::snapshot::SnapshotMachineContract {
         let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
         let policy = net_backend_resources::egress::EgressPolicy::new(
@@ -1271,6 +1306,7 @@ mod microvm_console_attachment_tests {
             .to_vec(),
             std::time::SystemTime::now().into(),
             1_000_000_000,
+            Some(1_000_000_000),
             vec![1, 2, 3],
         )
         .unwrap()
@@ -1369,6 +1405,7 @@ mod microvm_console_attachment_tests {
             .to_vec(),
             std::time::SystemTime::now().into(),
             1_000_000_000,
+            Some(1_000_000_000),
             vec![1, 2, 3],
         )
         .unwrap()
@@ -4334,7 +4371,7 @@ fn prepare_snapshot_restore(
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
     mesh::payload::message::ProtobufMessage,
-    Option<(Duration, u64, Vec<u8>)>,
+    Option<(Duration, u64, Option<u64>, Vec<u8>)>,
 )> {
     let expected_microvm_contract = if opt.machine == MachineProfileCli::Microvm {
         anyhow::ensure!(
@@ -4369,6 +4406,22 @@ fn prepare_snapshot_restore(
     )
 }
 
+const MAX_SNAPSHOT_DOWNTIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+fn calculate_snapshot_downtime(
+    capture_time: std::time::SystemTime,
+    destination_time: std::time::SystemTime,
+) -> anyhow::Result<Duration> {
+    let downtime = destination_time
+        .duration_since(capture_time)
+        .context("destination wall clock is before snapshot capture time")?;
+    anyhow::ensure!(
+        downtime <= MAX_SNAPSHOT_DOWNTIME,
+        "snapshot host downtime exceeds the supported 30-day bound"
+    );
+    Ok(downtime)
+}
+
 pub(crate) fn prepare_snapshot_restore_for_config(
     snapshot_dir: &Path,
     expected_memory_size: u64,
@@ -4391,7 +4444,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
     mesh::payload::message::ProtobufMessage,
-    Option<(Duration, u64, Vec<u8>)>,
+    Option<(Duration, u64, Option<u64>, Vec<u8>)>,
 )> {
     let (manifest, state_bytes, memory_file) =
         openvmm_helpers::snapshot::read_snapshot_with_memory_verification(
@@ -4430,6 +4483,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             saved_contract.state_unit_names.clone(),
             saved_contract.capture_wall_clock,
             saved_contract.tsc_frequency_hz,
+            saved_contract.apic_frequency_hz,
             saved_contract.cpu_contract.clone(),
         )?;
         openvmm_helpers::snapshot::validate_microvm_machine_contract(
@@ -4440,16 +4494,11 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             .capture_wall_clock
             .try_into()
             .context("snapshot capture wall clock is invalid")?;
-        let downtime = std::time::SystemTime::now()
-            .duration_since(capture_time)
-            .context("destination wall clock is before snapshot capture time")?;
-        anyhow::ensure!(
-            downtime <= Duration::from_secs(30 * 24 * 60 * 60),
-            "snapshot host downtime exceeds the supported 30-day bound"
-        );
+        let downtime = calculate_snapshot_downtime(capture_time, std::time::SystemTime::now())?;
         Some((
             downtime,
             saved_contract.tsc_frequency_hz,
+            saved_contract.apic_frequency_hz,
             saved_contract.cpu_contract.clone(),
         ))
     } else {
@@ -4887,9 +4936,12 @@ async fn run_control_inner(
             shared_memory_copy_on_write,
             snapshot_boundary_requests,
             snapshot_ready,
-            restore_downtime: restore_time.as_ref().map(|(downtime, _, _)| *downtime),
-            restore_tsc_frequency_hz: restore_time.as_ref().map(|(_, frequency, _)| *frequency),
-            restore_cpu_contract: restore_time.map(|(_, _, cpu_contract)| cpu_contract),
+            restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),
+            restore_tsc_frequency_hz: restore_time.as_ref().map(|(_, frequency, _, _)| *frequency),
+            restore_apic_frequency_hz: restore_time
+                .as_ref()
+                .and_then(|(_, _, frequency, _)| *frequency),
+            restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
             rpc: rpc_recv,
             notify: notify_send,
         };

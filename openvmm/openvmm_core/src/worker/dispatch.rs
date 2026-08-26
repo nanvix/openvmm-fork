@@ -319,9 +319,12 @@ impl Worker for VmWorker {
         let restore_time = match (
             parameters.restore_downtime,
             parameters.restore_tsc_frequency_hz,
+            parameters.restore_apic_frequency_hz,
         ) {
-            (Some(downtime), Some(frequency)) => Some((downtime, frequency)),
-            (None, None) => None,
+            (Some(downtime), Some(tsc_frequency), apic_frequency) => {
+                Some((downtime, tsc_frequency, apic_frequency))
+            }
+            (None, None, None) => None,
             _ => anyhow::bail!("restore downtime and TSC frequency must be provided together"),
         };
         tracing::debug!(?restore_time, "received snapshot restore time contract");
@@ -1411,7 +1414,7 @@ impl InitializedVm {
         self,
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
-        restore_time: Option<(Duration, u64)>,
+        restore_time: Option<(Duration, u64, Option<u64>)>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
 
@@ -3121,7 +3124,7 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
-            if let Some((_, saved_frequency)) = restore_time {
+            if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
                 let destination_frequency = this
                     .inner
                     .partition
@@ -3132,25 +3135,40 @@ impl InitializedVm {
                     "destination TSC frequency {destination_frequency} Hz does not match saved frequency {saved_frequency} Hz"
                 );
                 this.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
+                let destination_apic_frequency = this
+                    .inner
+                    .partition
+                    .apic_frequency_hz()?
+                    .context("destination backend does not expose a local APIC frequency")?;
+                if let Some(saved_apic_frequency) = saved_apic_frequency {
+                    anyhow::ensure!(
+                        destination_apic_frequency == saved_apic_frequency,
+                        "destination APIC frequency {destination_apic_frequency} Hz does not match saved frequency {saved_apic_frequency} Hz"
+                    );
+                }
             }
             this.restore(saved_state)
                 .await
                 .context("loadedvm restore failed")?;
-            if let Some((downtime, frequency)) = restore_time {
+            if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
                 this.state_units
                     .advance_time(downtime)
                     .await
                     .context("failed to advance restored VM time")?;
                 #[cfg(guest_arch = "x86_64")]
-                this.inner
-                    .partition_unit
-                    .advance_tsc(
-                        downtime,
-                        frequency,
-                        this.inner.partition.apic_frequency_hz()?,
-                    )
-                    .await
-                    .context("failed to advance restored vCPU TSC")?;
+                {
+                    let apic_frequency = match saved_apic_frequency {
+                        Some(frequency) => frequency,
+                        None => this.inner.partition.apic_frequency_hz()?.context(
+                            "destination backend does not expose a local APIC frequency",
+                        )?,
+                    };
+                    this.inner
+                        .partition_unit
+                        .advance_tsc(downtime, frequency, Some(apic_frequency))
+                        .await
+                        .context("failed to advance restored vCPU TSC")?;
+                }
                 this.inner
                     .partition
                     .advance_snapshot_time(downtime)
@@ -3941,6 +3959,22 @@ impl LoadedVm {
                                         )),
                                     )
                                 })?;
+                            let apic_frequency_hz = self
+                                .inner
+                                .partition
+                                .apic_frequency_hz()
+                                .map_err(|error| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(anyhow::anyhow!(
+                                            "backend does not expose a local APIC frequency"
+                                        )),
+                                    )
+                                })?;
                             let capture_wall_clock = self
                                 .snapshot_capture_wall_clock
                                 .ok_or_else(|| {
@@ -3954,6 +3988,7 @@ impl LoadedVm {
                                 state_unit_names: saved_state.inventory.clone(),
                                 saved_state: ProtobufMessage::new(saved_state),
                                 tsc_frequency_hz,
+                                apic_frequency_hz,
                                 capture_wall_clock,
                                 cpu_contract: mesh::payload::encode(
                                     self.inner.partition.cpu_compatibility_contract(),

@@ -45,6 +45,7 @@ impl Worker {
             snapshot_ready: None,
             restore_downtime: None,
             restore_tsc_frequency_hz: None,
+            restore_apic_frequency_hz: None,
             restore_cpu_contract: None,
             rpc: rpc_recv,
             notify: notify_send,

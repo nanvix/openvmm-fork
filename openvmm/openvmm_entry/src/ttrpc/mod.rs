@@ -1892,11 +1892,14 @@ impl VmService {
                     shared_memory_copy_on_write,
                     snapshot_boundary_requests: microvm_snapshot_requests,
                     snapshot_ready,
-                    restore_downtime: restore_time.as_ref().map(|(downtime, _, _)| *downtime),
+                    restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),
                     restore_tsc_frequency_hz: restore_time
                         .as_ref()
-                        .map(|(_, frequency, _)| *frequency),
-                    restore_cpu_contract: restore_time.map(|(_, _, cpu_contract)| cpu_contract),
+                        .map(|(_, frequency, _, _)| *frequency),
+                    restore_apic_frequency_hz: restore_time
+                        .as_ref()
+                        .and_then(|(_, _, frequency, _)| *frequency),
+                    restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
                     rpc: recv,
                     notify: notify_send,
                 },

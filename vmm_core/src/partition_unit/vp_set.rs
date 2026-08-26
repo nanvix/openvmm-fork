@@ -51,6 +51,51 @@ use vmm_core_defs::debug_rpc::DebuggerVpState;
 
 const NUM_VTLS: usize = 3;
 
+#[cfg(guest_arch = "x86_64")]
+struct AdvancedTsc {
+    value: u64,
+    cycles: u64,
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn advance_tsc_state(
+    previous_tsc: u64,
+    duration: std::time::Duration,
+    frequency_hz: u64,
+) -> anyhow::Result<AdvancedTsc> {
+    let cycles = duration
+        .as_nanos()
+        .checked_mul(u128::from(frequency_hz))
+        .context("TSC downtime adjustment overflows")?
+        / 1_000_000_000;
+    let cycles = u64::try_from(cycles).context("TSC downtime adjustment exceeds u64")?;
+    let value = previous_tsc
+        .checked_add(cycles)
+        .context("TSC downtime adjustment exceeds the counter range")?;
+    Ok(AdvancedTsc { value, cycles })
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod snapshot_tsc_tests {
+    use super::*;
+    use std::time::Duration;
+    use test_with_tracing::test;
+
+    #[test]
+    fn downtime_advances_tsc_by_elapsed_cycles() {
+        let advanced = advance_tsc_state(1_000, Duration::from_secs(1), 1_000).unwrap();
+
+        assert_eq!(advanced.value, 2_000);
+        assert_eq!(advanced.cycles, 1_000);
+    }
+
+    #[test]
+    fn downtime_rejects_tsc_overflow() {
+        assert!(advance_tsc_state(u64::MAX, Duration::from_nanos(1), 1_000_000_000).is_err());
+        assert!(advance_tsc_state(0, Duration::MAX, u64::MAX).is_err());
+    }
+}
+
 /// Trait for controlling a VP on a bound partition.
 #[async_trait(?Send)]
 trait ControlVp: ProtobufSaveRestore {
@@ -191,33 +236,29 @@ where
         frequency_hz: u64,
         apic_frequency_hz: Option<u64>,
     ) -> anyhow::Result<()> {
-        let cycles = duration
-            .as_nanos()
-            .checked_mul(u128::from(frequency_hz))
-            .context("TSC downtime adjustment overflows")?
-            / 1_000_000_000;
-        let cycles = u64::try_from(cycles).context("TSC downtime adjustment exceeds u64")?;
         let mut access = self.vp.access_state(Vtl::Vtl0);
         let mut tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
         let mut tsc_deadline = access
-            .tsc_deadline()
+            .caps()
+            .tsc_deadline
+            .then(|| access.tsc_deadline())
+            .transpose()
             .context("failed to read stopped vCPU TSC deadline")?;
         let mut apic = apic_frequency_hz
             .map(|frequency| {
                 let mut apic = access
                     .apic()
                     .context("failed to read stopped LAPIC timer")?;
-                apic.advance_timer(duration, frequency);
+                apic.advance_timer(duration, frequency)?;
                 anyhow::Ok(apic)
             })
             .transpose()?;
         let previous_tsc = tsc.value;
-        tsc.value = tsc.value.wrapping_add(cycles);
-        if tsc_deadline.value != 0 && tsc_deadline.value.wrapping_sub(previous_tsc) <= cycles {
-            // Some hypervisors do not inject an interrupt when a deadline is
-            // reprogrammed in the past. Rearm it just ahead of the advanced
-            // TSC so that it expires promptly after the VP starts.
-            tsc_deadline.value = tsc.value.wrapping_add((frequency_hz / 1000).max(1));
+        let advanced = advance_tsc_state(previous_tsc, duration, frequency_hz)?;
+        tsc.value = advanced.value;
+        if let (Some(apic), Some(tsc_deadline)) = (apic.as_mut(), tsc_deadline.as_mut()) {
+            tsc_deadline.value =
+                apic.advance_tsc_deadline(previous_tsc, advanced.value, tsc_deadline.value);
         }
         access
             .set_tsc(&tsc)
@@ -227,9 +268,11 @@ where
                 .set_apic(&apic)
                 .context("failed to reprogram stopped LAPIC timer")?;
         }
-        access
-            .set_tsc_deadline(&tsc_deadline)
-            .context("failed to reprogram stopped vCPU TSC deadline")?;
+        if let Some(tsc_deadline) = tsc_deadline {
+            access
+                .set_tsc_deadline(&tsc_deadline)
+                .context("failed to reprogram stopped vCPU TSC deadline")?;
+        }
         access
             .commit()
             .context("failed to commit adjusted vCPU TSC")?;
@@ -241,7 +284,7 @@ where
             previous_tsc,
             requested_tsc = tsc.value,
             observed_tsc,
-            cycles,
+            cycles = advanced.cycles,
             frequency_hz,
             ?duration,
             "adjusted restored vCPU TSC"

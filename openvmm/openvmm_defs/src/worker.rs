@@ -58,6 +58,8 @@ pub struct VmWorkerParameters {
     pub restore_downtime: Option<std::time::Duration>,
     /// Saved effective TSC frequency required by restore.
     pub restore_tsc_frequency_hz: Option<u64>,
+    /// Saved local APIC timer frequency required by restore.
+    pub restore_apic_frequency_hz: Option<u64>,
     /// Saved canonical CPU contract required by restore.
     pub restore_cpu_contract: Option<Vec<u8>>,
     /// The VM RPC channel.

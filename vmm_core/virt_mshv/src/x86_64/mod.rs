@@ -209,7 +209,9 @@ impl MshvProtoPartition<'_> {
             cet_ss: false,
             sgx: false,
             tsc_aux: false,
-            tsc_deadline: true,
+            // MSHV does not reliably deliver TSC deadline events to direct-boot
+            // guests. Fall back to the LAPIC count-mode clockevent.
+            tsc_deadline: false,
             kvm_clock: false,
             vtom: None,
             physical_address_width: self.max_physical_address_size(),
@@ -253,6 +255,14 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             tsc_frequency_hz,
             current_max_basic_leaf,
         )?);
+        cpuid.push(
+            virt::CpuidLeaf::new(CpuidFunction::VersionAndFeatures.0, [0; 4]).masked([
+                0,
+                0,
+                1 << 24,
+                0,
+            ]),
+        );
         let cpuid = virt::CpuidLeafSet::new(cpuid);
 
         // Apply CPUID overrides partition-wide.
@@ -311,6 +321,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                     self.caps_from_properties()?
                 }
             };
+            caps.tsc_deadline = false;
             caps.xsaves_state_bv_broken = true;
             // TimeFreeze stops reference time but not the virtual TSC.
             caps.can_freeze_time = false;
@@ -394,6 +405,15 @@ impl virt::Partition for MshvPartition {
             .into());
         }
         Ok(())
+    }
+
+    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(
+            self.inner
+                .vmfd
+                .get_partition_property(HvPartitionPropertyCode::ApicFrequency.0)
+                .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?,
+        ))
     }
 
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
@@ -1176,7 +1196,6 @@ fn supported_processor_features1() -> hvdef::HvX64PartitionProcessorFeatures1 {
         .with_movdir64b_support(true)
         .with_cldemote_support(true)
         .with_serialize_support(true)
-        .with_tsc_deadline_tmr_support(true)
         .with_tsc_adjust_support(true)
         .with_fz_l_rep_movsb(true)
         .with_fs_rep_stosb(true)
