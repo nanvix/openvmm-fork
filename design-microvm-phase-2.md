@@ -40,7 +40,7 @@ several persistence and compatibility checks:
 | Area | Pinned NVX | OpenVMM phase-2 contract |
 |---|---|---|
 | Manifest | Backend-local magic/version only | Authoritative machine, CPU, device, attachment, and artifact manifest |
-| Integrity | No artifact digests | Length and SHA-256 verification |
+| Integrity | No artifact digests | Strict structural and semantic validation; no embedded payload checksums |
 | Publication | KVM writes final files directly; WHP renames individual temp files | Same-filesystem staging directory and atomic directory rename |
 | CPU portability | Destination-derived CPUID | Recorded and reproducible effective CPU contract |
 | Downtime | WHP advances TSC and guest time by elapsed host time | Apply pinned NVX's advance-by-downtime policy consistently on KVM and WHP |
@@ -57,7 +57,7 @@ snapshot compatibility.
 - bounded and fallible quiescing;
 - exact saved-state inventory;
 - manifest-authoritative restore;
-- staged and checksummed publication;
+- staged checksum-free publication;
 - immutable/private memory restore;
 - same-backend CPU and TSC compatibility;
 - coherent TSC, paravirtual clock, RTC, PIT, LAPIC timer, and interrupt state
@@ -308,7 +308,7 @@ parent/
 Requirements:
 
 1. create the staging directory and files exclusively;
-2. stream bounded state and memory while computing SHA-256;
+2. stream bounded state and memory without computing payload checksums;
 3. use a filesystem COW/reflink clone when available, otherwise make a sparse
    copy from stopped guest memory;
 4. never hard-link a shared-writable inode;
@@ -327,8 +327,10 @@ The manifest contains fixed relative artifact names. It must reject absolute
 paths, parent traversal, symlinks/reparse-point escapes, oversized files, and
 unexpected artifacts.
 
-SHA-256 detects corruption but does not authenticate an attacker-controlled
-snapshot. Encryption/signatures are separate work.
+The v3 manifest does not embed checksums for `state.bin` or `memory.bin`.
+Regular-file, exact-length, bounded-decoding, and machine-contract validation
+remain mandatory, but same-length payload changes are not detected.
+Authenticated export or transport integrity is separate work.
 
 ### 6. Private copy-on-write RAM
 
@@ -354,8 +356,8 @@ backing. Validate the file length and each RAM-range-to-file-offset mapping
 before mapping.
 
 A conformance test must restore the same snapshot, dirty every RAM range,
-terminate it, and restore the original snapshot again while proving the
-`memory.bin` digest never changed.
+terminate it, and restore the original snapshot again while proving with a
+test-only payload comparison that `memory.bin` never changed.
 
 ### 7. CPU and TSC compatibility
 
@@ -515,7 +517,7 @@ Required order:
 1. open the snapshot directory without following escape paths;
 2. read a bounded manifest;
 3. validate format, ABI, backend, architecture, topology, and path fields;
-4. verify artifact lengths and digests;
+4. validate artifact types and exact lengths;
 5. validate CPU/TSC reproducibility;
 6. resolve and validate immutable attachments;
 7. compare the exact machine/device/state-unit inventory;
@@ -623,11 +625,11 @@ must not be advertised as safe for cloned cryptographic workloads.
 | Writable or unidentified media | Fail before pausing |
 | Missing/changed attachment | Fail before partition creation |
 | Quiesce/drain timeout | No publication; resume only if rollback is proven |
-| State or memory write/hash failure | Remove the exact staging directory; expose no final snapshot |
+| State or memory write failure | Remove the exact staging directory; expose no final snapshot |
 | Atomic rename failure | Expose no final snapshot |
 | Failure after commit rename | Treat capture as committed and terminate source |
 | Oversized/truncated artifact | Reject before decode/allocation |
-| Digest mismatch | Reject before state decode or writable mapping |
+| Wrong artifact type or length | Reject before state decode or writable mapping |
 | Added/removed/reordered device | Reject before partition creation |
 | CPU/XSTATE/MSR/TSC mismatch | Explicit pre-start incompatibility error |
 | Cross-backend restore | Explicit pre-start incompatibility error |
@@ -641,7 +643,7 @@ failed transaction. Never recursively remove an ambiguous destination.
 
 1. Finalize phase-1 stable device and state-unit identities.
 2. Add bounded manifest decoding and exact inventory validation.
-3. Add staged publication, artifact lengths/digests, and restrictive
+3. Add staged publication, exact artifact lengths, and restrictive
    permissions.
 4. Add file-backed COW mapping modes to `sparse_mmap` and `membacking`.
 5. Add backend CPU-contract discovery/reproduction and TSC-frequency control.
@@ -691,9 +693,9 @@ Run each applicable test on Linux/KVM, Linux/MSHV, and Windows/WHP:
 | Active immutable block I/O completes exactly once, when configured | Required | Required | Required |
 | Writable or changed configured media is rejected before capture/start | Required | Required | Required |
 | Same snapshot restores twice after the first VM dirties all RAM | Required | Required | Required |
-| `memory.bin` digest remains unchanged after both restores | Required | Required | Required |
+| Test-only payload comparison proves `memory.bin` remains unchanged after both restores | Required | Required | Required |
 | Restore-time entropy injection makes cloned guest RNG output diverge | Required | Required | Required |
-| Corrupt, truncated, oversized, symlinked artifacts are rejected | Required | Required | Required |
+| Malformed, truncated, oversized, symlinked, and wrong-type artifacts are rejected | Required | Required | Required |
 | Invalid virtio queue state is rejected before workers run | Required | Required | Required |
 | Added, removed, or reordered devices are rejected | Required | Required | Required |
 | ABI, topology, and command-line mismatch are rejected | Required | Required | Required |
@@ -709,6 +711,6 @@ appear exactly once after restore.
 
 Phase 2 is complete only when a guest-triggered snapshot on each host is
 published atomically, the source process exits, a separate process restores
-from verified immutable artifacts, and every incompatibility fails before
+from structurally validated immutable artifacts, and every incompatibility fails before
 guest execution. Saving and resuming the original process is not an acceptable
 proxy.

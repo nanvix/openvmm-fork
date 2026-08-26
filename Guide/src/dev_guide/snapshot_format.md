@@ -21,6 +21,18 @@ The manifest is a protobuf message defined as
 in `openvmm/openvmm_helpers/src/snapshot.rs`, encoded using the `mesh`
 crate's protobuf encoding.
 
+New snapshots use manifest version 3. The legacy `state_sha256` and
+`memory_sha256` protobuf tags remain reserved so version 2 manifests can be
+decoded, but version 3 requires both fields to be absent. Restore accepts
+well-formed version 2 digest fields for compatibility without computing or
+validating SHA-256 over either payload.
+
+The default format is a local machine-state contract, not an authenticated
+container. Both versions receive the same regular-file, no-follow/no-reparse,
+bounded decoding, exact-length, inventory, and machine-contract validation,
+but same-length payload changes are not detected. Export or transport layers
+must provide integrity and authentication outside this format.
+
 ## Device state (`state.bin`)
 
 The device state contains every device's saved state, collected via the
@@ -30,22 +42,10 @@ default values, forward/backward compatibility) apply.
 
 ## Memory (`memory.bin`)
 
-`memory.bin` is a hard link to the file-backed guest RAM file. During a save,
-`write_snapshot()` creates this hard link using `std::fs::hard_link`.
-
-```admonish note
-The hard-link approach means the memory backing file and snapshot directory
-must reside on the same filesystem. If they are on different filesystems,
-`write_snapshot` returns an error with a suggestion to place the backing
-file inside the snapshot directory.
-```
-
-### Same-file detection
-
-If the user passes `--memory file=<snapshot_dir>/memory.bin`, the source and
-target of the hard link are the same file. The code detects this by
-canonicalizing both paths and comparing them. When they match, the hard-link
-step is skipped.
+`memory.bin` is an exact-length copy of the opened file handle that backs guest
+RAM. Capture uses that handle rather than reopening its pathname, so replacing
+the source path cannot substitute different bytes during publication. The
+copy is flushed in the private staging directory before publication.
 
 ## Code references
 

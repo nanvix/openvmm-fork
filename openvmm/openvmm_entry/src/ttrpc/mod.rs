@@ -936,7 +936,6 @@ impl VmService {
                         .iter()
                         .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
                 )),
-                openvmm_helpers::snapshot::SnapshotMemoryVerification::Sha256,
             )?;
             let restore_time =
                 restore_time.context("microVM snapshot is missing its restore-time contract")?;
