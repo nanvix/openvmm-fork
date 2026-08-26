@@ -499,6 +499,8 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     const CONTINUED_MARKER: &[u8] = b"PHASE2-CONTINUED-ONCE";
     const NO_DESTINATION_MARKER: &[u8] = b"PHASE2-NO-DESTINATION-CONTINUED";
     const TIMER_WAIT_PREFIX: &[u8] = b"PHASE2-TIMER-WAIT-";
+    const MIN_CLOCK_ADVANCE_SECS: u64 = 4;
+    const MAX_CLOCK_SKEW_SECS: u64 = 1;
 
     let (openvmm,) = artifacts;
     let kernel = config
@@ -696,9 +698,12 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             .context("restored guest reported malformed clock deltas")?;
         let wall_delta = wall_delta.parse::<u64>()?;
         let uptime_delta = uptime_delta.parse::<u64>()?;
+        // Whole-second samples can straddle different boundaries. Require one
+        // clock to cover the minimum interval while keeping both coherent.
         anyhow::ensure!(
-            wall_delta >= 4 && uptime_delta >= 4 && wall_delta.abs_diff(uptime_delta) <= 1,
-            "restore {restore_index} clocks did not advance coherently: wall={wall_delta}s uptime={uptime_delta}s"
+            wall_delta.max(uptime_delta) >= MIN_CLOCK_ADVANCE_SECS
+                && wall_delta.abs_diff(uptime_delta) <= MAX_CLOCK_SKEW_SECS,
+            "restore {restore_index} clocks did not reflect host downtime coherently: wall={wall_delta}s uptime={uptime_delta}s; expected either clock to advance by at least {MIN_CLOCK_ADVANCE_SECS}s with at most {MAX_CLOCK_SKEW_SECS}s skew"
         );
         let cpu = std::str::from_utf8(
             output_line_value(&output, b"PHASE2-CPU-")
