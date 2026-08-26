@@ -134,6 +134,26 @@ impl OpenvmmTestProcess {
         }
     }
 
+    fn failure_context(&mut self) -> String {
+        self.drain_output();
+        let (status, exited) = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => (format!("exited with {status}"), true),
+                Ok(None) => ("was still running".to_owned(), false),
+                Err(error) => (format!("status query failed: {error}"), false),
+            },
+            None => ("was already reaped".to_owned(), true),
+        };
+        if exited {
+            while let Ok(chunk) = self.output_recv.recv_timeout(Duration::from_millis(100)) {
+                self.output.extend_from_slice(&chunk);
+            }
+        } else {
+            self.drain_output();
+        }
+        format!("{status}; output: {}", output_tail(&self.output))
+    }
+
     fn wait_for(&mut self, marker: &[u8]) -> anyhow::Result<()> {
         let started = Instant::now();
         loop {
@@ -777,12 +797,13 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     } else {
         "echo PHASE3-RX-RESTORED;"
     };
+    // Avoid tty-special bytes so this checks queued binary RX, not line discipline.
     let receive = if hypervisor == "mshv" {
         "IFS= read -r phase3_rx; \
          [ \"$phase3_rx\" = PHASE3-RX ] || { nvx-exit 53; exit; };"
     } else {
         "phase3_rx=$(dd bs=1 count=5 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
-         [ \"$phase3_rx\" = 000d0a7fff ] || { nvx-exit 53; exit; };"
+         [ \"$phase3_rx\" = 0001027fff ] || { nvx-exit 53; exit; };"
     };
     source_console.send_line(&format!(
         "set -eu; \
@@ -805,7 +826,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     if hypervisor == "mshv" {
         source_console.send_bytes(b"PHASE3-RX\n")?;
     } else {
-        source_console.send_bytes(&[0, 13, 10, 127, 255])?;
+        source_console.send_bytes(&[0, 1, 2, 127, 255])?;
     }
     let (status, source_process_output) = source.wait()?;
     anyhow::ensure!(
@@ -836,11 +857,21 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
             snapshot_dir.as_os_str().to_owned(),
             "--restore-entropy".into(),
         ]);
-        let restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
         let mut restore_console = TcpConsole::connect(address)?;
         if hypervisor != "mshv" {
-            restore_console.wait_for(RX_MARKER)?;
-            restore_console.wait_for(DONE_MARKER)?;
+            if let Err(error) = restore_console.wait_for(RX_MARKER) {
+                let process_context = restore.failure_context();
+                return Err(error).with_context(|| {
+                    format!("phase-3 restore {restore_index}: OpenVMM {process_context}")
+                });
+            }
+            if let Err(error) = restore_console.wait_for(DONE_MARKER) {
+                let process_context = restore.failure_context();
+                return Err(error).with_context(|| {
+                    format!("phase-3 restore {restore_index}: OpenVMM {process_context}")
+                });
+            }
         }
         let (status, process_output) = restore.wait()?;
         // On MSHV, exit 37 is the signal that the restored RX line was
