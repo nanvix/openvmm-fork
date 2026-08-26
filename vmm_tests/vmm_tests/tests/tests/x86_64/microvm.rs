@@ -14,6 +14,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::net::UdpSocket;
 use std::path::Path;
 use std::process::Child;
 use std::process::ChildStdin;
@@ -940,6 +941,7 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
 ) -> anyhow::Result<()> {
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
     const BEFORE_MARKER: &[u8] = b"PHASE4-HTTP-BEFORE";
+    const OLD_FLOW_INVALIDATED_MARKER: &[u8] = b"PHASE4-OLD-FLOW-INVALIDATED";
     const AFTER_MARKER: &[u8] = b"PHASE4-HTTP-AFTER";
 
     let (openvmm,) = artifacts;
@@ -959,27 +961,50 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
 
     let listener = TcpListener::bind("0.0.0.0:0")?;
     let http_port = listener.local_addr()?.port();
-    let (request_send, request_recv) = mpsc::channel();
+    let udp_socket = UdpSocket::bind("127.0.0.1:0")?;
+    udp_socket.set_read_timeout(Some(PHASE_2_TIMEOUT))?;
+    let udp_port = udp_socket.local_addr()?.port();
+    let (event_send, event_recv) = mpsc::channel();
     let server = thread::spawn(move || -> anyhow::Result<()> {
-        for _ in 0..3 {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(PHASE_2_TIMEOUT))?;
+        let mut request = [0u8; 4096];
+        let count = stream.read(&mut request)?;
+        anyhow::ensure!(
+            request[..count].starts_with(b"GET /hold HTTP/1."),
+            "unexpected phase-4 held HTTP request"
+        );
+        event_send.send("held").ok();
+        match stream.read(&mut request) {
+            Ok(0) => {}
+            Ok(_) => anyhow::bail!("the pre-capture HTTP request was replayed"),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                anyhow::bail!("the pre-capture HTTP connection remained live after capture")
+            }
+            Err(error) => return Err(error.into()),
+        }
+        event_send.send("old-flow-closed").ok();
+
+        for _ in 0..2 {
             let (mut stream, _) = listener.accept()?;
             stream.set_read_timeout(Some(PHASE_2_TIMEOUT))?;
-            let mut request = [0u8; 4096];
             let count = stream.read(&mut request)?;
             anyhow::ensure!(
-                request[..count].starts_with(b"GET / HTTP/1."),
-                "unexpected phase-4 HTTP request"
+                request[..count].starts_with(b"GET /fresh HTTP/1."),
+                "a restored pre-capture request was replayed instead of opening a fresh flow"
             );
             stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nPHASE4-HTTP-OK",
             )?;
             stream.flush()?;
-            request_send.send(()).ok();
+            event_send.send("fresh").ok();
         }
         Ok(())
     });
 
-    let endpoint = format!("10.0.0.1:{http_port}");
     let mut capture_args = phase_2_args(hypervisor);
     capture_args.extend([
         "--memory".into(),
@@ -992,15 +1017,29 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
         snapshot_dir.as_os_str().to_owned(),
         "--net".into(),
         "10.0.0.2/24".into(),
-        "--allow-endpoint".into(),
-        endpoint.clone().into(),
+        "--network-profile".into(),
+        "portable".into(),
+        "--allow-host".into(),
+        "10.0.0.1".into(),
     ]);
     let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    // The guest image has no deterministic raw DNS client, and its resolver
+    // follows the host's live DNS policy. This native test checks DNS bootstrap;
+    // Consomme's UDP and TCP DNS transaction tests cover resolver behavior.
+    // Egress denial is covered precisely by net_backend_resources unit tests.
     source.send_line(&format!(
         "set -eu; \
-         [ \"$(wget -qO- http://10.0.0.1:{http_port}/)\" = PHASE4-HTTP-OK ]; \
+         fail() {{ nvx-exit \"$1\"; exit 1; }}; \
+         grep -q 'virtnet_dns=10.0.0.1' /proc/cmdline || fail 20; \
+         ping -c 1 -W 5 10.0.0.1 >/dev/null || fail 21; \
+         printf PHASE4-UDP | nc -u -w 5 10.0.0.1 {udp_port} || fail 22; \
+         if ping -c 1 -W 1 -s 2000 10.0.0.1 >/dev/null; then fail 23; fi; \
+         wget -qO /tmp/phase4-held http://10.0.0.1:{http_port}/hold & held=$!; \
+         sleep 1; \
          echo PHASE4-HTTP-BEFORE; nvx-snapshot; \
-         [ \"$(wget -qO- http://10.0.0.1:{http_port}/)\" = PHASE4-HTTP-OK ]; \
+         if wait \"$held\"; then fail 24; fi; \
+         echo PHASE4-OLD-FLOW-INVALIDATED; \
+         [ \"$(wget -qO- http://10.0.0.1:{http_port}/fresh)\" = PHASE4-HTTP-OK ] || fail 25; \
          echo PHASE4-HTTP-AFTER; nvx-exit 37"
     ))?;
     source.wait_for(MICROVM_BOOT_MARKER)?;
@@ -1016,9 +1055,25 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
             && count_output_lines(&source_output, AFTER_MARKER) == 0,
         "phase-4 source crossed the snapshot boundary"
     );
-    request_recv
+    let event = event_recv
         .recv_timeout(PHASE_2_TIMEOUT)
         .context("phase-4 pre-snapshot HTTP request was not observed")?;
+    anyhow::ensure!(event == "held", "unexpected phase-4 event {event}");
+    let event = event_recv
+        .recv_timeout(PHASE_2_TIMEOUT)
+        .context("phase-4 pre-snapshot HTTP flow did not close at capture")?;
+    anyhow::ensure!(
+        event == "old-flow-closed",
+        "unexpected phase-4 event {event}"
+    );
+    let mut udp_payload = [0u8; 64];
+    let (udp_count, _) = udp_socket
+        .recv_from(&mut udp_payload)
+        .context("phase-4 guest UDP datagram was not observed")?;
+    anyhow::ensure!(
+        &udp_payload[..udp_count] == b"PHASE4-UDP",
+        "unexpected phase-4 guest UDP payload"
+    );
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
     let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
@@ -1026,6 +1081,8 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
     missing_policy_args.extend([
         "--restore-snapshot".into(),
         snapshot_dir.as_os_str().to_owned(),
+        "--network-profile".into(),
+        "portable".into(),
     ]);
     let missing_policy = OpenvmmTestProcess::launch(openvmm.get(), &missing_policy_args)?;
     let (status, output) = missing_policy.wait()?;
@@ -1040,11 +1097,14 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
         restore_args.extend([
             "--restore-snapshot".into(),
             snapshot_dir.as_os_str().to_owned(),
+            "--network-profile".into(),
+            "portable".into(),
             "--restore-entropy".into(),
-            "--allow-endpoint".into(),
-            endpoint.clone().into(),
+            "--allow-host".into(),
+            "10.0.0.1".into(),
         ]);
         let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        restore.wait_for_output_line(OLD_FLOW_INVALIDATED_MARKER)?;
         restore.wait_for_output_line(AFTER_MARKER)?;
         let (status, output) = restore.wait()?;
         anyhow::ensure!(
@@ -1053,14 +1113,14 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
             output_tail(&output)
         );
         anyhow::ensure!(
-            count_output_lines(&output, AFTER_MARKER) == 1,
-            "phase-4 restore {restore_index} did not complete HTTP exactly once"
+            count_output_lines(&output, OLD_FLOW_INVALIDATED_MARKER) == 1
+                && count_output_lines(&output, AFTER_MARKER) == 1,
+            "phase-4 restore {restore_index} did not invalidate the old flow and complete one fresh HTTP request"
         );
-        request_recv
-            .recv_timeout(PHASE_2_TIMEOUT)
-            .with_context(|| {
-                format!("phase-4 restore {restore_index} HTTP request was not observed")
-            })?;
+        let event = event_recv.recv_timeout(PHASE_2_TIMEOUT).with_context(|| {
+            format!("phase-4 restore {restore_index} fresh HTTP request was not observed")
+        })?;
+        anyhow::ensure!(event == "fresh", "unexpected phase-4 event {event}");
         anyhow::ensure!(
             snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
             "phase-4 restore {restore_index} modified snapshot payloads"

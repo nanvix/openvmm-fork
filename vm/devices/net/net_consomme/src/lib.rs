@@ -546,7 +546,10 @@ impl ConsommeQueue {
                 );
                 match error {
                     consomme::DropReason::SendBufferFull
-                    | consomme::DropReason::DestinationNotAllowed => {
+                    | consomme::DropReason::DestinationNotAllowed
+                    | consomme::DropReason::TcpConnectionLimit
+                    | consomme::DropReason::UdpConnectionLimit
+                    | consomme::DropReason::IcmpConnectionLimit => {
                         self.stats.tx_dropped.increment()
                     }
                     consomme::DropReason::UnsupportedEthertype(_)
