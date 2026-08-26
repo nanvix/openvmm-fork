@@ -1037,6 +1037,7 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
          wget -qO /tmp/phase4-held http://10.0.0.1:{http_port}/hold & held=$!; \
          sleep 1; \
          echo PHASE4-HTTP-BEFORE; nvx-snapshot; \
+         kill \"$held\" 2>/dev/null || true; \
          if wait \"$held\"; then fail 24; fi; \
          echo PHASE4-OLD-FLOW-INVALIDATED; \
          [ \"$(wget -qO- http://10.0.0.1:{http_port}/fresh)\" = PHASE4-HTTP-OK ] || fail 25; \
