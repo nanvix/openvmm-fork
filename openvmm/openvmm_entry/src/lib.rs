@@ -4637,9 +4637,11 @@ async fn run_control_inner(
             .prefix(".openvmm-microvm-memory-")
             .tempfile_in(parent)
             .context("failed to create snapshot memory backing")?;
-        file.as_file()
-            .set_len(opt.memory_size())
-            .context("failed to size snapshot memory backing")?;
+        openvmm_helpers::snapshot::initialize_sparse_memory_backing_file(
+            file.as_file(),
+            opt.memory_size(),
+        )
+        .context("failed to initialize sparse snapshot memory backing")?;
         Some(file)
     } else {
         None
