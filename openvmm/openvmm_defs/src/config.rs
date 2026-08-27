@@ -217,11 +217,32 @@ pub struct MicrovmSandboxBlockConfig {
 /// Static guest-visible network identity for the microVM ABI-v1 NIC.
 #[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
 pub struct MicrovmNetworkConfig {
+    /// Required cross-platform host-network implementation contract.
+    pub profile: MicrovmNetworkProfile,
     pub guest_ipv4: std::net::Ipv4Addr,
     pub prefix_length: u8,
     pub derived_gateway_ipv4: std::net::Ipv4Addr,
     pub guest_mac: MacAddress,
     pub gateway_mac: MacAddress,
+}
+
+/// Required host-network implementation contract for a microVM NIC.
+///
+/// Profiles are explicit so snapshots never silently acquire different host
+/// networking semantics on another supported hypervisor.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmNetworkProfile {
+    /// User-mode Consomme NAT on every supported host backend.
+    Portable,
+}
+
+impl MicrovmNetworkProfile {
+    /// Returns the stable command-line and snapshot spelling of this profile.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+        }
+    }
 }
 
 /// Access policy for the microVM ABI-v1 host filesystem.
@@ -392,6 +413,7 @@ impl std::str::FromStr for MicrovmNetworkConfig {
         }
 
         Ok(Self {
+            profile: MicrovmNetworkProfile::Portable,
             guest_ipv4,
             prefix_length,
             derived_gateway_ipv4,
@@ -715,9 +737,8 @@ fn validate_microvm_command_line(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("microVM DNS bootstrap requires virtio-net"))?;
         anyhow::ensure!(
-            microvm_virtio_net_irq(hypervisor_id)? == MICROVM_VIRTIO_NET_WHP_IRQ
-                && **dns == format!("virtnet_dns={}", network.derived_gateway_ipv4),
-            "microVM DNS bootstrap does not match the WHP gateway"
+            **dns == format!("virtnet_dns={}", network.derived_gateway_ipv4),
+            "microVM DNS bootstrap does not match the portable gateway"
         );
     }
     let mut expected_discovery = Vec::new();
@@ -1406,6 +1427,13 @@ pub enum GicConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microvm_network_identity_has_portable_profile() {
+        let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        assert_eq!(network.profile, MicrovmNetworkProfile::Portable);
+        assert_eq!(network.profile.as_str(), "portable");
+    }
 
     #[test]
     fn microvm_v2_sandbox_block_slots_are_stable() {

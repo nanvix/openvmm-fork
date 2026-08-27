@@ -50,37 +50,42 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `/1` through `/30` are accepted. The first usable subnet address becomes
   the gateway; network, broadcast, and gateway addresses cannot be assigned
   to the guest. Guest and gateway MAC addresses are derived as
-  `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses.
+  `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses. Networking
+  requires the only supported capability profile, `--network-profile portable`;
+  omitting it rejects the command before OpenVMM opens host resources.
 
   ```bash
   openvmm --machine microvm --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz \
-    --net 10.0.0.2/24
+    --net 10.0.0.2/24 --network-profile portable
   ```
 
-  On Linux/KVM or MSHV, OpenVMM creates, addresses, and removes a managed TAP.
-  This requires root or non-interactive `sudo ip` access. `--net-tap <NAME>`
-  uses an existing TAP instead; its link state, gateway address, and gateway
-  MAC are validated, and OpenVMM does not remove it. Forwarding or NAT beyond
-  the host is operator policy. On Windows/WHP, OpenVMM uses an in-process
-  Consomme endpoint and advertises the gateway DNS proxy when policy permits
-  it.
+  `portable` uses an in-process Consomme endpoint on Linux/KVM, Linux/MSHV,
+  and Windows/WHP. It needs no TAP, root access, driver, or host network
+  configuration. `--net-tap` is incompatible and is rejected before any
+  endpoint or host resource is created. The gateway provides DNS over UDP and
+  TCP, ICMP echo, and outbound TCP/UDP through ordinary host sockets. Consomme
+  rejects IPv4 fragments deterministically; policy filtering remains before
+  host socket creation. Its per-connection TCP buffers start at 16 KiB and
+  are bounded at 4 MiB; UDP bindings expire after five minutes; and at most
+  256 DNS requests are pending at once. At most 128 TCP, 256 UDP, and 16 ICMP
+  guest flows are active at once; excess flows are deterministically rejected
+  before a host socket is created.
 
   `--allow-host <IPv4[/PREFIX]>`, `--block-host <IPv4[/PREFIX]>`, and
   `--allow-endpoint <IPv4:TCP-PORT>` are repeatable, mutually exclusive
-  egress modes. Filtering runs before TAP transmission or host socket
-  creation. Active policy fails closed for malformed packets, non-IPv4
-  traffic, and IPv4 options. Exact endpoint mode also rejects UDP, ICMP, VLAN,
-  fragments, and every TCP destination not listed. No implicit DNS exception
-  is added.
+  egress modes. Filtering runs before host socket creation. Active policy
+  fails closed for malformed packets, non-IPv4 traffic, and IPv4 options.
+  Exact endpoint mode also rejects UDP, ICMP, VLAN, fragments, and every TCP
+  destination not listed. No implicit DNS exception is added.
 
-  Networked snapshots drain accepted TX and endpoint-ready RX at the capture
-  boundary, rewind unused guest RX descriptors, save the static identity and
-  completion cursors, and recreate the host endpoint on restore. An active
-  egress policy must be supplied again with the same canonical rules. Native
-  TAP descriptors, Consomme sockets, NAT flow tables, and remote peer state
-  are not serialized, so existing proxied TCP or UDP sessions may reconnect
-  or reset after restore.
+  Networked snapshots record the `portable` profile, drain accepted TX and
+  endpoint-ready RX at the capture boundary, rewind unused guest RX
+  descriptors, and recreate a fresh Consomme endpoint generation on restore.
+  Restore of a networked snapshot requires `--network-profile portable` and
+  the same active egress policy rules. Native sockets and NAT flow tables are
+  not serialized. The capture protocol does not retain pre-capture endpoint
+  completions; restored guest software must establish new host-side flows.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
   one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
   The default mode is read-only; `rw` must be explicit. The guest target must
@@ -149,6 +154,10 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `--mount`. The manifest supplies the guest target and `ro`/`rw` mode; the
   argument must reproduce them while supplying a live host root with the same
   saved identity.
+
+  When the snapshot contains virtio-net, restore also requires
+  `--network-profile portable`; the snapshot's profile and canonical egress
+  policy must match the supplied portable configuration.
 
   ```bash
   openvmm --machine microvm --hypervisor kvm \

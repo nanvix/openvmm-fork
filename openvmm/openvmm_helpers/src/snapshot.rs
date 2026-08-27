@@ -195,6 +195,9 @@ pub struct SnapshotAttachment {
 #[derive(Clone, Debug, PartialEq, Eq, Protobuf)]
 #[mesh(package = "openvmm.snapshot")]
 pub struct SnapshotMicrovmNetwork {
+    /// Required cross-platform host-network implementation contract.
+    #[mesh(9)]
+    pub profile: String,
     /// Guest IPv4 address in network byte order.
     #[mesh(1)]
     pub guest_ipv4: u32,
@@ -280,6 +283,7 @@ impl SnapshotMicrovmNetwork {
         egress_policy: &net_backend_resources::egress::EgressPolicy,
     ) -> Self {
         Self {
+            profile: config.profile.as_str().to_owned(),
             guest_ipv4: u32::from(config.guest_ipv4),
             prefix_length: u32::from(config.prefix_length),
             gateway_ipv4: u32::from(config.derived_gateway_ipv4),
@@ -514,26 +518,11 @@ pub fn microvm_v1_machine_contract(
     ];
     let mut attachments = Vec::new();
     let microvm_network = if let Some((network, egress_policy, attachment)) = network {
-        let policy_is_valid = match source_hypervisor {
-            "kvm" | "mshv" => match attachment.reconnect_policy.as_str() {
-                "recreate-endpoint" => {
-                    !attachment.required
-                        && attachment.identity_kind == "managed-tap"
-                        && attachment.identity == b"managed"
-                }
-                "require-inherited-attachment" => {
-                    attachment.required && attachment.identity_kind == "tap-name"
-                }
-                _ => false,
-            },
-            "whp" => {
-                attachment.reconnect_policy == "recreate-endpoint"
-                    && !attachment.required
-                    && attachment.identity_kind == "user-mode-nat"
-                    && attachment.identity == b"consomme"
-            }
-            _ => false,
-        };
+        let policy_is_valid = matches!(source_hypervisor, "kvm" | "mshv" | "whp")
+            && attachment.reconnect_policy == "recreate-endpoint"
+            && !attachment.required
+            && attachment.identity_kind == "user-mode-nat"
+            && attachment.identity == b"consomme";
         anyhow::ensure!(
             attachment.stable_id == "net:microvm0"
                 && attachment.kind == "virtio-net"
@@ -1588,6 +1577,11 @@ fn validate_machine_contract_shape(
     ensure_unique(&topology.apic_ids, "APIC ID")?;
 
     if let Some(network) = &contract.microvm_network {
+        anyhow::ensure!(
+            network.profile == openvmm_defs::config::MicrovmNetworkProfile::Portable.as_str(),
+            "snapshot microVM network profile '{}' is unsupported",
+            network.profile
+        );
         let prefix_length = u8::try_from(network.prefix_length)
             .context("snapshot network prefix does not fit in u8")?;
         let parsed = format!(
@@ -1915,18 +1909,14 @@ mod tests {
     }
 
     fn microvm_network_attachment(source_hypervisor: &str) -> SnapshotAttachment {
-        let (identity_kind, identity) = match source_hypervisor {
-            "kvm" | "mshv" => ("managed-tap", b"managed".as_slice()),
-            "whp" => ("user-mode-nat", b"consomme".as_slice()),
-            _ => unreachable!(),
-        };
+        assert!(matches!(source_hypervisor, "kvm" | "mshv" | "whp"));
         SnapshotAttachment {
             stable_id: "net:microvm0".to_owned(),
             kind: "virtio-net".to_owned(),
             required: false,
             reconnect_policy: "recreate-endpoint".to_owned(),
-            identity_kind: identity_kind.to_owned(),
-            identity: identity.to_vec(),
+            identity_kind: "user-mode-nat".to_owned(),
+            identity: b"consomme".to_vec(),
             length: 0,
             reconnect_timeout_ms: 0,
         }
@@ -1962,7 +1952,7 @@ mod tests {
         let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
         let command_line = format!(
             "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {}",
-            network.command_line_fragment()
+            network.command_line_fragment_with_dns(true)
         );
         microvm_v1_machine_contract(
             source_hypervisor,
@@ -2105,6 +2095,7 @@ mod tests {
             );
 
             let network = contract.microvm_network.unwrap();
+            assert_eq!(network.profile, "portable");
             assert_eq!(
                 network.guest_ipv4,
                 u32::from(std::net::Ipv4Addr::new(10, 0, 0, 2))
@@ -2193,6 +2184,47 @@ mod tests {
 
         let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
         assert!(error.to_string().contains("not canonical"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_unsupported_profile() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .profile = "other".to_owned();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("profile"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_legacy_missing_profile() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .profile
+            .clear();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("profile '' is unsupported"));
     }
 
     #[test]
