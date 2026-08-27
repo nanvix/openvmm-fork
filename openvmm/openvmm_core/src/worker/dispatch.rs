@@ -86,6 +86,7 @@ use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::X86TopologyConfig;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::RESTORE_READY_EVENT_V1;
 use openvmm_defs::worker::SavedState;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -104,6 +105,7 @@ use serial_16550_resources::ComPort;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::fs::File;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -316,6 +318,7 @@ impl Worker for VmWorker {
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
         let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
         let snapshot_ready = parameters.snapshot_ready;
+        let restore_ready_sink = parameters.restore_ready_sink;
         let restore_time = match (
             parameters.restore_downtime,
             parameters.restore_tsc_frequency_hz,
@@ -386,6 +389,7 @@ impl Worker for VmWorker {
         let mut vm = block_with_io(|_| vm.load(saved_state, parameters.notify, restore_time))?;
         vm.snapshot_boundary_requests = snapshot_boundary_requests;
         vm.snapshot_ready = snapshot_ready;
+        vm.restore_ready_sink = restore_ready_sink;
 
         LOADED_VM.store(&vm);
 
@@ -423,7 +427,7 @@ impl Worker for VmWorker {
             LOADED_VM.store(&vm);
 
             if running {
-                vm.resume().await;
+                vm.resume().await?;
             }
             Ok(Self {
                 vm,
@@ -760,9 +764,11 @@ pub(crate) struct LoadedVm {
     state_units: StateUnits,
     inner: LoadedVmInner,
     running: bool,
+    restore_start_guard: Option<vmm_core::partition_unit::StopGuard>,
+    restore_ready_sink: Option<File>,
     snapshot_boundary_requests:
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
-    snapshot_ready: Option<mesh::Sender<()>>,
+    snapshot_ready: Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
     snapshot_stop_guard: Option<vmm_core::partition_unit::StopGuard>,
     snapshot_transaction_complete: Option<Rpc<(), ()>>,
     snapshot_capture_wall_clock: Option<mesh::payload::Timestamp>,
@@ -2936,6 +2942,21 @@ impl InitializedVm {
                         let disabled_features = match id.as_str() {
                             "virtio-net" => !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES,
                             "virtiofs" => !openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES,
+                            "virtio-blk"
+                                if matches!(
+                                    cfg.machine_profile,
+                                    MachineProfile::Microvm {
+                                        abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
+                                    }
+                                ) =>
+                            {
+                                let block = cfg
+                                    .microvm_sandbox_blocks
+                                    .iter()
+                                    .find(|block| block.role.mmio_base() == start)
+                                    .context("microVM ABI version 2 block slot has no role")?;
+                                !openvmm_defs::config::microvm_sandbox_block_features(block.role)
+                            }
                             _ => 1 << 34,
                         };
                         (start, len, irq, disabled_features)
@@ -3062,6 +3083,8 @@ impl InitializedVm {
         let mut this = LoadedVm {
             state_units,
             running: false,
+            restore_start_guard: None,
+            restore_ready_sink: None,
             snapshot_boundary_requests: None,
             snapshot_ready: None,
             snapshot_stop_guard: None,
@@ -3174,6 +3197,7 @@ impl InitializedVm {
                     .advance_snapshot_time(downtime)
                     .context("failed to advance backend snapshot clock")?;
             }
+            this.restore_start_guard = Some(this.inner.partition_unit.temporarily_stop_vps().await);
         } else {
             // Assign PCI bus numbers/BARs before building firmware so that the
             // ACPI tables (specifically the SRAT generic-initiator entries) can
@@ -3599,19 +3623,33 @@ impl LoadedVmInner {
 }
 
 impl LoadedVm {
-    async fn resume(&mut self) -> bool {
+    async fn resume(&mut self) -> anyhow::Result<bool> {
         if self.running {
-            return false;
+            return Ok(false);
         }
-        if let Err(error) = self.state_units.start().await {
-            tracing::error!(
-                error = error.as_ref() as &dyn std::error::Error,
-                "VM state units failed to start"
-            );
-            return false;
+        self.state_units
+            .start()
+            .await
+            .context("VM state units failed to start")?;
+        if let Some(mut sink) = self.restore_ready_sink.take() {
+            let signal_result = sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
+                #[cfg(windows)]
+                {
+                    sink.sync_all()
+                }
+                #[cfg(not(windows))]
+                {
+                    sink.flush()
+                }
+            });
+            if let Err(error) = signal_result {
+                self.state_units.stop().await;
+                return Err(error).context("failed to publish restore readiness event");
+            }
         }
+        self.restore_start_guard.take();
         self.running = true;
-        true
+        Ok(true)
     }
 
     async fn pause(&mut self) -> bool {
@@ -3676,7 +3714,7 @@ impl LoadedVm {
                 self.snapshot_transaction_complete = Some(request.transaction_complete);
                 self.snapshot_capture_wall_clock = Some(std::time::SystemTime::now().into());
                 self.snapshot_input_gate_timeout = Some(request.input_gate_timeout);
-                snapshot_ready.send(());
+                snapshot_ready.send(request.scratch_policy);
                 true
             }
             Err(error) => {
@@ -3893,7 +3931,9 @@ impl LoadedVm {
                         rpc.handle(async |()| self.inner.partition_unit.clear_halt().await)
                             .await
                     }
-                    VmRpc::Resume(rpc) => rpc.handle(async |()| self.resume().await).await,
+                    VmRpc::Resume(rpc) => {
+                        rpc.handle_failable(async |()| self.resume().await).await
+                    }
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
                     VmRpc::Save(rpc) => {
                         if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
@@ -4084,7 +4124,7 @@ impl LoadedVm {
                             self.save_reset_restore().await?;
 
                             if paused {
-                                self.resume().await;
+                                self.resume().await?;
                             }
                             Ok(())
                         })
@@ -4450,7 +4490,7 @@ impl LoadedVm {
         }
 
         if resume {
-            self.resume().await;
+            self.resume().await?;
         }
         Ok(())
     }

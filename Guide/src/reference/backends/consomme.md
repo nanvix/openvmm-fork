@@ -38,6 +38,20 @@ flowchart TB
     NIC --> Internet((Internet))
 ```
 
+## microVM portable profile
+
+OpenVMM microVMs select this backend with
+`--net <IPv4/PREFIX> --network-profile portable`. This is the sole microVM
+network profile and has the same Consomme behavior on Linux/KVM, Linux/MSHV,
+and Windows/WHP. It provides gateway DNS over UDP and TCP, ICMP echo, and
+outbound TCP/UDP subject to the microVM egress policy. IPv4 fragments are
+rejected deterministically. `--net-tap` is incompatible.
+
+Snapshot restore creates a fresh endpoint generation. Host sockets and NAT
+flow tables are not saved. Virtio-net capture drains descriptor ownership
+before state is saved, and restored guest software must establish new
+host-side flows.
+
 ## Default network topology
 
 | Role | IPv4 Address |
@@ -150,6 +164,10 @@ Each unique guest source socket (guest IP + source port) gets a
 host-side UDP socket bound to an ephemeral port. Datagrams are
 forwarded in both directions. Idle bindings are cleaned up after a
 configurable timeout (5 minutes by default, per RFC 4787).
+
+Consomme admits at most 256 active guest UDP flows, 128 active guest TCP flows,
+and 16 guest ICMP source flows by default. It rejects an excess flow before
+creating its host socket; it never evicts an active flow to make room.
 
 UDP packets to the gateway on well-known ports are intercepted:
 

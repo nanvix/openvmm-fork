@@ -338,6 +338,7 @@ impl Worker for TtrpcWorker {
                 controller_task: None,
                 wait_vm_response: None,
                 lifecycle: VmLifecycle::Uninitialized,
+                restore_ready_pending: false,
                 rpc_tasks: Vec::new(),
                 transport: self.transport,
                 registry: FdRegistry::default(),
@@ -552,6 +553,7 @@ struct VmService {
     controller_task: Option<Task<()>>,
     wait_vm_response: Option<(mesh::CancelContext, mesh::OneshotSender<Result<(), Status>>)>,
     lifecycle: VmLifecycle,
+    restore_ready_pending: bool,
     rpc_tasks: Vec<Task<()>>,
     transport: ResolvedTransport,
     /// Registry of file descriptors passed in over the fd-passing protocol,
@@ -726,6 +728,7 @@ impl VmService {
             restore_path,
             restore_entropy,
             quiesce_timeout_ms,
+            restore_ready_path,
         } = microvm_snapshot.unwrap_or_default();
         let resolve_path = |value: String| -> anyhow::Result<Option<PathBuf>> {
             if value.is_empty() {
@@ -751,6 +754,10 @@ impl VmService {
         anyhow::ensure!(
             !restore_entropy || restore_path.is_some(),
             "restore_entropy requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_ready_path.is_empty() || restore_path.is_some(),
+            "restore_ready_path requires restore_path"
         );
         anyhow::ensure!(
             quiesce_timeout_ms == 0 || snapshot_destination.is_some(),
@@ -935,6 +942,8 @@ impl VmService {
                         .attachments
                         .iter()
                         .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
+                    MICROVM_ABI_VERSION_1,
+                    Vec::new(),
                 )),
             )?;
             let restore_time =
@@ -948,6 +957,15 @@ impl VmService {
         } else {
             None
         };
+        let restore_ready_sink = if restore_ready_path.is_empty() {
+            None
+        } else {
+            Some(
+                crate::serial_io::connect_restore_ready_sink(Path::new(&restore_ready_path))
+                    .context("failed to connect restore readiness endpoint")?,
+            )
+        };
+        let restore_ready_required = restore_ready_sink.is_some();
         let (microvm_snapshot_notify, microvm_snapshot_requests) = if is_microvm {
             let (notify, requests) = mesh::channel();
             (Some(notify), Some(requests))
@@ -1801,10 +1819,6 @@ impl VmService {
             LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
             _ => None,
         };
-        let has_microvm_block = config
-            .virtio_devices
-            .iter()
-            .any(|(_, device)| device.id() == "virtio-blk");
         let microvm_filesystem = config.microvm_filesystem.clone();
         if let Some(root_path) = microvm_filesystem_root_path.as_deref() {
             crate::validate_microvm_filesystem_private_storage(
@@ -1899,6 +1913,7 @@ impl VmService {
                         .as_ref()
                         .and_then(|(_, _, frequency, _)| *frequency),
                     restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
+                    restore_ready_sink,
                     rpc: recv,
                     notify: notify_send,
                 },
@@ -1936,7 +1951,7 @@ impl VmService {
             snapshot_quiesce_timeout,
             source_hypervisor,
             effective_command_line,
-            has_microvm_block,
+            microvm_sandbox_block_sources: Vec::new(),
             microvm_console_attachment,
             microvm_network: None,
             microvm_network_attachment: None,
@@ -1945,6 +1960,7 @@ impl VmService {
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
             snapshot_memory_file,
+            _private_scratch_dir: None,
             guest_power_actions,
         };
 
@@ -1962,6 +1978,7 @@ impl VmService {
             consomme_rpc,
             worker_rpc: send,
         }));
+        self.restore_ready_pending = restore_ready_required;
         self.lifecycle = VmLifecycle::Paused;
         Ok(())
     }
@@ -1980,6 +1997,7 @@ impl VmService {
             task.await;
         }
         self.vm_controller_events.take();
+        self.restore_ready_pending = false;
         self.lifecycle = VmLifecycle::Uninitialized;
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("VM torn down"))));
@@ -2045,15 +2063,22 @@ impl VmService {
 
     async fn resume_vm(&mut self) -> anyhow::Result<()> {
         let vm = self.vm.clone().context("VM not created yet")?;
-        let resumed = vm
-            .worker_rpc
-            .call(VmRpc::Resume, ())
-            .await
-            .context("resume failed")?;
+        let resumed = match vm.worker_rpc.call_failable(VmRpc::Resume, ()).await {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                if self.restore_ready_pending {
+                    self.teardown_vm()
+                        .await
+                        .context("failed to tear down VM after restore readiness failure")?;
+                }
+                return Err(error).context("resume failed");
+            }
+        };
         anyhow::ensure!(
             resumed,
             "VM did not resume; a state unit failed to start or the VM was already running"
         );
+        self.restore_ready_pending = false;
         if !matches!(self.lifecycle, VmLifecycle::Halted(_)) {
             self.lifecycle = VmLifecycle::Running;
         }

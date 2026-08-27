@@ -18,9 +18,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 /// Current manifest format version. Bump when making incompatible changes.
-pub const MANIFEST_VERSION: u32 = 3;
+pub const MANIFEST_VERSION: u32 = 4;
 /// Magic identifying the OpenVMM snapshot manifest format.
-pub const SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V3\0";
+pub const SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V4\0";
+const PREVIOUS_MANIFEST_VERSION: u32 = 3;
+const PREVIOUS_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V3\0";
 const LEGACY_MANIFEST_VERSION: u32 = 2;
 const LEGACY_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V2\0";
 /// Saved-state schema version used by the VM worker envelope.
@@ -35,6 +37,8 @@ pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const STATE_FILE_NAME: &str = "state.bin";
 const MEMORY_FILE_NAME: &str = "memory.bin";
+/// Fixed snapshot-relative name of an ABI-v2 paired scratch image.
+pub const SCRATCH_FILE_NAME: &str = "scratch.img";
 const MAX_MANIFEST_SIZE_BYTES: u64 = 1024 * 1024;
 const MAX_SAVED_STATE_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
@@ -195,6 +199,9 @@ pub struct SnapshotAttachment {
 #[derive(Clone, Debug, PartialEq, Eq, Protobuf)]
 #[mesh(package = "openvmm.snapshot")]
 pub struct SnapshotMicrovmNetwork {
+    /// Required cross-platform host-network implementation contract.
+    #[mesh(9)]
+    pub profile: String,
     /// Guest IPv4 address in network byte order.
     #[mesh(1)]
     pub guest_ipv4: u32,
@@ -257,6 +264,36 @@ pub struct SnapshotMicrovmFilesystem {
     pub attribute_cache_timeout_ns: u64,
 }
 
+/// Authoritative identity and snapshot policy for an ABI-v2 sandbox block.
+#[derive(Clone, Debug, PartialEq, Eq, Protobuf)]
+#[mesh(package = "openvmm.snapshot")]
+pub struct SnapshotMicrovmSandboxBlock {
+    /// Stable role (`distro`, `runtime`, `custom`, or `scratch`).
+    #[mesh(1)]
+    pub role: String,
+    /// Whether the guest sees the device as read-only.
+    #[mesh(2)]
+    pub read_only: bool,
+    /// Logical device length in bytes.
+    #[mesh(3)]
+    pub length: u64,
+    /// Kind of immutable identity carried in `identity`.
+    #[mesh(4)]
+    pub identity_kind: String,
+    /// Immutable layer identity or paired-scratch digest.
+    #[mesh(5)]
+    pub identity: Vec<u8>,
+    /// Fixed snapshot-relative artifact name; empty for external layers.
+    #[mesh(6)]
+    pub artifact: String,
+    /// Guest-visible logical block size in bytes.
+    #[mesh(7)]
+    pub logical_block_size: u32,
+    /// Guest-visible physical block size in bytes.
+    #[mesh(8)]
+    pub physical_block_size: u32,
+}
+
 impl SnapshotMicrovmFilesystem {
     fn new(config: &openvmm_defs::config::MicrovmFilesystemConfig) -> Self {
         Self {
@@ -280,6 +317,7 @@ impl SnapshotMicrovmNetwork {
         egress_policy: &net_backend_resources::egress::EgressPolicy,
     ) -> Self {
         Self {
+            profile: config.profile.as_str().to_owned(),
             guest_ipv4: u32::from(config.guest_ipv4),
             prefix_length: u32::from(config.prefix_length),
             gateway_ipv4: u32::from(config.derived_gateway_ipv4),
@@ -371,6 +409,9 @@ pub struct SnapshotMachineContract {
     /// Effective local APIC timer frequency.
     #[mesh(20)]
     pub apic_frequency_hz: Option<u64>,
+    /// Fixed-role ABI-v2 sandbox blocks in guest-visible order.
+    #[mesh(21)]
+    pub microvm_sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
 }
 
 impl SnapshotMachineContract {
@@ -401,6 +442,84 @@ pub fn microvm_v1_machine_contract(
         SnapshotAttachment,
     )>,
     console_attachment: Option<SnapshotAttachment>,
+    memory_size: u64,
+    state_unit_names: Vec<String>,
+    capture_wall_clock: Timestamp,
+    tsc_frequency_hz: u64,
+    apic_frequency_hz: Option<u64>,
+    cpu_contract: Vec<u8>,
+) -> anyhow::Result<SnapshotMachineContract> {
+    microvm_machine_contract(
+        openvmm_defs::config::MICROVM_ABI_VERSION_1,
+        source_hypervisor,
+        effective_command_line,
+        network,
+        filesystem,
+        console_attachment,
+        Vec::new(),
+        memory_size,
+        state_unit_names,
+        capture_wall_clock,
+        tsc_frequency_hz,
+        apic_frequency_hz,
+        cpu_contract,
+    )
+}
+
+/// Builds the authoritative fixed-block microVM ABI-v2 machine contract.
+pub fn microvm_v2_machine_contract(
+    source_hypervisor: &str,
+    effective_command_line: String,
+    network: Option<(
+        &openvmm_defs::config::MicrovmNetworkConfig,
+        &net_backend_resources::egress::EgressPolicy,
+        SnapshotAttachment,
+    )>,
+    filesystem: Option<(
+        &openvmm_defs::config::MicrovmFilesystemConfig,
+        SnapshotAttachment,
+    )>,
+    console_attachment: Option<SnapshotAttachment>,
+    sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
+    memory_size: u64,
+    state_unit_names: Vec<String>,
+    capture_wall_clock: Timestamp,
+    tsc_frequency_hz: u64,
+    apic_frequency_hz: Option<u64>,
+    cpu_contract: Vec<u8>,
+) -> anyhow::Result<SnapshotMachineContract> {
+    microvm_machine_contract(
+        openvmm_defs::config::MICROVM_ABI_VERSION_2,
+        source_hypervisor,
+        effective_command_line,
+        network,
+        filesystem,
+        console_attachment,
+        sandbox_blocks,
+        memory_size,
+        state_unit_names,
+        capture_wall_clock,
+        tsc_frequency_hz,
+        apic_frequency_hz,
+        cpu_contract,
+    )
+}
+
+fn microvm_machine_contract(
+    abi_version: u32,
+    source_hypervisor: &str,
+    effective_command_line: String,
+    network: Option<(
+        &openvmm_defs::config::MicrovmNetworkConfig,
+        &net_backend_resources::egress::EgressPolicy,
+        SnapshotAttachment,
+    )>,
+    filesystem: Option<(
+        &openvmm_defs::config::MicrovmFilesystemConfig,
+        SnapshotAttachment,
+    )>,
+    console_attachment: Option<SnapshotAttachment>,
+    sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
     memory_size: u64,
     state_unit_names: Vec<String>,
     capture_wall_clock: Timestamp,
@@ -514,26 +633,11 @@ pub fn microvm_v1_machine_contract(
     ];
     let mut attachments = Vec::new();
     let microvm_network = if let Some((network, egress_policy, attachment)) = network {
-        let policy_is_valid = match source_hypervisor {
-            "kvm" | "mshv" => match attachment.reconnect_policy.as_str() {
-                "recreate-endpoint" => {
-                    !attachment.required
-                        && attachment.identity_kind == "managed-tap"
-                        && attachment.identity == b"managed"
-                }
-                "require-inherited-attachment" => {
-                    attachment.required && attachment.identity_kind == "tap-name"
-                }
-                _ => false,
-            },
-            "whp" => {
-                attachment.reconnect_policy == "recreate-endpoint"
-                    && !attachment.required
-                    && attachment.identity_kind == "user-mode-nat"
-                    && attachment.identity == b"consomme"
-            }
-            _ => false,
-        };
+        let policy_is_valid = matches!(source_hypervisor, "kvm" | "mshv" | "whp")
+            && attachment.reconnect_policy == "recreate-endpoint"
+            && !attachment.required
+            && attachment.identity_kind == "user-mode-nat"
+            && attachment.identity == b"consomme";
         anyhow::ensure!(
             attachment.stable_id == "net:microvm0"
                 && attachment.kind == "virtio-net"
@@ -710,9 +814,48 @@ pub fn microvm_v1_machine_contract(
         attachments.push(attachment);
     }
 
+    for block in &sandbox_blocks {
+        let role = match block.role.as_str() {
+            "distro" => openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
+            "runtime" => openvmm_defs::config::MicrovmSandboxBlockRole::Runtime,
+            "custom" => openvmm_defs::config::MicrovmSandboxBlockRole::Custom,
+            "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+            role => anyhow::bail!("snapshot sandbox block role '{role}' is unsupported"),
+        };
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            role.mmio_base(),
+            role.irq(),
+        );
+        anyhow::ensure!(
+            effective_command_line
+                .split_ascii_whitespace()
+                .any(|token| token == discovery),
+            "microVM sandbox block '{}' is missing from the effective command line",
+            block.role
+        );
+        let features = openvmm_defs::config::microvm_sandbox_block_features(role);
+        devices.push(SnapshotDevice {
+            stable_id: format!("blk:sandbox:{}", role.as_str()),
+            state_unit_name: format!("virtio-blk-{}", role.mmio_base()),
+            kind: "virtio-blk".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                role.mmio_base(),
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(role.irq()),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![features as u32, (features >> 32) as u32],
+            queue_count: 1,
+            queue_max_sizes: vec![256],
+        });
+    }
+
     let mut contract = SnapshotMachineContract {
         machine_profile: "microvm".to_owned(),
-        microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
+        microvm_abi_version: abi_version,
         source_hypervisor: source_hypervisor.to_owned(),
         effective_command_line: String::new(),
         effective_command_line_sha256: Vec::new(),
@@ -737,6 +880,7 @@ pub fn microvm_v1_machine_contract(
         microvm_network,
         microvm_filesystem,
         apic_frequency_hz,
+        microvm_sandbox_blocks: sandbox_blocks,
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
@@ -772,10 +916,10 @@ pub struct SnapshotManifest {
     /// Length of `state.bin` in bytes.
     #[mesh(8)]
     pub state_size_bytes: u64,
-    /// Legacy v2 SHA-256 digest of `state.bin`; empty in v3.
+    /// Legacy v2 SHA-256 digest of `state.bin`; empty in v3 and v4.
     #[mesh(9)]
     pub state_sha256: Vec<u8>,
-    /// Legacy v2 SHA-256 digest of `memory.bin`; empty in v3.
+    /// Legacy v2 SHA-256 digest of `memory.bin`; empty in v3 and v4.
     #[mesh(10)]
     pub memory_sha256: Vec<u8>,
     /// Authoritative machine composition for versioned machine profiles.
@@ -821,7 +965,24 @@ pub fn write_snapshot_from_memory_file(
     saved_state_bytes: &[u8],
     memory_file: &std::fs::File,
 ) -> Result<(), SnapshotWriteError> {
-    let mut staging = stage_snapshot(dir, manifest, saved_state_bytes, memory_file)?;
+    write_snapshot_from_memory_and_scratch_files(
+        dir,
+        manifest,
+        saved_state_bytes,
+        memory_file,
+        None,
+    )
+}
+
+/// Writes a snapshot with an optional scratch image paired to the VM state.
+pub fn write_snapshot_from_memory_and_scratch_files(
+    dir: &Path,
+    manifest: &SnapshotManifest,
+    saved_state_bytes: &[u8],
+    memory_file: &std::fs::File,
+    scratch_file: Option<&std::fs::File>,
+) -> Result<(), SnapshotWriteError> {
+    let mut staging = stage_snapshot(dir, manifest, saved_state_bytes, memory_file, scratch_file)?;
     ensure_path_absent(dir, "snapshot destination")?;
     staging.publish(dir)?;
 
@@ -838,6 +999,7 @@ fn stage_snapshot(
     manifest: &SnapshotManifest,
     saved_state_bytes: &[u8],
     memory_file: &std::fs::File,
+    scratch_file: Option<&std::fs::File>,
 ) -> anyhow::Result<StagingDirectory> {
     validate_manifest_header(manifest)?;
     anyhow::ensure!(
@@ -861,7 +1023,34 @@ fn stage_snapshot(
     let manifest_path = staging.path().join(MANIFEST_FILE_NAME);
 
     write_bytes(&state_path, saved_state_bytes, "saved state")?;
-    copy_exact(memory_file, &memory_path, manifest.memory_size_bytes)?;
+    copy_exact(
+        memory_file,
+        &memory_path,
+        manifest.memory_size_bytes,
+        "memory backing file",
+        "snapshot memory",
+    )?;
+    match (paired_scratch_block(manifest), scratch_file) {
+        (Some(scratch), Some(scratch_file)) => {
+            let scratch_path = staging.path().join(SCRATCH_FILE_NAME);
+            copy_exact(
+                scratch_file,
+                &scratch_path,
+                scratch.length,
+                "scratch backing file",
+                "snapshot scratch",
+            )?;
+            verify_file_digest(
+                &open_file_with_length(&scratch_path, scratch.length, SCRATCH_FILE_NAME)?,
+                scratch.length,
+                &scratch.identity,
+                "scratch.img",
+            )?;
+        }
+        (Some(_), None) => anyhow::bail!("snapshot contract requires a paired scratch image"),
+        (None, Some(_)) => anyhow::bail!("snapshot contract does not declare a scratch image"),
+        (None, None) => {}
+    }
 
     let mut published_manifest = manifest.clone();
     published_manifest.state_size_bytes = saved_state_bytes.len() as u64;
@@ -896,7 +1085,7 @@ pub fn read_snapshot(
 /// Restore uses this before machine composition; all artifacts are opened and
 /// structurally validated again before partition creation.
 pub fn read_snapshot_manifest(dir: &Path) -> anyhow::Result<SnapshotManifest> {
-    validate_snapshot_directory(dir)?;
+    validate_directory(dir, "snapshot directory")?;
     let manifest_bytes = read_bounded_file(
         &dir.join(MANIFEST_FILE_NAME),
         MAX_MANIFEST_SIZE_BYTES,
@@ -909,6 +1098,7 @@ pub fn read_snapshot_manifest(dir: &Path) -> anyhow::Result<SnapshotManifest> {
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
+    validate_snapshot_directory(dir, &manifest)?;
     Ok(manifest)
 }
 
@@ -920,7 +1110,7 @@ pub fn read_snapshot_with_memory(
     dir: &Path,
     expected_memory_size: u64,
 ) -> anyhow::Result<(SnapshotManifest, Vec<u8>, std::fs::File)> {
-    validate_snapshot_directory(dir)?;
+    validate_directory(dir, "snapshot directory")?;
 
     let manifest_bytes = read_bounded_file(
         &dir.join(MANIFEST_FILE_NAME),
@@ -934,6 +1124,7 @@ pub fn read_snapshot_with_memory(
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
+    validate_snapshot_directory(dir, &manifest)?;
     anyhow::ensure!(
         manifest.state_size_bytes <= MAX_SAVED_STATE_SIZE_BYTES,
         "state.bin length in the manifest exceeds the maximum size of \
@@ -960,6 +1151,57 @@ pub fn read_snapshot_with_memory(
     let memory_file = open_file_with_length(&memory_path, expected_memory_size, MEMORY_FILE_NAME)?;
 
     Ok((manifest, state_bytes, memory_file))
+}
+
+/// Opens and verifies the scratch image paired to a snapshot, if present.
+pub fn open_paired_scratch_file(
+    dir: &Path,
+    manifest: &SnapshotManifest,
+) -> anyhow::Result<Option<std::fs::File>> {
+    let Some(scratch) = paired_scratch_block(manifest) else {
+        return Ok(None);
+    };
+    let file = open_file_with_length(
+        &dir.join(SCRATCH_FILE_NAME),
+        scratch.length,
+        SCRATCH_FILE_NAME,
+    )?;
+    verify_file_digest(&file, scratch.length, &scratch.identity, SCRATCH_FILE_NAME)?;
+    Ok(Some(file))
+}
+
+/// Copies a verified immutable artifact to a new private path.
+pub fn copy_verified_file(
+    source: &std::fs::File,
+    destination: &Path,
+    expected_length: u64,
+    expected_digest: &[u8],
+    description: &str,
+) -> anyhow::Result<()> {
+    verify_file_digest(source, expected_length, expected_digest, description)?;
+    copy_exact(
+        source,
+        destination,
+        expected_length,
+        description,
+        "private scratch copy",
+    )?;
+    let copy = open_file_with_length(destination, expected_length, "private scratch copy")?;
+    verify_file_digest(
+        &copy,
+        expected_length,
+        expected_digest,
+        "private scratch copy",
+    )
+}
+
+fn paired_scratch_block(manifest: &SnapshotManifest) -> Option<&SnapshotMicrovmSandboxBlock> {
+    manifest
+        .machine_contract
+        .as_ref()?
+        .microvm_sandbox_blocks
+        .iter()
+        .find(|block| block.artifact == SCRATCH_FILE_NAME)
 }
 
 fn snapshot_parent(dir: &Path) -> &Path {
@@ -1148,29 +1390,31 @@ fn copy_exact(
     source_file: &std::fs::File,
     destination_path: &Path,
     expected_length: u64,
+    source_description: &str,
+    destination_description: &str,
 ) -> anyhow::Result<()> {
     let source_metadata = source_file
         .metadata()
-        .context("failed to inspect memory backing file")?;
+        .with_context(|| format!("failed to inspect {source_description}"))?;
     anyhow::ensure!(
         source_metadata.file_type().is_file(),
-        "memory backing handle is not a regular file"
+        "{source_description} handle is not a regular file"
     );
     let mut source = source_file
         .try_clone()
-        .context("failed to duplicate memory backing file handle")?;
+        .with_context(|| format!("failed to duplicate {source_description} handle"))?;
     source
         .seek(SeekFrom::Start(0))
-        .context("failed to rewind memory backing file")?;
+        .with_context(|| format!("failed to rewind {source_description}"))?;
     let source_length = source
         .metadata()
-        .context("failed to inspect memory backing file")?
+        .with_context(|| format!("failed to inspect {source_description}"))?
         .len();
     anyhow::ensure!(
         source_length == expected_length,
-        "memory backing file size ({source_length} bytes) doesn't match manifest ({expected_length} bytes)",
+        "{source_description} size ({source_length} bytes) doesn't match manifest ({expected_length} bytes)",
     );
-    let mut destination = create_file(destination_path, "snapshot memory")?;
+    let mut destination = create_file(destination_path, destination_description)?;
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
     let limit = expected_length
@@ -1181,13 +1425,13 @@ fn copy_exact(
     loop {
         let count = source
             .read(&mut buffer)
-            .context("failed to read memory backing file")?;
+            .with_context(|| format!("failed to read {source_description}"))?;
         if count == 0 {
             break;
         }
         destination
             .write_all(&buffer[..count])
-            .context("failed to write snapshot memory")?;
+            .with_context(|| format!("failed to write {destination_description}"))?;
         total = total
             .checked_add(count as u64)
             .context("memory backing file length overflowed u64")?;
@@ -1195,16 +1439,16 @@ fn copy_exact(
 
     anyhow::ensure!(
         total == expected_length,
-        "memory backing file changed while it was being copied (expected {expected_length} bytes, copied {total} bytes)",
+        "{source_description} changed while it was being copied (expected {expected_length} bytes, copied {total} bytes)",
     );
 
     destination
         .sync_all()
-        .context("failed to flush snapshot memory")?;
+        .with_context(|| format!("failed to flush {destination_description}"))?;
     Ok(())
 }
 
-fn validate_snapshot_directory(dir: &Path) -> anyhow::Result<()> {
+fn validate_snapshot_directory(dir: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
     let metadata = fs_err::symlink_metadata(dir)
         .with_context(|| format!("failed to inspect snapshot directory {}", dir.display()))?;
     anyhow::ensure!(
@@ -1213,20 +1457,31 @@ fn validate_snapshot_directory(dir: &Path) -> anyhow::Result<()> {
         dir.display(),
     );
 
-    let mut entry_count = 0_usize;
+    let has_scratch = paired_scratch_block(manifest).is_some();
+    let mut entries = HashSet::new();
     for entry in fs_err::read_dir(dir)
         .with_context(|| format!("failed to enumerate snapshot directory {}", dir.display()))?
     {
         let entry = entry.context("failed to inspect snapshot directory entry")?;
         let name = entry.file_name();
         anyhow::ensure!(
-            name == MANIFEST_FILE_NAME || name == STATE_FILE_NAME || name == MEMORY_FILE_NAME,
+            name == MANIFEST_FILE_NAME
+                || name == STATE_FILE_NAME
+                || name == MEMORY_FILE_NAME
+                || (has_scratch && name == SCRATCH_FILE_NAME),
             "unexpected artifact in snapshot directory: {}",
             entry.path().display(),
         );
-        entry_count += 1;
+        entries.insert(name);
     }
-    anyhow::ensure!(entry_count == 3, "snapshot directory is incomplete");
+    anyhow::ensure!(
+        entries.len() == 3 + usize::from(has_scratch)
+            && entries.contains(std::ffi::OsStr::new(MANIFEST_FILE_NAME))
+            && entries.contains(std::ffi::OsStr::new(STATE_FILE_NAME))
+            && entries.contains(std::ffi::OsStr::new(MEMORY_FILE_NAME))
+            && (!has_scratch || entries.contains(std::ffi::OsStr::new(SCRATCH_FILE_NAME))),
+        "snapshot directory is incomplete"
+    );
     Ok(())
 }
 
@@ -1303,6 +1558,65 @@ fn verify_digest(bytes: &[u8], expected: &[u8], description: &str) -> anyhow::Re
     anyhow::ensure!(
         actual.as_slice() == expected,
         "{description} SHA-256 digest mismatch",
+    );
+    Ok(())
+}
+
+/// Computes SHA-256 over an exact-length regular file handle.
+pub fn file_sha256(
+    file: &std::fs::File,
+    expected_length: u64,
+    description: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let mut file = file
+        .try_clone()
+        .with_context(|| format!("failed to duplicate {description} handle"))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind {description}"))?;
+    let actual_length = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {description}"))?
+        .len();
+    anyhow::ensure!(
+        actual_length == expected_length,
+        "{description} size ({actual_length} bytes) doesn't match expected ({expected_length} bytes)"
+    );
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    let mut total = 0_u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {description}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        total = total
+            .checked_add(count as u64)
+            .context("file length overflowed u64 while hashing")?;
+        anyhow::ensure!(
+            total <= expected_length,
+            "{description} grew while it was being hashed"
+        );
+    }
+    anyhow::ensure!(
+        total == expected_length,
+        "{description} changed while it was being hashed"
+    );
+    Ok(digest.finalize().to_vec())
+}
+
+fn verify_file_digest(
+    file: &std::fs::File,
+    expected_length: u64,
+    expected_digest: &[u8],
+    description: &str,
+) -> anyhow::Result<()> {
+    validate_sha256(expected_digest, description)?;
+    anyhow::ensure!(
+        file_sha256(file, expected_length, description)? == expected_digest,
+        "{description} SHA-256 digest mismatch"
     );
     Ok(())
 }
@@ -1463,6 +1777,10 @@ pub fn validate_microvm_machine_contract(
         "snapshot filesystem policy doesn't match the requested machine"
     );
     anyhow::ensure!(
+        contract.microvm_sandbox_blocks == expected.microvm_sandbox_blocks,
+        "snapshot sandbox block topology or identity doesn't match the requested machine"
+    );
+    anyhow::ensure!(
         contract.tsc_frequency_hz == expected.tsc_frequency_hz
             && contract.tsc_tolerance_ppm == expected.tsc_tolerance_ppm,
         "snapshot TSC frequency contract doesn't match the destination"
@@ -1588,6 +1906,11 @@ fn validate_machine_contract_shape(
     ensure_unique(&topology.apic_ids, "APIC ID")?;
 
     if let Some(network) = &contract.microvm_network {
+        anyhow::ensure!(
+            network.profile == openvmm_defs::config::MicrovmNetworkProfile::Portable.as_str(),
+            "snapshot microVM network profile '{}' is unsupported",
+            network.profile
+        );
         let prefix_length = u8::try_from(network.prefix_length)
             .context("snapshot network prefix does not fit in u8")?;
         let parsed = format!(
@@ -1627,6 +1950,84 @@ fn validate_machine_contract_shape(
             *filesystem == SnapshotMicrovmFilesystem::new(&parsed),
             "snapshot filesystem policy is not canonical"
         );
+    }
+
+    match contract.microvm_abi_version {
+        openvmm_defs::config::MICROVM_ABI_VERSION_1 => anyhow::ensure!(
+            contract.microvm_sandbox_blocks.is_empty(),
+            "microVM ABI version 1 snapshot contains ABI-v2 sandbox blocks"
+        ),
+        openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
+            anyhow::ensure!(
+                contract.microvm_sandbox_blocks.len() >= 2
+                    && contract.microvm_sandbox_blocks.len() <= 4,
+                "microVM ABI version 2 snapshot must contain one to three layers and scratch"
+            );
+            let mut previous_role = None;
+            for block in &contract.microvm_sandbox_blocks {
+                let role = match block.role.as_str() {
+                    "distro" => openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
+                    "runtime" => openvmm_defs::config::MicrovmSandboxBlockRole::Runtime,
+                    "custom" => openvmm_defs::config::MicrovmSandboxBlockRole::Custom,
+                    "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+                    role => anyhow::bail!("snapshot sandbox block role '{role}' is unsupported"),
+                };
+                anyhow::ensure!(
+                    previous_role.is_none_or(|previous| previous < role),
+                    "snapshot sandbox block roles are duplicated or out of order"
+                );
+                previous_role = Some(role);
+                anyhow::ensure!(
+                    block.read_only == role.is_read_only(),
+                    "snapshot sandbox block '{}' has an invalid access mode",
+                    block.role
+                );
+                anyhow::ensure!(
+                    block.length != 0 && block.length % 512 == 0,
+                    "snapshot sandbox block '{}' has invalid geometry",
+                    block.role
+                );
+                anyhow::ensure!(
+                    block.logical_block_size >= 512
+                        && block.logical_block_size.is_power_of_two()
+                        && block.physical_block_size >= block.logical_block_size
+                        && block.physical_block_size.is_power_of_two()
+                        && block.length % u64::from(block.logical_block_size) == 0,
+                    "snapshot sandbox block '{}' has invalid block geometry",
+                    block.role
+                );
+                if role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch {
+                    anyhow::ensure!(
+                        block.artifact.is_empty() || block.artifact == SCRATCH_FILE_NAME,
+                        "snapshot scratch artifact name is invalid"
+                    );
+                    if block.artifact.is_empty() {
+                        anyhow::ensure!(
+                            block.identity_kind == "fresh" && block.identity.is_empty(),
+                            "snapshot fresh scratch policy is invalid"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            block.identity_kind == "sha256",
+                            "snapshot paired scratch has an unsupported identity kind"
+                        );
+                        validate_sha256(&block.identity, "scratch block")?;
+                    }
+                } else {
+                    anyhow::ensure!(
+                        block.artifact.is_empty() && block.identity_kind == "sha256",
+                        "snapshot read-only layer '{}' has an invalid identity policy",
+                        block.role
+                    );
+                    validate_sha256(&block.identity, &format!("{} block", block.role))?;
+                }
+            }
+            anyhow::ensure!(
+                previous_role == Some(openvmm_defs::config::MicrovmSandboxBlockRole::Scratch),
+                "microVM ABI version 2 snapshot is missing its scratch role"
+            );
+        }
+        version => anyhow::bail!("snapshot microVM ABI version {version} is unsupported"),
     }
 
     anyhow::ensure!(
@@ -1742,9 +2143,10 @@ fn validate_machine_contract_shape(
 fn validate_manifest_header(manifest: &SnapshotManifest) -> anyhow::Result<()> {
     let expected_magic = match manifest.version {
         LEGACY_MANIFEST_VERSION => LEGACY_SNAPSHOT_FORMAT_MAGIC,
+        PREVIOUS_MANIFEST_VERSION => PREVIOUS_SNAPSHOT_FORMAT_MAGIC,
         MANIFEST_VERSION => SNAPSHOT_FORMAT_MAGIC,
         version => anyhow::bail!(
-            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION} or {MANIFEST_VERSION})"
+            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION}, {PREVIOUS_MANIFEST_VERSION}, or {MANIFEST_VERSION})"
         ),
     };
     anyhow::ensure!(
@@ -1777,15 +2179,32 @@ fn validate_manifest_version(manifest: &SnapshotManifest) -> anyhow::Result<()> 
                 "legacy memory.bin SHA-256 digest has invalid length {}",
                 manifest.memory_sha256.len(),
             );
-        }
-        MANIFEST_VERSION => {
             anyhow::ensure!(
-                manifest.state_sha256.is_empty() && manifest.memory_sha256.is_empty(),
-                "snapshot manifest version {MANIFEST_VERSION} must not contain legacy artifact digests",
+                manifest
+                    .machine_contract
+                    .as_ref()
+                    .is_none_or(|contract| contract.microvm_sandbox_blocks.is_empty()),
+                "snapshot manifest version {LEGACY_MANIFEST_VERSION} cannot contain ABI-v2 sandbox blocks"
             );
         }
+        PREVIOUS_MANIFEST_VERSION | MANIFEST_VERSION => {
+            anyhow::ensure!(
+                manifest.state_sha256.is_empty() && manifest.memory_sha256.is_empty(),
+                "snapshot manifest version {} must not contain legacy artifact digests",
+                manifest.version,
+            );
+            if manifest.version == PREVIOUS_MANIFEST_VERSION {
+                anyhow::ensure!(
+                    manifest
+                        .machine_contract
+                        .as_ref()
+                        .is_none_or(|contract| contract.microvm_sandbox_blocks.is_empty()),
+                    "snapshot manifest version {PREVIOUS_MANIFEST_VERSION} cannot contain ABI-v2 sandbox blocks"
+                );
+            }
+        }
         version => anyhow::bail!(
-            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION} or {MANIFEST_VERSION})"
+            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION}, {PREVIOUS_MANIFEST_VERSION}, or {MANIFEST_VERSION})"
         ),
     }
     Ok(())
@@ -1895,10 +2314,41 @@ mod tests {
             microvm_network: None,
             microvm_filesystem: None,
             apic_frequency_hz: Some(1_000_000_000),
+            microvm_sandbox_blocks: Vec::new(),
         };
         contract.set_effective_command_line("console=hvc0".to_owned());
         contract.set_cpu_compatibility_contract(vec![1, 2, 3]);
         contract
+    }
+
+    fn paired_scratch_manifest(scratch: &[u8]) -> SnapshotManifest {
+        let mut manifest = test_manifest();
+        let mut contract = test_machine_contract();
+        contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_2;
+        contract.microvm_sandbox_blocks = vec![
+            SnapshotMicrovmSandboxBlock {
+                role: "distro".to_owned(),
+                read_only: true,
+                length: 512,
+                identity_kind: "sha256".to_owned(),
+                identity: vec![0x11; SHA256_SIZE],
+                artifact: String::new(),
+                logical_block_size: 512,
+                physical_block_size: 4096,
+            },
+            SnapshotMicrovmSandboxBlock {
+                role: "scratch".to_owned(),
+                read_only: false,
+                length: scratch.len() as u64,
+                identity_kind: "sha256".to_owned(),
+                identity: sha2::Sha256::digest(scratch).to_vec(),
+                artifact: SCRATCH_FILE_NAME.to_owned(),
+                logical_block_size: 512,
+                physical_block_size: 4096,
+            },
+        ];
+        manifest.machine_contract = Some(contract);
+        manifest
     }
 
     fn microvm_console_attachment() -> SnapshotAttachment {
@@ -1915,18 +2365,14 @@ mod tests {
     }
 
     fn microvm_network_attachment(source_hypervisor: &str) -> SnapshotAttachment {
-        let (identity_kind, identity) = match source_hypervisor {
-            "kvm" | "mshv" => ("managed-tap", b"managed".as_slice()),
-            "whp" => ("user-mode-nat", b"consomme".as_slice()),
-            _ => unreachable!(),
-        };
+        assert!(matches!(source_hypervisor, "kvm" | "mshv" | "whp"));
         SnapshotAttachment {
             stable_id: "net:microvm0".to_owned(),
             kind: "virtio-net".to_owned(),
             required: false,
             reconnect_policy: "recreate-endpoint".to_owned(),
-            identity_kind: identity_kind.to_owned(),
-            identity: identity.to_vec(),
+            identity_kind: "user-mode-nat".to_owned(),
+            identity: b"consomme".to_vec(),
             length: 0,
             reconnect_timeout_ms: 0,
         }
@@ -1962,7 +2408,7 @@ mod tests {
         let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
         let command_line = format!(
             "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {}",
-            network.command_line_fragment()
+            network.command_line_fragment_with_dns(true)
         );
         microvm_v1_machine_contract(
             source_hypervisor,
@@ -2105,6 +2551,7 @@ mod tests {
             );
 
             let network = contract.microvm_network.unwrap();
+            assert_eq!(network.profile, "portable");
             assert_eq!(
                 network.guest_ipv4,
                 u32::from(std::net::Ipv4Addr::new(10, 0, 0, 2))
@@ -2193,6 +2640,47 @@ mod tests {
 
         let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
         assert!(error.to_string().contains("not canonical"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_unsupported_profile() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .profile = "other".to_owned();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("profile"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_legacy_missing_profile() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .profile
+            .clear();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("profile '' is unsupported"));
     }
 
     #[test]
@@ -2418,6 +2906,93 @@ mod tests {
     }
 
     #[test]
+    fn paired_scratch_is_published_and_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("memory.bin");
+        let scratch_path = dir.path().join("scratch.img");
+        let scratch = vec![0x5a_u8; 1024];
+        std::fs::write(&memory_path, vec![0_u8; 1024]).unwrap();
+        std::fs::write(&scratch_path, &scratch).unwrap();
+        let memory_file = std::fs::File::open(memory_path).unwrap();
+        let scratch_file = std::fs::File::open(scratch_path).unwrap();
+        let manifest = paired_scratch_manifest(&scratch);
+
+        write_snapshot_from_memory_and_scratch_files(
+            &snap_dir,
+            &manifest,
+            b"state",
+            &memory_file,
+            Some(&scratch_file),
+        )
+        .unwrap();
+
+        let read_manifest = read_snapshot_manifest(&snap_dir).unwrap();
+        let verified = open_paired_scratch_file(&snap_dir, &read_manifest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file_sha256(&verified, 1024, SCRATCH_FILE_NAME).unwrap(),
+            manifest.machine_contract.unwrap().microvm_sandbox_blocks[1].identity
+        );
+
+        let published = snap_dir.join(SCRATCH_FILE_NAME);
+        std::fs::write(&published, vec![0xa5_u8; 1024]).unwrap();
+        assert!(
+            open_paired_scratch_file(&snap_dir, &read_manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("digest mismatch")
+        );
+
+        std::fs::write(&published, vec![0_u8; 512]).unwrap();
+        assert!(
+            open_paired_scratch_file(&snap_dir, &read_manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("doesn't match manifest")
+        );
+
+        std::fs::remove_file(&published).unwrap();
+        let error = match read_snapshot_manifest(&snap_dir) {
+            Ok(_) => panic!("snapshot without scratch.img unexpectedly validated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn paired_scratch_digest_mismatch_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("memory.bin");
+        let scratch_path = dir.path().join("scratch.img");
+        let scratch = vec![0x5a_u8; 1024];
+        std::fs::write(&memory_path, vec![0_u8; 1024]).unwrap();
+        std::fs::write(&scratch_path, &scratch).unwrap();
+        let memory_file = std::fs::File::open(memory_path).unwrap();
+        let scratch_file = std::fs::File::open(scratch_path).unwrap();
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks[1]
+            .identity = vec![0xff; SHA256_SIZE];
+
+        let error = write_snapshot_from_memory_and_scratch_files(
+            &snap_dir,
+            &manifest,
+            b"state",
+            &memory_file,
+            Some(&scratch_file),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
+        assert!(!snap_dir.exists());
+    }
+
+    #[test]
     fn write_snapshot_rejects_missing_parent() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("a").join("b").join("c");
@@ -2630,11 +3205,63 @@ mod tests {
     }
 
     #[test]
-    fn read_snapshot_rejects_legacy_digests_in_v3_manifest() {
+    fn current_manifest_rejects_legacy_payload_digests() {
         let mut manifest = test_manifest();
         manifest.state_sha256 = vec![0; SHA256_SIZE];
         let error = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
         assert!(error.to_string().contains("legacy artifact digests"));
+    }
+
+    #[test]
+    fn previous_v3_manifest_remains_accepted() {
+        let mut manifest = test_manifest();
+        manifest.version = PREVIOUS_MANIFEST_VERSION;
+        manifest.format_magic = PREVIOUS_SNAPSHOT_FORMAT_MAGIC.to_vec();
+
+        validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap();
+    }
+
+    #[test]
+    fn legacy_formats_reject_abi_v2_blocks() {
+        let scratch = vec![0x5a_u8; 1024];
+        for (version, magic) in [
+            (LEGACY_MANIFEST_VERSION, LEGACY_SNAPSHOT_FORMAT_MAGIC),
+            (PREVIOUS_MANIFEST_VERSION, PREVIOUS_SNAPSHOT_FORMAT_MAGIC),
+        ] {
+            let mut manifest = paired_scratch_manifest(&scratch);
+            manifest.version = version;
+            manifest.format_magic = magic.to_vec();
+            if version == LEGACY_MANIFEST_VERSION {
+                manifest.state_sha256 = vec![0; SHA256_SIZE];
+                manifest.memory_sha256 = vec![0; SHA256_SIZE];
+            }
+            let error = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot contain ABI-v2 sandbox blocks")
+            );
+        }
+    }
+
+    #[test]
+    fn abi_v2_contract_rejects_scratch_without_a_lower_layer() {
+        let scratch = vec![0x5a_u8; 1024];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks
+            .remove(0);
+        let contract = manifest.machine_contract.clone().unwrap();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("one to three layers and scratch")
+        );
     }
 
     #[test]

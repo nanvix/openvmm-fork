@@ -7,6 +7,7 @@ use pal_async::driver::Driver;
 #[cfg(windows)]
 use pal_async::pipe::PolledPipe;
 use serial_socket::net::OpenSocketSerialConfig;
+use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
 use std::net::TcpStream;
@@ -123,6 +124,32 @@ pub fn connect_serial_with_timeout(
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
             "serial connection worker terminated without a result",
         )),
+    }
+}
+
+/// Connects a single-use restore-readiness event sink.
+pub fn connect_restore_ready_sink(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::OwnedFd;
+
+        let socket = unix_socket::UnixStream::connect(path)?;
+        Ok(File::from(OwnedFd::from(socket)))
+    }
+
+    #[cfg(windows)]
+    {
+        const NAMED_PIPE_PREFIX: &str = "//./pipe/";
+
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if !normalized.starts_with(NAMED_PIPE_PREFIX) || normalized.len() == NAMED_PIPE_PREFIX.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "restore readiness path must name a Windows //./pipe/... endpoint",
+            ));
+        }
+        std::fs::OpenOptions::new().write(true).open(path)
     }
 }
 

@@ -34,6 +34,7 @@ use openvmm_defs::config::MICROVM_COMMAND_LINE_MAX_SIZE;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_CONSOLE_COMMAND_LINE;
 use openvmm_defs::config::MachineProfile;
+use openvmm_defs::config::MicrovmNetworkProfile;
 use openvmm_defs::config::MicrovmSandboxBlockRole;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
@@ -161,6 +162,21 @@ pub enum MachineProfileCli {
     Microvm,
     /// The microVM ABI version 2 sandbox-block machine.
     MicrovmV2,
+}
+
+/// Required host-network implementation contract for a microVM NIC.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MicrovmNetworkProfileCli {
+    /// Use the cross-platform user-mode Consomme NAT implementation.
+    Portable,
+}
+
+impl From<MicrovmNetworkProfileCli> for MicrovmNetworkProfile {
+    fn from(value: MicrovmNetworkProfileCli) -> Self {
+        match value {
+            MicrovmNetworkProfileCli::Portable => Self::Portable,
+        }
+    }
 }
 
 impl From<MachineProfileCli> for MachineProfile {
@@ -298,6 +314,11 @@ Examples:
         conflicts_with_all = ["deprecated_memory_backing_file", "numa", "kernel", "initrd"]
     )]
     pub restore_snapshot: Option<PathBuf>,
+
+    /// Write OPENVMM_RESTORE_READY_V1 to this Unix socket or Windows named pipe
+    /// after restore startup completes and before guest execution begins.
+    #[clap(long, value_name = "PATH", requires = "restore_snapshot")]
+    pub restore_ready_path: Option<PathBuf>,
 
     /// Expose a fresh OPENVMM_ENTROPY_V1 packet through the private portb restore channel.
     #[clap(long, requires = "restore_snapshot")]
@@ -636,7 +657,13 @@ options:
     #[clap(long)]
     pub net: Vec<NicConfigCli>,
 
-    /// Attach the microVM NIC to a preconfigured Linux TAP instead of creating one.
+    /// Required host-network implementation contract for microVM `--net`.
+    #[clap(long, value_enum, value_name = "PROFILE")]
+    pub network_profile: Option<MicrovmNetworkProfileCli>,
+
+    /// Select a preconfigured Linux TAP for a microVM NIC.
+    ///
+    /// This is incompatible with the portable microVM network profile.
     #[clap(long, value_name = "NAME")]
     pub net_tap: Option<String>,
 
@@ -1477,12 +1504,13 @@ impl Options {
         ) {
             anyhow::ensure!(
                 self.net_tap.is_none()
+                    && self.network_profile.is_none()
                     && self.allow_host.is_empty()
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
                     && self.microvm_mount.is_none()
                     && self.microvm_sandbox_block.is_empty(),
-                "--net-tap, --mount, --microvm-sandbox-block, and microVM egress policy require a microVM machine"
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, and microVM egress policy require a microVM machine"
             );
             return Ok(());
         }
@@ -1525,17 +1553,11 @@ impl Options {
                 "microVM snapshot quiesce timeout must be nonzero"
             );
             anyhow::ensure!(
-                abi_version == MICROVM_ABI_VERSION_1
-                    && self.virtio_blk.is_empty()
-                    && self.microvm_sandbox_block.is_empty(),
-                "microVM snapshot capture with virtio-blk is unavailable until immutable media identity is implemented"
+                abi_version != MICROVM_ABI_VERSION_1 || self.virtio_blk.is_empty(),
+                "microVM ABI version 1 snapshot capture with virtio-blk requires immutable media identity"
             );
         }
         if self.restore_snapshot.is_some() {
-            anyhow::ensure!(
-                abi_version == MICROVM_ABI_VERSION_1,
-                "microVM ABI version 2 snapshot restore is not implemented"
-            );
             anyhow::ensure!(
                 self.net.is_empty(),
                 "microVM restore takes network addressing from saved state; do not pass --net"
@@ -1669,7 +1691,7 @@ impl Options {
                     );
                 }
             }
-            if !self.microvm_sandbox_block.is_empty() {
+            if !self.microvm_sandbox_block.is_empty() && self.restore_snapshot.is_none() {
                 anyhow::ensure!(
                     self.microvm_sandbox_block
                         .last()
@@ -1716,6 +1738,16 @@ impl Options {
             "microVM ABI version 1 permits at most one virtio-net device"
         );
         anyhow::ensure!(
+            self.net.is_empty() || self.network_profile == Some(MicrovmNetworkProfileCli::Portable),
+            "microVM --net requires --network-profile portable"
+        );
+        anyhow::ensure!(
+            self.network_profile.is_none()
+                || !self.net.is_empty()
+                || self.restore_snapshot.is_some(),
+            "--network-profile portable requires --net or --restore-snapshot"
+        );
+        anyhow::ensure!(
             self.net.iter().all(|network| {
                 matches!(network.endpoint, EndpointConfigCli::Microvm(_))
                     && network.vtl == DeviceVtl::Vtl0
@@ -1726,8 +1758,8 @@ impl Options {
             "microVM --net requires a bare IPv4/prefix and does not permit queue, VTL, Underhill, or PCIe modifiers"
         );
         anyhow::ensure!(
-            self.net_tap.is_none() || !self.net.is_empty() || self.restore_snapshot.is_some(),
-            "--net-tap requires --net on cold boot or a networked snapshot restore"
+            self.net_tap.is_none(),
+            "--net-tap is incompatible with the portable microVM network profile"
         );
         anyhow::ensure!(
             (self.allow_host.is_empty()
@@ -1736,11 +1768,6 @@ impl Options {
                 || !self.net.is_empty()
                 || self.restore_snapshot.is_some(),
             "--allow-host, --block-host, and --allow-endpoint require --net or a networked snapshot restore"
-        );
-        #[cfg(not(target_os = "linux"))]
-        anyhow::ensure!(
-            self.net_tap.is_none(),
-            "--net-tap is available only with the Linux/KVM microVM backend"
         );
         anyhow::ensure!(
             self.cxl_test.is_empty()
@@ -2259,6 +2286,13 @@ impl FromStr for DiskCliKind {
                     Self::parse_autocache(arg, std::env::var("OPENVMM_AUTO_CACHE_PATH"))?
                 }
                 "prwrap" => DiskCliKind::PersistentReservationsWrapper(Box::new(arg.parse()?)),
+                "delay" => {
+                    let (delay_ms, kind) = arg.split_once(':').context("expected delay_ms:kind")?;
+                    DiskCliKind::DelayDiskWrapper {
+                        delay_ms: delay_ms.parse().context("invalid disk delay")?,
+                        disk: Box::new(kind.parse()?),
+                    }
+                }
                 "file" => {
                     let FileOpts {
                         path,
@@ -5622,9 +5656,16 @@ mod tests {
         ])
         .unwrap();
         valid_console.validate_microvm_options().unwrap();
-        let valid_network =
-            Options::try_parse_from(["openvmm", "--machine", "microvm", "--net", "10.0.0.2/24"])
-                .unwrap();
+        let valid_network = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+        ])
+        .unwrap();
         valid_network.validate_microvm_options().unwrap();
         let valid_filesystem = Options::try_parse_from([
             "openvmm",
@@ -5637,6 +5678,16 @@ mod tests {
         valid_filesystem.validate_microvm_options().unwrap();
 
         for args in [
+            vec!["openvmm", "--machine", "microvm", "--net", "10.0.0.2/24"],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--network-profile",
+                "portable",
+                "--net-tap",
+                "tap0",
+            ],
             vec!["openvmm", "--machine", "microvm", "--processors", "2"],
             vec!["openvmm", "--machine", "microvm", "--uefi"],
             vec!["openvmm", "--machine", "microvm", "--hypervisor", "unknown"],
@@ -5689,6 +5740,8 @@ mod tests {
             "microvm",
             "--net",
             "10.0.0.2/24",
+            "--network-profile",
+            "portable",
             "--allow-host",
             "192.168.1.9/24",
             "--allow-host",
@@ -5715,6 +5768,8 @@ mod tests {
             "microvm",
             "--net",
             "10.0.0.2/24",
+            "--network-profile",
+            "portable",
             "--allow-endpoint",
             "192.0.2.7:443",
         ])

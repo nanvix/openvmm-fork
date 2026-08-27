@@ -5,20 +5,23 @@ the complete state of a running VM and resume it later.
 
 ## Overview
 
-A snapshot captures three pieces of state:
+A snapshot captures three required pieces of state and may pair writable
+microVM scratch:
 
 - **Guest RAM** — the full contents of guest memory
 - **Device state** — the saved state of all emulated devices
 - **Manifest** — metadata describing the snapshot (architecture, memory size,
   VP count, page size, etc.)
+- **Scratch** — the exact ABI-v2 writable image when capture occurs after mount
 
-These are stored as three files in a snapshot directory:
+These are stored as three required files and one optional paired file:
 
 | File            | Contents                                    |
 |-----------------|---------------------------------------------|
 | `manifest.bin`  | Protobuf-encoded snapshot metadata          |
 | `state.bin`     | Serialized device state                     |
 | `memory.bin`    | Memory backing file                         |
+| `scratch.img`   | Paired ABI-v2 scratch, when declared        |
 
 ## Prerequisites
 
@@ -80,13 +83,24 @@ directory, so `file=...` should not be specified in `--memory` (the two options
 are mutually exclusive). Guest writes use a private copy-on-write mapping and
 do not modify the snapshot artifact.
 
+MicroVM orchestrators can add `--restore-ready-path <PATH>`. OpenVMM connects
+to an existing Unix domain socket on Linux or named pipe on Windows and writes
+`OPENVMM_RESTORE_READY_V1\n` after restore validation, attachment resolution,
+and state-unit startup, while restored vCPUs are still held. The event is
+single-use and is not serialized. Failure to write and flush it stops the
+started units and fails restore without releasing a vCPU. The peer must accept
+and read while resume is in progress; on Windows, flush completion waits until
+the named-pipe peer consumes the complete frame.
+
 ```admonish warning
-Version 3 snapshots do not contain or validate embedded checksums for
+Version 4 snapshots do not contain or validate embedded checksums for
 `state.bin` or `memory.bin`. Restore still requires regular files, bounded
 manifest and state decoding, exact artifact lengths, and a compatible machine
-contract, but same-length payload changes are not detected. Protect snapshot
-directories with host access controls. Integrity or authentication for export
-and transport must be supplied outside the default snapshot format.
+contract, but same-length payload changes are not detected. Paired
+`scratch.img` does have an exact length and SHA-256 identity because it must
+match captured guest filesystem state. Protect snapshot directories with host
+access controls. Integrity or authentication for export and transport must be
+supplied outside the default snapshot format.
 ```
 
 ```admonish note
@@ -98,7 +112,7 @@ validation error and refuse to start.
 ## Device configuration on restore
 
 For standard-machine snapshots, device flags must still be supplied on restore
-and must reproduce the saved machine. For microVM ABI-v1 snapshots, the
+and must reproduce the saved machine. For microVM ABI-v1 and ABI-v2 snapshots, the
 manifest is authoritative for RAM, topology, ABI, fixed devices, placement,
 features, interrupts, and the effective PVH command line. Restore-time
 guest-visible overrides are rejected.

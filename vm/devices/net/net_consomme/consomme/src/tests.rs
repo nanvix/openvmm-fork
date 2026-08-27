@@ -41,6 +41,30 @@ impl Client for TestClient {
     }
 }
 
+#[test]
+fn default_resource_limits_are_pinned() {
+    let params = ConsommeParams::new().unwrap();
+    assert_eq!(params.udp_timeout, Duration::from_secs(300));
+    assert_eq!(
+        params.tcp_rx_buffer,
+        TcpBufferBounds {
+            initial: 16 << 10,
+            max: 4 << 20,
+        }
+    );
+    assert_eq!(
+        params.tcp_tx_buffer,
+        TcpBufferBounds {
+            initial: 16 << 10,
+            max: 4 << 20,
+        }
+    );
+    assert_eq!(DEFAULT_MAX_ACTIVE_TCP_FLOWS, 128);
+    assert_eq!(DEFAULT_MAX_ACTIVE_UDP_FLOWS, 256);
+    assert_eq!(dns_resolver::DEFAULT_MAX_PENDING_DNS_REQUESTS, 256);
+    assert_eq!(DEFAULT_MAX_ACTIVE_ICMP_FLOWS, 16);
+}
+
 /// Build a minimal TCP SYN packet inside an Ethernet/IPv4 frame.
 fn build_ipv4_syn(
     buf: &mut [u8],
@@ -165,6 +189,34 @@ async fn ipv4_loopback_blocked_by_default(driver: DefaultDriver) {
     assert!(
         matches!(result, Err(DropReason::DestinationNotAllowed)),
         "loopback traffic should be rejected, got {result:?}"
+    );
+}
+
+/// IPv4 fragments are dropped before checksum validation or host socket work.
+#[pal_async::async_test]
+async fn ipv4_fragments_are_rejected(driver: DefaultDriver) {
+    let mut consomme = Consomme::new(ConsommeParams::new().unwrap());
+    let mut client = TestClient::new(driver);
+    let mut buf = vec![0u8; 1514];
+
+    let guest_mac = consomme.params_mut().client_mac;
+    let gateway_mac = consomme.params_mut().gateway_mac;
+    let guest_ip = consomme.params_mut().client_ip;
+    let len = build_ipv4_syn(
+        &mut buf,
+        guest_mac,
+        gateway_mac,
+        guest_ip,
+        Ipv4Address::new(192, 0, 2, 1),
+    );
+    Ipv4Packet::new_unchecked(&mut buf[ETHERNET_HEADER_LEN..len]).set_more_frags(true);
+
+    let result = consomme
+        .access(&mut client)
+        .send(&buf[..len], &ChecksumState::NONE);
+    assert!(
+        matches!(result, Err(DropReason::FragmentedPacket)),
+        "fragmented IPv4 traffic should be rejected, got {result:?}"
     );
 }
 

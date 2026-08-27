@@ -430,6 +430,7 @@ pub(crate) struct ReplResources {
     pub vm_rpc: mesh::Sender<VmRpc>,
     pub vm_controller: mesh::Sender<VmControllerRpc>,
     pub vm_controller_events: mesh::Receiver<VmControllerEvent>,
+    pub restore_ready_pending: bool,
     pub scsi_rpc: Option<mesh::Sender<ScsiControllerRequest>>,
     pub nvme_vtl2_rpc: Option<mesh::Sender<NvmeControllerRequest>>,
     pub consomme_rpc: Option<mesh::Sender<ConsommeRequest>>,
@@ -448,6 +449,7 @@ pub(crate) async fn run_repl(
         vm_rpc,
         vm_controller,
         mut vm_controller_events,
+        mut restore_ready_pending,
         mut scsi_rpc,
         mut nvme_vtl2_rpc,
         consomme_rpc,
@@ -609,7 +611,7 @@ pub(crate) async fn run_repl(
 
     enum StateChange {
         Pause(bool),
-        Resume(bool),
+        Resume(Result<bool, RemoteError>),
         Reset(Result<(), RemoteError>),
         PulseSaveRestore(Result<(), PulseSaveRestoreError>),
         ServiceVtl2(anyhow::Result<Duration>),
@@ -711,13 +713,23 @@ pub(crate) async fn run_repl(
                                 tracing::warn!("already paused");
                             }
                         }
-                        StateChange::Resume(success) => {
-                            if success {
+                        StateChange::Resume(result) => match result {
+                            Ok(true) => {
+                                restore_ready_pending = false;
                                 tracing::info!("resumed complete");
-                            } else {
-                                tracing::warn!("already running");
                             }
-                        }
+                            Ok(false) => tracing::warn!("already running"),
+                            Err(err) => {
+                                tracing::error!(
+                                    error = &err as &dyn std::error::Error,
+                                    "resume failed"
+                                );
+                                if restore_ready_pending {
+                                    return Err(anyhow::Error::new(err)
+                                        .context("restore readiness resume failed"));
+                                }
+                            }
+                        },
                         StateChange::Reset(r) => match r {
                             Ok(()) => tracing::info!("reset complete"),
                             Err(err) => tracing::error!(

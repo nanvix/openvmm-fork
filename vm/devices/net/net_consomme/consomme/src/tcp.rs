@@ -69,6 +69,7 @@ pub(crate) struct Tcp {
     connections: HashMap<FourTuple, TcpConnection>,
     #[inspect(iter_by_key)]
     listeners: HashMap<PortForwardKey, TcpListener>,
+    max_connections: usize,
     connection_params: ConnectionParams,
     aggregate_stats: TcpAggregateStats,
 }
@@ -135,10 +136,15 @@ pub enum TcpError {
 }
 
 impl Tcp {
-    pub fn new(rx_buffer: crate::TcpBufferBounds, tx_buffer: crate::TcpBufferBounds) -> Self {
+    pub fn new(
+        rx_buffer: crate::TcpBufferBounds,
+        tx_buffer: crate::TcpBufferBounds,
+        max_connections: usize,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             listeners: HashMap::new(),
+            max_connections: max_connections.max(1),
             connection_params: ConnectionParams {
                 rx_buffer: NormalizedBufferBounds::from_bounds(rx_buffer),
                 tx_buffer: NormalizedBufferBounds::from_bounds(tx_buffer),
@@ -455,8 +461,17 @@ impl<T: Client> Access<'_, T> {
                             dst: ft.src,
                         };
 
+                        let at_capacity = self.inner.tcp.connections.len()
+                            >= self.inner.tcp.max_connections;
                         match self.inner.tcp.connections.entry(ft) {
                             hash_map::Entry::Vacant(e) => {
+                                if at_capacity {
+                                    tracelimit::warn_ratelimited!(
+                                        max_connections = self.inner.tcp.max_connections,
+                                        "dropping inbound TCP flow because the active-flow limit was reached"
+                                    );
+                                    return true;
+                                }
                                 let mut sender = Sender {
                                     ft: &ft,
                                     client: self.client,
@@ -607,6 +622,18 @@ impl<T: Client> Access<'_, T> {
             client: self.client,
             state: &mut self.inner.state,
         };
+
+        if !self.inner.tcp.connections.contains_key(&ft)
+            && self.inner.tcp.connections.len() >= self.inner.tcp.max_connections
+        {
+            tracelimit::warn_ratelimited!(
+                max_connections = self.inner.tcp.max_connections,
+                src = %ft.src,
+                dst = %ft.dst,
+                "rejecting TCP flow before host socket creation because the active-flow limit was reached"
+            );
+            return Err(DropReason::TcpConnectionLimit);
+        }
 
         match self.inner.tcp.connections.entry(ft) {
             hash_map::Entry::Occupied(mut e) => {

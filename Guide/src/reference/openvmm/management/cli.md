@@ -42,45 +42,50 @@ as well as the generated CLI help (via `cargo run -- --help`).
   restart remain unavailable.
 
   Guest-requested snapshot capture and new-process restore are available for
-  the no-block ABI-v1 machine on Linux/KVM, Linux/MSHV, and Windows/WHP,
-  including an active virtio console. Capture with the optional virtio-blk
-  device is rejected until immutable media identity is implemented.
+  the no-block ABI-v1 machine and fixed-block ABI-v2 machine on Linux/KVM,
+  Linux/MSHV, and Windows/WHP. ABI-v1 capture with its optional unroled
+  virtio-blk device remains unsupported.
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
   at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
   `/1` through `/30` are accepted. The first usable subnet address becomes
   the gateway; network, broadcast, and gateway addresses cannot be assigned
   to the guest. Guest and gateway MAC addresses are derived as
-  `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses.
+  `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses. Networking
+  requires the only supported capability profile, `--network-profile portable`;
+  omitting it rejects the command before OpenVMM opens host resources.
 
   ```bash
   openvmm --machine microvm --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz \
-    --net 10.0.0.2/24
+    --net 10.0.0.2/24 --network-profile portable
   ```
 
-  On Linux/KVM or MSHV, OpenVMM creates, addresses, and removes a managed TAP.
-  This requires root or non-interactive `sudo ip` access. `--net-tap <NAME>`
-  uses an existing TAP instead; its link state, gateway address, and gateway
-  MAC are validated, and OpenVMM does not remove it. Forwarding or NAT beyond
-  the host is operator policy. On Windows/WHP, OpenVMM uses an in-process
-  Consomme endpoint and advertises the gateway DNS proxy when policy permits
-  it.
+  `portable` uses an in-process Consomme endpoint on Linux/KVM, Linux/MSHV,
+  and Windows/WHP. It needs no TAP, root access, driver, or host network
+  configuration. `--net-tap` is incompatible and is rejected before any
+  endpoint or host resource is created. The gateway provides DNS over UDP and
+  TCP, ICMP echo, and outbound TCP/UDP through ordinary host sockets. Consomme
+  rejects IPv4 fragments deterministically; policy filtering remains before
+  host socket creation. Its per-connection TCP buffers start at 16 KiB and
+  are bounded at 4 MiB; UDP bindings expire after five minutes; and at most
+  256 DNS requests are pending at once. At most 128 TCP, 256 UDP, and 16 ICMP
+  guest flows are active at once; excess flows are deterministically rejected
+  before a host socket is created.
 
   `--allow-host <IPv4[/PREFIX]>`, `--block-host <IPv4[/PREFIX]>`, and
   `--allow-endpoint <IPv4:TCP-PORT>` are repeatable, mutually exclusive
-  egress modes. Filtering runs before TAP transmission or host socket
-  creation. Active policy fails closed for malformed packets, non-IPv4
-  traffic, and IPv4 options. Exact endpoint mode also rejects UDP, ICMP, VLAN,
-  fragments, and every TCP destination not listed. No implicit DNS exception
-  is added.
+  egress modes. Filtering runs before host socket creation. Active policy
+  fails closed for malformed packets, non-IPv4 traffic, and IPv4 options.
+  Exact endpoint mode also rejects UDP, ICMP, VLAN, fragments, and every TCP
+  destination not listed. No implicit DNS exception is added.
 
-  Networked snapshots drain accepted TX and endpoint-ready RX at the capture
-  boundary, rewind unused guest RX descriptors, save the static identity and
-  completion cursors, and recreate the host endpoint on restore. An active
-  egress policy must be supplied again with the same canonical rules. Native
-  TAP descriptors, Consomme sockets, NAT flow tables, and remote peer state
-  are not serialized, so existing proxied TCP or UDP sessions may reconnect
-  or reset after restore.
+  Networked snapshots record the `portable` profile, drain accepted TX and
+  endpoint-ready RX at the capture boundary, rewind unused guest RX
+  descriptors, and recreate a fresh Consomme endpoint generation on restore.
+  Restore of a networked snapshot requires `--network-profile portable` and
+  the same active egress policy rules. Native sockets and NAT flow tables are
+  not serialized. The capture protocol does not retain pre-capture endpoint
+  completions; restored guest software must establish new host-side flows.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
   one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
   The default mode is read-only; `rw` must be explicit. The guest target must
@@ -115,9 +120,10 @@ as well as the generated CLI help (via `cargo run -- --help`).
 
   `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
   timeout and defaults to 5000. A request with no configured destination is
-  ignored and the guest continues. Capture currently requires microVM ABI v1,
-  one vCPU, KVM, MSHV, or WHP, shared file-backed RAM, and no virtio-blk
-  device. An attached virtio console saves accepted but undelivered input and the offset
+  ignored and the guest continues. Capture requires microVM ABI v1 or v2, one
+  vCPU, KVM, MSHV, or WHP, and shared file-backed RAM. ABI-v2 block media must
+  be cached regular raw files with nonzero 512-byte-aligned geometry. An
+  attached virtio console saves accepted but undelivered input and the offset
   of a partially forwarded guest transmit descriptor. An attached microVM
   virtio-net device saves its static identity, queue progress, drained packet
   ownership, endpoint generation, and policy requirement.
@@ -130,6 +136,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
     --kernel vmlinux --initrd initramfs.cpio.gz \
     --snapshot-destination snapshot
   ```
+
+  `/sbin/nvx-snapshot` requests a paired capture by default. When scratch is
+  mounted, it freezes the workload cgroup with a bounded wait, syncs, freezes
+  the scratch filesystem, and asks OpenVMM to drain queues and atomically
+  publish `scratch.img`. `/sbin/nvx-snapshot --fresh-scratch` is for a
+  pre-mount boundary and records that restore must supply a fresh scratch.
 * `--restore-snapshot <DIR>`: Restore a microVM from a committed snapshot.
   The manifest supplies the authoritative RAM size, one-vCPU topology, ABI,
   fixed device inventory, effective kernel command line, source backend, CPU
@@ -150,23 +162,43 @@ as well as the generated CLI help (via `cargo run -- --help`).
   argument must reproduce them while supplying a live host root with the same
   saved identity.
 
+  When the snapshot contains virtio-net, restore also requires
+  `--network-profile portable`; the snapshot's profile and canonical egress
+  policy must match the supplied portable configuration.
+
+  For ABI v2, restore repeats each read-only
+  `--microvm-sandbox-block` argument. Its role, access, geometry, and SHA-256
+  must match the manifest. A paired snapshot supplies scratch internally from
+  a verified process-private copy of `scratch.img`; passing another scratch is
+  rejected. A fresh-scratch snapshot instead requires a writable scratch
+  argument with matching geometry.
+
   ```bash
   openvmm --machine microvm --hypervisor kvm \
     --restore-snapshot snapshot --restore-entropy
   ```
+* `--restore-ready-path <PATH>`: Connect to an existing Unix domain socket on
+  Linux or a `//./pipe/...` named pipe on Windows and write exactly
+  `OPENVMM_RESTORE_READY_V1\n` once all restored state, required attachments,
+  and execution-owned workers are ready. The event is flushed before the
+  restored vCPU is released. It is valid only with `--restore-snapshot` and is
+  process-local; it is not saved in the snapshot. A connection, write, or
+  flush failure aborts startup and stops the VM. The peer must accept and read
+  the event while startup is in progress; Windows flush completion waits for
+  the named-pipe peer to consume the complete frame.
 * `--restore-entropy`: Make a fresh `OPENVMM_ENTROPY_V1` packet available on
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
 
-A committed snapshot contains exactly `manifest.bin`, `state.bin`, and
-`memory.bin`. Restore rejects unknown files, symlinks, malformed or oversized
-data, length mismatches, and incompatible machine contracts before starting a
-vCPU. `memory.bin` is opened through a private writable copy-on-write mapping,
-so the same snapshot can be restored repeatedly without modifying its
-artifacts.
+A committed snapshot contains `manifest.bin`, `state.bin`, `memory.bin`, and
+optionally the manifest-declared `scratch.img`. Restore rejects unknown files,
+symlinks, malformed or oversized data, length or scratch-digest mismatches, and
+incompatible machine contracts before starting a vCPU. `memory.bin` uses a
+private writable copy-on-write mapping and paired scratch is privately copied,
+so the same snapshot can be restored repeatedly without modifying artifacts.
 
-Version 3 does not embed or validate checksums for `state.bin` or `memory.bin`;
+Version 4 does not embed or validate checksums for `state.bin` or `memory.bin`;
 legacy version 2 checksum fields are accepted without re-hashing their
 payloads. This format does not detect same-length payload changes,
 authenticate, or encrypt a snapshot. Treat all three artifacts as sensitive

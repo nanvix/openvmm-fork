@@ -165,6 +165,16 @@ pub enum MicrovmSandboxBlockRole {
 }
 
 impl MicrovmSandboxBlockRole {
+    /// Returns the canonical manifest and CLI name of this role.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Distro => "distro",
+            Self::Runtime => "runtime",
+            Self::Custom => "custom",
+            Self::Scratch => "scratch",
+        }
+    }
+
     /// Returns the role's fixed ABI-v2 virtio-mmio address.
     pub const fn mmio_base(self) -> u64 {
         MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[self.index()]
@@ -195,6 +205,33 @@ impl MicrovmSandboxBlockRole {
     }
 }
 
+/// Returns the fixed ABI-v2 virtio-blk feature mask for a sandbox role.
+pub const fn microvm_sandbox_block_features(role: MicrovmSandboxBlockRole) -> u64 {
+    const RING_INDIRECT_DESC: u64 = 1 << 28;
+    const RING_EVENT_IDX: u64 = 1 << 29;
+    const VERSION_1: u64 = 1 << 32;
+    const ACCESS_PLATFORM: u64 = 1 << 33;
+    const BLK_SEG_MAX: u64 = 1 << 2;
+    const BLK_READ_ONLY: u64 = 1 << 5;
+    const BLK_SIZE: u64 = 1 << 6;
+    const BLK_FLUSH: u64 = 1 << 9;
+    const BLK_TOPOLOGY: u64 = 1 << 10;
+
+    RING_INDIRECT_DESC
+        | RING_EVENT_IDX
+        | VERSION_1
+        | ACCESS_PLATFORM
+        | BLK_SEG_MAX
+        | BLK_SIZE
+        | BLK_FLUSH
+        | BLK_TOPOLOGY
+        | if role.is_read_only() {
+            BLK_READ_ONLY
+        } else {
+            0
+        }
+}
+
 /// Returns the IRQs that must be described as level-triggered in a microVM
 /// ABI's x86 MADT.
 pub fn microvm_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static [u32]> {
@@ -217,11 +254,32 @@ pub struct MicrovmSandboxBlockConfig {
 /// Static guest-visible network identity for the microVM ABI-v1 NIC.
 #[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
 pub struct MicrovmNetworkConfig {
+    /// Required cross-platform host-network implementation contract.
+    pub profile: MicrovmNetworkProfile,
     pub guest_ipv4: std::net::Ipv4Addr,
     pub prefix_length: u8,
     pub derived_gateway_ipv4: std::net::Ipv4Addr,
     pub guest_mac: MacAddress,
     pub gateway_mac: MacAddress,
+}
+
+/// Required host-network implementation contract for a microVM NIC.
+///
+/// Profiles are explicit so snapshots never silently acquire different host
+/// networking semantics on another supported hypervisor.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmNetworkProfile {
+    /// User-mode Consomme NAT on every supported host backend.
+    Portable,
+}
+
+impl MicrovmNetworkProfile {
+    /// Returns the stable command-line and snapshot spelling of this profile.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+        }
+    }
 }
 
 /// Access policy for the microVM ABI-v1 host filesystem.
@@ -392,6 +450,7 @@ impl std::str::FromStr for MicrovmNetworkConfig {
         }
 
         Ok(Self {
+            profile: MicrovmNetworkProfile::Portable,
             guest_ipv4,
             prefix_length,
             derived_gateway_ipv4,
@@ -715,9 +774,8 @@ fn validate_microvm_command_line(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("microVM DNS bootstrap requires virtio-net"))?;
         anyhow::ensure!(
-            microvm_virtio_net_irq(hypervisor_id)? == MICROVM_VIRTIO_NET_WHP_IRQ
-                && **dns == format!("virtnet_dns={}", network.derived_gateway_ipv4),
-            "microVM DNS bootstrap does not match the WHP gateway"
+            **dns == format!("virtnet_dns={}", network.derived_gateway_ipv4),
+            "microVM DNS bootstrap does not match the portable gateway"
         );
     }
     let mut expected_discovery = Vec::new();
@@ -1406,6 +1464,13 @@ pub enum GicConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microvm_network_identity_has_portable_profile() {
+        let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        assert_eq!(network.profile, MicrovmNetworkProfile::Portable);
+        assert_eq!(network.profile.as_str(), "portable");
+    }
 
     #[test]
     fn microvm_v2_sandbox_block_slots_are_stable() {
