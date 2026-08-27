@@ -657,7 +657,7 @@ fn test_ttrpc_microvm_snapshot_restore(
                     &driver,
                     tempdir.path().join("interrupted-restore-ready.sock"),
                 )?;
-                let interrupted_portb_path = tempdir.path().join("interrupted-restore-portb.sock");
+                let interrupted_portb_path = tempdir.path().join("i-portb.sock");
                 client
                     .call()
                     .start(
@@ -721,7 +721,7 @@ fn test_ttrpc_microvm_snapshot_restore(
                     &driver,
                     tempdir.path().join("failed-restore-ready.sock"),
                 )?;
-                let failed_portb_path = tempdir.path().join("failed-restore-portb.sock");
+                let failed_portb_path = tempdir.path().join("f-portb.sock");
                 client
                     .call()
                     .start(
