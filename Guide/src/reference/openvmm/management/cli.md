@@ -158,23 +158,19 @@ as well as the generated CLI help (via `cargo run -- --help`).
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
-* `--unsafe-skip-snapshot-memory-verification`: Skip restore-time SHA-256
-  verification of `memory.bin`. This requires `--restore-snapshot` and is
-  intended only for benchmarking or snapshots whose memory backing is
-  independently trusted and immutable. Manifest validation, `state.bin`
-  SHA-256 verification, regular-file checks, and the exact `memory.bin` length
-  check remain enabled. The ttrpc restore API does not expose this bypass.
 
-  A committed snapshot contains exactly `manifest.bin`, `state.bin`, and
-  `memory.bin`. By default, restore rejects unknown files, symlinks, malformed
-  or oversized data, and length or SHA-256 mismatches before starting a vCPU.
-  `memory.bin` is opened through a private writable copy-on-write mapping, so
-  the same snapshot can be restored repeatedly without modifying its
-  artifacts.
+A committed snapshot contains exactly `manifest.bin`, `state.bin`, and
+`memory.bin`. Restore rejects unknown files, symlinks, malformed or oversized
+data, length mismatches, and incompatible machine contracts before starting a
+vCPU. `memory.bin` is opened through a private writable copy-on-write mapping,
+so the same snapshot can be restored repeatedly without modifying its
+artifacts.
 
-  Snapshot integrity checks detect accidental or untrusted modification, but
-  they do not authenticate or encrypt a snapshot. Treat all three artifacts as
-  sensitive guest state and protect the directory with host access controls.
+Version 3 does not embed or validate checksums for `state.bin` or `memory.bin`;
+legacy version 2 checksum fields are accepted without re-hashing their
+payloads. This format does not detect same-length payload changes,
+authenticate, or encrypt a snapshot. Treat all three artifacts as sensitive
+guest state and protect the directory with host access controls.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:

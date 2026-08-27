@@ -8,6 +8,7 @@ use petri::PetriHaltReason;
 use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
 use std::ffi::OsString;
+use std::hash::Hasher;
 use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -31,6 +32,30 @@ const MICROVM_BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
 const MICROVM_SHELL_PROMPT: &[u8] = b"/ # ";
 const PHASE_2_TIMEOUT: Duration = Duration::from_secs(60);
 const PHASE_3_TX_COUNT: usize = 10_000;
+
+fn snapshot_payload_fingerprint(snapshot_dir: &Path) -> anyhow::Result<(u64, u64)> {
+    fn file_fingerprint(path: &Path) -> anyhow::Result<u64> {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open snapshot payload {}", path.display()))?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read snapshot payload {}", path.display()))?;
+            if count == 0 {
+                break;
+            }
+            hasher.write(&buffer[..count]);
+        }
+        Ok(hasher.finish())
+    }
+
+    Ok((
+        file_fingerprint(&snapshot_dir.join("state.bin"))?,
+        file_fingerprint(&snapshot_dir.join("memory.bin"))?,
+    ))
+}
 
 fn microvm_hypervisor() -> anyhow::Result<&'static str> {
     if cfg!(windows) {
@@ -107,6 +132,26 @@ impl OpenvmmTestProcess {
         while let Ok(chunk) = self.output_recv.try_recv() {
             self.output.extend_from_slice(&chunk);
         }
+    }
+
+    fn failure_context(&mut self) -> String {
+        self.drain_output();
+        let (status, exited) = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => (format!("exited with {status}"), true),
+                Ok(None) => ("was still running".to_owned(), false),
+                Err(error) => (format!("status query failed: {error}"), false),
+            },
+            None => ("was already reaped".to_owned(), true),
+        };
+        if exited {
+            while let Ok(chunk) = self.output_recv.recv_timeout(Duration::from_millis(100)) {
+                self.output.extend_from_slice(&chunk);
+            }
+        } else {
+            self.drain_output();
+        }
+        format!("{status}; output: {}", output_tail(&self.output))
     }
 
     fn wait_for(&mut self, marker: &[u8]) -> anyhow::Result<()> {
@@ -453,6 +498,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
     const CONTINUED_MARKER: &[u8] = b"PHASE2-CONTINUED-ONCE";
     const NO_DESTINATION_MARKER: &[u8] = b"PHASE2-NO-DESTINATION-CONTINUED";
+    const TIMER_WAIT_PREFIX: &[u8] = b"PHASE2-TIMER-WAIT-";
 
     let (openvmm,) = artifacts;
     let kernel = config
@@ -536,7 +582,15 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         _ => unreachable!(),
     };
     let arm_timer = "sleep 5 & timer_pid=$!; sleep 1; ";
-    let complete_timer = "wait $timer_pid; echo PHASE2-TIMER-DONE; ";
+    let complete_timer = "\
+        wait $timer_pid; \
+        timer_wait_after=$(cut -d. -f1 /proc/uptime); \
+        echo PHASE2-CONTINUED-ONCE; \
+        echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
+        echo PHASE2-CPU-$((process_cpu_restored-process_cpu_before))-$((thread_cpu_restored-thread_cpu_before)); \
+        echo PHASE2-TIMER-WAIT-$((timer_wait_after-timer_wait_before)); \
+        echo PHASE2-TIMER-DONE; \
+        ";
     let capture_workload = [
         select_clocksource,
         validate_clocksource,
@@ -546,12 +600,10 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
          thread_cpu_before=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
          ",
         "nvx-snapshot; \
-         echo PHASE2-CONTINUED-ONCE; \
          wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
-         echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
          process_cpu_restored=$(awk '{print $14+$15}' /proc/$$/stat); \
          thread_cpu_restored=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
-         echo PHASE2-CPU-$((process_cpu_restored-process_cpu_before))-$((thread_cpu_restored-thread_cpu_before)); \
+         timer_wait_before=$(cut -d. -f1 /proc/uptime); \
          ",
         complete_timer,
         "\
@@ -586,13 +638,20 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         snapshot_dir.is_dir(),
         "snapshot directory was not published"
     );
-    openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-        .context("published snapshot failed verification")?;
+    let (manifest, _) = openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
+        .context("published snapshot failed structural validation")?;
+    anyhow::ensure!(
+        manifest.version == openvmm_helpers::snapshot::MANIFEST_VERSION
+            && manifest.state_sha256.is_empty()
+            && manifest.memory_sha256.is_empty(),
+        "new microVM snapshot contains legacy artifact digests"
+    );
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut rng_hashes = Vec::new();
     let mut restore_latencies = Vec::new();
     for restore_index in 0..2 {
-        thread::sleep(Duration::from_secs(3));
+        thread::sleep(Duration::from_secs(5));
         let mut restore_args = phase_2_args(hypervisor);
         restore_args.extend([
             "--restore-snapshot".into(),
@@ -603,9 +662,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
         restore.wait_for_output_line(CONTINUED_MARKER)?;
         restore_latencies.push(restore_started.elapsed());
-        let timer_wait_started = Instant::now();
         restore.wait_for_output_line(b"PHASE2-TIMER-DONE")?;
-        let timer_elapsed = timer_wait_started.elapsed();
         let (status, output) = restore.wait()?;
         anyhow::ensure!(
             status.code() == Some(37),
@@ -620,9 +677,14 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             count_output_lines(&output, b"PHASE2-TIMER-DONE") == 1,
             "restore {restore_index} did not complete the armed timer"
         );
+        let timer_wait = std::str::from_utf8(
+            output_line_value(&output, TIMER_WAIT_PREFIX)
+                .context("restored guest did not report its timer wait")?,
+        )?
+        .parse::<u64>()?;
         anyhow::ensure!(
-            timer_elapsed < Duration::from_millis(3500),
-            "restore {restore_index} did not shorten the armed timer by host downtime: {timer_elapsed:?}; output: {}",
+            timer_wait <= 1,
+            "restore {restore_index} did not shorten the armed timer by host downtime: guest waited {timer_wait}s; output: {}",
             output_tail(&output)
         );
         let downtime = std::str::from_utf8(
@@ -635,7 +697,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let wall_delta = wall_delta.parse::<u64>()?;
         let uptime_delta = uptime_delta.parse::<u64>()?;
         anyhow::ensure!(
-            wall_delta >= 3 && uptime_delta >= 3 && wall_delta.abs_diff(uptime_delta) <= 1,
+            wall_delta >= 4 && uptime_delta >= 4 && wall_delta.abs_diff(uptime_delta) <= 1,
             "restore {restore_index} clocks did not advance coherently: wall={wall_delta}s uptime={uptime_delta}s"
         );
         let cpu = std::str::from_utf8(
@@ -658,8 +720,10 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             "restore {restore_index} reported a malformed RNG digest"
         );
         rng_hashes.push(rng_hash.to_vec());
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("restore {restore_index} modified snapshot artifacts"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "restore {restore_index} modified snapshot payloads"
+        );
     }
     anyhow::ensure!(
         rng_hashes[0] != rng_hashes[1],
@@ -743,12 +807,13 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     } else {
         "echo PHASE3-RX-RESTORED;"
     };
+    // Avoid tty-special bytes so this checks queued binary RX, not line discipline.
     let receive = if hypervisor == "mshv" {
         "IFS= read -r phase3_rx; \
          [ \"$phase3_rx\" = PHASE3-RX ] || { nvx-exit 53; exit; };"
     } else {
         "phase3_rx=$(dd bs=1 count=5 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
-         [ \"$phase3_rx\" = 000d0a7fff ] || { nvx-exit 53; exit; };"
+         [ \"$phase3_rx\" = 0001027fff ] || { nvx-exit 53; exit; };"
     };
     source_console.send_line(&format!(
         "set -eu; \
@@ -757,12 +822,13 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
          [ -e /sys/class/tty/hvc1 ] || {{ nvx-exit 52; exit; }}; \
          stty -F /dev/hvc1 raw -echo; \
          printf '\\000\\015\\012\\177\\377PHASE3-BINARY\\n'; \
-         rm -f /tmp/phase3-tx-started /tmp/phase3-restored; \
-         (i=0; while [ $i -lt {tx_count} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; while [ ! -e /tmp/phase3-restored ]; do sleep 0.01; done; fi; done) & tx_pid=$!; \
+         rm -f /tmp/phase3-tx-started /tmp/phase3-resume; \
+         mkfifo /tmp/phase3-resume; \
+         (i=0; while [ $i -lt {tx_count} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; IFS= read -r phase3_resume < /tmp/phase3-resume; [ \"$phase3_resume\" = resume ]; fi; done) & tx_pid=$!; \
          while [ ! -e /tmp/phase3-tx-started ]; do sleep 0.01; done; \
          echo PHASE3-SNAPSHOT-NOW; sleep 1; nvx-snapshot; \
             {receive} \
-             touch /tmp/phase3-restored; \
+             printf 'resume\\n' > /tmp/phase3-resume; \
             {restored_marker} \
          {completion}"
     ))?;
@@ -770,7 +836,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     if hypervisor == "mshv" {
         source_console.send_bytes(b"PHASE3-RX\n")?;
     } else {
-        source_console.send_bytes(&[0, 13, 10, 127, 255])?;
+        source_console.send_bytes(&[0, 1, 2, 127, 255])?;
     }
     let (status, source_process_output) = source.wait()?;
     anyhow::ensure!(
@@ -792,6 +858,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     );
     anyhow::ensure!(snapshot_dir.is_dir(), "phase-3 snapshot was not published");
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     for restore_index in 0..2 {
         let mut restore_args = phase_2_args(hypervisor);
@@ -800,11 +867,21 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
             snapshot_dir.as_os_str().to_owned(),
             "--restore-entropy".into(),
         ]);
-        let restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
         let mut restore_console = TcpConsole::connect(address)?;
         if hypervisor != "mshv" {
-            restore_console.wait_for(RX_MARKER)?;
-            restore_console.wait_for(DONE_MARKER)?;
+            if let Err(error) = restore_console.wait_for(RX_MARKER) {
+                let process_context = restore.failure_context();
+                return Err(error).with_context(|| {
+                    format!("phase-3 restore {restore_index}: OpenVMM {process_context}")
+                });
+            }
+            if let Err(error) = restore_console.wait_for(DONE_MARKER) {
+                let process_context = restore.failure_context();
+                return Err(error).with_context(|| {
+                    format!("phase-3 restore {restore_index}: OpenVMM {process_context}")
+                });
+            }
         }
         let (status, process_output) = restore.wait()?;
         // On MSHV, exit 37 is the signal that the restored RX line was
@@ -836,8 +913,10 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
                 "phase-3 restore {restore_index} did not preserve queued RX exactly once"
             );
         }
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("phase-3 restore {restore_index} modified the snapshot"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-3 restore {restore_index} modified snapshot payloads"
+        );
     }
 
     Ok(())
@@ -936,6 +1015,7 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
         .recv_timeout(PHASE_2_TIMEOUT)
         .context("phase-4 pre-snapshot HTTP request was not observed")?;
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut missing_policy_args = phase_2_args(hypervisor);
     missing_policy_args.extend([
@@ -976,8 +1056,10 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
             .with_context(|| {
                 format!("phase-4 restore {restore_index} HTTP request was not observed")
             })?;
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("phase-4 restore {restore_index} modified the snapshot"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-4 restore {restore_index} modified snapshot payloads"
+        );
     }
     server
         .join()
@@ -1095,6 +1177,7 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         "phase-5 source completed a post-snapshot filesystem write"
     );
     openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut missing_mount_args = phase_2_args(hypervisor);
     missing_mount_args.extend([
@@ -1163,8 +1246,10 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
             "phase-5 restore {restore_index} exited with {status}: {}",
             output_tail(&output)
         );
-        openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)
-            .with_context(|| format!("phase-5 restore {restore_index} modified the snapshot"))?;
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-5 restore {restore_index} modified snapshot payloads"
+        );
     }
 
     Ok(())
