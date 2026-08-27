@@ -85,7 +85,9 @@ to an existing Unix domain socket on Linux or named pipe on Windows and writes
 `OPENVMM_RESTORE_READY_V1\n` after restore validation, attachment resolution,
 and state-unit startup, while restored vCPUs are still held. The event is
 single-use and is not serialized. Failure to write and flush it stops the
-started units and fails restore without releasing a vCPU.
+started units and fails restore without releasing a vCPU. The peer must accept
+and read while resume is in progress; on Windows, flush completion waits until
+the named-pipe peer consumes the complete frame.
 
 ```admonish warning
 Version 3 snapshots do not contain or validate embedded checksums for

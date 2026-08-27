@@ -169,7 +169,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   and execution-owned workers are ready. The event is flushed before the
   restored vCPU is released. It is valid only with `--restore-snapshot` and is
   process-local; it is not saved in the snapshot. A connection, write, or
-  flush failure aborts startup and stops the VM.
+  flush failure aborts startup and stops the VM. The peer must accept and read
+  the event while startup is in progress; Windows flush completion waits for
+  the named-pipe peer to consume the complete frame.
 * `--restore-entropy`: Make a fresh `OPENVMM_ENTROPY_V1` packet available on
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is

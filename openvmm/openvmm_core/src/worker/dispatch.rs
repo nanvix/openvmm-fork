@@ -3617,9 +3617,16 @@ impl LoadedVm {
             .await
             .context("VM state units failed to start")?;
         if let Some(mut sink) = self.restore_ready_sink.take() {
-            let signal_result = sink
-                .write_all(RESTORE_READY_EVENT_V1)
-                .and_then(|()| sink.flush());
+            let signal_result = sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
+                #[cfg(windows)]
+                {
+                    sink.sync_all()
+                }
+                #[cfg(not(windows))]
+                {
+                    sink.flush()
+                }
+            });
             if let Err(error) = signal_result {
                 self.state_units.stop().await;
                 return Err(error).context("failed to publish restore readiness event");

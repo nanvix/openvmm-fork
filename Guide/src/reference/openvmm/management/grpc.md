@@ -63,7 +63,9 @@ restore flow over both transports:
   `//./pipe/...` named pipe on Windows. `ResumeVM` writes and flushes exactly
   `OPENVMM_RESTORE_READY_V1\n` after all fatal restore startup work completes
   and before the restored vCPU is released. Signaling failure makes
-  `ResumeVM` fail and tears down the managed VM.
+  `ResumeVM` fail and tears down the managed VM. The peer must accept and read
+  concurrently with `ResumeVM`; Windows flush completion waits until the
+  complete frame has been consumed.
 
 On cold boot, `DevicesConfig.virtio_console` may configure one microVM Unix
 socket or named-pipe endpoint. Listener mode recreates the path on restore.

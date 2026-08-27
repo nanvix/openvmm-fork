@@ -803,14 +803,13 @@ fn test_ttrpc_microvm_snapshot_restore(
                 .map_err(|status| anyhow::anyhow!("restore CreateVM failed: {}", status.message))?;
             let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
             let (mut portb_read, _portb_write) = portb.split();
-            client
-                .call()
-                .start(vmservice::Vm::ResumeVm, ())
-                .await
+            let resume = client.call().start(vmservice::Vm::ResumeVm, ());
+            let readiness = restore_ready.read_all(&driver);
+            let (resume, readiness) = futures::join!(resume, readiness);
+            resume
                 .map_err(|status| anyhow::anyhow!("restore ResumeVM failed: {}", status.message))?;
             anyhow::ensure!(
-                restore_ready.read_all(&driver).await?
-                    == openvmm_defs::worker::RESTORE_READY_EVENT_V1,
+                readiness? == openvmm_defs::worker::RESTORE_READY_EVENT_V1,
                 "restore {restore_index} did not publish exactly one readiness event"
             );
             let mut output = Vec::new();
