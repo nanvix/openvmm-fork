@@ -653,6 +653,70 @@ fn test_ttrpc_microvm_snapshot_restore(
                     "attachment failure published a restore readiness event"
                 );
 
+                let interrupted_ready = RestoreReadyListener::bind(
+                    &driver,
+                    tempdir.path().join("interrupted-restore-ready.sock"),
+                )?;
+                let interrupted_portb_path = tempdir.path().join("interrupted-restore-portb.sock");
+                client
+                    .call()
+                    .start(
+                        vmservice::Vm::CreateVm,
+                        microvm_restore_request(
+                            &snapshot_path,
+                            &interrupted_portb_path,
+                            Some(interrupted_ready.path()),
+                        ),
+                    )
+                    .await
+                    .map_err(|status| {
+                        anyhow::anyhow!(
+                            "interrupted CreateVM failed unexpectedly: {}",
+                            status.message
+                        )
+                    })?;
+                let interrupted_portb =
+                    PolledSocket::new(&driver, UnixStream::connect(&interrupted_portb_path)?)?;
+                let (mut interrupted_portb_read, _interrupted_portb_write) =
+                    interrupted_portb.split();
+                client
+                    .call()
+                    .start(vmservice::Vm::TeardownVm, ())
+                    .await
+                    .map_err(|status| {
+                        anyhow::anyhow!("interrupted TeardownVM failed: {}", status.message)
+                    })?;
+                anyhow::ensure!(
+                    interrupted_ready.read_all(&driver).await?.is_empty(),
+                    "interrupted restore published a restore readiness event"
+                );
+                let mut interrupted_restore_output = Vec::new();
+                CancelContext::new()
+                    .with_timeout(Duration::from_secs(10))
+                    .until_cancelled(drain_until_closed(
+                        &mut interrupted_portb_read,
+                        &mut interrupted_restore_output,
+                    ))
+                    .await
+                    .context("timed out waiting for interrupted restore teardown")??;
+                anyhow::ensure!(
+                    interrupted_restore_output.is_empty(),
+                    "interrupted restored guest emitted output: {:?}",
+                    String::from_utf8_lossy(&interrupted_restore_output)
+                );
+                let properties = client
+                    .call()
+                    .start(
+                        vmservice::Vm::PropertiesVm,
+                        vmservice::PropertiesVmRequest { types: Vec::new() },
+                    )
+                    .await
+                    .map_err(|status| anyhow::anyhow!("PropertiesVM failed: {}", status.message))?;
+                anyhow::ensure!(
+                    properties.state == vmservice::VmState::Uninitialized as i32,
+                    "interrupted restore did not tear down the VM"
+                );
+
                 let failed_ready = RestoreReadyListener::bind(
                     &driver,
                     tempdir.path().join("failed-restore-ready.sock"),
