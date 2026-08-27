@@ -315,6 +315,11 @@ Examples:
     )]
     pub restore_snapshot: Option<PathBuf>,
 
+    /// Write OPENVMM_RESTORE_READY_V1 to this Unix socket or Windows named pipe
+    /// after restore startup completes and before guest execution begins.
+    #[clap(long, value_name = "PATH", requires = "restore_snapshot")]
+    pub restore_ready_path: Option<PathBuf>,
+
     /// Expose a fresh OPENVMM_ENTROPY_V1 packet through the private portb restore channel.
     #[clap(long, requires = "restore_snapshot")]
     pub restore_entropy: bool,

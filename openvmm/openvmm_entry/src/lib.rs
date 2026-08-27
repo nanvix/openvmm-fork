@@ -4709,6 +4709,12 @@ async fn run_control_inner(
                     .transpose()?;
                 (shared_memory, None, false, None)
             };
+        let restore_ready_sink = opt
+            .restore_ready_path
+            .as_deref()
+            .map(serial_io::connect_restore_ready_sink)
+            .transpose()
+            .context("failed to connect restore readiness endpoint")?;
 
         let params = VmWorkerParameters {
             hypervisor,
@@ -4724,6 +4730,7 @@ async fn run_control_inner(
                 .as_ref()
                 .and_then(|(_, _, frequency, _)| *frequency),
             restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
+            restore_ready_sink,
             rpc: rpc_recv,
             notify: notify_send,
         };
@@ -4739,7 +4746,7 @@ async fn run_control_inner(
 
     if !opt.paused {
         anyhow::ensure!(
-            vm_rpc.call(VmRpc::Resume, ()).await?,
+            vm_rpc.call_failable(VmRpc::Resume, ()).await?,
             "VM failed to start; inspect the worker log for the device startup error"
         );
     }

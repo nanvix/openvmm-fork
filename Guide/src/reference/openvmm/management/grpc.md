@@ -59,6 +59,11 @@ restore flow over both transports:
   client requires the matching path configuration.
 * `restore_entropy` requests fresh entropy and is valid only with
 	`restore_path`.
+* `restore_ready_path` names an existing Unix domain socket on Linux or a
+  `//./pipe/...` named pipe on Windows. `ResumeVM` writes and flushes exactly
+  `OPENVMM_RESTORE_READY_V1\n` after all fatal restore startup work completes
+  and before the restored vCPU is released. Signaling failure makes
+  `ResumeVM` fail and tears down the managed VM.
 
 On cold boot, `DevicesConfig.virtio_console` may configure one microVM Unix
 socket or named-pipe endpoint. Listener mode recreates the path on restore.
@@ -78,6 +83,9 @@ Capture and restore paths are mutually exclusive. A successful capture halts
 the managed source VM at the committed boundary and terminates the OpenVMM
 source process; clients observe the transport closing. Restore creates a private
 copy-on-write RAM view and leaves the VM paused until `ResumeVM`.
+The readiness endpoint is a process-local orchestration attachment and is not
+part of saved state. Each successful restore publishes one event; validation,
+attachment, or worker-start failure publishes none.
 
 The API has the same KVM/WHP backend, no-block device, artifact integrity, and
 security restrictions documented under [`--snapshot-destination`].

@@ -47,6 +47,7 @@ impl Worker {
             restore_tsc_frequency_hz: None,
             restore_apic_frequency_hz: None,
             restore_cpu_contract: None,
+            restore_ready_sink: None,
             rpc: rpc_recv,
             notify: notify_send,
         };
@@ -65,8 +66,8 @@ impl Worker {
         self.rpc.call(VmRpc::Pause, ()).await
     }
 
-    pub(crate) async fn resume(&self) -> Result<bool, RpcError> {
-        self.rpc.call(VmRpc::Resume, ()).await
+    pub(crate) async fn resume(&self) -> anyhow::Result<bool> {
+        Ok(self.rpc.call_failable(VmRpc::Resume, ()).await?)
     }
 
     pub(crate) async fn save(&self) -> anyhow::Result<mesh::payload::message::ProtobufMessage> {

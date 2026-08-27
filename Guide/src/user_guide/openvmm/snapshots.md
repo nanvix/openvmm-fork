@@ -80,6 +80,13 @@ directory, so `file=...` should not be specified in `--memory` (the two options
 are mutually exclusive). Guest writes use a private copy-on-write mapping and
 do not modify the snapshot artifact.
 
+MicroVM orchestrators can add `--restore-ready-path <PATH>`. OpenVMM connects
+to an existing Unix domain socket on Linux or named pipe on Windows and writes
+`OPENVMM_RESTORE_READY_V1\n` after restore validation, attachment resolution,
+and state-unit startup, while restored vCPUs are still held. The event is
+single-use and is not serialized. Failure to write and flush it stops the
+started units and fails restore without releasing a vCPU.
+
 ```admonish warning
 Version 3 snapshots do not contain or validate embedded checksums for
 `state.bin` or `memory.bin`. Restore still requires regular files, bounded

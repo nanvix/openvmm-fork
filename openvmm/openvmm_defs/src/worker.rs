@@ -24,6 +24,9 @@ pub type SharedMemoryFd = std::os::windows::io::OwnedHandle;
 
 pub const VM_WORKER: WorkerId<VmWorkerParameters> = WorkerId::new("VmWorker");
 
+/// Complete event written before a restored VM can execute.
+pub const RESTORE_READY_EVENT_V1: &[u8] = b"OPENVMM_RESTORE_READY_V1\n";
+
 /// Complete saved state consumed by the VM worker.
 #[derive(Protobuf, SavedStateRoot)]
 #[mesh(package = "openvmm")]
@@ -62,6 +65,8 @@ pub struct VmWorkerParameters {
     pub restore_apic_frequency_hz: Option<u64>,
     /// Saved canonical CPU contract required by restore.
     pub restore_cpu_contract: Option<Vec<u8>>,
+    /// Single-use process-local sink for the restore readiness event.
+    pub restore_ready_sink: Option<std::fs::File>,
     /// The VM RPC channel.
     pub rpc: mesh::Receiver<VmRpc>,
     /// The notification channel.

@@ -163,6 +163,13 @@ as well as the generated CLI help (via `cargo run -- --help`).
   openvmm --machine microvm --hypervisor kvm \
     --restore-snapshot snapshot --restore-entropy
   ```
+* `--restore-ready-path <PATH>`: Connect to an existing Unix domain socket on
+  Linux or a `//./pipe/...` named pipe on Windows and write exactly
+  `OPENVMM_RESTORE_READY_V1\n` once all restored state, required attachments,
+  and execution-owned workers are ready. The event is flushed before the
+  restored vCPU is released. It is valid only with `--restore-snapshot` and is
+  process-local; it is not saved in the snapshot. A connection, write, or
+  flush failure aborts startup and stops the VM.
 * `--restore-entropy`: Make a fresh `OPENVMM_ENTROPY_V1` packet available on
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
