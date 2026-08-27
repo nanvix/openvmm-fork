@@ -34,7 +34,7 @@ const MICROVM_SHELL_PROMPT: &[u8] = b"/ # ";
 const PHASE_2_TIMEOUT: Duration = Duration::from_secs(60);
 const PHASE_3_TX_COUNT: usize = 10_000;
 
-fn snapshot_payload_fingerprint(snapshot_dir: &Path) -> anyhow::Result<(u64, u64)> {
+fn snapshot_payload_fingerprint(snapshot_dir: &Path) -> anyhow::Result<(u64, u64, Option<u64>)> {
     fn file_fingerprint(path: &Path) -> anyhow::Result<u64> {
         let mut file = std::fs::File::open(path)
             .with_context(|| format!("failed to open snapshot payload {}", path.display()))?;
@@ -55,6 +55,13 @@ fn snapshot_payload_fingerprint(snapshot_dir: &Path) -> anyhow::Result<(u64, u64
     Ok((
         file_fingerprint(&snapshot_dir.join("state.bin"))?,
         file_fingerprint(&snapshot_dir.join("memory.bin"))?,
+        snapshot_dir
+            .join(openvmm_helpers::snapshot::SCRATCH_FILE_NAME)
+            .is_file()
+            .then(|| {
+                file_fingerprint(&snapshot_dir.join(openvmm_helpers::snapshot::SCRATCH_FILE_NAME))
+            })
+            .transpose()?,
     ))
 }
 
@@ -584,7 +591,14 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         "mshv" => ("", ""),
         _ => unreachable!(),
     };
-    let arm_timer = "sleep 5 & timer_pid=$!; sleep 1; ";
+    // Measure a separate sleeping task so command processing by this shell is
+    // not mistaken for CPU time accumulated during snapshot downtime.
+    let arm_timer = "\
+        sleep 3600 & p=$!; \
+        sleep 5 & timer_pid=$!; \
+        sleep 1; \
+        [ -r /proc/$p/stat ] || { nvx-exit 47; exit; }; \
+        ";
     let complete_timer = "\
         wait $timer_pid; \
         timer_wait_after=$(cut -d. -f1 /proc/uptime); \
@@ -596,34 +610,40 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         ";
     let capture_workload = [
         select_clocksource,
+        "\n",
         validate_clocksource,
+        "\n",
         arm_timer,
+        "\n",
         "wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
-         process_cpu_before=$(awk '{print $14+$15}' /proc/$$/stat); \
-         thread_cpu_before=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
-         ",
-        "nvx-snapshot; \
-         wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
-         process_cpu_restored=$(awk '{print $14+$15}' /proc/$$/stat); \
-         thread_cpu_restored=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
-         timer_wait_before=$(cut -d. -f1 /proc/uptime); \
-         ",
+         process_cpu_before=$(awk '{print $14+$15}' /proc/$p/stat); \
+         thread_cpu_before=$(awk '{print $14+$15}' /proc/$p/task/$p/stat)\n",
+        "nvx-snapshot\n",
+        "wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
+         process_cpu_restored=$(awk '{print $14+$15}' /proc/$p/stat); \
+         thread_cpu_restored=$(awk '{print $14+$15}' /proc/$p/task/$p/stat); \
+         kill $p; \
+         timer_wait_before=$(cut -d. -f1 /proc/uptime)\n",
         complete_timer,
-        "\
-         printf '\\245' | dd of=/dev/port bs=1 seek=234 count=1 conv=notrunc 2>/dev/null; \
-         rm -f /tmp/phase2-entropy-packet /tmp/entropy; i=0; \
-         while [ $i -lt 83 ]; do \
+        "\n",
+        "printf '\\245' | dd of=/dev/port bs=1 seek=234 count=1 conv=notrunc 2>/dev/null\n",
+        "rm -f /tmp/phase2-entropy-packet /tmp/entropy; i=0\n",
+        "while [ $i -lt 83 ]; do \
              dd if=/dev/port bs=1 skip=233 count=1 2>/dev/null >> /tmp/phase2-entropy-packet; \
              i=$((i+1)); \
-         done; \
-         head -c 18 /tmp/phase2-entropy-packet | grep -q OPENVMM_ENTROPY_V1 || { nvx-exit 44; exit; }; \
-         tail -c 64 /tmp/phase2-entropy-packet > /tmp/entropy; \
-         /openvmm-reseed || { nvx-exit 45; exit; }; \
-         rng=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1); echo PHASE2-RNG-$rng; \
-            dd if=/dev/zero of=/tmp/phase2-dirty bs=1M count=32 2>/dev/null; nvx-exit 37",
-        ]
-        .concat();
+         done\n",
+        "head -c 18 /tmp/phase2-entropy-packet | grep -q OPENVMM_ENTROPY_V1 \
+             || { nvx-exit 44; exit; }\n",
+        "tail -c 64 /tmp/phase2-entropy-packet > /tmp/entropy\n",
+        "/openvmm-reseed || { nvx-exit 45; exit; }\n",
+        "rng=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1); echo PHASE2-RNG-$rng\n",
+        "dd if=/dev/zero of=/tmp/phase2-dirty bs=1M count=32 2>/dev/null; nvx-exit 37\n",
+    ]
+    .concat();
+    source.send_line("cat >/tmp/phase2-workload <<'PHASE2_WORKLOAD'")?;
     source.send_line(&capture_workload)?;
+    source.send_line("PHASE2_WORKLOAD")?;
+    source.send_line("sh /tmp/phase2-workload")?;
     source.wait_for(MICROVM_BOOT_MARKER)?;
     source.wait_for(MICROVM_SHELL_PROMPT)?;
     let cold_start = cold_start_started.elapsed();
@@ -716,8 +736,8 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let process_cpu_delta = process_cpu_delta.parse::<u64>()?;
         let thread_cpu_delta = thread_cpu_delta.parse::<u64>()?;
         anyhow::ensure!(
-            process_cpu_delta <= 2 && thread_cpu_delta <= 2,
-            "restore {restore_index} CPU clocks advanced during downtime: process={process_cpu_delta} ticks thread={thread_cpu_delta} ticks"
+            process_cpu_delta == 0 && thread_cpu_delta == 0,
+            "restore {restore_index} sleeping-task CPU clocks advanced during downtime: process={process_cpu_delta} ticks thread={thread_cpu_delta} ticks"
         );
         let rng_hash = output_line_value(&output, b"PHASE2-RNG-")
             .context("restored guest did not report an RNG digest")?;
@@ -1316,6 +1336,371 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
             "phase-5 restore {restore_index} modified snapshot payloads"
         );
     }
+
+    Ok(())
+}
+
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
+async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const LAYER_BYTES: usize = 1024 * 1024;
+    const SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+    const POST_OUT_MARKER: &[u8] = b"MICROVM-V2-SCRATCH-POST-OUT";
+    const RESTORED_MARKER: &[u8] = b"MICROVM-V2-SCRATCH-RESTORED";
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("ABI-v2 snapshot test requires direct-boot Linux artifacts")?;
+    let hypervisor = microvm_hypervisor()?;
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-microvm-v2-snapshot-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create ABI-v2 snapshot test directory")?;
+    let snapshot_dir = temp_dir.path().join("snapshot");
+    let layer_path = temp_dir.path().join("distro.erofs");
+    let wrong_layer_path = temp_dir.path().join("wrong-distro.erofs");
+    let scratch_path = temp_dir.path().join("source-scratch.raw");
+    std::fs::write(&layer_path, vec![0x3c; LAYER_BYTES])?;
+    std::fs::write(&wrong_layer_path, vec![0xc3; LAYER_BYTES])?;
+    std::fs::write(&scratch_path, vec![0xa5; SCRATCH_BYTES])?;
+
+    let block_arg = |role: &str, path: &Path, read_only: bool| -> OsString {
+        format!(
+            "{role}:file:{}{}",
+            path.display(),
+            if read_only { ",ro" } else { "" }
+        )
+        .into()
+    };
+    let mut capture_args = [
+        "--single-process",
+        "--machine",
+        "microvm-v2",
+        "--hypervisor",
+        hypervisor,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--microvm-sandbox-block".into(),
+        block_arg("distro", &layer_path, true),
+        "--microvm-sandbox-block".into(),
+        format!("scratch:delay:250:file:{}", scratch_path.display()).into(),
+    ]);
+
+    let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.wait_for(MICROVM_SHELL_PROMPT)?;
+    source.send_line(
+        "set -eu; \
+         tries=0; while { [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; } && [ $tries -lt 600 ]; do sleep 0.05; tries=$((tries+1)); done; \
+         [ \"$(cat /sys/block/vda/ro)\" = 1 ] || { nvx-exit 60; exit; }; \
+         [ \"$(cat /sys/block/vdb/ro)\" = 0 ] || { nvx-exit 61; exit; }; \
+         dd if=/dev/zero of=/dev/vdb bs=512 count=1 conv=notrunc 2>/dev/null & writer=$!; \
+         tries=0; while [ $tries -lt 2000 ]; do set -- $(cat /sys/block/vdb/inflight); [ $(($1+$2)) -gt 0 ] && break; kill -0 $writer 2>/dev/null || break; tries=$((tries+1)); done; \
+         [ $tries -lt 2000 ] && kill -0 $writer 2>/dev/null || { nvx-exit 62; exit; }; \
+         printf '\\001' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
+         echo MICROVM-V2-SCRATCH-POST-OUT; \
+         wait $writer; \
+         first_byte=$(dd if=/dev/vdb bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
+         [ \"$first_byte\" = 0 ] || { nvx-exit 63; exit; }; \
+         echo MICROVM-V2-SCRATCH-RESTORED; \
+         printf PRIVATE-RESTORE-MUTATION | dd of=/dev/vdb bs=512 count=1 conv=sync,notrunc 2>/dev/null; \
+         sync; nvx-exit 37",
+    )?;
+    let (status, output) = source.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "ABI-v2 snapshot source exited with {status}; output: {}",
+        output_tail(&output)
+    );
+    anyhow::ensure!(
+        count_output_lines(&output, POST_OUT_MARKER) == 0
+            && count_output_lines(&output, RESTORED_MARKER) == 0,
+        "ABI-v2 source continued past its snapshot boundary"
+    );
+
+    let (manifest, _) = openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let contract = manifest
+        .machine_contract
+        .as_ref()
+        .context("ABI-v2 snapshot is missing its machine contract")?;
+    anyhow::ensure!(
+        contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2
+            && contract.microvm_sandbox_blocks.last().is_some_and(|block| {
+                block.role == "scratch"
+                    && block.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME
+            }),
+        "ABI-v2 snapshot did not publish a paired scratch contract"
+    );
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
+
+    let restore_args = |layer: &Path| {
+        let mut args = [
+            "--single-process",
+            "--machine",
+            "microvm-v2",
+            "--hypervisor",
+            hypervisor,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--restore-entropy".into(),
+            "--microvm-sandbox-block".into(),
+            block_arg("distro", layer, true),
+        ]);
+        args
+    };
+    for restore_index in 0..2 {
+        let restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args(&layer_path))?;
+        let (status, output) = restore.wait()?;
+        anyhow::ensure!(
+            status.code() == Some(37),
+            "ABI-v2 restore {restore_index} exited with {status}; output: {}",
+            output_tail(&output)
+        );
+        anyhow::ensure!(
+            count_output_lines(&output, POST_OUT_MARKER) == 1
+                && count_output_lines(&output, RESTORED_MARKER) == 1,
+            "ABI-v2 restore {restore_index} did not observe one coherent scratch outcome"
+        );
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "ABI-v2 restore {restore_index} modified snapshot artifacts"
+        );
+    }
+
+    let rejected_restore = |description: &str, layer: &Path| -> anyhow::Result<()> {
+        let restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args(layer))?;
+        let (status, output) = restore.wait()?;
+        anyhow::ensure!(
+            !status.success()
+                && count_output_lines(&output, POST_OUT_MARKER) == 0
+                && count_output_lines(&output, RESTORED_MARKER) == 0,
+            "{description} unexpectedly entered the guest; status={status}; output: {}",
+            output_tail(&output)
+        );
+        Ok(())
+    };
+    rejected_restore("mismatched read-only layer", &wrong_layer_path)?;
+
+    let published_scratch = snapshot_dir.join(openvmm_helpers::snapshot::SCRATCH_FILE_NAME);
+    let scratch_bytes = std::fs::read(&published_scratch)?;
+    std::fs::remove_file(&published_scratch)?;
+    rejected_restore("missing paired scratch", &layer_path)?;
+    std::fs::write(&published_scratch, &scratch_bytes)?;
+
+    let mut corrupt = scratch_bytes.clone();
+    corrupt[0] ^= 0xff;
+    std::fs::write(&published_scratch, &corrupt)?;
+    rejected_restore("corrupt paired scratch", &layer_path)?;
+    std::fs::write(&published_scratch, &scratch_bytes)?;
+
+    let scratch_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&published_scratch)?;
+    scratch_file.set_len((SCRATCH_BYTES - 512) as u64)?;
+    drop(scratch_file);
+    rejected_restore("truncated paired scratch", &layer_path)?;
+    std::fs::write(&published_scratch, &scratch_bytes)?;
+
+    Ok(())
+}
+
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
+async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const DISK_BYTES: usize = 1024 * 1024;
+    const POST_OUT_MARKER: &[u8] = b"MICROVM-V2-FRESH-POST-OUT";
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("ABI-v2 fresh-scratch test requires direct-boot Linux artifacts")?;
+    let hypervisor = microvm_hypervisor()?;
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-microvm-v2-fresh-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create fresh-scratch test directory")?;
+    let snapshot_dir = temp_dir.path().join("snapshot");
+    let layer_path = temp_dir.path().join("distro.erofs");
+    let capture_scratch_path = temp_dir.path().join("capture-scratch.raw");
+    std::fs::write(&layer_path, vec![0x3c; DISK_BYTES])?;
+    std::fs::write(&capture_scratch_path, vec![0xa5; DISK_BYTES])?;
+
+    let block_arg = |role: &str, path: &Path, read_only: bool| -> OsString {
+        format!(
+            "{role}:file:{}{}",
+            path.display(),
+            if read_only { ",ro" } else { "" }
+        )
+        .into()
+    };
+    let base_args = || {
+        [
+            "--single-process",
+            "--machine",
+            "microvm-v2",
+            "--hypervisor",
+            hypervisor,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>()
+    };
+    let mut capture_args = base_args();
+    capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--microvm-sandbox-block".into(),
+        block_arg("distro", &layer_path, true),
+        "--microvm-sandbox-block".into(),
+        block_arg("scratch", &capture_scratch_path, false),
+    ]);
+
+    let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.wait_for(MICROVM_SHELL_PROMPT)?;
+    source.send_line(
+        "set -eu; \
+         tries=0; while [ ! -b /dev/vdb ] && [ $tries -lt 600 ]; do sleep 0.05; tries=$((tries+1)); done; \
+         printf '\\000' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
+         echo MICROVM-V2-FRESH-POST-OUT; \
+         blockdev --flushbufs /dev/vdb; \
+         value=$(dd if=/dev/vdb bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
+         echo MICROVM-V2-FRESH-SCRATCH-$value; nvx-exit 37",
+    )?;
+    let (status, output) = source.wait()?;
+    anyhow::ensure!(
+        status.success()
+            && count_output_lines(&output, POST_OUT_MARKER) == 0
+            && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
+        "fresh-scratch source crossed its capture boundary: {}",
+        output_tail(&output)
+    );
+
+    let (manifest, _) = openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let scratch = manifest
+        .machine_contract
+        .as_ref()
+        .and_then(|contract| contract.microvm_sandbox_blocks.last())
+        .context("fresh-scratch snapshot is missing its scratch contract")?;
+    anyhow::ensure!(
+        scratch.role == "scratch"
+            && scratch.identity_kind == "fresh"
+            && scratch.identity.is_empty()
+            && scratch.artifact.is_empty()
+            && !snapshot_dir
+                .join(openvmm_helpers::snapshot::SCRATCH_FILE_NAME)
+                .exists(),
+        "fresh-scratch snapshot unexpectedly contains paired state"
+    );
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
+
+    let restore_args = |scratch_path: Option<&Path>| {
+        let mut args = base_args();
+        args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--restore-entropy".into(),
+            "--microvm-sandbox-block".into(),
+            block_arg("distro", &layer_path, true),
+        ]);
+        if let Some(scratch_path) = scratch_path {
+            args.extend([
+                "--microvm-sandbox-block".into(),
+                block_arg("scratch", scratch_path, false),
+            ]);
+        }
+        args
+    };
+    for (restore_index, value) in [17_u8, 34].into_iter().enumerate() {
+        let scratch_path = temp_dir
+            .path()
+            .join(format!("fresh-scratch-{restore_index}.raw"));
+        std::fs::write(&scratch_path, vec![value; DISK_BYTES])?;
+        let restore =
+            OpenvmmTestProcess::launch(openvmm.get(), &restore_args(Some(&scratch_path)))?;
+        let (status, output) = restore.wait()?;
+        let marker = format!("MICROVM-V2-FRESH-SCRATCH-{value}");
+        anyhow::ensure!(
+            status.code() == Some(37)
+                && count_output_lines(&output, POST_OUT_MARKER) == 1
+                && count_output_lines(&output, marker.as_bytes()) == 1,
+            "fresh-scratch restore {restore_index} did not use its new scratch; status={status}; output: {}",
+            output_tail(&output)
+        );
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "fresh-scratch restore {restore_index} modified snapshot artifacts"
+        );
+    }
+
+    let missing = OpenvmmTestProcess::launch(openvmm.get(), &restore_args(None))?;
+    let (status, output) = missing.wait()?;
+    anyhow::ensure!(
+        !status.success()
+            && count_output_lines(&output, POST_OUT_MARKER) == 0
+            && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
+        "fresh-scratch restore without scratch entered the guest"
+    );
+
+    let wrong_geometry = temp_dir.path().join("wrong-geometry.raw");
+    std::fs::write(&wrong_geometry, vec![0_u8; DISK_BYTES / 2])?;
+    let wrong = OpenvmmTestProcess::launch(openvmm.get(), &restore_args(Some(&wrong_geometry)))?;
+    let (status, output) = wrong.wait()?;
+    anyhow::ensure!(
+        !status.success()
+            && count_output_lines(&output, POST_OUT_MARKER) == 0
+            && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
+        "fresh-scratch restore with wrong geometry entered the guest"
+    );
 
     Ok(())
 }

@@ -23,6 +23,10 @@ use pal_async::process::PolledChild;
 use pal_async::socket::PolledSocket;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+#[cfg(windows)]
+use pal_async::windows::pipe::ListeningPipe;
+#[cfg(windows)]
+use pal_async::windows::pipe::NamedPipeServer;
 use petri::ResolvedArtifact;
 use petri::pipette::cmd;
 use petri_artifacts_vmm_test::artifacts;
@@ -30,6 +34,7 @@ use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use unix_socket::UnixListener;
@@ -85,7 +90,97 @@ fn microvm_portb_config(path: &Path) -> vmservice::SerialConfig {
     }
 }
 
-fn microvm_restore_request(snapshot_path: &Path, portb_path: &Path) -> vmservice::CreateVmRequest {
+#[cfg(unix)]
+struct RestoreReadyListener {
+    path: PathBuf,
+    listener: UnixListener,
+}
+
+#[cfg(windows)]
+struct RestoreReadyListener {
+    path: PathBuf,
+    _server: NamedPipeServer,
+    listener: ListeningPipe,
+}
+
+#[cfg(unix)]
+impl RestoreReadyListener {
+    fn bind(_driver: &DefaultDriver, path: PathBuf) -> anyhow::Result<Self> {
+        let listener = UnixListener::bind(&path)?;
+        Ok(Self { path, listener })
+    }
+
+    async fn read_all(self, driver: &DefaultDriver) -> anyhow::Result<Vec<u8>> {
+        let mut listener = PolledSocket::new(driver, self.listener)?;
+        let (connection, _) = listener.accept().await?;
+        let mut connection = PolledSocket::new(driver, connection)?;
+        let mut bytes = Vec::new();
+        connection.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+
+    async fn reject(self, driver: &DefaultDriver) -> anyhow::Result<()> {
+        let mut listener = PolledSocket::new(driver, self.listener)?;
+        let (connection, _) = listener.accept().await?;
+        connection.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl RestoreReadyListener {
+    fn bind(driver: &DefaultDriver, _path: PathBuf) -> anyhow::Result<Self> {
+        let path = PathBuf::from(format!(
+            "//./pipe/openvmm-restore-ready-{}-{}",
+            std::process::id(),
+            Guid::new_random()
+        ));
+        let server = NamedPipeServer::create(&path)?;
+        let listener = server.accept(driver)?;
+        Ok(Self {
+            path,
+            _server: server,
+            listener,
+        })
+    }
+
+    async fn read_all(self, driver: &DefaultDriver) -> anyhow::Result<Vec<u8>> {
+        let connection = self.listener.await?;
+        let mut connection = PolledPipe::new(driver, connection)?;
+        let mut bytes = Vec::new();
+        connection.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+
+    async fn reject(self, _driver: &DefaultDriver) -> anyhow::Result<()> {
+        drop(self.listener.await?);
+        Ok(())
+    }
+}
+
+impl RestoreReadyListener {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn expect_no_connection(self, driver: &DefaultDriver) -> anyhow::Result<()> {
+        let result = CancelContext::new()
+            .with_timeout(Duration::from_millis(250))
+            .until_cancelled(self.read_all(driver))
+            .await;
+        anyhow::ensure!(
+            result.is_err(),
+            "failed restore connected its readiness sink"
+        );
+        Ok(())
+    }
+}
+
+fn microvm_restore_request(
+    snapshot_path: &Path,
+    portb_path: &Path,
+    restore_ready_path: Option<&Path>,
+) -> vmservice::CreateVmRequest {
     vmservice::CreateVmRequest {
         config: Some(vmservice::VmConfig {
             serial_config: Some(microvm_portb_config(portb_path)),
@@ -96,6 +191,9 @@ fn microvm_restore_request(snapshot_path: &Path, portb_path: &Path) -> vmservice
         microvm_snapshot: Some(vmservice::MicrovmSnapshotConfig {
             restore_path: snapshot_path.to_string_lossy().into_owned(),
             restore_entropy: true,
+            restore_ready_path: restore_ready_path
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             ..Default::default()
         }),
     }
@@ -389,14 +487,20 @@ fn test_ttrpc_microvm_snapshot_restore(
                 let state_path = snapshot_path.join("state.bin");
                 let state_bytes = std::fs::read(&state_path)?;
                 let mut corrupt_state = state_bytes.clone();
-                corrupt_state[0] ^= 0xff;
+                corrupt_state.pop();
                 std::fs::write(&state_path, &corrupt_state)?;
-                expect_create_vm_error(
-                    &client,
-                    attachment_free_restore_request(&snapshot_path),
-                    "digest mismatch",
-                )
-                .await?;
+                let malformed_ready = RestoreReadyListener::bind(
+                    &driver,
+                    tempdir.path().join("malformed-restore-ready.sock"),
+                )?;
+                let mut malformed_request = attachment_free_restore_request(&snapshot_path);
+                malformed_request
+                    .microvm_snapshot
+                    .as_mut()
+                    .unwrap()
+                    .restore_ready_path = malformed_ready.path().to_string_lossy().into_owned();
+                expect_create_vm_error(&client, malformed_request, "state.bin size").await?;
+                malformed_ready.expect_no_connection(&driver).await?;
                 std::fs::write(&state_path, &state_bytes)?;
 
                 std::fs::write(snapshot_path.join("unexpected.bin"), b"unexpected")?;
@@ -453,12 +557,27 @@ fn test_ttrpc_microvm_snapshot_restore(
                 cpu_contract.physical_address_width ^= 1;
                 contract.set_cpu_compatibility_contract(mesh::payload::encode(cpu_contract));
                 std::fs::write(&manifest_path, mesh::payload::encode(wrong_cpu))?;
+                let worker_failure_ready = RestoreReadyListener::bind(
+                    &driver,
+                    tempdir.path().join("worker-failure-restore-ready.sock"),
+                )?;
+                let mut wrong_cpu_request = attachment_free_restore_request(&snapshot_path);
+                wrong_cpu_request
+                    .microvm_snapshot
+                    .as_mut()
+                    .unwrap()
+                    .restore_ready_path =
+                    worker_failure_ready.path().to_string_lossy().into_owned();
                 expect_create_vm_error(
                     &client,
-                    attachment_free_restore_request(&snapshot_path),
+                    wrong_cpu_request,
                     "destination CPU contract does not match",
                 )
                 .await?;
+                anyhow::ensure!(
+                    worker_failure_ready.read_all(&driver).await?.is_empty(),
+                    "worker startup failure published a restore readiness event"
+                );
                 std::fs::write(&manifest_path, &manifest_bytes)?;
 
                 let mut wrong_tsc = manifest.clone();
@@ -492,7 +611,7 @@ fn test_ttrpc_microvm_snapshot_restore(
                 .await?;
                 std::fs::write(&manifest_path, &manifest_bytes)?;
 
-                let mut conflicting = microvm_restore_request(&snapshot_path, &portb_path);
+                let mut conflicting = microvm_restore_request(&snapshot_path, &portb_path, None);
                 conflicting.config.as_mut().unwrap().memory_config =
                     Some(vmservice::MemoryConfig {
                         memory_mb: 64,
@@ -510,23 +629,189 @@ fn test_ttrpc_microvm_snapshot_restore(
                     "unexpected restore override error: {}",
                     error.message
                 );
+
+                let attachment_failure_ready = RestoreReadyListener::bind(
+                    &driver,
+                    tempdir.path().join("attachment-failure-restore-ready.sock"),
+                )?;
+                let missing_portb_path = tempdir
+                    .path()
+                    .join("missing-attachment-parent")
+                    .join("portb.sock");
+                expect_create_vm_error(
+                    &client,
+                    microvm_restore_request(
+                        &snapshot_path,
+                        &missing_portb_path,
+                        Some(attachment_failure_ready.path()),
+                    ),
+                    "failed to bind serial socket",
+                )
+                .await?;
+                anyhow::ensure!(
+                    attachment_failure_ready.read_all(&driver).await?.is_empty(),
+                    "attachment failure published a restore readiness event"
+                );
+
+                let interrupted_ready = RestoreReadyListener::bind(
+                    &driver,
+                    tempdir.path().join("interrupted-restore-ready.sock"),
+                )?;
+                let interrupted_portb_path = tempdir.path().join("i-portb.sock");
+                client
+                    .call()
+                    .start(
+                        vmservice::Vm::CreateVm,
+                        microvm_restore_request(
+                            &snapshot_path,
+                            &interrupted_portb_path,
+                            Some(interrupted_ready.path()),
+                        ),
+                    )
+                    .await
+                    .map_err(|status| {
+                        anyhow::anyhow!(
+                            "interrupted CreateVM failed unexpectedly: {}",
+                            status.message
+                        )
+                    })?;
+                let interrupted_portb =
+                    PolledSocket::new(&driver, UnixStream::connect(&interrupted_portb_path)?)?;
+                let (mut interrupted_portb_read, _interrupted_portb_write) =
+                    interrupted_portb.split();
+                client
+                    .call()
+                    .start(vmservice::Vm::TeardownVm, ())
+                    .await
+                    .map_err(|status| {
+                        anyhow::anyhow!("interrupted TeardownVM failed: {}", status.message)
+                    })?;
+                anyhow::ensure!(
+                    interrupted_ready.read_all(&driver).await?.is_empty(),
+                    "interrupted restore published a restore readiness event"
+                );
+                let mut interrupted_restore_output = Vec::new();
+                CancelContext::new()
+                    .with_timeout(Duration::from_secs(10))
+                    .until_cancelled(drain_until_closed(
+                        &mut interrupted_portb_read,
+                        &mut interrupted_restore_output,
+                    ))
+                    .await
+                    .context("timed out waiting for interrupted restore teardown")??;
+                anyhow::ensure!(
+                    interrupted_restore_output.is_empty(),
+                    "interrupted restored guest emitted output: {:?}",
+                    String::from_utf8_lossy(&interrupted_restore_output)
+                );
+                let properties = client
+                    .call()
+                    .start(
+                        vmservice::Vm::PropertiesVm,
+                        vmservice::PropertiesVmRequest { types: Vec::new() },
+                    )
+                    .await
+                    .map_err(|status| anyhow::anyhow!("PropertiesVM failed: {}", status.message))?;
+                anyhow::ensure!(
+                    properties.state == vmservice::VmState::Uninitialized as i32,
+                    "interrupted restore did not tear down the VM"
+                );
+
+                let failed_ready = RestoreReadyListener::bind(
+                    &driver,
+                    tempdir.path().join("failed-restore-ready.sock"),
+                )?;
+                let failed_portb_path = tempdir.path().join("f-portb.sock");
+                client
+                    .call()
+                    .start(
+                        vmservice::Vm::CreateVm,
+                        microvm_restore_request(
+                            &snapshot_path,
+                            &failed_portb_path,
+                            Some(failed_ready.path()),
+                        ),
+                    )
+                    .await
+                    .map_err(|status| {
+                        anyhow::anyhow!(
+                            "readiness-failure CreateVM failed unexpectedly: {}",
+                            status.message
+                        )
+                    })?;
+                let failed_portb =
+                    PolledSocket::new(&driver, UnixStream::connect(&failed_portb_path)?)?;
+                let (mut failed_portb_read, _failed_portb_write) = failed_portb.split();
+                failed_ready.reject(&driver).await?;
+                let error = client
+                    .call()
+                    .start(vmservice::Vm::ResumeVm, ())
+                    .await
+                    .expect_err("restore resumed after readiness transport failure");
+                anyhow::ensure!(
+                    error
+                        .message
+                        .contains("failed to publish restore readiness event"),
+                    "unexpected readiness transport error: {}",
+                    error.message
+                );
+                let mut failed_restore_output = Vec::new();
+                CancelContext::new()
+                    .with_timeout(Duration::from_secs(10))
+                    .until_cancelled(drain_until_closed(
+                        &mut failed_portb_read,
+                        &mut failed_restore_output,
+                    ))
+                    .await
+                    .context("timed out waiting for failed restore teardown")??;
+                anyhow::ensure!(
+                    failed_restore_output.is_empty(),
+                    "restored guest emitted output before readiness: {:?}",
+                    String::from_utf8_lossy(&failed_restore_output)
+                );
+                let properties = client
+                    .call()
+                    .start(
+                        vmservice::Vm::PropertiesVm,
+                        vmservice::PropertiesVmRequest { types: Vec::new() },
+                    )
+                    .await
+                    .map_err(|status| anyhow::anyhow!("PropertiesVM failed: {}", status.message))?;
+                anyhow::ensure!(
+                    properties.state == vmservice::VmState::Uninitialized as i32,
+                    "readiness transport failure did not tear down the VM"
+                );
             }
 
+            let restore_ready = RestoreReadyListener::bind(
+                &driver,
+                tempdir
+                    .path()
+                    .join(format!("restore-{restore_index}-ready.sock")),
+            )?;
             client
                 .call()
                 .start(
                     vmservice::Vm::CreateVm,
-                    microvm_restore_request(&snapshot_path, &portb_path),
+                    microvm_restore_request(
+                        &snapshot_path,
+                        &portb_path,
+                        Some(restore_ready.path()),
+                    ),
                 )
                 .await
                 .map_err(|status| anyhow::anyhow!("restore CreateVM failed: {}", status.message))?;
             let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
             let (mut portb_read, _portb_write) = portb.split();
-            client
-                .call()
-                .start(vmservice::Vm::ResumeVm, ())
-                .await
+            let resume = client.call().start(vmservice::Vm::ResumeVm, ());
+            let readiness = restore_ready.read_all(&driver);
+            let (resume, readiness) = futures::join!(resume, readiness);
+            resume
                 .map_err(|status| anyhow::anyhow!("restore ResumeVM failed: {}", status.message))?;
+            anyhow::ensure!(
+                readiness? == openvmm_defs::worker::RESTORE_READY_EVENT_V1,
+                "restore {restore_index} did not publish exactly one readiness event"
+            );
             let mut output = Vec::new();
             wait_for_bytes(&mut portb_read, &mut output, RESTORE_MARKER).await?;
             CancelContext::new()

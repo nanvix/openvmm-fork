@@ -130,12 +130,14 @@ pub struct VmController {
     pub(crate) processors: u32,
     pub(crate) log_file: Option<PathBuf>,
     pub(crate) crash_dump_path: Option<PathBuf>,
-    pub(crate) snapshot_requests: Option<mesh::Receiver<()>>,
+    pub(crate) snapshot_requests:
+        Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
     pub(crate) snapshot_destination: Option<PathBuf>,
     pub(crate) snapshot_quiesce_timeout: std::time::Duration,
     pub(crate) source_hypervisor: String,
     pub(crate) effective_command_line: Option<String>,
-    pub(crate) has_microvm_block: bool,
+    pub(crate) microvm_sandbox_block_sources:
+        Vec<crate::storage_builder::MicrovmSandboxBlockSource>,
     pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
     pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
@@ -144,6 +146,7 @@ pub struct VmController {
     pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
+    pub(crate) _private_scratch_dir: Option<tempfile::TempDir>,
     pub(crate) guest_power_actions: GuestPowerActions,
 }
 
@@ -207,7 +210,7 @@ impl VmController {
             Worker(WorkerEvent),
             VncWorker(WorkerEvent),
             Halt(HaltReason),
-            SnapshotRequest,
+            SnapshotRequest(chipset_resources::microvm::MicrovmSnapshotScratchPolicy),
         }
 
         let mut quit = false;
@@ -231,7 +234,7 @@ impl VmController {
                 let halt = (&mut notify_recv).map(Event::Halt);
                 let snapshot_request = futures::stream::iter(self.snapshot_requests.as_mut())
                     .flatten()
-                    .map(|()| Event::SnapshotRequest);
+                    .map(Event::SnapshotRequest);
 
                 (rpc.into_stream(), vm, vnc, halt, snapshot_request)
                     .merge()
@@ -359,8 +362,8 @@ impl VmController {
                         }
                     }
                 }
-                Event::SnapshotRequest => {
-                    let action = self.handle_guest_snapshot_request().await;
+                Event::SnapshotRequest(scratch_policy) => {
+                    let action = self.handle_guest_snapshot_request(scratch_policy).await;
                     if let GuestSnapshotAction::Terminate { exit_code } = action {
                         event_send.send(VmControllerEvent::ExitRequested { code: exit_code });
                         break;
@@ -565,7 +568,10 @@ impl VmController {
         Ok(())
     }
 
-    async fn handle_guest_snapshot_request(&mut self) -> GuestSnapshotAction {
+    async fn handle_guest_snapshot_request(
+        &mut self,
+        scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
+    ) -> GuestSnapshotAction {
         let Some(destination) = self.snapshot_destination.clone() else {
             tracelimit::warn_ratelimited!(
                 "ignoring microVM snapshot request because no destination is configured"
@@ -577,18 +583,32 @@ impl VmController {
             anyhow::ensure!(
                 matches!(
                     self.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1 }
+                    MachineProfile::Microvm { abi_version: 1 | 2 }
                 ),
-                "guest-requested snapshot capture requires microVM ABI version 1"
+                "guest-requested snapshot capture requires microVM ABI version 1 or 2"
             );
             anyhow::ensure!(
                 matches!(self.source_hypervisor.as_str(), "kvm" | "mshv" | "whp"),
                 "microVM snapshot source backend must be KVM, MSHV, or WHP"
             );
-            anyhow::ensure!(
-                !self.has_microvm_block,
-                "microVM snapshot capture with virtio-blk requires immutable media identity"
-            );
+            match self.machine_profile {
+                MachineProfile::Microvm { abi_version: 1 } => anyhow::ensure!(
+                    self.microvm_sandbox_block_sources.is_empty(),
+                    "microVM ABI version 1 snapshot cannot contain sandbox blocks"
+                ),
+                MachineProfile::Microvm { abi_version: 2 } => anyhow::ensure!(
+                    self.microvm_sandbox_block_sources.len() >= 2
+                        && self
+                            .microvm_sandbox_block_sources
+                            .last()
+                            .is_some_and(|source| {
+                                source.role
+                                    == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                            }),
+                    "microVM ABI version 2 snapshot requires at least one lower layer and scratch"
+                ),
+                _ => unreachable!(),
+            }
             anyhow::ensure!(
                 fs_err::symlink_metadata(&destination)
                     .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
@@ -667,25 +687,54 @@ impl VmController {
         };
 
         let result = (|| -> anyhow::Result<()> {
-            let machine_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
-                &self.source_hypervisor,
-                command_line,
-                self.microvm_network
-                    .as_ref()
-                    .zip(self.microvm_egress_policy.as_ref())
-                    .zip(self.microvm_network_attachment.clone())
-                    .map(|((network, policy), attachment)| (network, policy, attachment)),
-                self.microvm_filesystem
-                    .as_ref()
-                    .zip(self.microvm_filesystem_attachment.clone()),
-                self.microvm_console_attachment.clone(),
-                self.memory,
-                response.state_unit_names,
-                response.capture_wall_clock,
-                response.tsc_frequency_hz,
-                Some(response.apic_frequency_hz),
-                response.cpu_contract,
-            )?;
+            let network = self
+                .microvm_network
+                .as_ref()
+                .zip(self.microvm_egress_policy.as_ref())
+                .zip(self.microvm_network_attachment.clone())
+                .map(|((network, policy), attachment)| (network, policy, attachment));
+            let filesystem = self
+                .microvm_filesystem
+                .as_ref()
+                .zip(self.microvm_filesystem_attachment.clone());
+            let machine_contract = match self.machine_profile {
+                MachineProfile::Microvm { abi_version: 1 } => {
+                    openvmm_helpers::snapshot::microvm_v1_machine_contract(
+                        &self.source_hypervisor,
+                        command_line,
+                        network,
+                        filesystem,
+                        self.microvm_console_attachment.clone(),
+                        self.memory,
+                        response.state_unit_names,
+                        response.capture_wall_clock,
+                        response.tsc_frequency_hz,
+                        Some(response.apic_frequency_hz),
+                        response.cpu_contract,
+                    )?
+                }
+                MachineProfile::Microvm { abi_version: 2 } => {
+                    let blocks = crate::storage_builder::snapshot_block_contract(
+                        &self.microvm_sandbox_block_sources,
+                        scratch_policy,
+                    )?;
+                    openvmm_helpers::snapshot::microvm_v2_machine_contract(
+                        &self.source_hypervisor,
+                        command_line,
+                        network,
+                        filesystem,
+                        self.microvm_console_attachment.clone(),
+                        blocks,
+                        self.memory,
+                        response.state_unit_names,
+                        response.capture_wall_clock,
+                        response.tsc_frequency_hz,
+                        Some(response.apic_frequency_hz),
+                        response.cpu_contract,
+                    )?
+                }
+                _ => unreachable!(),
+            };
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
                 version: openvmm_helpers::snapshot::MANIFEST_VERSION,
                 created_at: std::time::SystemTime::now().into(),
@@ -710,11 +759,27 @@ impl VmController {
             memory_file
                 .sync_all()
                 .context("failed to flush snapshot RAM handle")?;
-            openvmm_helpers::snapshot::write_snapshot_from_memory_file(
+            let scratch_file = (matches!(
+                self.machine_profile,
+                MachineProfile::Microvm { abi_version: 2 }
+            ) && scratch_policy
+                == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
+                .then(|| {
+                    self.microvm_sandbox_block_sources
+                        .iter()
+                        .find(|source| {
+                            source.role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                        })
+                        .map(|source| &source.file)
+                        .context("paired snapshot lost its scratch backing handle")
+                })
+                .transpose()?;
+            openvmm_helpers::snapshot::write_snapshot_from_memory_and_scratch_files(
                 &destination,
                 &manifest,
                 &saved_state_bytes,
                 memory_file,
+                scratch_file,
             )
             .map_err(anyhow::Error::new)
         })();

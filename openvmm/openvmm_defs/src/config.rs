@@ -165,6 +165,16 @@ pub enum MicrovmSandboxBlockRole {
 }
 
 impl MicrovmSandboxBlockRole {
+    /// Returns the canonical manifest and CLI name of this role.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Distro => "distro",
+            Self::Runtime => "runtime",
+            Self::Custom => "custom",
+            Self::Scratch => "scratch",
+        }
+    }
+
     /// Returns the role's fixed ABI-v2 virtio-mmio address.
     pub const fn mmio_base(self) -> u64 {
         MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[self.index()]
@@ -193,6 +203,33 @@ impl MicrovmSandboxBlockRole {
             Self::Scratch => 3,
         }
     }
+}
+
+/// Returns the fixed ABI-v2 virtio-blk feature mask for a sandbox role.
+pub const fn microvm_sandbox_block_features(role: MicrovmSandboxBlockRole) -> u64 {
+    const RING_INDIRECT_DESC: u64 = 1 << 28;
+    const RING_EVENT_IDX: u64 = 1 << 29;
+    const VERSION_1: u64 = 1 << 32;
+    const ACCESS_PLATFORM: u64 = 1 << 33;
+    const BLK_SEG_MAX: u64 = 1 << 2;
+    const BLK_READ_ONLY: u64 = 1 << 5;
+    const BLK_SIZE: u64 = 1 << 6;
+    const BLK_FLUSH: u64 = 1 << 9;
+    const BLK_TOPOLOGY: u64 = 1 << 10;
+
+    RING_INDIRECT_DESC
+        | RING_EVENT_IDX
+        | VERSION_1
+        | ACCESS_PLATFORM
+        | BLK_SEG_MAX
+        | BLK_SIZE
+        | BLK_FLUSH
+        | BLK_TOPOLOGY
+        | if role.is_read_only() {
+            BLK_READ_ONLY
+        } else {
+            0
+        }
 }
 
 /// Returns the IRQs that must be described as level-triggered in a microVM

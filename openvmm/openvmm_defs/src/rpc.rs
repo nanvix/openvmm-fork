@@ -27,7 +27,7 @@ pub enum VmRpc {
     ResumeAfterFailedSnapshot(FailableRpc<Duration, ()>),
     /// Release a post-OUT boundary without starting a snapshot transaction.
     ReleaseSnapshotBoundary(FailableRpc<(), ()>),
-    Resume(Rpc<(), bool>),
+    Resume(FailableRpc<(), bool>),
     Pause(Rpc<(), bool>),
     ClearHalt(Rpc<(), bool>),
     Reset(FailableRpc<(), ()>),
