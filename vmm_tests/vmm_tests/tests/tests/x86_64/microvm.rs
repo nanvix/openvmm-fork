@@ -584,7 +584,14 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         "mshv" => ("", ""),
         _ => unreachable!(),
     };
-    let arm_timer = "sleep 5 & timer_pid=$!; sleep 1; ";
+    // Measure a separate sleeping task so command processing by this shell is
+    // not mistaken for CPU time accumulated during snapshot downtime.
+    let arm_timer = "\
+        sleep 3600 & p=$!; \
+        sleep 5 & timer_pid=$!; \
+        sleep 1; \
+        [ -r /proc/$p/stat ] || { nvx-exit 47; exit; }; \
+        ";
     let complete_timer = "\
         wait $timer_pid; \
         timer_wait_after=$(cut -d. -f1 /proc/uptime); \
@@ -596,34 +603,40 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         ";
     let capture_workload = [
         select_clocksource,
+        "\n",
         validate_clocksource,
+        "\n",
         arm_timer,
+        "\n",
         "wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
-         process_cpu_before=$(awk '{print $14+$15}' /proc/$$/stat); \
-         thread_cpu_before=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
-         ",
-        "nvx-snapshot; \
-         wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
-         process_cpu_restored=$(awk '{print $14+$15}' /proc/$$/stat); \
-         thread_cpu_restored=$(awk '{print $14+$15}' /proc/$$/task/$$/stat); \
-         timer_wait_before=$(cut -d. -f1 /proc/uptime); \
-         ",
+         process_cpu_before=$(awk '{print $14+$15}' /proc/$p/stat); \
+         thread_cpu_before=$(awk '{print $14+$15}' /proc/$p/task/$p/stat)\n",
+        "nvx-snapshot\n",
+        "wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
+         process_cpu_restored=$(awk '{print $14+$15}' /proc/$p/stat); \
+         thread_cpu_restored=$(awk '{print $14+$15}' /proc/$p/task/$p/stat); \
+         kill $p; \
+         timer_wait_before=$(cut -d. -f1 /proc/uptime)\n",
         complete_timer,
-        "\
-         printf '\\245' | dd of=/dev/port bs=1 seek=234 count=1 conv=notrunc 2>/dev/null; \
-         rm -f /tmp/phase2-entropy-packet /tmp/entropy; i=0; \
-         while [ $i -lt 83 ]; do \
+        "\n",
+        "printf '\\245' | dd of=/dev/port bs=1 seek=234 count=1 conv=notrunc 2>/dev/null\n",
+        "rm -f /tmp/phase2-entropy-packet /tmp/entropy; i=0\n",
+        "while [ $i -lt 83 ]; do \
              dd if=/dev/port bs=1 skip=233 count=1 2>/dev/null >> /tmp/phase2-entropy-packet; \
              i=$((i+1)); \
-         done; \
-         head -c 18 /tmp/phase2-entropy-packet | grep -q OPENVMM_ENTROPY_V1 || { nvx-exit 44; exit; }; \
-         tail -c 64 /tmp/phase2-entropy-packet > /tmp/entropy; \
-         /openvmm-reseed || { nvx-exit 45; exit; }; \
-         rng=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1); echo PHASE2-RNG-$rng; \
-            dd if=/dev/zero of=/tmp/phase2-dirty bs=1M count=32 2>/dev/null; nvx-exit 37",
-        ]
-        .concat();
+         done\n",
+        "head -c 18 /tmp/phase2-entropy-packet | grep -q OPENVMM_ENTROPY_V1 \
+             || { nvx-exit 44; exit; }\n",
+        "tail -c 64 /tmp/phase2-entropy-packet > /tmp/entropy\n",
+        "/openvmm-reseed || { nvx-exit 45; exit; }\n",
+        "rng=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1); echo PHASE2-RNG-$rng\n",
+        "dd if=/dev/zero of=/tmp/phase2-dirty bs=1M count=32 2>/dev/null; nvx-exit 37\n",
+    ]
+    .concat();
+    source.send_line("cat >/tmp/phase2-workload <<'PHASE2_WORKLOAD'")?;
     source.send_line(&capture_workload)?;
+    source.send_line("PHASE2_WORKLOAD")?;
+    source.send_line("sh /tmp/phase2-workload")?;
     source.wait_for(MICROVM_BOOT_MARKER)?;
     source.wait_for(MICROVM_SHELL_PROMPT)?;
     let cold_start = cold_start_started.elapsed();
@@ -716,8 +729,8 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         let process_cpu_delta = process_cpu_delta.parse::<u64>()?;
         let thread_cpu_delta = thread_cpu_delta.parse::<u64>()?;
         anyhow::ensure!(
-            process_cpu_delta <= 2 && thread_cpu_delta <= 2,
-            "restore {restore_index} CPU clocks advanced during downtime: process={process_cpu_delta} ticks thread={thread_cpu_delta} ticks"
+            process_cpu_delta == 0 && thread_cpu_delta == 0,
+            "restore {restore_index} sleeping-task CPU clocks advanced during downtime: process={process_cpu_delta} ticks thread={thread_cpu_delta} ticks"
         );
         let rng_hash = output_line_value(&output, b"PHASE2-RNG-")
             .context("restored guest did not report an RNG digest")?;
