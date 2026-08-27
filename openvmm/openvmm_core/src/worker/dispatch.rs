@@ -768,7 +768,7 @@ pub(crate) struct LoadedVm {
     restore_ready_sink: Option<File>,
     snapshot_boundary_requests:
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
-    snapshot_ready: Option<mesh::Sender<()>>,
+    snapshot_ready: Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
     snapshot_stop_guard: Option<vmm_core::partition_unit::StopGuard>,
     snapshot_transaction_complete: Option<Rpc<(), ()>>,
     snapshot_capture_wall_clock: Option<mesh::payload::Timestamp>,
@@ -2942,6 +2942,21 @@ impl InitializedVm {
                         let disabled_features = match id.as_str() {
                             "virtio-net" => !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES,
                             "virtiofs" => !openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES,
+                            "virtio-blk"
+                                if matches!(
+                                    cfg.machine_profile,
+                                    MachineProfile::Microvm {
+                                        abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
+                                    }
+                                ) =>
+                            {
+                                let block = cfg
+                                    .microvm_sandbox_blocks
+                                    .iter()
+                                    .find(|block| block.role.mmio_base() == start)
+                                    .context("microVM ABI version 2 block slot has no role")?;
+                                !openvmm_defs::config::microvm_sandbox_block_features(block.role)
+                            }
                             _ => 1 << 34,
                         };
                         (start, len, irq, disabled_features)
@@ -3699,7 +3714,7 @@ impl LoadedVm {
                 self.snapshot_transaction_complete = Some(request.transaction_complete);
                 self.snapshot_capture_wall_clock = Some(std::time::SystemTime::now().into());
                 self.snapshot_input_gate_timeout = Some(request.input_gate_timeout);
-                snapshot_ready.send(());
+                snapshot_ready.send(request.scratch_policy);
                 true
             }
             Err(error) => {

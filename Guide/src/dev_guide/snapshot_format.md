@@ -5,13 +5,15 @@ for developers working on the save/restore subsystem.
 
 ## Directory layout
 
-A snapshot is stored as a directory containing three files:
+A snapshot is stored as a directory containing three required files and, for
+an ABI-v2 mounted-scratch capture, one paired scratch image:
 
 ```text
 snapshot-dir/
 ├── manifest.bin   # Protobuf-encoded SnapshotManifest
 ├── state.bin      # Protobuf-encoded device saved state
-└── memory.bin     # Hard link to the guest memory backing file
+├── memory.bin     # Exact copy of the opened guest-memory handle
+└── scratch.img    # Optional paired ABI-v2 writable scratch image
 ```
 
 ## Manifest format
@@ -21,17 +23,19 @@ The manifest is a protobuf message defined as
 in `openvmm/openvmm_helpers/src/snapshot.rs`, encoded using the `mesh`
 crate's protobuf encoding.
 
-New snapshots use manifest version 3. The legacy `state_sha256` and
+New snapshots use manifest version 4. The legacy `state_sha256` and
 `memory_sha256` protobuf tags remain reserved so version 2 manifests can be
-decoded, but version 3 requires both fields to be absent. Restore accepts
-well-formed version 2 digest fields for compatibility without computing or
-validating SHA-256 over either payload.
+decoded; versions 3 and 4 require both fields to be absent. Restore accepts
+versions 2 and 3 for compatibility. ABI-v2 snapshots require version 4.
 
 The default format is a local machine-state contract, not an authenticated
-container. Both versions receive the same regular-file, no-follow/no-reparse,
+container. All versions receive the same regular-file, no-follow/no-reparse,
 bounded decoding, exact-length, inventory, and machine-contract validation,
-but same-length payload changes are not detected. Export or transport layers
-must provide integrity and authentication outside this format.
+but same-length changes to `state.bin` or `memory.bin` are not detected.
+Version 4 records the SHA-256 and exact length of `scratch.img`, because guest
+RAM and a mounted writable filesystem must be restored as one exact pair.
+Export or transport layers must provide broader integrity and authentication
+outside this format.
 
 ## Device state (`state.bin`)
 
@@ -46,6 +50,18 @@ default values, forward/backward compatibility) apply.
 RAM. Capture uses that handle rather than reopening its pathname, so replacing
 the source path cannot substitute different bytes during publication. The
 copy is flushed in the private staging directory before publication.
+
+## Scratch (`scratch.img`)
+
+The ABI-v2 block contract records every fixed role, access mode, geometry, and
+immutable read-only layer digest. A paired capture copies the exact opened
+writable scratch handle into the same staging directory after device queues
+drain, verifies its SHA-256, and publishes it atomically with VM state. Restore
+verifies the artifact before worker construction and makes a private copy for
+each process, so repeated restores cannot mutate the snapshot.
+
+A pre-mount capture instead records the `fresh` scratch policy and geometry,
+contains no `scratch.img`, and requires a new matching scratch file on restore.
 
 ## Code references
 

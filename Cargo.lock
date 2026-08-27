@@ -5847,6 +5847,7 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
+ "libc",
  "memory_range",
  "mesh",
  "mesh_process",
@@ -9802,6 +9803,7 @@ name = "virtio_blk"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "disk_backend",
  "disklayer_ram",

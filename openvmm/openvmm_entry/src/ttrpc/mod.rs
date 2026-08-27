@@ -942,6 +942,8 @@ impl VmService {
                         .attachments
                         .iter()
                         .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
+                    MICROVM_ABI_VERSION_1,
+                    Vec::new(),
                 )),
             )?;
             let restore_time =
@@ -1817,10 +1819,6 @@ impl VmService {
             LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
             _ => None,
         };
-        let has_microvm_block = config
-            .virtio_devices
-            .iter()
-            .any(|(_, device)| device.id() == "virtio-blk");
         let microvm_filesystem = config.microvm_filesystem.clone();
         if let Some(root_path) = microvm_filesystem_root_path.as_deref() {
             crate::validate_microvm_filesystem_private_storage(
@@ -1953,7 +1951,7 @@ impl VmService {
             snapshot_quiesce_timeout,
             source_hypervisor,
             effective_command_line,
-            has_microvm_block,
+            microvm_sandbox_block_sources: Vec::new(),
             microvm_console_attachment,
             microvm_network: None,
             microvm_network_attachment: None,
@@ -1962,6 +1960,7 @@ impl VmService {
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
             snapshot_memory_file,
+            _private_scratch_dir: None,
             guest_power_actions,
         };
 

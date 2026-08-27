@@ -1553,17 +1553,11 @@ impl Options {
                 "microVM snapshot quiesce timeout must be nonzero"
             );
             anyhow::ensure!(
-                abi_version == MICROVM_ABI_VERSION_1
-                    && self.virtio_blk.is_empty()
-                    && self.microvm_sandbox_block.is_empty(),
-                "microVM snapshot capture with virtio-blk is unavailable until immutable media identity is implemented"
+                abi_version != MICROVM_ABI_VERSION_1 || self.virtio_blk.is_empty(),
+                "microVM ABI version 1 snapshot capture with virtio-blk requires immutable media identity"
             );
         }
         if self.restore_snapshot.is_some() {
-            anyhow::ensure!(
-                abi_version == MICROVM_ABI_VERSION_1,
-                "microVM ABI version 2 snapshot restore is not implemented"
-            );
             anyhow::ensure!(
                 self.net.is_empty(),
                 "microVM restore takes network addressing from saved state; do not pass --net"
@@ -1697,7 +1691,7 @@ impl Options {
                     );
                 }
             }
-            if !self.microvm_sandbox_block.is_empty() {
+            if !self.microvm_sandbox_block.is_empty() && self.restore_snapshot.is_none() {
                 anyhow::ensure!(
                     self.microvm_sandbox_block
                         .last()
@@ -2292,6 +2286,13 @@ impl FromStr for DiskCliKind {
                     Self::parse_autocache(arg, std::env::var("OPENVMM_AUTO_CACHE_PATH"))?
                 }
                 "prwrap" => DiskCliKind::PersistentReservationsWrapper(Box::new(arg.parse()?)),
+                "delay" => {
+                    let (delay_ms, kind) = arg.split_once(':').context("expected delay_ms:kind")?;
+                    DiskCliKind::DelayDiskWrapper {
+                        delay_ms: delay_ms.parse().context("invalid disk delay")?,
+                        disk: Box::new(kind.parse()?),
+                    }
+                }
                 "file" => {
                     let FileOpts {
                         path,

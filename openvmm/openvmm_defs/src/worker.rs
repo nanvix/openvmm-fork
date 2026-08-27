@@ -56,7 +56,8 @@ pub struct VmWorkerParameters {
     pub snapshot_boundary_requests:
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     /// Notifies the controller after the worker establishes the boundary.
-    pub snapshot_ready: Option<mesh::Sender<()>>,
+    pub snapshot_ready:
+        Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
     /// Host downtime to apply before starting a restored VM.
     pub restore_downtime: Option<std::time::Duration>,
     /// Saved effective TSC frequency required by restore.

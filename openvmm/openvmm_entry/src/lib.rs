@@ -205,6 +205,7 @@ struct VmResources {
     microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
     microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_filesystem_root_path: Option<PathBuf>,
+    microvm_sandbox_block_sources: Vec<storage_builder::MicrovmSandboxBlockSource>,
     /// Receives dirty rectangles from the synthetic video device for the VNC worker.
     dirty_rect_recv: Option<mesh::Receiver<Vec<video_core::DirtyRect>>>,
     #[cfg(windows)]
@@ -2057,7 +2058,12 @@ async fn vm_config_from_command_line(
             "--microvm-sandbox-block accepts only a plain VTL0 disk backend"
         );
         storage
-            .add_microvm_sandbox_block(block.role, &disk.kind, disk.read_only)
+            .add_microvm_sandbox_block(
+                block.role,
+                &disk.kind,
+                disk.read_only,
+                opt.snapshot_destination.is_some() || opt.restore_snapshot.is_some(),
+            )
             .await?;
     }
 
@@ -4164,16 +4170,41 @@ fn prepare_snapshot_restore(
         &openvmm_helpers::snapshot::SnapshotAttachment,
     )>,
     console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
+    sandbox_block_sources: &[storage_builder::MicrovmSandboxBlockSource],
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
     mesh::payload::message::ProtobufMessage,
     Option<(Duration, u64, Option<u64>, Vec<u8>)>,
 )> {
-    let expected_microvm_contract = if opt.machine == MachineProfileCli::Microvm {
-        anyhow::ensure!(
-            opt.virtio_blk.is_empty(),
-            "microVM snapshot restore with virtio-blk requires immutable media identity"
-        );
+    let expected_microvm_contract = if matches!(
+        opt.machine,
+        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+    ) {
+        let abi_version = match opt.machine {
+            MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
+            MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            MachineProfileCli::Standard => unreachable!(),
+        };
+        let sandbox_blocks = if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+            let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(snapshot_dir)?;
+            let scratch_policy = if manifest
+                .machine_contract
+                .as_ref()
+                .and_then(|contract| contract.microvm_sandbox_blocks.last())
+                .is_some_and(|block| block.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME)
+            {
+                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
+            } else {
+                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Fresh
+            };
+            storage_builder::snapshot_block_contract(sandbox_block_sources, scratch_policy)?
+        } else {
+            anyhow::ensure!(
+                sandbox_block_sources.is_empty() && opt.virtio_blk.is_empty(),
+                "microVM ABI version 1 snapshot restore cannot attach block media"
+            );
+            Vec::new()
+        };
         Some((
             expected_hypervisor,
             effective_command_line
@@ -4181,6 +4212,8 @@ fn prepare_snapshot_restore(
             network,
             filesystem,
             console_attachment,
+            abi_version,
+            sandbox_blocks,
         ))
     } else {
         None
@@ -4226,6 +4259,8 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             &openvmm_helpers::snapshot::SnapshotAttachment,
         )>,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
+        u32,
+        Vec<openvmm_helpers::snapshot::SnapshotMicrovmSandboxBlock>,
     )>,
 ) -> anyhow::Result<(
     openvmm_defs::worker::SharedMemoryFd,
@@ -4249,25 +4284,51 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         network,
         filesystem,
         console_attachment,
+        abi_version,
+        sandbox_blocks,
     )) = expected_microvm_contract
     {
         let saved_contract = manifest
             .machine_contract
             .as_ref()
             .context("microVM snapshot is missing its authoritative machine contract")?;
-        let expected_contract = openvmm_helpers::snapshot::microvm_v1_machine_contract(
-            expected_hypervisor,
-            effective_command_line.to_owned(),
-            network.map(|(config, policy, attachment)| (config, policy, attachment.clone())),
-            filesystem.map(|(config, attachment)| (config, attachment.clone())),
-            console_attachment.cloned(),
-            expected_memory_size,
-            saved_contract.state_unit_names.clone(),
-            saved_contract.capture_wall_clock,
-            saved_contract.tsc_frequency_hz,
-            saved_contract.apic_frequency_hz,
-            saved_contract.cpu_contract.clone(),
-        )?;
+        let network =
+            network.map(|(config, policy, attachment)| (config, policy, attachment.clone()));
+        let filesystem = filesystem.map(|(config, attachment)| (config, attachment.clone()));
+        let expected_contract = match abi_version {
+            openvmm_defs::config::MICROVM_ABI_VERSION_1 => {
+                openvmm_helpers::snapshot::microvm_v1_machine_contract(
+                    expected_hypervisor,
+                    effective_command_line.to_owned(),
+                    network,
+                    filesystem,
+                    console_attachment.cloned(),
+                    expected_memory_size,
+                    saved_contract.state_unit_names.clone(),
+                    saved_contract.capture_wall_clock,
+                    saved_contract.tsc_frequency_hz,
+                    saved_contract.apic_frequency_hz,
+                    saved_contract.cpu_contract.clone(),
+                )?
+            }
+            openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
+                openvmm_helpers::snapshot::microvm_v2_machine_contract(
+                    expected_hypervisor,
+                    effective_command_line.to_owned(),
+                    network,
+                    filesystem,
+                    console_attachment.cloned(),
+                    sandbox_blocks,
+                    expected_memory_size,
+                    saved_contract.state_unit_names.clone(),
+                    saved_contract.capture_wall_clock,
+                    saved_contract.tsc_frequency_hz,
+                    saved_contract.apic_frequency_hz,
+                    saved_contract.cpu_contract.clone(),
+                )?
+            }
+            version => anyhow::bail!("microVM ABI version {version} is unsupported"),
+        };
         openvmm_helpers::snapshot::validate_microvm_machine_contract(
             &manifest,
             &expected_contract,
@@ -4415,17 +4476,26 @@ async fn run_control_inner(
     mut opt: Options,
 ) -> anyhow::Result<i32> {
     let mesh = mesh_slot.as_ref().unwrap();
-    let restore_machine_contract = if opt.machine == MachineProfileCli::Microvm
-        && let Some(snapshot_dir) = &opt.restore_snapshot
+    let mut private_scratch_dir = None;
+    let restore_machine_contract = if matches!(
+        opt.machine,
+        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+    ) && let Some(snapshot_dir) = opt.restore_snapshot.clone()
     {
-        let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(snapshot_dir)?;
+        let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(&snapshot_dir)?;
         let contract = manifest
             .machine_contract
+            .as_ref()
             .context("microVM snapshot is missing its authoritative machine contract")?;
+        let expected_abi_version = match opt.machine {
+            MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
+            MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            MachineProfileCli::Standard => unreachable!(),
+        };
         anyhow::ensure!(
             contract.machine_profile == "microvm"
-                && contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_1,
-            "snapshot is not a supported microVM ABI-v1 snapshot"
+                && contract.microvm_abi_version == expected_abi_version,
+            "snapshot microVM ABI version does not match the requested machine"
         );
         anyhow::ensure!(
             opt.cmdline.is_empty(),
@@ -4440,7 +4510,71 @@ async fn run_control_inner(
             "restore-time memory overrides are not allowed"
         );
         opt.memory.size = Some(vmm_cli::MemorySize(manifest.memory_size_bytes));
-        Some(contract)
+        if expected_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+            let scratch = contract
+                .microvm_sandbox_blocks
+                .last()
+                .filter(|block| block.role == "scratch")
+                .context("microVM ABI-v2 snapshot is missing its scratch contract")?;
+            if scratch.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME {
+                anyhow::ensure!(
+                    !opt.microvm_sandbox_block.iter().any(|block| {
+                        block.role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                    }),
+                    "paired snapshot restore supplies scratch.img; do not pass a scratch block"
+                );
+                let source =
+                    openvmm_helpers::snapshot::open_paired_scratch_file(&snapshot_dir, &manifest)?
+                        .context("paired snapshot is missing scratch.img")?;
+                let parent = snapshot_dir
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let temp_dir = tempfile::Builder::new()
+                    .prefix(".openvmm-private-scratch-")
+                    .tempdir_in(parent)
+                    .context("failed to create private restore scratch directory")?;
+                let private_path = temp_dir
+                    .path()
+                    .join(openvmm_helpers::snapshot::SCRATCH_FILE_NAME);
+                openvmm_helpers::snapshot::copy_verified_file(
+                    &source,
+                    &private_path,
+                    scratch.length,
+                    &scratch.identity,
+                    openvmm_helpers::snapshot::SCRATCH_FILE_NAME,
+                )?;
+                opt.microvm_sandbox_block
+                    .push(cli_args::MicrovmSandboxBlockCli {
+                        role: openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+                        disk: cli_args::DiskCli {
+                            vtl: DeviceVtl::Vtl0,
+                            kind: DiskCliKind::File {
+                                path: private_path,
+                                create_with_len: None,
+                                direct: false,
+                            },
+                            read_only: false,
+                            is_dvd: false,
+                            underhill: None,
+                            pcie_port: None,
+                            controller: None,
+                            nsid: None,
+                            lun: None,
+                            relay: None,
+                        },
+                    });
+                private_scratch_dir = Some(temp_dir);
+            } else {
+                anyhow::ensure!(
+                    opt.microvm_sandbox_block.iter().any(|block| {
+                        block.role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                    }),
+                    "fresh-scratch snapshot restore requires a scratch block"
+                );
+            }
+        }
+        Some(manifest.machine_contract.unwrap())
     } else {
         None
     };
@@ -4455,10 +4589,8 @@ async fn run_control_inner(
         LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
         _ => None,
     };
-    let has_microvm_block = vm_config
-        .virtio_devices
-        .iter()
-        .any(|(_, device)| device.id() == "virtio-blk");
+    let microvm_sandbox_block_sources =
+        std::mem::take(&mut resources.microvm_sandbox_block_sources);
     let microvm_console_attachment = resources.microvm_console_attachment.clone();
     let microvm_network = vm_config.microvm_network.clone();
     let microvm_network_attachment = resources.microvm_network_attachment.clone();
@@ -4689,6 +4821,7 @@ async fn run_control_inner(
                         .as_ref()
                         .zip(microvm_filesystem_attachment.as_ref()),
                     microvm_console_attachment.as_ref(),
+                    &microvm_sandbox_block_sources,
                 )?;
                 (Some(fd), Some(state_msg), true, restore_time)
             } else if let Some(file) = &snapshot_memory_handle {
@@ -4804,7 +4937,7 @@ async fn run_control_inner(
         snapshot_quiesce_timeout: Duration::from_millis(opt.snapshot_quiesce_timeout_ms),
         source_hypervisor,
         effective_command_line,
-        has_microvm_block,
+        microvm_sandbox_block_sources,
         microvm_console_attachment,
         microvm_network,
         microvm_network_attachment,
@@ -4813,6 +4946,7 @@ async fn run_control_inner(
         microvm_filesystem_attachment,
         microvm_console_socket_cleanup: resources.microvm_console_socket_cleanup.take(),
         snapshot_memory_file,
+        _private_scratch_dir: private_scratch_dir,
         guest_power_actions: vm_controller::GuestPowerActions {
             shutdown: opt.guest_shutdown_action,
             reset: opt.guest_reset_action,

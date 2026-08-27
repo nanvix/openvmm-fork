@@ -65,8 +65,12 @@ openvmm --machine microvm-v2 --kernel vmlinux --initrd initramfs.cpio.gz \
   --microvm-sandbox-block scratch:file:scratch.img
 ```
 
-ABI-v2 block snapshots are not implemented. Do not use `--snapshot-destination`
-or `--restore-snapshot` with this profile.
+ABI-v2 capture and restore support cached regular raw files. Capture records
+the role, access mode, exact geometry, and SHA-256 of every read-only layer. A
+normal snapshot request pairs the writable scratch as `scratch.img`; restore
+accepts the read-only layer arguments again and creates a private scratch copy
+from that artifact. A pre-mount request may select fresh-scratch policy instead,
+in which case restore requires a new writable scratch file of matching size.
 
 ~~~admonish tip title="UEFI firmware required when running outside cargo"
 When running via `cargo run`, environment variables in `.cargo/config.toml`

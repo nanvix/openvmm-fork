@@ -42,9 +42,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   restart remain unavailable.
 
   Guest-requested snapshot capture and new-process restore are available for
-  the no-block ABI-v1 machine on Linux/KVM, Linux/MSHV, and Windows/WHP,
-  including an active virtio console. Capture with the optional virtio-blk
-  device is rejected until immutable media identity is implemented.
+  the no-block ABI-v1 machine and fixed-block ABI-v2 machine on Linux/KVM,
+  Linux/MSHV, and Windows/WHP. ABI-v1 capture with its optional unroled
+  virtio-blk device remains unsupported.
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
   at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
   `/1` through `/30` are accepted. The first usable subnet address becomes
@@ -120,9 +120,10 @@ as well as the generated CLI help (via `cargo run -- --help`).
 
   `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
   timeout and defaults to 5000. A request with no configured destination is
-  ignored and the guest continues. Capture currently requires microVM ABI v1,
-  one vCPU, KVM, MSHV, or WHP, shared file-backed RAM, and no virtio-blk
-  device. An attached virtio console saves accepted but undelivered input and the offset
+  ignored and the guest continues. Capture requires microVM ABI v1 or v2, one
+  vCPU, KVM, MSHV, or WHP, and shared file-backed RAM. ABI-v2 block media must
+  be cached regular raw files with nonzero 512-byte-aligned geometry. An
+  attached virtio console saves accepted but undelivered input and the offset
   of a partially forwarded guest transmit descriptor. An attached microVM
   virtio-net device saves its static identity, queue progress, drained packet
   ownership, endpoint generation, and policy requirement.
@@ -135,6 +136,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
     --kernel vmlinux --initrd initramfs.cpio.gz \
     --snapshot-destination snapshot
   ```
+
+  `/sbin/nvx-snapshot` requests a paired capture by default. When scratch is
+  mounted, it freezes the workload cgroup with a bounded wait, syncs, freezes
+  the scratch filesystem, and asks OpenVMM to drain queues and atomically
+  publish `scratch.img`. `/sbin/nvx-snapshot --fresh-scratch` is for a
+  pre-mount boundary and records that restore must supply a fresh scratch.
 * `--restore-snapshot <DIR>`: Restore a microVM from a committed snapshot.
   The manifest supplies the authoritative RAM size, one-vCPU topology, ABI,
   fixed device inventory, effective kernel command line, source backend, CPU
@@ -159,6 +166,13 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `--network-profile portable`; the snapshot's profile and canonical egress
   policy must match the supplied portable configuration.
 
+  For ABI v2, restore repeats each read-only
+  `--microvm-sandbox-block` argument. Its role, access, geometry, and SHA-256
+  must match the manifest. A paired snapshot supplies scratch internally from
+  a verified process-private copy of `scratch.img`; passing another scratch is
+  rejected. A fresh-scratch snapshot instead requires a writable scratch
+  argument with matching geometry.
+
   ```bash
   openvmm --machine microvm --hypervisor kvm \
     --restore-snapshot snapshot --restore-entropy
@@ -177,14 +191,14 @@ as well as the generated CLI help (via `cargo run -- --help`).
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
 
-A committed snapshot contains exactly `manifest.bin`, `state.bin`, and
-`memory.bin`. Restore rejects unknown files, symlinks, malformed or oversized
-data, length mismatches, and incompatible machine contracts before starting a
-vCPU. `memory.bin` is opened through a private writable copy-on-write mapping,
-so the same snapshot can be restored repeatedly without modifying its
-artifacts.
+A committed snapshot contains `manifest.bin`, `state.bin`, `memory.bin`, and
+optionally the manifest-declared `scratch.img`. Restore rejects unknown files,
+symlinks, malformed or oversized data, length or scratch-digest mismatches, and
+incompatible machine contracts before starting a vCPU. `memory.bin` uses a
+private writable copy-on-write mapping and paired scratch is privately copied,
+so the same snapshot can be restored repeatedly without modifying artifacts.
 
-Version 3 does not embed or validate checksums for `state.bin` or `memory.bin`;
+Version 4 does not embed or validate checksums for `state.bin` or `memory.bin`;
 legacy version 2 checksum fields are accepted without re-hashing their
 payloads. This format does not detect same-length payload changes,
 authenticate, or encrypt a snapshot. Treat all three artifacts as sensitive
