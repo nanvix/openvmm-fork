@@ -487,7 +487,7 @@ fn test_ttrpc_microvm_snapshot_restore(
                 let state_path = snapshot_path.join("state.bin");
                 let state_bytes = std::fs::read(&state_path)?;
                 let mut corrupt_state = state_bytes.clone();
-                corrupt_state[0] ^= 0xff;
+                corrupt_state.pop();
                 std::fs::write(&state_path, &corrupt_state)?;
                 let malformed_ready = RestoreReadyListener::bind(
                     &driver,
@@ -499,7 +499,7 @@ fn test_ttrpc_microvm_snapshot_restore(
                     .as_mut()
                     .unwrap()
                     .restore_ready_path = malformed_ready.path().to_string_lossy().into_owned();
-                expect_create_vm_error(&client, malformed_request, "digest mismatch").await?;
+                expect_create_vm_error(&client, malformed_request, "state.bin size").await?;
                 malformed_ready.expect_no_connection(&driver).await?;
                 std::fs::write(&state_path, &state_bytes)?;
 
