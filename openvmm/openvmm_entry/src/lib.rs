@@ -4834,6 +4834,7 @@ async fn run_control_inner(
             vm_rpc,
             vm_controller: vm_controller_send,
             vm_controller_events: vm_controller_event_recv,
+            restore_ready_pending: opt.paused && opt.restore_ready_path.is_some(),
             scsi_rpc: resources.scsi_rpc,
             nvme_vtl2_rpc: resources.nvme_vtl2_rpc,
             consomme_rpc: resources.consomme_rpc,
