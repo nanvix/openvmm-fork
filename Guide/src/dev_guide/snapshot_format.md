@@ -12,7 +12,7 @@ an ABI-v2 mounted-scratch capture, one paired scratch image:
 snapshot-dir/
 ├── manifest.bin   # Protobuf-encoded SnapshotManifest
 ├── state.bin      # Protobuf-encoded device saved state
-├── memory.bin     # Exact copy of the opened guest-memory handle
+├── memory.bin     # Sparse independent clone of the guest-memory handle
 └── scratch.img    # Optional paired ABI-v2 writable scratch image
 ```
 
@@ -46,10 +46,13 @@ default values, forward/backward compatibility) apply.
 
 ## Memory (`memory.bin`)
 
-`memory.bin` is an exact-length copy of the opened file handle that backs guest
-RAM. Capture uses that handle rather than reopening its pathname, so replacing
-the source path cannot substitute different bytes during publication. The
-copy is flushed in the private staging directory before publication.
+`memory.bin` is an exact-length sparse-aware clone of the opened file handle
+that backs guest RAM. Capture uses that handle rather than reopening its
+pathname, so replacing the source path cannot substitute different bytes
+during publication. Clone support is used when available, with allocated-range
+or zero-scan copying as a fallback. The independently owned clone is flushed in
+the private staging directory before publication, and later source writes
+cannot change it.
 
 ## Scratch (`scratch.img`)
 

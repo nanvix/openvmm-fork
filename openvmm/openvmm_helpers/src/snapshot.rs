@@ -1386,6 +1386,42 @@ fn write_bytes(path: &Path, bytes: &[u8], description: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Sizes a newly created snapshot RAM backing.
+///
+/// Windows leaves the file non-sparse to avoid slow copy-on-write faults from
+/// sparse files. Other supported platforms retain sparse allocation.
+pub fn initialize_snapshot_memory_backing_file(
+    file: &std::fs::File,
+    size: u64,
+) -> anyhow::Result<u64> {
+    let metadata = file
+        .metadata()
+        .context("failed to inspect new snapshot memory backing")?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "snapshot memory backing handle is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() == 0,
+        "new snapshot memory backing is not empty"
+    );
+
+    size_empty_file(file, size, "snapshot memory backing")?;
+    let allocated_bytes = allocated_file_bytes(file, size)
+        .context("failed to inspect snapshot memory backing allocation")?;
+    #[cfg(not(windows))]
+    anyhow::ensure!(
+        allocated_bytes == 0,
+        "snapshot memory backing allocated {allocated_bytes} bytes while sizing to {size} bytes"
+    );
+    tracing::info!(
+        logical_bytes = size,
+        allocated_bytes,
+        "initialized snapshot RAM backing"
+    );
+    Ok(allocated_bytes)
+}
+
 fn copy_exact(
     source_file: &std::fs::File,
     destination_path: &Path,
@@ -1400,52 +1436,300 @@ fn copy_exact(
         source_metadata.file_type().is_file(),
         "{source_description} handle is not a regular file"
     );
-    let mut source = source_file
-        .try_clone()
-        .with_context(|| format!("failed to duplicate {source_description} handle"))?;
-    source
-        .seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to rewind {source_description}"))?;
-    let source_length = source
-        .metadata()
-        .with_context(|| format!("failed to inspect {source_description}"))?
-        .len();
+    let source_length = source_metadata.len();
     anyhow::ensure!(
         source_length == expected_length,
         "{source_description} size ({source_length} bytes) doesn't match manifest ({expected_length} bytes)",
     );
-    let mut destination = create_file(destination_path, destination_description)?;
-    let mut total = 0_u64;
-    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-    let limit = expected_length
-        .checked_add(1)
-        .context("memory backing file length cannot be bounded")?;
-    let mut source = Read::by_ref(&mut source).take(limit);
-
-    loop {
-        let count = source
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read {source_description}"))?;
-        if count == 0 {
-            break;
-        }
-        destination
-            .write_all(&buffer[..count])
-            .with_context(|| format!("failed to write {destination_description}"))?;
-        total = total
-            .checked_add(count as u64)
-            .context("memory backing file length overflowed u64")?;
-    }
+    let destination = create_file(destination_path, destination_description)?;
+    let method = clone_or_copy(source_file, &destination, expected_length)
+        .with_context(|| format!("failed to copy {source_description}"))?;
 
     anyhow::ensure!(
-        total == expected_length,
-        "{source_description} changed while it was being copied (expected {expected_length} bytes, copied {total} bytes)",
+        source_file
+            .metadata()
+            .with_context(|| format!("failed to re-inspect {source_description}"))?
+            .len()
+            == expected_length,
+        "{source_description} changed length while it was being copied",
+    );
+    anyhow::ensure!(
+        destination
+            .metadata()
+            .with_context(|| format!("failed to inspect {destination_description}"))?
+            .len()
+            == expected_length,
+        "{destination_description} length does not match {source_description}",
     );
 
     destination
         .sync_all()
         .with_context(|| format!("failed to flush {destination_description}"))?;
+    let source_allocated_bytes = allocated_file_bytes(source_file, expected_length).ok();
+    let allocated_bytes = allocated_file_bytes(&destination, expected_length).ok();
+    tracing::info!(
+        method,
+        logical_bytes = expected_length,
+        ?source_allocated_bytes,
+        ?allocated_bytes,
+        "published independent snapshot artifact"
+    );
     Ok(())
+}
+
+fn size_empty_file(file: &std::fs::File, length: u64, description: &str) -> anyhow::Result<()> {
+    file.set_len(0)
+        .with_context(|| format!("failed to reset {description}"))?;
+    file.set_len(length)
+        .with_context(|| format!("failed to size {description}"))?;
+    anyhow::ensure!(
+        file.metadata()
+            .with_context(|| format!("failed to inspect {description}"))?
+            .len()
+            == length,
+        "{description} has the wrong logical length after sizing"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clone_or_copy(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+    length: u64,
+) -> anyhow::Result<&'static str> {
+    let clone_error = match pal::fs::reflink(source, destination) {
+        Ok(()) => return Ok("ficlone"),
+        Err(error) => error,
+    };
+    tracing::debug!(
+        error = &clone_error as &dyn std::error::Error,
+        "FICLONE unavailable"
+    );
+    size_empty_file(destination, length, "snapshot clone destination")?;
+    match linux_allocated_ranges(source, length) {
+        Ok(ranges) => {
+            copy_allocated_ranges(source, destination, length, &ranges)?;
+            Ok("seek-data-hole")
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = &error as &dyn std::error::Error,
+                "SEEK_DATA/SEEK_HOLE unavailable"
+            );
+            copy_nonzero_data(source, destination, 0, length)?;
+            Ok("zero-scan")
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clone_or_copy(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+    length: u64,
+) -> anyhow::Result<&'static str> {
+    let mut source = source
+        .try_clone()
+        .context("failed to duplicate snapshot memory source handle")?;
+    source
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind snapshot memory source")?;
+    let mut destination = destination
+        .try_clone()
+        .context("failed to duplicate snapshot memory destination handle")?;
+    destination
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind snapshot memory destination")?;
+
+    let limit = length
+        .checked_add(1)
+        .context("snapshot memory length cannot be bounded")?;
+    let mut source = Read::by_ref(&mut source).take(limit);
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .context("failed to read snapshot memory source")?;
+        if count == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..count])
+            .context("failed to write dense snapshot memory destination")?;
+        total = total
+            .checked_add(count as u64)
+            .context("snapshot memory length overflowed u64")?;
+    }
+    anyhow::ensure!(
+        total == length,
+        "snapshot memory changed while it was copied (expected {length} bytes, copied {total} bytes)",
+    );
+    Ok("dense-copy")
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn clone_or_copy(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+    length: u64,
+) -> anyhow::Result<&'static str> {
+    size_empty_file(destination, length, "snapshot clone destination")?;
+    copy_nonzero_data(source, destination, 0, length)?;
+    Ok("zero-scan")
+}
+
+#[cfg(target_os = "linux")]
+fn copy_allocated_ranges(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+    length: u64,
+    ranges: &[(u64, u64)],
+) -> anyhow::Result<()> {
+    let mut cursor = 0_u64;
+    for &(offset, range_length) in ranges {
+        let end = offset
+            .checked_add(range_length)
+            .context("allocated range overflowed u64")?;
+        anyhow::ensure!(
+            offset >= cursor && range_length != 0 && end <= length,
+            "invalid allocated range for sparse copy"
+        );
+        copy_nonzero_data(source, destination, offset, range_length)?;
+        cursor = end;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn copy_nonzero_data(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+    offset: u64,
+    length: u64,
+) -> anyhow::Result<()> {
+    let end = offset
+        .checked_add(length)
+        .context("snapshot copy range overflowed u64")?;
+    let mut cursor = offset;
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    while cursor < end {
+        let count = usize::try_from((end - cursor).min(buffer.len() as u64)).unwrap();
+        let read = read_file_at(source, &mut buffer[..count], cursor)
+            .context("failed to read snapshot source")?;
+        anyhow::ensure!(
+            read != 0,
+            "snapshot source changed while it was being copied"
+        );
+        if buffer[..read].iter().any(|byte| *byte != 0) {
+            write_file_all_at(destination, &buffer[..read], cursor)
+                .context("failed to write snapshot destination")?;
+        }
+        cursor = cursor
+            .checked_add(read as u64)
+            .context("snapshot copy offset overflowed u64")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+    }
+}
+
+#[cfg(not(windows))]
+fn write_file_all_at(
+    file: &std::fs::File,
+    mut bytes: &[u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        let written = std::os::unix::fs::FileExt::write_at(file, bytes, offset)?;
+        #[cfg(windows)]
+        let written = std::os::windows::fs::FileExt::seek_write(file, bytes, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write snapshot destination",
+            ));
+        }
+        bytes = &bytes[written..];
+        offset = offset
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("snapshot write offset overflowed u64"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_allocated_ranges(file: &std::fs::File, length: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    use std::os::fd::AsRawFd;
+
+    let extent_file = std::fs::File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    let mut ranges = Vec::new();
+    let mut cursor = 0_u64;
+    while cursor < length {
+        let Some(data) = pal::fs::seek_data(&extent_file, cursor)? else {
+            break;
+        };
+        if data >= length {
+            break;
+        }
+        let hole = pal::fs::seek_hole(&extent_file, data)?.unwrap_or(length);
+        if hole <= data || hole > length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "filesystem returned an invalid sparse extent",
+            ));
+        }
+        ranges.push((data, hole - data));
+        cursor = hole;
+    }
+    Ok(ranges)
+}
+
+#[cfg(target_os = "linux")]
+fn allocated_file_bytes(file: &std::fs::File, _length: u64) -> anyhow::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    file.metadata()?
+        .blocks()
+        .checked_mul(512)
+        .context("allocated byte count overflowed u64")
+}
+
+#[cfg(windows)]
+fn allocated_file_bytes(file: &std::fs::File, length: u64) -> anyhow::Result<u64> {
+    match pal::fs::allocated_ranges(file, length) {
+        Ok(ranges) => ranges
+            .into_iter()
+            .try_fold(0_u64, |total, (_, range_length)| {
+                total
+                    .checked_add(range_length)
+                    .context("allocated byte count overflowed u64")
+            }),
+        Err(error) => {
+            tracing::debug!(
+                error = &error as &dyn std::error::Error,
+                "allocated-range accounting is unavailable"
+            );
+            pal::fs::allocation_size(file).map_err(anyhow::Error::new)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn allocated_file_bytes(file: &std::fs::File, _length: u64) -> anyhow::Result<u64> {
+    Ok(file.metadata()?.len())
 }
 
 fn validate_snapshot_directory(dir: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
@@ -3022,6 +3306,172 @@ mod tests {
             std::fs::read(snap_dir.join(MEMORY_FILE_NAME)).unwrap(),
             b"SAMEFILE"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_snapshot_preserves_sparse_memory_and_clone_independence() {
+        const MEMORY_SIZE: u64 = 16 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        for (case, sparse) in [("zero", true), ("mixed", true), ("dense", false)] {
+            let case_dir = dir.path().join(case);
+            std::fs::create_dir(&case_dir).unwrap();
+            let snap_dir = case_dir.join("snap");
+            let mem_path = case_dir.join("memory.bin");
+            let mut memory_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&mem_path)
+                .unwrap();
+            assert_eq!(
+                initialize_snapshot_memory_backing_file(&memory_file, MEMORY_SIZE).unwrap(),
+                0
+            );
+
+            let mut expected = vec![0_u8; MEMORY_SIZE as usize];
+            match case {
+                "zero" => {}
+                "mixed" => {
+                    let tail_offset = expected.len() - 4;
+                    expected[..4].copy_from_slice(b"head");
+                    expected[tail_offset..].copy_from_slice(b"tail");
+                    memory_file.write_all(b"head").unwrap();
+                    memory_file.seek(SeekFrom::End(-4)).unwrap();
+                    memory_file.write_all(b"tail").unwrap();
+                }
+                "dense" => {
+                    expected.fill(0x5a);
+                    memory_file.seek(SeekFrom::Start(0)).unwrap();
+                    memory_file.write_all(&expected).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            memory_file.sync_all().unwrap();
+
+            let mut manifest = test_manifest();
+            manifest.memory_size_bytes = MEMORY_SIZE;
+            write_snapshot_from_memory_file(&snap_dir, &manifest, b"state", &memory_file).unwrap();
+
+            memory_file.seek(SeekFrom::Start(0)).unwrap();
+            memory_file.write_all(b"xxxx").unwrap();
+            memory_file.sync_all().unwrap();
+
+            let published_path = snap_dir.join(MEMORY_FILE_NAME);
+            let published = std::fs::File::open(&published_path).unwrap();
+            assert_eq!(published.metadata().unwrap().len(), MEMORY_SIZE);
+            if sparse {
+                let allocated = allocated_file_bytes(&published, MEMORY_SIZE).unwrap();
+                assert!(
+                    allocated < MEMORY_SIZE / 4,
+                    "{case} snapshot allocated {allocated} bytes for a {MEMORY_SIZE}-byte file",
+                );
+            }
+            assert_eq!(std::fs::read(published_path).unwrap(), expected, "{case}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_snapshot_uses_dense_memory_files_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        const MEMORY_SIZE: u64 = 4 * 1024 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let mem_path = dir.path().join("memory.bin");
+        let mut memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(mem_path)
+            .unwrap();
+        initialize_snapshot_memory_backing_file(&memory_file, MEMORY_SIZE).unwrap();
+        assert_eq!(
+            memory_file.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+            0
+        );
+
+        memory_file.write_all(b"head").unwrap();
+        memory_file.seek(SeekFrom::End(-4)).unwrap();
+        memory_file.write_all(b"tail").unwrap();
+        memory_file.sync_all().unwrap();
+
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = MEMORY_SIZE;
+        write_snapshot_from_memory_file(&snap_dir, &manifest, b"state", &memory_file).unwrap();
+
+        let published_path = snap_dir.join(MEMORY_FILE_NAME);
+        let published = std::fs::File::open(&published_path).unwrap();
+        assert_eq!(
+            published.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+            0
+        );
+
+        let mut expected = vec![0_u8; MEMORY_SIZE as usize];
+        expected[..4].copy_from_slice(b"head");
+        let tail_offset = expected.len() - 4;
+        expected[tail_offset..].copy_from_slice(b"tail");
+        assert_eq!(std::fs::read(published_path).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_copy_fallbacks_preserve_extents_and_clone_independence() {
+        const MEMORY_SIZE: u64 = 16 * 1024 * 1024;
+        const EXTENT_SIZE: u64 = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.bin");
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(source_path)
+            .unwrap();
+        initialize_snapshot_memory_backing_file(&source, MEMORY_SIZE).unwrap();
+        source.write_all(b"head").unwrap();
+        source.seek(SeekFrom::End(-4)).unwrap();
+        source.write_all(b"tail").unwrap();
+        source.sync_all().unwrap();
+
+        let mut expected = vec![0_u8; MEMORY_SIZE as usize];
+        let tail_offset = expected.len() - 4;
+        expected[..4].copy_from_slice(b"head");
+        expected[tail_offset..].copy_from_slice(b"tail");
+
+        let allocated_ranges = [(0, EXTENT_SIZE), (MEMORY_SIZE - EXTENT_SIZE, EXTENT_SIZE)];
+        for fallback in ["allocated-ranges", "zero-scan"] {
+            let path = dir.path().join(format!("{fallback}.bin"));
+            let destination = create_file(&path, fallback).unwrap();
+            size_empty_file(&destination, MEMORY_SIZE, fallback).unwrap();
+            match fallback {
+                "allocated-ranges" => {
+                    copy_allocated_ranges(&source, &destination, MEMORY_SIZE, &allocated_ranges)
+                        .unwrap()
+                }
+                "zero-scan" => copy_nonzero_data(&source, &destination, 0, MEMORY_SIZE).unwrap(),
+                _ => unreachable!(),
+            }
+            destination.sync_all().unwrap();
+            let allocated = allocated_file_bytes(&destination, MEMORY_SIZE).unwrap();
+            assert!(
+                allocated < MEMORY_SIZE / 4,
+                "{fallback} allocated {allocated} bytes for a {MEMORY_SIZE}-byte file",
+            );
+        }
+
+        source.seek(SeekFrom::Start(0)).unwrap();
+        source.write_all(b"xxxx").unwrap();
+        source.sync_all().unwrap();
+        for fallback in ["allocated-ranges", "zero-scan"] {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("{fallback}.bin"))).unwrap(),
+                expected,
+                "{fallback}"
+            );
+        }
     }
 
     #[test]

@@ -674,7 +674,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     let mut rng_hashes = Vec::new();
     let mut restore_latencies = Vec::new();
     for restore_index in 0..2 {
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(6));
         let mut restore_args = phase_2_args(hypervisor);
         restore_args.extend([
             "--restore-snapshot".into(),

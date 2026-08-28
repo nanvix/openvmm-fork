@@ -26,17 +26,18 @@ pub fn open_memory_backing_file_handle(
     path: &std::path::Path,
     size: u64,
 ) -> anyhow::Result<std::fs::File> {
-    let file = fs_err::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
+        .open(path)
+        .with_context(|| format!("failed to open memory backing file {}", path.display()))?;
 
     let existing_len = file.metadata()?.len();
     if existing_len == 0 {
-        file.set_len(size)
-            .context("failed to set memory backing file size")?;
+        crate::snapshot::initialize_snapshot_memory_backing_file(&file, size)
+            .context("failed to initialize snapshot memory backing file")?;
     } else if existing_len != size {
         anyhow::bail!(
             "memory backing file {} has size {} bytes, expected {} bytes",
@@ -46,7 +47,7 @@ pub fn open_memory_backing_file_handle(
         );
     }
 
-    Ok(file.into())
+    Ok(file)
 }
 
 /// Convert a `std::fs::File` to the platform-appropriate shared memory handle.
