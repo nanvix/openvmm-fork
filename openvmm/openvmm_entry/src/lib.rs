@@ -3720,6 +3720,19 @@ async fn vm_config_from_command_line(
             .as_ref()
             .zip(network_irq)
             .map(|(network, irq)| (network, irq, microvm_gateway_dns));
+        if let Some(snapshot_tier) = opt.snapshot_tier {
+            anyhow::ensure!(
+                !cmdline
+                    .split_ascii_whitespace()
+                    .any(|token| token.starts_with("nvx_snapshot_tier=")),
+                "nvx_snapshot_tier is reserved for the host snapshot policy"
+            );
+            if !cmdline.is_empty() {
+                cmdline.push(' ');
+            }
+            cmdline.push_str("nvx_snapshot_tier=");
+            cmdline.push_str(snapshot_tier.manifest_name());
+        }
         match cfg.machine_profile {
             MachineProfile::Microvm {
                 abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
@@ -4157,6 +4170,7 @@ pub(crate) const GUEST_ARCH: &str = if cfg!(guest_arch = "x86_64") {
 /// Returns the shared memory fd (from memory.bin) and the saved device state.
 fn prepare_snapshot_restore(
     snapshot_dir: &Path,
+    manifest: &openvmm_helpers::snapshot::SnapshotManifest,
     opt: &Options,
     expected_hypervisor: &str,
     effective_command_line: Option<&str>,
@@ -4186,7 +4200,6 @@ fn prepare_snapshot_restore(
             MachineProfileCli::Standard => unreachable!(),
         };
         let sandbox_blocks = if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
-            let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(snapshot_dir)?;
             let scratch_policy = if manifest
                 .machine_contract
                 .as_ref()
@@ -4220,6 +4233,7 @@ fn prepare_snapshot_restore(
     };
     prepare_snapshot_restore_for_config(
         snapshot_dir,
+        manifest,
         opt.memory_size(),
         opt.processors,
         expected_microvm_contract,
@@ -4244,6 +4258,7 @@ fn calculate_snapshot_downtime(
 
 pub(crate) fn prepare_snapshot_restore_for_config(
     snapshot_dir: &Path,
+    manifest: &openvmm_helpers::snapshot::SnapshotManifest,
     expected_memory_size: u64,
     expected_vp_count: u32,
     expected_microvm_contract: Option<(
@@ -4267,12 +4282,16 @@ pub(crate) fn prepare_snapshot_restore_for_config(
     mesh::payload::message::ProtobufMessage,
     Option<(Duration, u64, Option<u64>, Vec<u8>)>,
 )> {
-    let (manifest, state_bytes, memory_file) =
-        openvmm_helpers::snapshot::read_snapshot_with_memory(snapshot_dir, expected_memory_size)?;
+    let (state_bytes, memory_file) =
+        openvmm_helpers::snapshot::read_snapshot_artifacts_with_memory(
+            snapshot_dir,
+            manifest,
+            expected_memory_size,
+        )?;
 
     // Validate manifest against current VM config.
     openvmm_helpers::snapshot::validate_manifest(
-        &manifest,
+        manifest,
         GUEST_ARCH,
         expected_memory_size,
         expected_vp_count,
@@ -4329,10 +4348,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             }
             version => anyhow::bail!("microVM ABI version {version} is unsupported"),
         };
-        openvmm_helpers::snapshot::validate_microvm_machine_contract(
-            &manifest,
-            &expected_contract,
-        )?;
+        openvmm_helpers::snapshot::validate_microvm_machine_contract(manifest, &expected_contract)?;
         let capture_time: std::time::SystemTime = saved_contract
             .capture_wall_clock
             .try_into()
@@ -4369,6 +4385,8 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             "snapshot manifest state-unit inventory does not match state.bin"
         );
     }
+
+    openvmm_helpers::snapshot::claim_snapshot_for_restore(snapshot_dir, manifest)?;
 
     Ok((shared_memory_fd, state_msg, restore_time))
 }
@@ -4477,12 +4495,39 @@ async fn run_control_inner(
 ) -> anyhow::Result<i32> {
     let mesh = mesh_slot.as_ref().unwrap();
     let mut private_scratch_dir = None;
+    let mut restore_gate_required = false;
+    let restore_manifest = opt
+        .restore_snapshot
+        .as_deref()
+        .map(openvmm_helpers::snapshot::read_snapshot_manifest)
+        .transpose()?;
+    if let Some(contract) = restore_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.machine_contract.as_ref())
+        && contract.machine_profile == "microvm"
+    {
+        let requested_abi_version = match opt.machine {
+            MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
+            MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            MachineProfileCli::Standard => {
+                anyhow::bail!("microVM snapshot restore requires --machine microvm or microvm-v2")
+            }
+        };
+        anyhow::ensure!(
+            contract.microvm_abi_version == requested_abi_version,
+            "snapshot microVM ABI version does not match the requested machine"
+        );
+    }
     let restore_machine_contract = if matches!(
         opt.machine,
         MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
-    ) && let Some(snapshot_dir) = opt.restore_snapshot.clone()
+    ) && let Some(manifest) = restore_manifest.as_ref()
     {
-        let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(&snapshot_dir)?;
+        let snapshot_dir = opt
+            .restore_snapshot
+            .as_deref()
+            .expect("restore manifest requires a snapshot path");
+        restore_gate_required = openvmm_helpers::snapshot::requires_post_restore_gate(&manifest);
         let contract = manifest
             .machine_contract
             .as_ref()
@@ -4524,7 +4569,7 @@ async fn run_control_inner(
                     "paired snapshot restore supplies scratch.img; do not pass a scratch block"
                 );
                 let source =
-                    openvmm_helpers::snapshot::open_paired_scratch_file(&snapshot_dir, &manifest)?
+                    openvmm_helpers::snapshot::open_paired_scratch_file(snapshot_dir, manifest)?
                         .context("paired snapshot is missing scratch.img")?;
                 let parent = snapshot_dir
                     .parent()
@@ -4574,17 +4619,20 @@ async fn run_control_inner(
                 );
             }
         }
-        Some(manifest.machine_contract.unwrap())
+        Some(contract)
     } else {
         None
     };
+    if restore_gate_required {
+        opt.restore_entropy = true;
+    }
     if restore_machine_contract.is_some() && !opt.restore_entropy {
         tracing::warn!(
             "restoring cloned guest RNG state without fresh entropy injection; cryptographic workloads are unsafe"
         );
     }
     let (mut vm_config, mut resources) =
-        vm_config_from_command_line(driver, mesh, &opt, restore_machine_contract.as_ref()).await?;
+        vm_config_from_command_line(driver, mesh, &opt, restore_machine_contract).await?;
     let effective_command_line = match &vm_config.load_mode {
         LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
         _ => None,
@@ -4811,6 +4859,9 @@ async fn run_control_inner(
             if let Some(snapshot_dir) = &opt.restore_snapshot {
                 let (fd, state_msg, restore_time) = prepare_snapshot_restore(
                     snapshot_dir,
+                    restore_manifest
+                        .as_ref()
+                        .context("snapshot restore is missing its validated manifest")?,
                     &opt,
                     &source_hypervisor,
                     effective_command_line.as_deref(),
@@ -4866,6 +4917,8 @@ async fn run_control_inner(
                 .and_then(|(_, _, frequency, _)| *frequency),
             restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
             restore_ready_sink,
+            restore_gate_timeout: restore_gate_required
+                .then_some(Duration::from_millis(opt.restore_gate_timeout_ms)),
             rpc: rpc_recv,
             notify: notify_send,
         };
@@ -4936,6 +4989,7 @@ async fn run_control_inner(
         crash_dump_path: opt.crash_dump_path.clone(),
         snapshot_requests,
         snapshot_destination,
+        snapshot_tier: opt.snapshot_tier,
         snapshot_quiesce_timeout: Duration::from_millis(opt.snapshot_quiesce_timeout_ms),
         source_hypervisor,
         effective_command_line,

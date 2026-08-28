@@ -522,6 +522,7 @@ struct Vm {
 
 struct AuthoritativeMicrovmRestore {
     path: PathBuf,
+    manifest: openvmm_helpers::snapshot::SnapshotManifest,
     memory_size: u64,
     vp_count: u32,
     machine_contract: openvmm_helpers::snapshot::SnapshotMachineContract,
@@ -780,6 +781,7 @@ impl VmService {
             )?;
             let machine_contract = manifest
                 .machine_contract
+                .as_ref()
                 .context("microVM snapshot is missing its authoritative machine contract")?;
             anyhow::ensure!(
                 machine_contract.machine_profile == "microvm"
@@ -788,9 +790,10 @@ impl VmService {
             );
             Some(AuthoritativeMicrovmRestore {
                 path,
+                manifest: manifest.clone(),
                 memory_size: manifest.memory_size_bytes,
                 vp_count: manifest.vp_count,
-                machine_contract,
+                machine_contract: machine_contract.clone(),
             })
         } else {
             None
@@ -928,6 +931,7 @@ impl VmService {
             );
             let (fd, state, restore_time) = crate::prepare_snapshot_restore_for_config(
                 &restore.path,
+                &restore.manifest,
                 restore.memory_size,
                 restore.vp_count,
                 Some((
@@ -1916,6 +1920,7 @@ impl VmService {
                         .and_then(|(_, _, frequency, _)| *frequency),
                     restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
                     restore_ready_sink,
+                    restore_gate_timeout: None,
                     rpc: recv,
                     notify: notify_send,
                 },
@@ -1950,6 +1955,7 @@ impl VmService {
             crash_dump_path: None,
             snapshot_requests,
             snapshot_destination,
+            snapshot_tier: None,
             snapshot_quiesce_timeout,
             source_hypervisor,
             effective_command_line,

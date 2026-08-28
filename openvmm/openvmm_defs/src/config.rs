@@ -863,6 +863,7 @@ pub fn build_microvm_command_line(
                 "virtfs_dir=",
                 "virtfs_tag=",
                 "virtfs_mode=",
+                "nvx_snapshot_tier=",
             ]
             .iter()
             .any(|reserved| token.starts_with(reserved))
@@ -1464,6 +1465,13 @@ pub enum GicConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microvm_snapshot_tier_command_line_token_is_host_owned() {
+        assert!(
+            build_microvm_command_line(&["nvx_snapshot_tier=platform".to_owned()], false).is_err()
+        );
+    }
 
     #[test]
     fn microvm_network_identity_has_portable_profile() {

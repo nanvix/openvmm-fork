@@ -190,15 +190,21 @@ as well as the generated CLI help (via `cargo run -- --help`).
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
+* `--restore-gate-timeout-ms <MILLISECONDS>`: Bound ABI-v2 guest repair and
+  gate acknowledgement after restore. The default is 30000 milliseconds.
+* `--snapshot-tier <TIER>`: Required with ABI-v2 snapshot capture. Choose
+  `platform`, `workload-start`, or `instance-checkpoint`. The first two are
+  reusable clone policies; instance checkpoints use single-use resume policy.
 
 A committed snapshot contains `manifest.bin`, `state.bin`, `memory.bin`, and
 optionally the manifest-declared `scratch.img`. Restore rejects unknown files,
 symlinks, malformed or oversized data, length or scratch-digest mismatches, and
 incompatible machine contracts before starting a vCPU. `memory.bin` uses a
 private writable copy-on-write mapping and paired scratch is privately copied,
-so the same snapshot can be restored repeatedly without modifying artifacts.
+so clone-policy snapshots can be restored repeatedly without modifying
+artifacts. Instance-checkpoint snapshots permit one restore attempt.
 
-Version 4 does not embed or validate checksums for `state.bin` or `memory.bin`;
+Versions 3 through 5 do not embed or validate checksums for `state.bin` or `memory.bin`;
 legacy version 2 checksum fields are accepted without re-hashing their
 payloads. This format does not detect same-length payload changes,
 authenticate, or encrypt a snapshot. Treat all three artifacts as sensitive

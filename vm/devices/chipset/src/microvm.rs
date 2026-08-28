@@ -37,6 +37,8 @@ const STATUS_PORT: u16 = 0xea;
 const SHUTDOWN_PORT: u16 = 0x604;
 const SNAPSHOT_PORT: u16 = 0x605;
 const RESTORE_ENTROPY_SELECT: u8 = 0xa5;
+const STATUS_INPUT_AVAILABLE: u8 = 1 << 0;
+const STATUS_RESTORE_PACKET_AVAILABLE: u8 = 1 << 1;
 const BUFFER_MAX: usize = 1024 * 1024;
 
 /// Raw bidirectional microVM portb console.
@@ -53,6 +55,7 @@ pub struct MicrovmPortb {
     #[inspect(with = "VecDeque::len")]
     restore_entropy: VecDeque<u8>,
     restore_entropy_selected: bool,
+    input_gated: bool,
     #[inspect(skip)]
     rx_waker: Option<Waker>,
     #[inspect(skip)]
@@ -69,6 +72,7 @@ impl MicrovmPortb {
             tx_buffer: VecDeque::new(),
             restore_entropy: restore_entropy.into(),
             restore_entropy_selected: false,
+            input_gated: false,
             rx_waker: None,
             tx_waker: None,
         }
@@ -139,6 +143,17 @@ impl MicrovmPortb {
 impl ChangeDeviceState for MicrovmPortb {
     fn start(&mut self) {}
 
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.input_gated = true;
+        Ok(())
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.input_gated = false;
+        self.wake_rx();
+        Ok(())
+    }
+
     async fn stop(&mut self) {
         // Drain every byte the endpoint accepts immediately. Any remaining
         // VMM-owned bytes are serialized and retried against the reconstructed
@@ -151,6 +166,7 @@ impl ChangeDeviceState for MicrovmPortb {
         self.tx_buffer.clear();
         self.restore_entropy.clear();
         self.restore_entropy_selected = false;
+        self.input_gated = false;
     }
 }
 
@@ -179,7 +195,9 @@ impl PollDevice for MicrovmPortb {
                 Poll::Pending => return,
             }
         }
-        self.poll_rx(cx);
+        if !self.input_gated {
+            self.poll_rx(cx);
+        }
         self.poll_tx(cx);
     }
 }
@@ -197,13 +215,23 @@ impl PortIoIntercept for MicrovmPortb {
                     if self.restore_entropy.is_empty() {
                         self.restore_entropy_selected = false;
                     }
-                } else {
+                } else if !self.input_gated {
                     data[0] = self.rx_buffer.pop_front().unwrap_or(0);
                     self.wake_rx();
                 }
             }
             STATUS_PORT => {
-                data[0] = u8::from(!self.restore_entropy_selected && !self.rx_buffer.is_empty())
+                data[0] = if !self.input_gated
+                    && !self.restore_entropy_selected
+                    && !self.rx_buffer.is_empty()
+                {
+                    STATUS_INPUT_AVAILABLE
+                } else {
+                    0
+                };
+                if !self.restore_entropy.is_empty() {
+                    data[0] |= STATUS_RESTORE_PACKET_AVAILABLE;
+                }
             }
             _ => return IoResult::Err(IoError::InvalidRegister),
         }
@@ -643,7 +671,7 @@ mod tests {
             restored.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
         ));
-        assert_eq!(data, [0]);
+        assert_eq!(data, [STATUS_RESTORE_PACKET_AVAILABLE]);
         for expected in [7, 8] {
             assert!(matches!(
                 restored.io_read(DATA_PORT, &mut data),
@@ -664,6 +692,37 @@ mod tests {
         );
         portb.poll_device(&mut Context::from_waker(Waker::noop()));
         assert_eq!(portb.rx_buffer, [0x5a]);
+    }
+
+    #[test]
+    fn portb_input_gate_blocks_rx_but_not_tx() {
+        let mut portb = MicrovmPortb::new(
+            Box::new(ConnectWithByte {
+                connected: true,
+                byte: Some(0x5a),
+            }),
+            Vec::new(),
+        );
+        portb.rx_buffer.push_back(0x44);
+        futures::executor::block_on(portb.quiesce_input()).unwrap();
+        assert!(matches!(portb.io_write(DATA_PORT, b"output"), IoResult::Ok));
+        portb.poll_device(&mut Context::from_waker(Waker::noop()));
+        let mut data = [0xff];
+        assert!(matches!(
+            portb.io_read(STATUS_PORT, &mut data),
+            IoResult::Ok
+        ));
+        assert_eq!(data, [0]);
+        assert!(matches!(portb.io_read(DATA_PORT, &mut data), IoResult::Ok));
+        assert_eq!(data, [0]);
+        assert_eq!(portb.rx_buffer, [0x44]);
+        assert!(portb.tx_buffer.is_empty());
+
+        futures::executor::block_on(portb.resume_input()).unwrap();
+        portb.poll_device(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(portb.rx_buffer, [0x44, 0x5a]);
+        assert!(matches!(portb.io_read(DATA_PORT, &mut data), IoResult::Ok));
+        assert_eq!(data, [0x44]);
     }
 
     #[test]

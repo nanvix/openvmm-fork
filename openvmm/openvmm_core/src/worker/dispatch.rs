@@ -93,9 +93,11 @@ use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_pcat_locator::RomFileLocation;
 use pal_async::DefaultDriver;
 use pal_async::DefaultPool;
+use pal_async::driver::SpawnDriver;
 use pal_async::local::block_with_io;
-use pal_async::task::Spawn;
 use pal_async::task::Task;
+use pal_async::timer::Instant;
+use pal_async::timer::PolledTimer;
 use pci_core::PciInterruptPin;
 use pcie::root::GenericPcieRootComplex;
 use pcie::switch::GenericPcieSwitch;
@@ -319,6 +321,7 @@ impl Worker for VmWorker {
         let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
         let snapshot_ready = parameters.snapshot_ready;
         let restore_ready_sink = parameters.restore_ready_sink;
+        let restore_gate_timeout = parameters.restore_gate_timeout;
         let restore_time = match (
             parameters.restore_downtime,
             parameters.restore_tsc_frequency_hz,
@@ -390,6 +393,7 @@ impl Worker for VmWorker {
         vm.snapshot_boundary_requests = snapshot_boundary_requests;
         vm.snapshot_ready = snapshot_ready;
         vm.restore_ready_sink = restore_ready_sink;
+        vm.restore_gate_timeout = restore_gate_timeout;
 
         LOADED_VM.store(&vm);
 
@@ -766,6 +770,9 @@ pub(crate) struct LoadedVm {
     running: bool,
     restore_start_guard: Option<vmm_core::partition_unit::StopGuard>,
     restore_ready_sink: Option<File>,
+    restore_gate_timeout: Option<Duration>,
+    restore_gate_deadline: Option<Instant>,
+    restore_input_gated: bool,
     snapshot_boundary_requests:
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     snapshot_ready: Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
@@ -3085,6 +3092,9 @@ impl InitializedVm {
             running: false,
             restore_start_guard: None,
             restore_ready_sink: None,
+            restore_gate_timeout: None,
+            restore_gate_deadline: None,
+            restore_input_gated: false,
             snapshot_boundary_requests: None,
             snapshot_ready: None,
             snapshot_stop_guard: None,
@@ -3627,6 +3637,13 @@ impl LoadedVm {
         if self.running {
             return Ok(false);
         }
+        if let Some(timeout) = self.restore_gate_timeout {
+            self.state_units
+                .quiesce_input_for_save(timeout)
+                .await
+                .context("failed to establish post-restore input gate")?;
+            self.restore_input_gated = true;
+        }
         self.state_units
             .start()
             .await
@@ -3646,6 +3663,9 @@ impl LoadedVm {
                 self.state_units.stop().await;
                 return Err(error).context("failed to publish restore readiness event");
             }
+        }
+        if let Some(timeout) = self.restore_gate_timeout {
+            self.restore_gate_deadline = Some(Instant::now().saturating_add(timeout));
         }
         self.restore_start_guard.take();
         self.running = true;
@@ -3677,10 +3697,11 @@ impl LoadedVm {
             return true;
         };
 
-        if let Err(error) = self
-            .state_units
-            .quiesce_input_for_save(request.input_gate_timeout)
-            .await
+        if !self.restore_input_gated
+            && let Err(error) = self
+                .state_units
+                .quiesce_input_for_save(request.input_gate_timeout)
+                .await
         {
             tracelimit::error_ratelimited!(
                 error = error.as_ref() as &dyn std::error::Error,
@@ -3722,6 +3743,13 @@ impl LoadedVm {
                     error = error.as_ref() as &dyn std::error::Error,
                     "failed to establish snapshot PMIO boundary"
                 );
+                if self.restore_input_gated {
+                    tracelimit::error_ratelimited!(
+                        "failed to establish post-restore acknowledgement boundary; terminating VM worker"
+                    );
+                    request.transaction_complete.complete(());
+                    return false;
+                }
                 if let Err(resume_error) = self
                     .state_units
                     .resume_input_after_save(request.input_gate_timeout)
@@ -3757,6 +3785,9 @@ impl LoadedVm {
             .context("snapshot boundary is missing its vCPU stop guard")?;
         self.snapshot_capture_wall_clock = None;
         self.snapshot_input_gate_timeout = None;
+        self.restore_gate_timeout = None;
+        self.restore_gate_deadline = None;
+        self.restore_input_gated = false;
         transaction_complete.complete(());
         drop(stop_guard);
         Ok(())
@@ -3810,7 +3841,7 @@ impl LoadedVm {
 
     pub async fn run(
         mut self,
-        driver: &impl Spawn,
+        driver: &impl SpawnDriver,
         mut rpc_recv: mesh::Receiver<VmRpc>,
         mut worker_rpc: mesh::Receiver<WorkerRpc<RestartState>>,
     ) {
@@ -3821,6 +3852,7 @@ impl LoadedVm {
             SnapshotBoundary(
                 Result<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest, mesh::RecvError>,
             ),
+            RestoreGateTimeout,
         }
 
         // Start a task to handle state unit inspections by filtering the worker
@@ -3854,18 +3886,40 @@ impl LoadedVm {
                         None => std::future::pending().await,
                     }
                 };
-                (a, b, c, d).race().await
+                let restore_gate_deadline = self.restore_gate_deadline;
+                let e = async {
+                    match restore_gate_deadline {
+                        Some(deadline) => {
+                            PolledTimer::new(driver).sleep_until(deadline).await;
+                            Event::RestoreGateTimeout
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                (a, b, c, d, e).race().await
             };
 
             match event {
                 Event::WorkerRpc(Err(_)) => break,
                 Event::SnapshotBoundary(Ok(request)) => {
                     if !self.establish_snapshot_boundary(request).await {
+                        if self.running {
+                            self.state_units.stop().await;
+                            self.running = false;
+                        }
                         break;
                     }
                 }
                 Event::SnapshotBoundary(Err(_)) => {
                     self.snapshot_boundary_requests = None;
+                }
+                Event::RestoreGateTimeout => {
+                    tracing::error!("post-restore input gate acknowledgement timed out");
+                    if self.running {
+                        self.state_units.stop().await;
+                        self.running = false;
+                    }
+                    break;
                 }
                 Event::WorkerRpc(Ok(message)) => match message {
                     WorkerRpc::Stop => break,

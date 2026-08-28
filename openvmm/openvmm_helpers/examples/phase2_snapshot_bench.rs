@@ -187,6 +187,9 @@ fn run_iteration(
         format_magic: openvmm_helpers::snapshot::SNAPSHOT_FORMAT_MAGIC.to_vec(),
         saved_state_schema_version: openvmm_helpers::snapshot::SAVED_STATE_SCHEMA_VERSION,
         saved_state_root_type: openvmm_helpers::snapshot::SAVED_STATE_ROOT_TYPE.to_owned(),
+        snapshot_tier: String::new(),
+        restore_policy: String::new(),
+        consumed_config_sections: 0,
     };
 
     let started = Instant::now();

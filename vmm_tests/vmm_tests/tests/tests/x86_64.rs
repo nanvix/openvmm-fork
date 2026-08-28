@@ -619,6 +619,9 @@ async fn snapshot_save_to_disk(
         format_magic: openvmm_helpers::snapshot::SNAPSHOT_FORMAT_MAGIC.to_vec(),
         saved_state_schema_version: openvmm_helpers::snapshot::SAVED_STATE_SCHEMA_VERSION,
         saved_state_root_type: openvmm_helpers::snapshot::SAVED_STATE_ROOT_TYPE.to_owned(),
+        snapshot_tier: String::new(),
+        restore_policy: String::new(),
+        consumed_config_sections: 0,
     };
     openvmm_helpers::snapshot::write_snapshot(&snap_dir, &manifest, &saved_state_bytes, &mem_path)?;
 

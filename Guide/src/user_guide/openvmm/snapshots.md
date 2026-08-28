@@ -28,7 +28,11 @@ These are stored as three required files and one optional paired file:
 Host-driven snapshots require **file-backed guest memory**. Pass `file=<PATH>`
 in the `--memory` option when launching a standard VM. A microVM launched with
 `--snapshot-destination` automatically creates temporary file-backed RAM in
-the destination's parent directory when no backing file was supplied.
+the destination's parent directory when no backing file was supplied. ABI-v2
+capture additionally requires
+`--snapshot-tier platform|workload-start|instance-checkpoint`. Platform and
+workload-start snapshots are reusable clones; instance checkpoints are
+single-use resumes.
 
 ```admonish warning
 The memory backing file and snapshot destination must be on the **same
@@ -92,8 +96,20 @@ started units and fails restore without releasing a vCPU. The peer must accept
 and read while resume is in progress; on Windows, flush completion waits until
 the named-pipe peer consumes the complete frame.
 
+For a tiered ABI-v2 restore, OpenVMM starts device workers with network and
+control input gated. The guest performs post-restore repair and writes the
+existing snapshot port (`0x605`) to acknowledge completion. OpenVMM stops at
+that exact post-write boundary, completes the deferred write while the vCPU is
+stopped, and then releases device input before resuming the vCPU. The acknowledgement is bounded by
+`--restore-gate-timeout-ms` (30000 milliseconds by default). Platform manifests
+leave read-only layer identities unbound, while later tiers require exact image
+identities. An instance-checkpoint restore attempt atomically creates
+`resume.claim`; subsequent restores are rejected. The claim is committed after
+artifact and configuration validation but before worker construction, so the
+restore attempt remains consumed if later worker startup fails.
+
 ```admonish warning
-Version 4 snapshots do not contain or validate embedded checksums for
+Versions 3 through 5 do not contain or validate embedded checksums for
 `state.bin` or `memory.bin`. Restore still requires regular files, bounded
 manifest and state decoding, exact artifact lengths, and a compatible machine
 contract, but same-length payload changes are not detected. Paired
@@ -236,8 +252,9 @@ immediately with a clear error if any active device does not support it.
 
 - Snapshots are **not portable** across architectures (e.g., you cannot
   restore an x86_64 snapshot on aarch64)
-- Restores use private copy-on-write RAM, so a committed snapshot can be
+- Restores use private copy-on-write RAM, so a clone-policy snapshot can be
   restored repeatedly without copying it or modifying `memory.bin`.
+  Instance-checkpoint snapshots permit one restore attempt.
 - VMs using VPCI or PCIe devices do not currently support save/restore
 - OpenHCL-based VMs do not currently support this snapshot mechanism
 - VMs using PCAT firmware do not support save/restore
