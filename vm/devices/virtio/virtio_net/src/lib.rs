@@ -251,6 +251,7 @@ pub struct Device {
     stopped_feature_banks: Option<[u32; 2]>,
     stopped_queue_count: u32,
     endpoint_generation: u64,
+    input_quiesced: bool,
 }
 
 /// Tracks the state of a queue pair through the start_queue lifecycle.
@@ -286,6 +287,7 @@ impl Device {
                 .coordinator
                 .state_mut()
                 .context("virtio-net coordinator state is unavailable")?;
+            coordinator.input_quiesced = self.input_quiesced;
             for worker in &mut coordinator.workers {
                 worker.stop().await;
             }
@@ -347,6 +349,7 @@ impl Device {
                 .coordinator
                 .state_mut()
                 .context("virtio-net coordinator state is unavailable")?;
+            coordinator.input_quiesced = false;
             for worker in &mut coordinator.workers {
                 worker.stop().await;
             }
@@ -614,6 +617,7 @@ impl VirtioDevice for Device {
         self.stop_error = None;
         self.stopped_feature_banks = None;
         self.stopped_queue_count = 0;
+        self.input_quiesced = false;
     }
 
     async fn quiesce_input(&mut self) -> anyhow::Result<()> {
@@ -621,11 +625,14 @@ impl VirtioDevice for Device {
             self.adapter.save_restore,
             "virtio-net input quiesce is unavailable without saved-state configuration"
         );
+        self.input_quiesced = true;
         self.quiesce_active_workers(true).await
     }
 
     async fn resume_input(&mut self) -> anyhow::Result<()> {
-        self.resume_quiesced_input().await
+        self.resume_quiesced_input().await?;
+        self.input_quiesced = false;
+        Ok(())
     }
 
     fn supports_save_restore(&self) -> bool {
@@ -1109,6 +1116,7 @@ impl NicBuilder {
             stopped_feature_banks: None,
             stopped_queue_count: 0,
             endpoint_generation: 0,
+            input_quiesced: false,
         })
     }
 }
@@ -1140,6 +1148,7 @@ impl Device {
                     .collect(),
                 num_queues,
                 restart: true,
+                input_quiesced: self.input_quiesced,
             },
         );
     }
@@ -1180,7 +1189,6 @@ impl Device {
         let coordinator = self.coordinator.state_mut().unwrap();
         let worker_task = &mut coordinator.workers[idx];
         worker_task.insert(&driver, "virtio-net".to_string(), worker);
-        worker_task.start();
     }
 }
 
@@ -1188,6 +1196,7 @@ struct Coordinator {
     workers: Vec<TaskControl<NetQueue, Worker>>,
     num_queues: u16,
     restart: bool,
+    input_quiesced: bool,
 }
 
 struct CoordinatorState {
@@ -1248,6 +1257,15 @@ impl Coordinator {
                         "failed to restart queues"
                     );
                 }
+                if self.input_quiesced
+                    && let Err(err) = stop.until_stopped(self.quiesce_workers()).await?
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to establish virtio-net input gate"
+                    );
+                    stop.until_stopped(pending::<()>()).await?;
+                }
                 self.restart = false;
             }
             self.start_workers();
@@ -1267,6 +1285,20 @@ impl Coordinator {
         for worker in &mut self.workers {
             worker.stop().await;
         }
+    }
+
+    async fn quiesce_workers(&mut self) -> anyhow::Result<()> {
+        for worker in &mut self.workers {
+            let (queue, state) = worker.get_mut();
+            let state = state.context("virtio-net worker state is unavailable")?;
+            if let Some(queue) = queue.state.as_mut() {
+                state
+                    .quiesce_endpoint(queue)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+            }
+        }
+        Ok(())
     }
 
     async fn restart_queues(&mut self, c_state: &mut CoordinatorState) -> Result<(), WorkerError> {

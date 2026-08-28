@@ -88,9 +88,10 @@ struct OpenvmmTestProcess {
 
 impl OpenvmmTestProcess {
     fn launch(executable: &Path, args: &[OsString]) -> anyhow::Result<Self> {
+        let openvmm_log = std::env::var_os("VMM_TEST_OPENVMM_LOG").unwrap_or_else(|| "off".into());
         let mut child = Command::new(executable)
             .args(args)
-            .env("OPENVMM_LOG", "off")
+            .env("OPENVMM_LOG", openvmm_log)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -364,9 +365,38 @@ impl TcpConsole {
         Ok(())
     }
 
+    fn wait_for_output_line(&mut self, marker: &[u8]) -> anyhow::Result<()> {
+        let started = Instant::now();
+        while count_output_lines(&self.output, marker) == 0 {
+            let remaining = PHASE_2_TIMEOUT.saturating_sub(started.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "timed out waiting for console output line {:?}; output: {}",
+                String::from_utf8_lossy(marker),
+                output_tail(&self.output)
+            );
+            match self
+                .output_recv
+                .recv_timeout(remaining.min(Duration::from_millis(100)))
+            {
+                Ok(chunk) => self.output.extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!(
+                        "console disconnected before output line {:?}; output: {}",
+                        String::from_utf8_lossy(marker),
+                        output_tail(&self.output)
+                    )
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn finish(mut self) -> Vec<u8> {
+        self.stream.shutdown(std::net::Shutdown::Both).ok();
         drop(self.stream);
-        while let Ok(chunk) = self.output_recv.recv_timeout(Duration::from_millis(100)) {
+        while let Ok(chunk) = self.output_recv.recv() {
             self.output.extend_from_slice(&chunk);
         }
         self.output
@@ -381,7 +411,8 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn count_output_lines(output: &[u8], marker: &[u8]) -> usize {
     output
-        .split(|byte| *byte == b'\n')
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_suffix(b"\n"))
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .filter(|line| *line == marker)
         .count()
@@ -1429,6 +1460,8 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
         initrd.as_os_str().to_owned(),
         "--snapshot-destination".into(),
         snapshot_dir.as_os_str().to_owned(),
+        "--snapshot-tier".into(),
+        "workload-start".into(),
         "--microvm-sandbox-block".into(),
         block_arg("distro", &layer_path, true),
         "--microvm-sandbox-block".into(),
@@ -1447,6 +1480,7 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
          tries=0; while [ $tries -lt 2000 ]; do set -- $(cat /sys/block/vdb/inflight); [ $(($1+$2)) -gt 0 ] && break; kill -0 $writer 2>/dev/null || break; tries=$((tries+1)); done; \
          [ $tries -lt 2000 ] && kill -0 $writer 2>/dev/null || { nvx-exit 62; exit; }; \
          printf '\\001' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
+         printf '\002' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
          echo MICROVM-V2-SCRATCH-POST-OUT; \
          wait $writer; \
          first_byte=$(dd if=/dev/vdb bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
@@ -1622,6 +1656,8 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
         initrd.as_os_str().to_owned(),
         "--snapshot-destination".into(),
         snapshot_dir.as_os_str().to_owned(),
+        "--snapshot-tier".into(),
+        "platform".into(),
         "--microvm-sandbox-block".into(),
         block_arg("distro", &layer_path, true),
         "--microvm-sandbox-block".into(),
@@ -1635,6 +1671,7 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
         "set -eu; \
          tries=0; while [ ! -b /dev/vdb ] && [ $tries -lt 600 ]; do sleep 0.05; tries=$((tries+1)); done; \
          printf '\\000' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
+         printf '\002' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
          echo MICROVM-V2-FRESH-POST-OUT; \
          blockdev --flushbufs /dev/vdb; \
          value=$(dd if=/dev/vdb bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
@@ -1725,6 +1762,395 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
             && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
         "fresh-scratch restore with wrong geometry entered the guest"
     );
+
+    Ok(())
+}
+
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
+async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const DISK_BYTES: usize = 1024 * 1024;
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("snapshot tier test requires direct-boot Linux artifacts")?;
+    let hypervisor = microvm_hypervisor()?;
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-microvm-v2-tiers-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create snapshot tier test directory")?;
+    let source_layer = temp_dir.path().join("source.erofs");
+    let replacement_layer = temp_dir.path().join("replacement.erofs");
+    std::fs::write(&source_layer, vec![0x3c; DISK_BYTES])?;
+    std::fs::write(&replacement_layer, vec![0xc3; DISK_BYTES])?;
+
+    let block_arg = |role: &str, path: &Path, read_only: bool| -> OsString {
+        format!(
+            "{role}:file:{}{}",
+            path.display(),
+            if read_only { ",ro" } else { "" }
+        )
+        .into()
+    };
+    let base_args = || {
+        [
+            "--single-process",
+            "--machine",
+            "microvm-v2",
+            "--hypervisor",
+            hypervisor,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>()
+    };
+
+    for (tier, restore_policy, consumed_sections, single_use) in [
+        (
+            openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM,
+            openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_CLONE,
+            openvmm_helpers::snapshot::SNAPSHOT_CONFIG_INVARIANTS,
+            false,
+        ),
+        (
+            openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START,
+            openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_CLONE,
+            openvmm_helpers::snapshot::SNAPSHOT_CONFIG_INVARIANTS
+                | openvmm_helpers::snapshot::SNAPSHOT_CONFIG_IMAGE_BINDING
+                | openvmm_helpers::snapshot::SNAPSHOT_CONFIG_SANDBOX,
+            false,
+        ),
+        (
+            openvmm_helpers::snapshot::SNAPSHOT_TIER_INSTANCE_CHECKPOINT,
+            openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_RESUME,
+            openvmm_helpers::snapshot::SNAPSHOT_CONFIG_INVARIANTS
+                | openvmm_helpers::snapshot::SNAPSHOT_CONFIG_IMAGE_BINDING
+                | openvmm_helpers::snapshot::SNAPSHOT_CONFIG_SANDBOX,
+            true,
+        ),
+    ] {
+        let snapshot_dir = temp_dir.path().join(format!("{tier}-snapshot"));
+        let source_scratch = temp_dir.path().join(format!("{tier}-source-scratch.raw"));
+        let restore_scratch = temp_dir.path().join(format!("{tier}-restore-scratch.raw"));
+        std::fs::write(&source_scratch, vec![0xa5; DISK_BYTES])?;
+        std::fs::write(&restore_scratch, vec![0x5a; DISK_BYTES])?;
+        let address = {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.local_addr()?
+        };
+        let capture_marker = format!("TIER-{tier}-CAPTURE");
+        let repair_marker = format!("TIER-{tier}-REPAIR");
+        let input_marker = format!("TIER-{tier}-INPUT");
+        let released_marker = format!("TIER-{tier}-RELEASED");
+        let premature_marker = format!("TIER-{tier}-PREMATURE-INPUT");
+        let mismatch_marker = format!("TIER-{tier}-MISMATCH-REJECTED");
+        let setup_marker = format!("TIER-{tier}-SETUP-READY");
+        let hook_marker = format!("TIER-{tier}-HOOK-READY");
+        let workload_marker = format!("TIER-{tier}-WORKLOAD-RAN");
+        let layer_marker = format!("TIER-{tier}-LAYER-");
+        let platform_tier = tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM;
+        let mismatched_tier = if platform_tier {
+            openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START
+        } else {
+            openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM
+        };
+        let paired_setup = if platform_tier {
+            String::new()
+        } else {
+            format!(
+                "mkdir -p /run/nvx/scratch /sys/fs/cgroup; \
+             mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup; \
+             mkdir -p /sys/fs/cgroup/container; \
+             mkfs.ext4 -F /dev/vdb >/dev/null; mount -t ext4 /dev/vdb /run/nvx/scratch; \
+             printf 'captured-workload-id\\n' >/run/nvx/workload-machine-id; \
+             barrier=/run/nvx/test-container-start; mkfifo \"$barrier\"; \
+             (IFS= read -r start <\"$barrier\"; [ \"$start\" = start ]; \
+             exec unshare --mount --uts --fork --kill-child sh -c 'mount --make-rprivate /; mkdir -p /etc; : >/etc/machine-id; mount --bind /run/nvx/workload-machine-id /etc/machine-id; hostname captured-workload; while [ ! -e /run/nvx/restore-active ]; do sleep 0.01; done; echo {workload_marker}; while :; do sleep 60; done') & workload_pid=$!; \
+             echo \"$workload_pid\" >/sys/fs/cgroup/container/cgroup.procs; \
+             printf 'start\\n' >\"$barrier\"; rm -f \"$barrier\"; \
+             echo \"$workload_pid\" >/run/nvx/container.pid; \
+             tries=0; while [ \"$(nsenter -t \"$workload_pid\" -u hostname 2>/dev/null || true)\" != captured-workload ] && [ $tries -lt 200 ]; do sleep 0.01; tries=$((tries+1)); done; \
+             [ $tries -lt 200 ] || {{ nvx-exit 67; exit; }};"
+            )
+        };
+        let pre_capture_action = if platform_tier {
+            "date -u -s 200001010000.00 >/dev/null; printf 'captured-machine-id\\n' > /etc/machine-id;"
+                .to_owned()
+        } else {
+            "hostname captured-host; printf 'captured-machine-id\\n' > /etc/machine-id;".to_owned()
+        };
+        let capture_action = if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_INSTANCE_CHECKPOINT
+        {
+            "/sbin/nvx-snapshot".to_owned()
+        } else {
+            format!("/sbin/nvx-snapshot --tier {tier}")
+        };
+        let repair_action = if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_INSTANCE_CHECKPOINT
+        {
+            format!(
+                "[ \"$(cat /etc/machine-id)\" = captured-machine-id ]; \
+                 [ \"$(cat /run/nvx/workload-machine-id)\" = captured-workload-id ]; \
+                 [ \"$(nsenter -t \"$(cat /run/nvx/container.pid)\" -m -r cat /etc/machine-id)\" = captured-workload-id ]; \
+                 [ \"$(nsenter -t \"$(cat /run/nvx/container.pid)\" -u hostname)\" = captured-workload ]; \
+                 echo {repair_marker};"
+            )
+        } else {
+            String::new()
+        };
+        let runtime_hook = if platform_tier {
+            format!(
+                "printf '%s\\n' '#!/bin/sh' 'echo {repair_marker}' 'sleep 1' \
+                 '[ \"$(date -u +%Y)\" -ge 2025 ] || exit 1' \
+                 'grep -Eq \"^[0-9a-f]{{32}}$\" /etc/machine-id || exit 1' \
+                 '[ \"$(hostname)\" = nvx-sandbox ] || exit 1' \
+                 'if ! kill -0 \"$(cat /run/nvx/gate-reader.pid)\" 2>/dev/null; then echo {premature_marker}; exit 1; fi' \
+                 > /run/nvx/runtime-post-restore; chmod +x /run/nvx/runtime-post-restore;"
+            )
+        } else if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START {
+            format!(
+                "printf '%s\\n' '#!/bin/sh' ': >/run/nvx/restore-active' 'echo {repair_marker}' 'sleep 1' \
+                 'grep -Eq \"^[0-9a-f]{{32}}$\" /etc/machine-id || exit 1' \
+                 '[ \"$(cat /run/nvx/workload-machine-id)\" = \"$(cat /etc/machine-id)\" ] || exit 1' \
+                 '[ \"$(nsenter -t \"$(cat /run/nvx/container.pid)\" -m -r cat /etc/machine-id)\" = \"$(cat /etc/machine-id)\" ] || exit 1' \
+                 '[ \"$(nsenter -t \"$(cat /run/nvx/container.pid)\" -u hostname)\" = restored-workload-start ] || exit 1' \
+                 'if ! kill -0 \"$(cat /run/nvx/gate-reader.pid)\" 2>/dev/null; then echo {premature_marker}; exit 1; fi' \
+                 > /run/nvx/runtime-post-restore; chmod +x /run/nvx/runtime-post-restore;"
+            )
+        } else {
+            String::new()
+        };
+
+        let mut capture_args = base_args();
+        capture_args.extend([
+            "--memory".into(),
+            "128M".into(),
+            "--kernel".into(),
+            kernel.as_os_str().to_owned(),
+            "--initrd".into(),
+            initrd.as_os_str().to_owned(),
+            "--snapshot-destination".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--snapshot-tier".into(),
+            tier.into(),
+            "--net".into(),
+            "10.0.0.2/24".into(),
+            "--network-profile".into(),
+            "portable".into(),
+            "--allow-host".into(),
+            "10.0.0.1".into(),
+            "--virtio-console".into(),
+            format!("listen=tcp:{address}").into(),
+            "--microvm-sandbox-block".into(),
+            block_arg("distro", &source_layer, true),
+            "--microvm-sandbox-block".into(),
+            block_arg("scratch", &source_scratch, false),
+        ]);
+        if !platform_tier {
+            capture_args.extend([
+                "--cmdline".into(),
+                format!("nvx_hostname=restored-{tier}").into(),
+            ]);
+        }
+
+        let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+        let mut source_console = TcpConsole::connect(address)
+            .with_context(|| format!("capture process {}", source.failure_context()))?;
+        source_console.wait_for(MICROVM_BOOT_MARKER)?;
+        source_console.wait_for(MICROVM_SHELL_PROMPT)?;
+        source_console.send_line(&format!(
+            "set -eu; \
+             if /sbin/nvx-snapshot --tier {mismatched_tier} >/run/nvx-tier-mismatch.log 2>&1; then nvx-exit 69; exit; fi; \
+             grep -q 'requested tier does not match host snapshot tier' /run/nvx-tier-mismatch.log || {{ cat /run/nvx-tier-mismatch.log; nvx-exit 68; exit; }}; \
+             echo {mismatch_marker}"
+        ))?;
+        source_console.wait_for_output_line(mismatch_marker.as_bytes())?;
+        source_console.send_line(&format!("{paired_setup} echo {setup_marker}"))?;
+        source_console.wait_for_output_line(setup_marker.as_bytes())?;
+        source_console.send_line(&format!("{runtime_hook} echo {hook_marker}"))?;
+        source_console.wait_for_output_line(hook_marker.as_bytes())?;
+        source_console.send_line(&format!(
+            "{pre_capture_action} \
+             stty -F /dev/hvc1 raw -echo; \
+             (dd if=/dev/hvc1 bs=1 count=1 >/dev/null 2>&1; echo {input_marker}) & gate_reader=$!; \
+             mkdir -p /run/nvx; echo \"$gate_reader\" > /run/nvx/gate-reader.pid; \
+             sleep 0.1; echo {capture_marker}; \
+             {capture_action}; \
+             {repair_action} \
+             wait \"$gate_reader\"; echo {released_marker}; \
+             blockdev --flushbufs /dev/vda; \
+             value=$(dd if=/dev/vda bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
+             echo {layer_marker}$value; nvx-exit 37"
+        ))?;
+        source_console.wait_for_output_line(capture_marker.as_bytes())?;
+        let (status, output) = source.wait()?;
+        anyhow::ensure!(
+            status.success(),
+            "{tier} capture failed with {status}: {}",
+            output_tail(&output)
+        );
+        let source_output = source_console.finish();
+        anyhow::ensure!(
+            count_output_lines(&source_output, repair_marker.as_bytes()) == 0
+                && count_output_lines(&source_output, mismatch_marker.as_bytes()) == 1,
+            "{tier} source crossed its terminal capture boundary: {}",
+            output_tail(&source_output)
+        );
+
+        let (manifest, _) = openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+        anyhow::ensure!(
+            manifest.snapshot_tier == tier
+                && manifest.restore_policy == restore_policy
+                && manifest.consumed_config_sections == consumed_sections,
+            "{tier} manifest policy is inconsistent"
+        );
+        let layer = &manifest
+            .machine_contract
+            .as_ref()
+            .context("tier snapshot is missing its machine contract")?
+            .microvm_sandbox_blocks[0];
+        anyhow::ensure!(
+            (tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM)
+                == (layer.identity_kind == "unbound" && layer.identity.is_empty()),
+            "{tier} layer binding does not match its sharing scope"
+        );
+
+        let restore_layer = if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM {
+            &replacement_layer
+        } else {
+            &source_layer
+        };
+        let mut restore_args = base_args();
+        restore_args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--restore-entropy".into(),
+            "--network-profile".into(),
+            "portable".into(),
+            "--allow-host".into(),
+            "10.0.0.1".into(),
+            "--microvm-sandbox-block".into(),
+            block_arg("distro", restore_layer, true),
+        ]);
+        if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM {
+            restore_args.extend([
+                "--microvm-sandbox-block".into(),
+                block_arg("scratch", &restore_scratch, false),
+            ]);
+        }
+
+        if single_use {
+            let invalid_profile_args = [
+                "--single-process".into(),
+                "--hypervisor".into(),
+                hypervisor.into(),
+                "--restore-snapshot".into(),
+                snapshot_dir.as_os_str().to_owned(),
+            ];
+            let invalid = OpenvmmTestProcess::launch(openvmm.get(), &invalid_profile_args)?;
+            let (status, output) = invalid.wait()?;
+            anyhow::ensure!(
+                !status.success()
+                    && contains_bytes(
+                        &output,
+                        b"microVM snapshot restore requires --machine microvm or microvm-v2"
+                    )
+                    && !snapshot_dir.join("resume.claim").exists(),
+                "wrong-profile restore consumed or entered an instance checkpoint: {}",
+                output_tail(&output)
+            );
+        }
+
+        let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        let mut restore_console = TcpConsole::connect(address)
+            .with_context(|| format!("restore process {}", restore.failure_context()))?;
+        restore_console.send_bytes(b"Z")?;
+        restore_console
+            .wait_for_output_line(repair_marker.as_bytes())
+            .with_context(|| format!("restore process {}", restore.failure_context()))?;
+        restore_console
+            .wait_for_output_line(released_marker.as_bytes())
+            .with_context(|| format!("restore process {}", restore.failure_context()))?;
+        if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START {
+            restore_console
+                .wait_for_output_line(workload_marker.as_bytes())
+                .with_context(|| format!("restore process {}", restore.failure_context()))?;
+        }
+        let (status, output) = restore.wait()?;
+        anyhow::ensure!(
+            status.code() == Some(37),
+            "{tier} restore failed with {status}: {}",
+            output_tail(&output)
+        );
+        let restore_output = restore_console.finish();
+        anyhow::ensure!(
+            count_output_lines(&restore_output, input_marker.as_bytes()) == 1
+                && count_output_lines(&restore_output, premature_marker.as_bytes()) == 0,
+            "{tier} restore input crossed the gate before acknowledgement: {}",
+            output_tail(&restore_output)
+        );
+        let expected_layer = if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM {
+            195
+        } else {
+            60
+        };
+        anyhow::ensure!(
+            count_output_lines(
+                &restore_output,
+                format!("{layer_marker}{expected_layer}").as_bytes()
+            ) == 1,
+            "{tier} restore observed the wrong layer binding: {}",
+            output_tail(&restore_output)
+        );
+
+        if tier == openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START {
+            let mut timeout_args = restore_args.clone();
+            timeout_args.extend(["--restore-gate-timeout-ms".into(), "500".into()]);
+            let mut timeout_restore = OpenvmmTestProcess::launch(openvmm.get(), &timeout_args)?;
+            let mut timeout_console = TcpConsole::connect(address).with_context(|| {
+                format!(
+                    "timeout restore process {}",
+                    timeout_restore.failure_context()
+                )
+            })?;
+            timeout_console.send_bytes(b"Z")?;
+            let (status, output) = timeout_restore.wait()?;
+            let timeout_output = timeout_console.finish();
+            anyhow::ensure!(
+                !status.success()
+                    && count_output_lines(&timeout_output, input_marker.as_bytes()) == 0
+                    && count_output_lines(&timeout_output, released_marker.as_bytes()) == 0
+                    && count_output_lines(&timeout_output, workload_marker.as_bytes()) == 0,
+                "workload-start restore gate timeout released input, thawed the workload, or succeeded; status={status}; process output: {}; console output: {}",
+                output_tail(&output),
+                output_tail(&timeout_output)
+            );
+        }
+
+        if single_use {
+            let duplicate = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+            let (status, output) = duplicate.wait()?;
+            anyhow::ensure!(
+                !status.success()
+                    && contains_bytes(&output, b"resume snapshot has already been claimed"),
+                "duplicate instance-checkpoint restore was not rejected: {}",
+                output_tail(&output)
+            );
+        }
+    }
 
     Ok(())
 }

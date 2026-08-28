@@ -18,9 +18,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 /// Current manifest format version. Bump when making incompatible changes.
-pub const MANIFEST_VERSION: u32 = 4;
+pub const MANIFEST_VERSION: u32 = 5;
 /// Magic identifying the OpenVMM snapshot manifest format.
-pub const SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V4\0";
+pub const SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V5\0";
+const VERSION_4_MANIFEST_VERSION: u32 = 4;
+const VERSION_4_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V4\0";
 const PREVIOUS_MANIFEST_VERSION: u32 = 3;
 const PREVIOUS_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V3\0";
 const LEGACY_MANIFEST_VERSION: u32 = 2;
@@ -33,10 +35,29 @@ pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
 pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 1;
 /// Clock policy applied when a snapshot is restored.
 pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
+/// Fleet-wide snapshot captured before image and sandbox configuration is consumed.
+pub const SNAPSHOT_TIER_PLATFORM: &str = "platform";
+/// Tenant-scoped snapshot captured at a warm workload handoff point.
+pub const SNAPSHOT_TIER_WORKLOAD_START: &str = "workload-start";
+/// Single-instance checkpoint captured during a live workload.
+pub const SNAPSHOT_TIER_INSTANCE_CHECKPOINT: &str = "instance-checkpoint";
+/// Reusable restore policy for snapshots that create independent instances.
+pub const SNAPSHOT_RESTORE_POLICY_CLONE: &str = "clone";
+/// Single-use restore policy for snapshots that continue one instance.
+pub const SNAPSHOT_RESTORE_POLICY_RESUME: &str = "resume";
+/// The invariant configuration section was consumed before capture.
+pub const SNAPSHOT_CONFIG_INVARIANTS: u32 = 1 << 0;
+/// The image-binding configuration section was consumed before capture.
+pub const SNAPSHOT_CONFIG_IMAGE_BINDING: u32 = 1 << 1;
+/// The per-sandbox configuration section was consumed before capture.
+pub const SNAPSHOT_CONFIG_SANDBOX: u32 = 1 << 2;
+const SNAPSHOT_CONFIG_ALL: u32 =
+    SNAPSHOT_CONFIG_INVARIANTS | SNAPSHOT_CONFIG_IMAGE_BINDING | SNAPSHOT_CONFIG_SANDBOX;
 
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const STATE_FILE_NAME: &str = "state.bin";
 const MEMORY_FILE_NAME: &str = "memory.bin";
+const RESUME_CLAIM_FILE_NAME: &str = "resume.claim";
 /// Fixed snapshot-relative name of an ABI-v2 paired scratch image.
 pub const SCRATCH_FILE_NAME: &str = "scratch.img";
 const MAX_MANIFEST_SIZE_BYTES: u64 = 1024 * 1024;
@@ -916,10 +937,10 @@ pub struct SnapshotManifest {
     /// Length of `state.bin` in bytes.
     #[mesh(8)]
     pub state_size_bytes: u64,
-    /// Legacy v2 SHA-256 digest of `state.bin`; empty in v3 and v4.
+    /// Legacy v2 SHA-256 digest of `state.bin`; empty in v3 through v5.
     #[mesh(9)]
     pub state_sha256: Vec<u8>,
-    /// Legacy v2 SHA-256 digest of `memory.bin`; empty in v3 and v4.
+    /// Legacy v2 SHA-256 digest of `memory.bin`; empty in v3 through v5.
     #[mesh(10)]
     pub memory_sha256: Vec<u8>,
     /// Authoritative machine composition for versioned machine profiles.
@@ -934,6 +955,15 @@ pub struct SnapshotManifest {
     /// Fully qualified protobuf root type stored in `state.bin`.
     #[mesh(14)]
     pub saved_state_root_type: String,
+    /// Sandbox capture tier. Empty for snapshots outside microVM ABI v2.
+    #[mesh(15)]
+    pub snapshot_tier: String,
+    /// `clone` for reusable artifacts or `resume` for single-use artifacts.
+    #[mesh(16)]
+    pub restore_policy: String,
+    /// Bitmask of configuration sections consumed before capture.
+    #[mesh(17)]
+    pub consumed_config_sections: u32,
 }
 
 /// Write a snapshot to the given directory.
@@ -1002,6 +1032,10 @@ fn stage_snapshot(
     scratch_file: Option<&std::fs::File>,
 ) -> anyhow::Result<StagingDirectory> {
     validate_manifest_header(manifest)?;
+    validate_manifest_version(manifest)?;
+    if let Some(contract) = &manifest.machine_contract {
+        validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
+    }
     anyhow::ensure!(
         manifest.version == MANIFEST_VERSION,
         "snapshot manifest version {} is not supported for writing (expected {})",
@@ -1110,21 +1144,28 @@ pub fn read_snapshot_with_memory(
     dir: &Path,
     expected_memory_size: u64,
 ) -> anyhow::Result<(SnapshotManifest, Vec<u8>, std::fs::File)> {
-    validate_directory(dir, "snapshot directory")?;
+    let manifest = read_snapshot_manifest(dir)?;
+    let (state_bytes, memory_file) =
+        read_snapshot_artifacts_with_memory(dir, &manifest, expected_memory_size)?;
+    Ok((manifest, state_bytes, memory_file))
+}
 
-    let manifest_bytes = read_bounded_file(
-        &dir.join(MANIFEST_FILE_NAME),
-        MAX_MANIFEST_SIZE_BYTES,
-        "snapshot manifest",
-    )?;
-    let manifest: SnapshotManifest =
-        mesh::payload::decode(&manifest_bytes).context("failed to decode snapshot manifest")?;
-    validate_manifest_header(&manifest)?;
-    validate_manifest_version(&manifest)?;
+/// Opens snapshot artifacts against an already validated manifest.
+///
+/// Restore uses this to keep one manifest authoritative from machine
+/// composition through worker construction.
+pub fn read_snapshot_artifacts_with_memory(
+    dir: &Path,
+    manifest: &SnapshotManifest,
+    expected_memory_size: u64,
+) -> anyhow::Result<(Vec<u8>, std::fs::File)> {
+    validate_directory(dir, "snapshot directory")?;
+    validate_manifest_header(manifest)?;
+    validate_manifest_version(manifest)?;
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
-    validate_snapshot_directory(dir, &manifest)?;
+    validate_snapshot_directory(dir, manifest)?;
     anyhow::ensure!(
         manifest.state_size_bytes <= MAX_SAVED_STATE_SIZE_BYTES,
         "state.bin length in the manifest exceeds the maximum size of \
@@ -1150,7 +1191,7 @@ pub fn read_snapshot_with_memory(
     let memory_path = dir.join(MEMORY_FILE_NAME);
     let memory_file = open_file_with_length(&memory_path, expected_memory_size, MEMORY_FILE_NAME)?;
 
-    Ok((manifest, state_bytes, memory_file))
+    Ok((state_bytes, memory_file))
 }
 
 /// Opens and verifies the scratch image paired to a snapshot, if present.
@@ -1193,6 +1234,60 @@ pub fn copy_verified_file(
         expected_digest,
         "private scratch copy",
     )
+}
+
+/// Atomically consumes a single-use resume snapshot.
+///
+/// Call this after artifact and configuration validation and before constructing
+/// execution-owned workers. A later startup failure does not roll back the claim.
+/// Clone snapshots are unchanged.
+pub fn claim_snapshot_for_restore(dir: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
+    validate_manifest_header(manifest)?;
+    validate_manifest_version(manifest)?;
+    if manifest.restore_policy != SNAPSHOT_RESTORE_POLICY_RESUME {
+        return Ok(());
+    }
+
+    validate_directory(dir, "snapshot directory")?;
+    let claim_path = dir.join(RESUME_CLAIM_FILE_NAME);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut claim = match options.open(&claim_path) {
+        Ok(claim) => claim,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("resume snapshot has already been claimed")
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to claim resume snapshot at {}",
+                    claim_path.display()
+                )
+            });
+        }
+    };
+    claim
+        .write_all(b"OPENVMM_RESUME_CLAIM_V1\n")
+        .context("failed to write resume snapshot claim")?;
+    claim
+        .sync_all()
+        .context("failed to flush resume snapshot claim")?;
+    sync_directory(dir).context("failed to commit resume snapshot claim")?;
+    Ok(())
+}
+
+/// Returns whether restore must hold external device input until guest repair completes.
+pub fn requires_post_restore_gate(manifest: &SnapshotManifest) -> bool {
+    manifest.version == MANIFEST_VERSION
+        && manifest.machine_contract.as_ref().is_some_and(|contract| {
+            contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2
+        })
+        && !manifest.snapshot_tier.is_empty()
 }
 
 fn paired_scratch_block(manifest: &SnapshotManifest) -> Option<&SnapshotMicrovmSandboxBlock> {
@@ -1748,6 +1843,11 @@ fn validate_snapshot_directory(dir: &Path, manifest: &SnapshotManifest) -> anyho
     {
         let entry = entry.context("failed to inspect snapshot directory entry")?;
         let name = entry.file_name();
+        if name == RESUME_CLAIM_FILE_NAME
+            && manifest.restore_policy == SNAPSHOT_RESTORE_POLICY_RESUME
+        {
+            anyhow::bail!("resume snapshot has already been claimed");
+        }
         anyhow::ensure!(
             name == MANIFEST_FILE_NAME
                 || name == STATE_FILE_NAME
@@ -2061,7 +2161,18 @@ pub fn validate_microvm_machine_contract(
         "snapshot filesystem policy doesn't match the requested machine"
     );
     anyhow::ensure!(
-        contract.microvm_sandbox_blocks == expected.microvm_sandbox_blocks,
+        {
+            let mut expected_blocks = expected.microvm_sandbox_blocks.clone();
+            if manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM {
+                for block in &mut expected_blocks {
+                    if block.read_only {
+                        block.identity_kind = "unbound".to_owned();
+                        block.identity.clear();
+                    }
+                }
+            }
+            contract.microvm_sandbox_blocks == expected_blocks
+        },
         "snapshot sandbox block topology or identity doesn't match the requested machine"
     );
     anyhow::ensure!(
@@ -2299,11 +2410,20 @@ fn validate_machine_contract_shape(
                     }
                 } else {
                     anyhow::ensure!(
-                        block.artifact.is_empty() && block.identity_kind == "sha256",
+                        block.artifact.is_empty()
+                            && matches!(block.identity_kind.as_str(), "sha256" | "unbound"),
                         "snapshot read-only layer '{}' has an invalid identity policy",
                         block.role
                     );
-                    validate_sha256(&block.identity, &format!("{} block", block.role))?;
+                    if block.identity_kind == "sha256" {
+                        validate_sha256(&block.identity, &format!("{} block", block.role))?;
+                    } else {
+                        anyhow::ensure!(
+                            block.identity.is_empty(),
+                            "snapshot unbound layer '{}' carries an identity",
+                            block.role
+                        );
+                    }
                 }
             }
             anyhow::ensure!(
@@ -2428,9 +2548,10 @@ fn validate_manifest_header(manifest: &SnapshotManifest) -> anyhow::Result<()> {
     let expected_magic = match manifest.version {
         LEGACY_MANIFEST_VERSION => LEGACY_SNAPSHOT_FORMAT_MAGIC,
         PREVIOUS_MANIFEST_VERSION => PREVIOUS_SNAPSHOT_FORMAT_MAGIC,
+        VERSION_4_MANIFEST_VERSION => VERSION_4_SNAPSHOT_FORMAT_MAGIC,
         MANIFEST_VERSION => SNAPSHOT_FORMAT_MAGIC,
         version => anyhow::bail!(
-            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION}, {PREVIOUS_MANIFEST_VERSION}, or {MANIFEST_VERSION})"
+            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION} through {MANIFEST_VERSION})"
         ),
     };
     anyhow::ensure!(
@@ -2451,6 +2572,15 @@ fn validate_manifest_header(manifest: &SnapshotManifest) -> anyhow::Result<()> {
 }
 
 fn validate_manifest_version(manifest: &SnapshotManifest) -> anyhow::Result<()> {
+    if manifest.version < MANIFEST_VERSION {
+        anyhow::ensure!(
+            manifest.snapshot_tier.is_empty()
+                && manifest.restore_policy.is_empty()
+                && manifest.consumed_config_sections == 0,
+            "snapshot manifest version {} cannot contain snapshot tier metadata",
+            manifest.version,
+        );
+    }
     match manifest.version {
         LEGACY_MANIFEST_VERSION => {
             anyhow::ensure!(
@@ -2471,7 +2601,7 @@ fn validate_manifest_version(manifest: &SnapshotManifest) -> anyhow::Result<()> 
                 "snapshot manifest version {LEGACY_MANIFEST_VERSION} cannot contain ABI-v2 sandbox blocks"
             );
         }
-        PREVIOUS_MANIFEST_VERSION | MANIFEST_VERSION => {
+        PREVIOUS_MANIFEST_VERSION | VERSION_4_MANIFEST_VERSION | MANIFEST_VERSION => {
             anyhow::ensure!(
                 manifest.state_sha256.is_empty() && manifest.memory_sha256.is_empty(),
                 "snapshot manifest version {} must not contain legacy artifact digests",
@@ -2486,12 +2616,121 @@ fn validate_manifest_version(manifest: &SnapshotManifest) -> anyhow::Result<()> 
                     "snapshot manifest version {PREVIOUS_MANIFEST_VERSION} cannot contain ABI-v2 sandbox blocks"
                 );
             }
+            if manifest.version == MANIFEST_VERSION {
+                validate_snapshot_tier(manifest)?;
+            }
         }
         version => anyhow::bail!(
-            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION}, {PREVIOUS_MANIFEST_VERSION}, or {MANIFEST_VERSION})"
+            "snapshot manifest version {version} is not supported (expected {LEGACY_MANIFEST_VERSION} through {MANIFEST_VERSION})"
         ),
     }
     Ok(())
+}
+
+fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
+    let Some(contract) = manifest.machine_contract.as_ref() else {
+        anyhow::ensure!(
+            manifest.snapshot_tier.is_empty()
+                && manifest.restore_policy.is_empty()
+                && manifest.consumed_config_sections == 0,
+            "snapshot tier metadata requires a microVM ABI-v2 machine contract"
+        );
+        return Ok(());
+    };
+    if contract.microvm_abi_version != openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+        anyhow::ensure!(
+            manifest.snapshot_tier.is_empty()
+                && manifest.restore_policy.is_empty()
+                && manifest.consumed_config_sections == 0,
+            "snapshot tier metadata requires microVM ABI version 2"
+        );
+        return Ok(());
+    }
+
+    let paired_scratch = paired_scratch_block(manifest).is_some();
+    let expected_consumed_sections = match manifest.snapshot_tier.as_str() {
+        SNAPSHOT_TIER_PLATFORM => SNAPSHOT_CONFIG_INVARIANTS,
+        SNAPSHOT_TIER_WORKLOAD_START | SNAPSHOT_TIER_INSTANCE_CHECKPOINT => SNAPSHOT_CONFIG_ALL,
+        _ => 0,
+    };
+    let valid = manifest.consumed_config_sections == expected_consumed_sections
+        && matches!(
+            (
+                manifest.snapshot_tier.as_str(),
+                manifest.restore_policy.as_str(),
+                paired_scratch,
+            ),
+            (SNAPSHOT_TIER_PLATFORM, SNAPSHOT_RESTORE_POLICY_CLONE, false)
+                | (
+                    SNAPSHOT_TIER_WORKLOAD_START,
+                    SNAPSHOT_RESTORE_POLICY_CLONE,
+                    true
+                )
+                | (
+                    SNAPSHOT_TIER_INSTANCE_CHECKPOINT,
+                    SNAPSHOT_RESTORE_POLICY_RESUME,
+                    true
+                )
+        );
+    anyhow::ensure!(
+        valid,
+        "snapshot tier '{}', restore policy '{}', and scratch policy are not a canonical ABI-v2 combination",
+        manifest.snapshot_tier,
+        manifest.restore_policy,
+    );
+    let expected_tier_token = format!("nvx_snapshot_tier={}", manifest.snapshot_tier);
+    let tier_tokens = contract
+        .effective_command_line
+        .split_ascii_whitespace()
+        .filter(|token| token.starts_with("nvx_snapshot_tier="))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        tier_tokens == [expected_tier_token.as_str()],
+        "snapshot tier '{}' does not match its saved host policy",
+        manifest.snapshot_tier,
+    );
+    let layers_are_unbound = contract
+        .microvm_sandbox_blocks
+        .iter()
+        .filter(|block| block.read_only)
+        .all(|block| block.identity_kind == "unbound" && block.identity.is_empty());
+    anyhow::ensure!(
+        layers_are_unbound == (manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM),
+        "snapshot layer identity binding does not match tier '{}'",
+        manifest.snapshot_tier,
+    );
+    if manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM {
+        anyhow::ensure!(
+            contract
+                .effective_command_line
+                .split_ascii_whitespace()
+                .all(platform_command_line_token_is_invariant),
+            "platform snapshot command line contains tenant or unsupported configuration"
+        );
+    }
+    Ok(())
+}
+
+fn platform_command_line_token_is_invariant(token: &str) -> bool {
+    matches!(
+        token,
+        "earlycon=xe9"
+            | "console=hvc0"
+            | "console=hvc1"
+            | "reboot=t"
+            | "panic=-1"
+            | "nvx_sandbox=1"
+            | "nvx_config=0xd0010000,65536"
+            | "nvx_snapshot_tier=platform"
+    ) || [
+        "virtio_mmio.device=",
+        "virtnet_ip=",
+        "virtnet_mask=",
+        "virtnet_gw=",
+        "virtnet_dns=",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
 }
 
 fn ensure_unique<T>(values: &[T], description: &str) -> anyhow::Result<()>
@@ -2530,6 +2769,9 @@ mod tests {
             format_magic: SNAPSHOT_FORMAT_MAGIC.to_vec(),
             saved_state_schema_version: SAVED_STATE_SCHEMA_VERSION,
             saved_state_root_type: SAVED_STATE_ROOT_TYPE.to_owned(),
+            snapshot_tier: String::new(),
+            restore_policy: String::new(),
+            consumed_config_sections: 0,
         }
     }
 
@@ -2631,8 +2873,174 @@ mod tests {
                 physical_block_size: 4096,
             },
         ];
+        contract
+            .set_effective_command_line("console=hvc0 nvx_snapshot_tier=workload-start".to_owned());
         manifest.machine_contract = Some(contract);
+        manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_ALL;
         manifest
+    }
+
+    #[test]
+    fn abi_v2_snapshot_tier_contract_is_canonical() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_INSTANCE_CHECKPOINT.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_RESUME.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_ALL;
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=instance-checkpoint".to_owned(),
+            );
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        assert!(validate_manifest_version(&manifest).is_err());
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+        assert!(validate_manifest_version(&manifest).is_err());
+
+        let scratch = manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks
+            .last_mut()
+            .unwrap();
+        scratch.identity_kind = "fresh".to_owned();
+        scratch.identity.clear();
+        scratch.artifact.clear();
+        for block in manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks
+            .iter_mut()
+            .filter(|block| block.read_only)
+        {
+            block.identity_kind = "unbound".to_owned();
+            block.identity.clear();
+        }
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line("console=hvc0 nvx_snapshot_tier=platform".to_owned());
+        validate_manifest_version(&manifest).unwrap();
+    }
+
+    #[test]
+    fn platform_snapshot_rejects_tenant_command_line() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+        {
+            let contract = manifest.machine_contract.as_mut().unwrap();
+            for block in contract
+                .microvm_sandbox_blocks
+                .iter_mut()
+                .filter(|block| block.read_only)
+            {
+                block.identity_kind = "unbound".to_owned();
+                block.identity.clear();
+            }
+            let scratch = contract.microvm_sandbox_blocks.last_mut().unwrap();
+            scratch.identity_kind = "fresh".to_owned();
+            scratch.identity.clear();
+            scratch.artifact.clear();
+            contract.set_effective_command_line(
+                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_entrypoint=/tenant".to_owned(),
+            );
+        }
+
+        assert!(
+            validate_manifest_version(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("contains tenant or unsupported configuration")
+        );
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform"
+                .to_owned(),
+        );
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_config=tenant-data".to_owned(),
+            );
+        assert!(
+            validate_manifest_version(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("contains tenant or unsupported configuration")
+        );
+    }
+
+    #[test]
+    fn version_4_manifest_has_no_snapshot_tier_metadata() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.version = VERSION_4_MANIFEST_VERSION;
+        manifest.format_magic = VERSION_4_SNAPSHOT_FORMAT_MAGIC.to_vec();
+        manifest.snapshot_tier.clear();
+        manifest.restore_policy.clear();
+        manifest.consumed_config_sections = 0;
+        validate_manifest_header(&manifest).unwrap();
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+        assert!(validate_manifest_version(&manifest).is_err());
+    }
+
+    #[test]
+    fn resume_snapshot_claim_is_single_use() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.snapshot_tier = SNAPSHOT_TIER_INSTANCE_CHECKPOINT.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_RESUME.to_owned();
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=instance-checkpoint".to_owned(),
+            );
+        let dir = tempfile::tempdir().unwrap();
+
+        claim_snapshot_for_restore(dir.path(), &manifest).unwrap();
+        let error = claim_snapshot_for_restore(dir.path(), &manifest).unwrap_err();
+        assert!(error.to_string().contains("already been claimed"));
+    }
+
+    #[test]
+    fn clone_snapshot_claim_is_a_noop() {
+        let scratch = vec![0x5a; 512];
+        let manifest = paired_scratch_manifest(&scratch);
+        let dir = tempfile::tempdir().unwrap();
+
+        claim_snapshot_for_restore(dir.path(), &manifest).unwrap();
+        claim_snapshot_for_restore(dir.path(), &manifest).unwrap();
+        assert!(!dir.path().join(RESUME_CLAIM_FILE_NAME).exists());
     }
 
     fn microvm_console_attachment() -> SnapshotAttachment {
@@ -3586,6 +3994,25 @@ mod tests {
     }
 
     #[test]
+    fn supplied_manifest_remains_authoritative_during_artifact_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let mem_path = dir.path().join("memory.bin");
+        std::fs::write(&mem_path, vec![0_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
+        let manifest = read_snapshot_manifest(&snap_dir).unwrap();
+
+        std::fs::write(snap_dir.join(MANIFEST_FILE_NAME), b"replacement").unwrap();
+        let (state, mut memory) =
+            read_snapshot_artifacts_with_memory(&snap_dir, &manifest, 1024).unwrap();
+        let mut bytes = Vec::new();
+        memory.read_to_end(&mut bytes).unwrap();
+
+        assert_eq!(state, b"state");
+        assert_eq!(bytes, vec![0_u8; 1024]);
+    }
+
+    #[test]
     fn read_snapshot_accepts_legacy_v2_manifest_without_verifying_digests() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
@@ -3681,6 +4108,9 @@ mod tests {
             let mut manifest = paired_scratch_manifest(&scratch);
             manifest.version = version;
             manifest.format_magic = magic.to_vec();
+            manifest.snapshot_tier.clear();
+            manifest.restore_policy.clear();
+            manifest.consumed_config_sections = 0;
             if version == LEGACY_MANIFEST_VERSION {
                 manifest.state_sha256 = vec![0; SHA256_SIZE];
                 manifest.memory_sha256 = vec![0; SHA256_SIZE];

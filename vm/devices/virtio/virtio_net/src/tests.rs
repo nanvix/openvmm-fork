@@ -126,6 +126,7 @@ struct MockQueue {
     tx_avail_notify: mesh::Sender<()>,
     egress_policy: Option<EgressPolicy>,
     replace_next_tx: Arc<Mutex<Option<Vec<u8>>>>,
+    quiesce_notify: mesh::Sender<()>,
 }
 
 impl InspectMut for MockQueue {
@@ -181,6 +182,7 @@ impl net_backend::Queue for MockQueue {
         &mut self,
         _pool: &mut dyn net_backend::BufferAccess,
     ) -> anyhow::Result<QueueQuiesceResult> {
+        self.quiesce_notify.send(());
         self.rx_pending.lock().clear();
         Ok(QueueQuiesceResult {
             rx_ready: self.rx_ready.lock().len(),
@@ -274,6 +276,7 @@ struct MockQueueHandle {
     rx_avail_notify: mesh::Receiver<()>,
     tx_avail_notify: mesh::Receiver<()>,
     replace_next_tx: Arc<Mutex<Option<Vec<u8>>>>,
+    quiesce_notify: mesh::Receiver<()>,
 }
 
 impl MockQueueHandle {
@@ -368,6 +371,15 @@ impl MockQueueHandle {
             .expect("timed out waiting for tx_avail")
             .expect("channel closed");
     }
+
+    async fn wait_for_quiesce(&mut self) {
+        mesh::CancelContext::new()
+            .with_timeout(Duration::from_secs(5))
+            .until_cancelled(self.quiesce_notify.next())
+            .await
+            .expect("timed out waiting for queue quiesce")
+            .expect("channel closed");
+    }
 }
 
 fn new_mock_queue(egress_policy: Option<EgressPolicy>) -> (MockQueue, MockQueueHandle) {
@@ -380,6 +392,7 @@ fn new_mock_queue(egress_policy: Option<EgressPolicy>) -> (MockQueue, MockQueueH
     let (rx_avail_tx, rx_avail_rx) = mesh::channel();
     let (tx_avail_tx, tx_avail_rx) = mesh::channel();
     let replace_next_tx = Arc::new(Mutex::new(None));
+    let (quiesce_tx, quiesce_rx) = mesh::channel();
 
     let queue = MockQueue {
         tx_avail_behavior: tx_avail_behavior.clone(),
@@ -392,6 +405,7 @@ fn new_mock_queue(egress_policy: Option<EgressPolicy>) -> (MockQueue, MockQueueH
         tx_avail_notify: tx_avail_tx,
         egress_policy,
         replace_next_tx: replace_next_tx.clone(),
+        quiesce_notify: quiesce_tx,
     };
     let handle = MockQueueHandle {
         tx_avail_behavior,
@@ -403,6 +417,7 @@ fn new_mock_queue(egress_policy: Option<EgressPolicy>) -> (MockQueue, MockQueueH
         rx_avail_notify: rx_avail_rx,
         tx_avail_notify: tx_avail_rx,
         replace_next_tx,
+        quiesce_notify: quiesce_rx,
     };
     (queue, handle)
 }
@@ -926,6 +941,17 @@ async fn save_restore_rewinds_unused_rx_and_validates_private_state(driver: Defa
     let mut restored_device = restored.device;
     restored_device.restore_device(Some(saved)).unwrap();
     assert_eq!(restored_device.endpoint_generation, 1);
+}
+
+#[async_test]
+async fn input_quiesce_latches_before_queue_start(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_save_restore(&driver);
+    harness.device.quiesce_input().await.unwrap();
+
+    let mut handle = harness.enable_and_get_handle().await;
+    handle.wait_for_quiesce().await;
+
+    harness.device.resume_input().await.unwrap();
 }
 
 #[async_test]

@@ -171,6 +171,42 @@ pub enum MicrovmNetworkProfileCli {
     Portable,
 }
 
+/// Capture tier for a microVM ABI-v2 sandbox snapshot.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum SnapshotTierCli {
+    /// Fleet-wide clone point before image or sandbox configuration is consumed.
+    Platform,
+    /// Tenant-scoped reusable clone point at the workload handoff.
+    WorkloadStart,
+    /// Single-use continuation of one stopped instance.
+    InstanceCheckpoint,
+}
+
+impl SnapshotTierCli {
+    pub(crate) fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Platform => openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM,
+            Self::WorkloadStart => openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START,
+            Self::InstanceCheckpoint => {
+                openvmm_helpers::snapshot::SNAPSHOT_TIER_INSTANCE_CHECKPOINT
+            }
+        }
+    }
+
+    pub(crate) fn restore_policy(self) -> &'static str {
+        match self {
+            Self::Platform | Self::WorkloadStart => {
+                openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_CLONE
+            }
+            Self::InstanceCheckpoint => openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_RESUME,
+        }
+    }
+
+    pub(crate) fn requires_paired_scratch(self) -> bool {
+        !matches!(self, Self::Platform)
+    }
+}
+
 impl From<MicrovmNetworkProfileCli> for MicrovmNetworkProfile {
     fn from(value: MicrovmNetworkProfileCli) -> Self {
         match value {
@@ -324,9 +360,22 @@ Examples:
     #[clap(long, requires = "restore_snapshot")]
     pub restore_entropy: bool,
 
+    /// Maximum time allowed for an ABI-v2 guest to complete post-restore repair.
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 30000)]
+    pub restore_gate_timeout_ms: u64,
+
     /// Capture a microVM snapshot to this directory when the guest writes PMIO 0x605.
     #[clap(long, value_name = "DIR", conflicts_with = "restore_snapshot")]
     pub snapshot_destination: Option<PathBuf>,
+
+    /// Sandbox capture tier. Required for microVM ABI-v2 snapshot capture.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "TIER",
+        requires = "snapshot_destination"
+    )]
+    pub snapshot_tier: Option<SnapshotTierCli>,
 
     /// Maximum time allowed to quiesce the VM for a guest-requested snapshot.
     #[clap(long, value_name = "MILLISECONDS", default_value_t = 5000)]
@@ -1556,11 +1605,19 @@ impl Options {
                 abi_version != MICROVM_ABI_VERSION_1 || self.virtio_blk.is_empty(),
                 "microVM ABI version 1 snapshot capture with virtio-blk requires immutable media identity"
             );
+            anyhow::ensure!(
+                (abi_version == MICROVM_ABI_VERSION_2) == self.snapshot_tier.is_some(),
+                "--snapshot-tier is required exactly for microVM ABI-v2 snapshot capture"
+            );
         }
         if self.restore_snapshot.is_some() {
             anyhow::ensure!(
                 self.net.is_empty(),
                 "microVM restore takes network addressing from saved state; do not pass --net"
+            );
+            anyhow::ensure!(
+                self.restore_gate_timeout_ms != 0,
+                "microVM post-restore gate timeout must be nonzero"
             );
         }
         anyhow::ensure!(
@@ -5529,6 +5586,65 @@ mod tests {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
+    }
+
+    #[test]
+    fn test_microvm_v2_snapshot_tier_is_explicit() {
+        for tier in ["platform", "workload-start", "instance-checkpoint"] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                tier,
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ])
+            .unwrap();
+            assert_eq!(options.restore_gate_timeout_ms, 30_000);
+            options.validate_microvm_options().unwrap();
+        }
+
+        let missing = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm-v2",
+            "--snapshot-destination",
+            "snapshot",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        assert!(missing.validate_microvm_options().is_err());
+
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--snapshot-tier",
+                "platform",
+            ])
+            .is_err()
+        );
+
+        let zero_timeout = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm-v2",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-gate-timeout-ms",
+            "0",
+        ])
+        .unwrap();
+        assert!(zero_timeout.validate_microvm_options().is_err());
     }
 
     #[test]

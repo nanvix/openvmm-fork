@@ -23,6 +23,12 @@
 # https://nexte.st/docs/configuration/per-test-overrides/#override-precedence
 # https://nexte.st/docs/configuration/?h=hierar#hierarchical-configuration
 
+[[profile.default.overrides]]
+filter = 'test(microvm_v2_snapshot_tiers_and_restore_gate)'
+# This test creates several VMs and restore attempts in one process. Running it
+# alongside the rest of the microVM suite can exhaust WHP partition capacity.
+threads-required = "num-test-threads"
+
 [[profile.ci.overrides]]
 # use fuzzy-matching for the package() to allow out-of-tree tests to use the
 # same profile
