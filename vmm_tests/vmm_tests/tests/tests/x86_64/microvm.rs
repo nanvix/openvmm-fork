@@ -507,6 +507,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
     const CONTINUED_MARKER: &[u8] = b"PHASE2-CONTINUED-ONCE";
     const NO_DESTINATION_MARKER: &[u8] = b"PHASE2-NO-DESTINATION-CONTINUED";
     const TIMER_WAIT_PREFIX: &[u8] = b"PHASE2-TIMER-WAIT-";
+    const UPTIME_CENTISECONDS_PREFIX: &[u8] = b"PHASE2-UPTIME-CS-";
     const MIN_CLOCK_ADVANCE_SECS: u64 = 4;
     const MAX_CLOCK_SKEW_SECS: u64 = 1;
 
@@ -604,6 +605,7 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         timer_wait_after=$(cut -d. -f1 /proc/uptime); \
         echo PHASE2-CONTINUED-ONCE; \
         echo PHASE2-DOWNTIME-$((wall_restored-wall_before))-$((uptime_restored-uptime_before)); \
+        echo PHASE2-UPTIME-CS-$((uptime_restored_cs-uptime_before_cs)); \
         echo PHASE2-CPU-$((process_cpu_restored-process_cpu_before))-$((thread_cpu_restored-thread_cpu_before)); \
         echo PHASE2-TIMER-WAIT-$((timer_wait_after-timer_wait_before)); \
         echo PHASE2-TIMER-DONE; \
@@ -615,11 +617,13 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
         "\n",
         arm_timer,
         "\n",
-        "wall_before=$(date +%s); uptime_before=$(cut -d. -f1 /proc/uptime); \
+        "wall_before=$(date +%s); uptime_before_raw=$(cut -d' ' -f1 /proc/uptime); \
+         uptime_before=${uptime_before_raw%%.*}; uptime_before_cs=$(echo $uptime_before_raw | tr -d .); \
          process_cpu_before=$(awk '{print $14+$15}' /proc/$p/stat); \
          thread_cpu_before=$(awk '{print $14+$15}' /proc/$p/task/$p/stat)\n",
         "nvx-snapshot\n",
-        "wall_restored=$(date +%s); uptime_restored=$(cut -d. -f1 /proc/uptime); \
+        "wall_restored=$(date +%s); uptime_restored_raw=$(cut -d' ' -f1 /proc/uptime); \
+         uptime_restored=${uptime_restored_raw%%.*}; uptime_restored_cs=$(echo $uptime_restored_raw | tr -d .); \
          process_cpu_restored=$(awk '{print $14+$15}' /proc/$p/stat); \
          thread_cpu_restored=$(awk '{print $14+$15}' /proc/$p/task/$p/stat); \
          kill $p; \
@@ -669,12 +673,22 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             && manifest.memory_sha256.is_empty(),
         "new microVM snapshot contains legacy artifact digests"
     );
+    let snapshot_capture_time: std::time::SystemTime = manifest
+        .machine_contract
+        .as_ref()
+        .context("published snapshot is missing its machine contract")?
+        .capture_wall_clock
+        .try_into()
+        .context("published snapshot has an invalid capture wall clock")?;
     let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
     let mut rng_hashes = Vec::new();
     let mut restore_latencies = Vec::new();
     for restore_index in 0..2 {
-        thread::sleep(Duration::from_secs(6));
+        thread::sleep(Duration::from_secs(5));
+        let minimum_downtime = std::time::SystemTime::now()
+            .duration_since(snapshot_capture_time)
+            .context("host wall clock moved before snapshot capture time")?;
         let mut restore_args = phase_2_args(hypervisor);
         restore_args.extend([
             "--restore-snapshot".into(),
@@ -725,6 +739,16 @@ async fn phase_2_snapshot_restore<OpenvmmArtifact>(
             wall_delta.max(uptime_delta) >= MIN_CLOCK_ADVANCE_SECS
                 && wall_delta.abs_diff(uptime_delta) <= MAX_CLOCK_SKEW_SECS,
             "restore {restore_index} clocks did not reflect host downtime coherently: wall={wall_delta}s uptime={uptime_delta}s; expected either clock to advance by at least {MIN_CLOCK_ADVANCE_SECS}s with at most {MAX_CLOCK_SKEW_SECS}s skew"
+        );
+        let uptime_centiseconds = std::str::from_utf8(
+            output_line_value(&output, UPTIME_CENTISECONDS_PREFIX)
+                .context("restored guest did not report precise uptime advancement")?,
+        )?
+        .parse::<u128>()?;
+        let minimum_downtime_centiseconds = minimum_downtime.as_millis() / 10;
+        anyhow::ensure!(
+            uptime_centiseconds + 5 >= minimum_downtime_centiseconds,
+            "restore {restore_index} discarded captured guest uptime: advanced {uptime_centiseconds}cs, expected at least {minimum_downtime_centiseconds}cs from snapshot capture to restore launch"
         );
         let cpu = std::str::from_utf8(
             output_line_value(&output, b"PHASE2-CPU-")
