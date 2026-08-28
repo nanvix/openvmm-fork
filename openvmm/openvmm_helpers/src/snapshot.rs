@@ -1386,8 +1386,11 @@ fn write_bytes(path: &Path, bytes: &[u8], description: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Sizes a newly created snapshot RAM backing without allocating its contents.
-pub fn initialize_sparse_memory_backing_file(
+/// Sizes a newly created snapshot RAM backing.
+///
+/// Windows leaves the file non-sparse to avoid slow copy-on-write faults from
+/// sparse files. Other supported platforms retain sparse allocation.
+pub fn initialize_snapshot_memory_backing_file(
     file: &std::fs::File,
     size: u64,
 ) -> anyhow::Result<u64> {
@@ -1403,9 +1406,10 @@ pub fn initialize_sparse_memory_backing_file(
         "new snapshot memory backing is not empty"
     );
 
-    prepare_sparse_destination(file, size, "snapshot memory backing")?;
+    size_empty_file(file, size, "snapshot memory backing")?;
     let allocated_bytes = allocated_file_bytes(file, size)
         .context("failed to inspect snapshot memory backing allocation")?;
+    #[cfg(not(windows))]
     anyhow::ensure!(
         allocated_bytes == 0,
         "snapshot memory backing allocated {allocated_bytes} bytes while sizing to {size} bytes"
@@ -1413,7 +1417,7 @@ pub fn initialize_sparse_memory_backing_file(
     tracing::info!(
         logical_bytes = size,
         allocated_bytes,
-        "initialized sparse snapshot RAM"
+        "initialized snapshot RAM backing"
     );
     Ok(allocated_bytes)
 }
@@ -1438,8 +1442,8 @@ fn copy_exact(
         "{source_description} size ({source_length} bytes) doesn't match manifest ({expected_length} bytes)",
     );
     let destination = create_file(destination_path, destination_description)?;
-    let method = clone_or_sparse_copy(source_file, &destination, expected_length)
-        .with_context(|| format!("failed to clone {source_description}"))?;
+    let method = clone_or_copy(source_file, &destination, expected_length)
+        .with_context(|| format!("failed to copy {source_description}"))?;
 
     anyhow::ensure!(
         source_file
@@ -1447,7 +1451,7 @@ fn copy_exact(
             .with_context(|| format!("failed to re-inspect {source_description}"))?
             .len()
             == expected_length,
-        "{source_description} changed length while it was being cloned",
+        "{source_description} changed length while it was being copied",
     );
     anyhow::ensure!(
         destination
@@ -1468,20 +1472,14 @@ fn copy_exact(
         logical_bytes = expected_length,
         ?source_allocated_bytes,
         ?allocated_bytes,
-        "published independent snapshot file"
+        "published independent snapshot artifact"
     );
     Ok(())
 }
 
-fn prepare_sparse_destination(
-    file: &std::fs::File,
-    length: u64,
-    description: &str,
-) -> anyhow::Result<()> {
+fn size_empty_file(file: &std::fs::File, length: u64, description: &str) -> anyhow::Result<()> {
     file.set_len(0)
         .with_context(|| format!("failed to reset {description}"))?;
-    #[cfg(windows)]
-    pal::fs::set_sparse(file).with_context(|| format!("failed to mark {description} sparse"))?;
     file.set_len(length)
         .with_context(|| format!("failed to size {description}"))?;
     anyhow::ensure!(
@@ -1495,7 +1493,7 @@ fn prepare_sparse_destination(
 }
 
 #[cfg(target_os = "linux")]
-fn clone_or_sparse_copy(
+fn clone_or_copy(
     source: &std::fs::File,
     destination: &std::fs::File,
     length: u64,
@@ -1508,7 +1506,7 @@ fn clone_or_sparse_copy(
         error = &clone_error as &dyn std::error::Error,
         "FICLONE unavailable"
     );
-    prepare_sparse_destination(destination, length, "snapshot clone destination")?;
+    size_empty_file(destination, length, "snapshot clone destination")?;
     match linux_allocated_ranges(source, length) {
         Ok(ranges) => {
             copy_allocated_ranges(source, destination, length, &ranges)?;
@@ -1526,50 +1524,63 @@ fn clone_or_sparse_copy(
 }
 
 #[cfg(windows)]
-fn clone_or_sparse_copy(
+fn clone_or_copy(
     source: &std::fs::File,
     destination: &std::fs::File,
     length: u64,
 ) -> anyhow::Result<&'static str> {
-    prepare_sparse_destination(destination, length, "snapshot clone destination")?;
-    if let Err(error) = pal::fs::duplicate_extents(source, destination, length) {
-        tracing::debug!(
-            error = &error as &dyn std::error::Error,
-            "block cloning snapshot backing is unavailable"
-        );
-        prepare_sparse_destination(destination, length, "snapshot clone destination")?;
-        match pal::fs::allocated_ranges(source, length) {
-            Ok(ranges) => {
-                copy_allocated_ranges(source, destination, length, &ranges)?;
-                Ok("allocated-ranges")
-            }
-            Err(error) => {
-                tracing::debug!(
-                    error = &error as &dyn std::error::Error,
-                    "allocated-range queries are unavailable"
-                );
-                pal::fs::zero_range(destination, 0, length)
-                    .context("failed to deallocate sparse range")?;
-                copy_nonzero_data(source, destination, 0, length)?;
-                Ok("zero-scan")
-            }
+    let mut source = source
+        .try_clone()
+        .context("failed to duplicate snapshot memory source handle")?;
+    source
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind snapshot memory source")?;
+    let mut destination = destination
+        .try_clone()
+        .context("failed to duplicate snapshot memory destination handle")?;
+    destination
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind snapshot memory destination")?;
+
+    let limit = length
+        .checked_add(1)
+        .context("snapshot memory length cannot be bounded")?;
+    let mut source = Read::by_ref(&mut source).take(limit);
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .context("failed to read snapshot memory source")?;
+        if count == 0 {
+            break;
         }
-    } else {
-        Ok("block-clone")
+        destination
+            .write_all(&buffer[..count])
+            .context("failed to write dense snapshot memory destination")?;
+        total = total
+            .checked_add(count as u64)
+            .context("snapshot memory length overflowed u64")?;
     }
+    anyhow::ensure!(
+        total == length,
+        "snapshot memory changed while it was copied (expected {length} bytes, copied {total} bytes)",
+    );
+    Ok("dense-copy")
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn clone_or_sparse_copy(
+fn clone_or_copy(
     source: &std::fs::File,
     destination: &std::fs::File,
     length: u64,
 ) -> anyhow::Result<&'static str> {
-    prepare_sparse_destination(destination, length, "snapshot clone destination")?;
+    size_empty_file(destination, length, "snapshot clone destination")?;
     copy_nonzero_data(source, destination, 0, length)?;
     Ok("zero-scan")
 }
 
+#[cfg(target_os = "linux")]
 fn copy_allocated_ranges(
     source: &std::fs::File,
     destination: &std::fs::File,
@@ -1585,18 +1596,13 @@ fn copy_allocated_ranges(
             offset >= cursor && range_length != 0 && end <= length,
             "invalid allocated range for sparse copy"
         );
-        #[cfg(windows)]
-        pal::fs::zero_range(destination, cursor, offset)
-            .context("failed to deallocate sparse range")?;
         copy_nonzero_data(source, destination, offset, range_length)?;
         cursor = end;
     }
-    #[cfg(windows)]
-    pal::fs::zero_range(destination, cursor, length)
-        .context("failed to deallocate sparse range")?;
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn copy_nonzero_data(
     source: &std::fs::File,
     destination: &std::fs::File,
@@ -1627,6 +1633,7 @@ fn copy_nonzero_data(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
@@ -1638,6 +1645,7 @@ fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io
     }
 }
 
+#[cfg(not(windows))]
 fn write_file_all_at(
     file: &std::fs::File,
     mut bytes: &[u8],
@@ -3300,7 +3308,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn write_snapshot_preserves_sparse_memory_and_clone_independence() {
         const MEMORY_SIZE: u64 = 16 * 1024 * 1024;
@@ -3317,7 +3325,7 @@ mod tests {
                 .open(&mem_path)
                 .unwrap();
             assert_eq!(
-                initialize_sparse_memory_backing_file(&memory_file, MEMORY_SIZE).unwrap(),
+                initialize_snapshot_memory_backing_file(&memory_file, MEMORY_SIZE).unwrap(),
                 0
             );
 
@@ -3358,17 +3366,58 @@ mod tests {
                     allocated < MEMORY_SIZE / 4,
                     "{case} snapshot allocated {allocated} bytes for a {MEMORY_SIZE}-byte file",
                 );
-                #[cfg(windows)]
-                assert!(
-                    pal::fs::allocation_size(&published).unwrap() < MEMORY_SIZE / 4,
-                    "{case} snapshot allocation-size fallback reported a dense file",
-                );
             }
             assert_eq!(std::fs::read(published_path).unwrap(), expected, "{case}");
         }
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(windows)]
+    #[test]
+    fn write_snapshot_uses_dense_memory_files_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        const MEMORY_SIZE: u64 = 4 * 1024 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let mem_path = dir.path().join("memory.bin");
+        let mut memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(mem_path)
+            .unwrap();
+        initialize_snapshot_memory_backing_file(&memory_file, MEMORY_SIZE).unwrap();
+        assert_eq!(
+            memory_file.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+            0
+        );
+
+        memory_file.write_all(b"head").unwrap();
+        memory_file.seek(SeekFrom::End(-4)).unwrap();
+        memory_file.write_all(b"tail").unwrap();
+        memory_file.sync_all().unwrap();
+
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = MEMORY_SIZE;
+        write_snapshot_from_memory_file(&snap_dir, &manifest, b"state", &memory_file).unwrap();
+
+        let published_path = snap_dir.join(MEMORY_FILE_NAME);
+        let published = std::fs::File::open(&published_path).unwrap();
+        assert_eq!(
+            published.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+            0
+        );
+
+        let mut expected = vec![0_u8; MEMORY_SIZE as usize];
+        expected[..4].copy_from_slice(b"head");
+        let tail_offset = expected.len() - 4;
+        expected[tail_offset..].copy_from_slice(b"tail");
+        assert_eq!(std::fs::read(published_path).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn sparse_copy_fallbacks_preserve_extents_and_clone_independence() {
         const MEMORY_SIZE: u64 = 16 * 1024 * 1024;
@@ -3381,7 +3430,7 @@ mod tests {
             .create_new(true)
             .open(source_path)
             .unwrap();
-        initialize_sparse_memory_backing_file(&source, MEMORY_SIZE).unwrap();
+        initialize_snapshot_memory_backing_file(&source, MEMORY_SIZE).unwrap();
         source.write_all(b"head").unwrap();
         source.seek(SeekFrom::End(-4)).unwrap();
         source.write_all(b"tail").unwrap();
@@ -3396,7 +3445,7 @@ mod tests {
         for fallback in ["allocated-ranges", "zero-scan"] {
             let path = dir.path().join(format!("{fallback}.bin"));
             let destination = create_file(&path, fallback).unwrap();
-            prepare_sparse_destination(&destination, MEMORY_SIZE, fallback).unwrap();
+            size_empty_file(&destination, MEMORY_SIZE, fallback).unwrap();
             match fallback {
                 "allocated-ranges" => {
                     copy_allocated_ranges(&source, &destination, MEMORY_SIZE, &allocated_ranges)

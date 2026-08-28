@@ -36,8 +36,8 @@ pub fn open_memory_backing_file_handle(
 
     let existing_len = file.metadata()?.len();
     if existing_len == 0 {
-        crate::snapshot::initialize_sparse_memory_backing_file(&file, size)
-            .context("failed to initialize sparse memory backing file")?;
+        crate::snapshot::initialize_snapshot_memory_backing_file(&file, size)
+            .context("failed to initialize snapshot memory backing file")?;
     } else if existing_len != size {
         anyhow::bail!(
             "memory backing file {} has size {} bytes, expected {} bytes",

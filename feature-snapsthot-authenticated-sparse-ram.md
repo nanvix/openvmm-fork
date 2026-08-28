@@ -76,13 +76,20 @@ until profiling shows this scan is significant.
 
 ## Platform support
 
-On Windows, mark the destination sparse through the appropriate filesystem
-control operation before seeking over holes. Query allocated ranges during
-restore through the opened file handle.
+Windows currently publishes normal RAM files because sparse files used as
+private copy-on-write guest memory caused severe restore latency on both
+bare-metal and nested WHP. The investigation, measurements, and criteria for
+re-enabling sparse Windows artifacts are tracked in
+[nanvix/nvx#202](https://github.com/nanvix/nvx/issues/202).
 
-On Linux, create holes by seeking over zero chunks and setting the final length.
-Use `SEEK_DATA` and `SEEK_HOLE`, or an equivalent supported API, to validate
-extent coverage.
+Any future Windows implementation must validate its target filesystem and
+mapping strategy explicitly. Marking the destination sparse and querying
+allocated ranges is not sufficient if restoring that representation makes
+private page materialization launch-critical.
+
+Linux may create holes by seeking over zero chunks and setting the final
+length. Use `SEEK_DATA` and `SEEK_HOLE`, or an equivalent supported API, to
+validate extent coverage.
 
 Filesystems differ. If sparse creation or extent queries are unsupported, fall
 back to writing and reading the logical bytes. Correctness must never depend on
