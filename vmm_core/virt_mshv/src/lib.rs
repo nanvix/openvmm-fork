@@ -886,7 +886,14 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             exec,
         )
         .entered();
-        self.vmfd.map_user_memory(mem_region)?;
+        let started = std::time::Instant::now();
+        let result = self.vmfd.map_user_memory(mem_region);
+        tracing::info!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            success = result.is_ok(),
+            "MSHV_SET_GUEST_MEMORY completed"
+        );
+        result?;
         state.ranges[slot_to_use] = Some(mem_region);
         Ok(())
     }
