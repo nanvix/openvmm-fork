@@ -516,11 +516,36 @@ Serial devices can be configured to appear as different devices inside the guest
   console. The control device normally appears as the profile-owned
   `nvx_control_tty=hvc2`.
 
-  The accepted backends are `listen=PATH`, `connect=PATH`, and `none`. TCP,
-  terminal, file, and inherited-console backends are rejected. Boot and control
-  endpoints must be distinct. Snapshot capture records a separate
-  `console:microvm-control0` attachment and restores it independently from the
-  boot console.
+  On Linux, the only live backend is `listen=PATH`, and PATH is always an
+  AF_UNIX socket. TCP, client-connect, terminal, file, stdout/stderr, and
+  inherited console backends are rejected. A listener's parent must already be an owned,
+  non-symlink directory with mode `0700`; OpenVMM exclusively binds the socket,
+  sets and verifies mode `0600`, and never removes a pre-existing path.
+  OpenVMM verifies `SO_PEERCRED` before accepting the protocol attachment.
+
+  A live endpoint also requires the hidden launcher option
+  `--microvm-control-auth-handle=<FD>`. FD is an inherited, readable, one-way
+  pipe containing exactly 32 random capability bytes. The launcher must close
+  its writer before starting OpenVMM. OpenVMM duplicates the descriptor,
+  performs one bounded nonblocking read through EOF, and closes it. Capability
+  bytes must never appear in arguments, environment variables, endpoint names,
+  logs, snapshots, or attachment identities. The first host record must prove
+  that capability. Peer identity is checked first. Authentication must complete
+  within five seconds; a stalled or rejected client is closed without changing
+  the broker epoch.
+
+  `none` needs no authentication handle. OpenVMM generates an unreachable
+  random capability so disconnected process tests remain supported. Secure
+  Windows named-pipe SID verification and restrictive DACL creation are not
+  yet available in PAL, so live control-console endpoints are rejected on
+  Windows rather than falling back to capability-only authentication.
+
+  Boot and control endpoints must be distinct. Snapshot capture records only
+  the separate `console:microvm-control0` endpoint and broker-authenticated
+  reconnect policy. It never records a capability or UID/SID. Restore validates
+  the saved endpoint contract, requires a fresh launcher-provided capability
+  for a live endpoint, and generates a fresh VMM instance ID; saved credentials
+  and stale capabilities are never reused.
 
   Restore snapshots containing this device through the CLI. The OpenVMM
   management RPC does not expose control-console restore attachments and

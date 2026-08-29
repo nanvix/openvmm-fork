@@ -243,13 +243,8 @@ impl OutputLeg {
     }
 
     fn restore(snapshot: OutputSnapshot) -> Result<Self, BrokerError> {
+        Self::validate_snapshot(&snapshot)?;
         let current = if let Some(current) = snapshot.current {
-            validate_encoded_output(&current.bytes)?;
-            if current.offset >= current.bytes.len() {
-                return Err(BrokerError::InvalidSnapshot(
-                    "current output offset is out of bounds",
-                ));
-            }
             Some(EncodedRecord {
                 bytes: current.bytes,
                 offset: current.offset,
@@ -258,15 +253,9 @@ impl OutputLeg {
             None
         };
 
-        if snapshot.queued_records.len() > MAX_QUEUED_RECORDS_PER_LEG {
-            return Err(BrokerError::InvalidSnapshot(
-                "too many queued output records",
-            ));
-        }
         let mut queue = VecDeque::with_capacity(snapshot.queued_records.len());
         let mut queued_bytes = 0usize;
         for bytes in snapshot.queued_records {
-            validate_encoded_output(&bytes)?;
             queued_bytes =
                 queued_bytes
                     .checked_add(bytes.len())
@@ -285,6 +274,38 @@ impl OutputLeg {
             queue,
             queued_bytes,
         })
+    }
+
+    fn validate_snapshot(snapshot: &OutputSnapshot) -> Result<(), BrokerError> {
+        if let Some(current) = &snapshot.current {
+            validate_encoded_output(&current.bytes)?;
+            if current.offset >= current.bytes.len() {
+                return Err(BrokerError::InvalidSnapshot(
+                    "current output offset is out of bounds",
+                ));
+            }
+        }
+        if snapshot.queued_records.len() > MAX_QUEUED_RECORDS_PER_LEG {
+            return Err(BrokerError::InvalidSnapshot(
+                "too many queued output records",
+            ));
+        }
+        let mut queued_bytes = 0usize;
+        for bytes in &snapshot.queued_records {
+            validate_encoded_output(bytes)?;
+            queued_bytes =
+                queued_bytes
+                    .checked_add(bytes.len())
+                    .ok_or(BrokerError::InvalidSnapshot(
+                        "queued output byte count overflow",
+                    ))?;
+            if queued_bytes > MAX_QUEUED_BYTES_PER_LEG {
+                return Err(BrokerError::InvalidSnapshot(
+                    "queued output bytes exceed configured bound",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -355,6 +376,7 @@ impl ControlSessionBroker {
         self.state
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by protocol tests"))]
     pub fn instance_id(&self) -> [u8; 16] {
         self.instance_id
     }
@@ -369,6 +391,44 @@ impl ControlSessionBroker {
 
     pub fn host_is_authenticated(&self) -> bool {
         self.host_authenticated
+    }
+
+    pub fn host_is_connected(&self) -> bool {
+        self.host_connected
+    }
+
+    pub fn output_record_count(&self, leg: OutputLegId) -> usize {
+        let output = self.output(leg);
+        output.queue.len() + usize::from(output.current.is_some())
+    }
+
+    pub fn output_byte_count(&self, leg: OutputLegId) -> usize {
+        let output = self.output(leg);
+        output.queued_bytes
+            + output
+                .current
+                .as_ref()
+                .map_or(0, |current| current.bytes.len() - current.offset)
+    }
+
+    pub fn guest_parser_buffered_bytes(&self) -> usize {
+        let snapshot = self.guest_parser.snapshot();
+        snapshot.header_count + snapshot.body_bytes.len()
+    }
+
+    pub fn has_pending_guest_record(&self) -> bool {
+        self.pending_guest_record.is_some()
+    }
+
+    pub fn has_pending_host_record(&self) -> bool {
+        self.pending_host_record.is_some()
+    }
+
+    /// Resets the device-facing protocol state without changing constructor
+    /// credentials. A still-open host transport must be detached separately by
+    /// the physical adapter before it can attach again.
+    pub fn reset_for_device(&mut self) {
+        *self = Self::new(self.instance_id, self.capability);
     }
 
     /// Reserves the single host slot after OS-level identity verification.
@@ -572,20 +632,29 @@ impl ControlSessionBroker {
     }
 
     pub fn snapshot(&self) -> BrokerSnapshot {
+        let mut guest_output = self.guest_output.snapshot();
+        guest_output.queued_records.clear();
+        if guest_output
+            .current
+            .as_ref()
+            .is_some_and(|current| current.offset == 0)
+        {
+            guest_output.current = None;
+        }
         BrokerSnapshot {
             state: self.state as u8,
             instance_id: self.instance_id,
             drain_foreign_instance_records: self.drain_foreign_instance_records,
             epoch: self.epoch,
             guest_parser: self.guest_parser.snapshot(),
-            guest_output: self.guest_output.snapshot(),
-            host_output: self.host_output.snapshot(),
+            guest_output,
+            host_output: OutputSnapshot::default(),
             guest_receive_sequence: self.guest_receive_sequence,
             guest_send_sequence: self.guest_send_sequence,
             host_receive_sequence: self.host_receive_sequence,
             host_send_sequence: self.host_send_sequence,
-            pending_guest_record: self.pending_guest_record.clone(),
-            pending_host_record: self.pending_host_record.clone(),
+            pending_guest_record: None,
+            pending_host_record: None,
             counters: self.counters.clone(),
         }
     }
@@ -597,11 +666,8 @@ impl ControlSessionBroker {
         new_instance_id: [u8; 16],
         new_capability: [u8; 32],
     ) -> Result<Self, BrokerError> {
-        let _saved_state = BrokerState::from_snapshot(snapshot.state)?;
-        if snapshot.epoch == 0 {
-            return Err(BrokerError::InvalidSnapshot("saved epoch is zero"));
-        }
-        if snapshot.instance_id == [0; 16] || new_instance_id == [0; 16] {
+        Self::validate_snapshot(&snapshot)?;
+        if new_instance_id == [0; 16] {
             return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
         }
         if snapshot.instance_id == new_instance_id {
@@ -609,8 +675,6 @@ impl ControlSessionBroker {
                 "restore reused the saved instance ID",
             ));
         }
-        validate_pending(snapshot.pending_guest_record.as_ref())?;
-        validate_pending(snapshot.pending_host_record.as_ref())?;
         let guest_parser = Parser::restore(snapshot.guest_parser)?;
         let mut saved_guest_output = OutputLeg::restore(snapshot.guest_output)?;
         let _saved_host_output = OutputLeg::restore(snapshot.host_output)?;
@@ -641,6 +705,24 @@ impl ControlSessionBroker {
         broker.counters = snapshot.counters;
         broker.enqueue_guest_control(RecordType::Reset)?;
         Ok(broker)
+    }
+
+    /// Validates all snapshot bounds and encoded values without constructing a
+    /// broker or allocating output queues.
+    pub fn validate_snapshot(snapshot: &BrokerSnapshot) -> Result<(), BrokerError> {
+        let _saved_state = BrokerState::from_snapshot(snapshot.state)?;
+        if snapshot.epoch == 0 {
+            return Err(BrokerError::InvalidSnapshot("saved epoch is zero"));
+        }
+        if snapshot.instance_id == [0; 16] {
+            return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
+        }
+        validate_pending(snapshot.pending_guest_record.as_ref())?;
+        validate_pending(snapshot.pending_host_record.as_ref())?;
+        Parser::validate_snapshot(&snapshot.guest_parser)?;
+        OutputLeg::validate_snapshot(&snapshot.guest_output)?;
+        OutputLeg::validate_snapshot(&snapshot.host_output)?;
+        Ok(())
     }
 
     fn handle_guest_record(&mut self, record: Record) -> Result<(), BrokerError> {
@@ -1460,6 +1542,27 @@ mod tests {
             assert_eq!(broker.state(), BrokerState::ReadyNoHost);
             assert!(!broker.drain_foreign_instance_records);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn device_reset_discards_attachment_and_protocol_progress() -> Result<(), BrokerError> {
+        let mut broker = make_active()?;
+        feed_guest(
+            &mut broker,
+            &Record::session(RecordType::Data, INSTANCE, 1, 1, b"queued".to_vec()),
+        )?;
+        assert!(broker.output_record_count(OutputLegId::Host) != 0);
+
+        broker.reset_for_device();
+
+        assert_eq!(broker.state(), BrokerState::AwaitGuestAttach);
+        assert_eq!(broker.epoch(), 1);
+        assert!(!broker.host_is_connected());
+        assert!(!broker.host_is_authenticated());
+        assert_eq!(broker.output_record_count(OutputLegId::Guest), 0);
+        assert_eq!(broker.output_record_count(OutputLegId::Host), 0);
+        assert_eq!(broker.guest_parser_buffered_bytes(), 0);
         Ok(())
     }
 }

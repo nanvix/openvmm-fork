@@ -11,6 +11,7 @@ use virtio::resolve::VirtioResolveInput;
 use virtio_resources::console::VirtioConsoleAttachmentMode;
 use virtio_resources::console::VirtioConsoleHandle;
 use virtio_resources::console::VirtioConsoleReconnectPolicy;
+use virtio_resources::console::VirtioControlConsoleBrokerConfig;
 use virtio_resources::console::VirtioControlConsoleHandle;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
@@ -68,15 +69,10 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioControlConsoleHandle>
         resource: VirtioControlConsoleHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        resolve_console(
-            resolver,
-            input,
-            resource.backend,
-            resource.disconnect_policy,
-            resource.attachment,
-            "virtio-control-console",
-        )
-        .await
+        validate_attachment(resource.attachment.as_ref())?;
+        validate_broker_config(&resource.broker_config)?;
+        let io = resolve_backend(resolver, &input, resource.backend).await?;
+        Ok(VirtioConsoleDevice::new_broker(input.driver_source, io, resource.broker_config).into())
     }
 }
 
@@ -88,7 +84,23 @@ async fn resolve_console(
     attachment: Option<virtio_resources::console::VirtioConsoleAttachment>,
     worker_name: &'static str,
 ) -> anyhow::Result<ResolvedVirtioDevice> {
-    if let Some(attachment) = &attachment {
+    validate_attachment(attachment.as_ref())?;
+    let io = resolve_backend(resolver, &input, backend).await?;
+
+    let device = VirtioConsoleDevice::new_with_name_and_policy(
+        input.driver_source,
+        io,
+        worker_name,
+        disconnect_policy,
+    );
+
+    Ok(device.into())
+}
+
+fn validate_attachment(
+    attachment: Option<&virtio_resources::console::VirtioConsoleAttachment>,
+) -> anyhow::Result<()> {
+    if let Some(attachment) = attachment {
         anyhow::ensure!(
             !attachment.stable_id.is_empty() && attachment.stable_id.len() <= 128,
             "virtio-console attachment has an invalid stable ID"
@@ -135,6 +147,30 @@ async fn resolve_console(
             ),
         }
     }
+    Ok(())
+}
+
+fn validate_broker_config(config: &VirtioControlConsoleBrokerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.instance_id != [0; 16],
+        "control-console broker instance ID must not be zero"
+    );
+    anyhow::ensure!(
+        config.capability != [0; 32],
+        "control-console broker capability must not be zero"
+    );
+    anyhow::ensure!(
+        (1..=60_000).contains(&config.auth_timeout_ms),
+        "control-console broker authentication timeout must be between 1 and 60000 ms"
+    );
+    Ok(())
+}
+
+async fn resolve_backend(
+    resolver: &ResourceResolver,
+    input: &VirtioResolveInput<'_>,
+    backend: vm_resource::Resource<vm_resource::kind::SerialBackendHandle>,
+) -> anyhow::Result<Box<dyn serial_core::SerialIo>> {
     let io = resolver
         .resolve(
             backend,
@@ -144,13 +180,5 @@ async fn resolve_console(
             },
         )
         .await?;
-
-    let device = VirtioConsoleDevice::new_with_name_and_policy(
-        input.driver_source,
-        io.0.into_io(),
-        worker_name,
-        disconnect_policy,
-    );
-
-    Ok(device.into())
+    Ok(io.0.into_io())
 }

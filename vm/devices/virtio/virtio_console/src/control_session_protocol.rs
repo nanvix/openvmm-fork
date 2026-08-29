@@ -54,6 +54,7 @@ pub struct Record {
 
 impl Record {
     /// Creates a bootstrap record. Bootstrap records never consume a sequence.
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by protocol tests"))]
     pub fn bootstrap(record_type: RecordType, payload: Vec<u8>) -> Self {
         Self {
             record_type,
@@ -230,8 +231,8 @@ impl Parser {
         }
     }
 
-    /// Restores parser state after validating all bounds before allocation.
-    pub fn restore(snapshot: ParserSnapshot) -> Result<Self, ProtocolError> {
+    /// Validates a parser snapshot without allocating parser storage.
+    pub fn validate_snapshot(snapshot: &ParserSnapshot) -> Result<(), ProtocolError> {
         if snapshot.header_bytes.len() != HEADER_LEN {
             return Err(ProtocolError::InvalidSnapshot(
                 "header storage must be exactly 44 bytes",
@@ -268,6 +269,12 @@ impl Parser {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Restores parser state after validating all bounds before allocation.
+    pub fn restore(snapshot: ParserSnapshot) -> Result<Self, ProtocolError> {
+        Self::validate_snapshot(&snapshot)?;
 
         let mut header = [0; HEADER_LEN];
         header.copy_from_slice(&snapshot.header_bytes);
