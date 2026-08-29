@@ -86,6 +86,45 @@ pub struct SendSyncRawHandle(pub RawHandle);
 unsafe impl Send for SendSyncRawHandle {}
 unsafe impl Sync for SendSyncRawHandle {}
 
+/// Takes a numeric inherited handle and returns an owned duplicate.
+///
+/// The launcher transfers ownership of a valid handle to the new process and
+/// must not use it there. This function immediately creates a non-inheritable
+/// duplicate and closes the inherited handle.
+pub fn take_inherited_file(raw: u64) -> Result<File> {
+    let raw = usize::try_from(raw)
+        .map_err(|_| Error::new(io::ErrorKind::InvalidInput, "invalid inherited handle"))?
+        as RawHandle;
+    let mut duplicate = null_mut();
+    // SAFETY: DuplicateHandle treats `raw` as an opaque value and reports an
+    // error for an invalid handle. A successful result is uniquely owned.
+    let process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+    if unsafe {
+        windows_sys::Win32::Foundation::DuplicateHandle(
+            process,
+            raw,
+            process,
+            &mut duplicate,
+            0,
+            0,
+            windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: the validity and ownership contract above permits consuming the
+    // inherited handle.
+    if unsafe { CloseHandle(raw) } == 0 {
+        let error = Error::last_os_error();
+        // SAFETY: `duplicate` is uniquely owned here.
+        unsafe { CloseHandle(duplicate) };
+        return Err(error);
+    }
+    // SAFETY: successful DuplicateHandle returns a fresh owned handle.
+    Ok(unsafe { File::from_raw_handle(duplicate) })
+}
+
 pub trait BorrowedHandleExt: Sized {
     fn duplicate(&self, inherit: bool, access: Option<u32>) -> Result<OwnedHandle>;
 }

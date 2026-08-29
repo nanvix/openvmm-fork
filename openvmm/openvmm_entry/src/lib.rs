@@ -573,17 +573,54 @@ fn microvm_control_console_attachment_from_cli(
     openvmm_helpers::snapshot::SnapshotAttachment,
 )> {
     anyhow::ensure!(
-        matches!(
-            config,
-            SerialConfigCli::Pipe(_) | SerialConfigCli::ConnectPipe(_) | SerialConfigCli::None
-        ),
-        "microVM control console requires listen=..., connect=..., or none"
+        matches!(config, SerialConfigCli::Pipe(_) | SerialConfigCli::None),
+        "microVM control console requires listen=... or none"
     );
-    microvm_console_attachment_from_cli_with_identity(
-        config,
+    let config = match config {
+        #[cfg(unix)]
+        SerialConfigCli::Pipe(path) => {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
+
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()
+                    .context("failed to resolve current directory for control endpoint")?
+                    .join(path)
+            };
+            let parent = absolute
+                .parent()
+                .context("microVM control endpoint has no parent directory")?;
+            let metadata = fs_err::symlink_metadata(parent).with_context(|| {
+                format!(
+                    "failed to inspect microVM control endpoint parent {}",
+                    parent.display()
+                )
+            })?;
+            anyhow::ensure!(
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.uid() == pal::unix::effective_user_id()
+                    && metadata.permissions().mode() & 0o7777 == 0o700,
+                "microVM control endpoint parent must be a non-symlink directory owned by OpenVMM with mode 0700"
+            );
+            SerialConfigCli::Pipe(canonical_microvm_console_path(&absolute)?)
+        }
+        _ => config.clone(),
+    };
+    let (effective, attachment, mut snapshot) = microvm_console_attachment_from_cli_with_identity(
+        &config,
         MICROVM_CONTROL_CONSOLE_STABLE_ID,
         MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
-    )
+    )?;
+    snapshot.reconnect_policy = match config {
+        SerialConfigCli::Pipe(_) => "broker-authenticated-listener",
+        SerialConfigCli::None => "broker-disconnected",
+        _ => unreachable!("control-console backend was validated"),
+    }
+    .to_owned();
+    Ok((effective, attachment, snapshot))
 }
 
 pub(crate) fn validate_microvm_console_attachment_namespace(
@@ -658,11 +695,26 @@ fn microvm_console_attachment_from_snapshot_with_identity(
             "snapshot requires an explicitly approved restore-time client attachment"
         );
     }
+    if control_console
+        && matches!(
+            attachment.reconnect_policy.as_str(),
+            "broker-authenticated-listener"
+        )
+    {
+        anyhow::ensure!(
+            requested.is_some(),
+            "snapshot requires an explicitly approved restore-time control attachment"
+        );
+    }
     let config = match (
         attachment.reconnect_policy.as_str(),
         attachment.identity_kind.as_str(),
     ) {
-        ("recreate-listener", "unix-socket" | "named-pipe") => {
+        ("recreate-listener", "unix-socket" | "named-pipe")
+        | ("broker-authenticated-listener", "unix-socket" | "named-pipe")
+            if !control_console
+                || attachment.reconnect_policy == "broker-authenticated-listener" =>
+        {
             SerialConfigCli::Pipe(PathBuf::from(identity))
         }
         ("recreate-listener", "tcp") => SerialConfigCli::Tcp(
@@ -670,7 +722,7 @@ fn microvm_console_attachment_from_snapshot_with_identity(
                 .parse()
                 .context("snapshot microVM console TCP identity is invalid")?,
         ),
-        ("reconnect-client", "unix-socket" | "named-pipe") => {
+        ("reconnect-client", "unix-socket" | "named-pipe") if !control_console => {
             SerialConfigCli::ConnectPipe(PathBuf::from(identity))
         }
         ("reconnect-client", "tcp") => SerialConfigCli::ConnectTcp(
@@ -681,7 +733,12 @@ fn microvm_console_attachment_from_snapshot_with_identity(
         ("require-inherited-attachment", "provider") => requested
             .cloned()
             .context("snapshot requires --virtio-console console as a replacement attachment")?,
-        ("discard-while-disconnected", "disconnected") => SerialConfigCli::None,
+        ("discard-while-disconnected", "disconnected")
+        | ("broker-disconnected", "disconnected")
+            if !control_console || attachment.reconnect_policy == "broker-disconnected" =>
+        {
+            SerialConfigCli::None
+        }
         (policy, kind) => anyhow::bail!(
             "snapshot microVM console policy '{policy}' and backend kind '{kind}' are unsupported"
         ),
@@ -816,6 +873,58 @@ fn effective_microvm_control_console(
         MICROVM_CONTROL_CONSOLE_STABLE_ID,
         MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
         true,
+    )
+}
+
+fn random_nonzero_bytes<const N: usize>(description: &'static str) -> anyhow::Result<[u8; N]> {
+    loop {
+        let mut bytes = [0; N];
+        getrandom::fill(&mut bytes).with_context(|| format!("failed to generate {description}"))?;
+        if bytes != [0; N] {
+            return Ok(bytes);
+        }
+    }
+}
+
+fn microvm_control_broker_config(
+    opt: &Options,
+    endpoint: &SerialConfigCli,
+) -> anyhow::Result<virtio_resources::console::VirtioControlConsoleBrokerConfig> {
+    let capability = if matches!(endpoint, SerialConfigCli::None) {
+        random_nonzero_bytes("disconnected control-console capability")?
+    } else {
+        let inherited = opt
+            .microvm_control_auth_handle
+            .context("live microVM control console requires an inherited authentication handle")?;
+        #[cfg(unix)]
+        {
+            let capability = serial_io::read_control_capability(inherited)
+                .context("failed to read control-console authentication capability")?;
+            anyhow::ensure!(
+                capability != [0; 32],
+                "control-console authentication capability is invalid"
+            );
+            capability
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = inherited;
+            anyhow::bail!("secure live microVM control consoles are unavailable on this platform")
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let expected_peer_identity =
+        serial_core::LocalPeerIdentity::UnixUid(pal::unix::effective_user_id());
+    #[cfg(not(target_os = "linux"))]
+    let expected_peer_identity = serial_core::LocalPeerIdentity::Unsupported;
+
+    Ok(
+        virtio_resources::console::VirtioControlConsoleBrokerConfig {
+            instance_id: random_nonzero_bytes("control-console instance ID")?,
+            capability,
+            expected_peer_identity,
+            auth_timeout_ms: opt.microvm_control_auth_timeout_ms,
+        },
     )
 }
 
@@ -1429,6 +1538,50 @@ mod microvm_console_attachment_tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn disconnected_control_console_uses_fresh_nonzero_runtime_secrets() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm-v2",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "none",
+        ])
+        .unwrap();
+        let first = microvm_control_broker_config(&options, &SerialConfigCli::None).unwrap();
+        let second = microvm_control_broker_config(&options, &SerialConfigCli::None).unwrap();
+        assert_ne!(first.instance_id, [0; 16]);
+        assert_ne!(second.instance_id, [0; 16]);
+        assert_ne!(first.instance_id, second.instance_id);
+        assert_ne!(first.capability, [0; 32]);
+        assert_ne!(second.capability, [0; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_capability_handle_requires_exact_closed_pipe_payload() {
+        use std::io::Write as _;
+        use std::os::fd::IntoRawFd as _;
+
+        fn read_payload(payload: &[u8], keep_writer_open: bool) -> io::Result<[u8; 32]> {
+            let (read, mut write) = pal::pipe_pair()?;
+            write.write_all(payload)?;
+            if !keep_writer_open {
+                drop(write);
+            }
+            let raw = read.into_raw_fd();
+            serial_io::read_control_capability(raw as u64)
+        }
+
+        assert_eq!(read_payload(&[0x5a; 32], false).unwrap(), [0x5a; 32]);
+        assert!(read_payload(&[0x5a; 31], false).is_err());
+        assert!(read_payload(&[0x5a; 33], false).is_err());
+        assert!(read_payload(&[0x5a; 32], true).is_err());
+        assert!(serial_io::read_control_capability(u64::MAX).is_err());
     }
 
     #[test]
@@ -2105,6 +2258,10 @@ async fn vm_config_from_command_line(
     } else {
         None
     };
+    let microvm_control_broker_config = microvm_control_console
+        .as_ref()
+        .map(|(endpoint, _, _)| microvm_control_broker_config(opt, endpoint))
+        .transpose()?;
     anyhow::ensure!(
         microvm_control_console.is_none() || microvm_console.is_some(),
         "microVM control console requires the boot virtio-console"
@@ -2317,33 +2474,15 @@ async fn vm_config_from_command_line(
         {
             match serial_cfg {
                 SerialConfigCli::Pipe(path) => {
-                    let backend =
-                        serial_io::bind_serial_without_cleanup(&path).with_context(|| {
-                            format!(
-                                "failed to bind microVM control console listener {}",
-                                path.display()
-                            )
-                        })?;
+                    let backend = serial_io::bind_control_serial(&path).with_context(|| {
+                        format!(
+                            "failed to bind microVM control console listener {}",
+                            path.display()
+                        )
+                    })?;
                     let cleanup = microvm_console_socket_cleanup(path)?;
                     (Some(backend), cleanup)
                 }
-                SerialConfigCli::ConnectPipe(path) => (
-                    Some(
-                        serial_io::connect_serial_with_timeout(
-                            &path,
-                            Duration::from_millis(
-                                openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
-                            ),
-                        )
-                        .with_context(|| {
-                            format!(
-                                "failed to reconnect microVM control console client {}",
-                                path.display()
-                            )
-                        })?,
-                    ),
-                    None,
-                ),
                 SerialConfigCli::None => {
                     (Some(DisconnectedSerialBackendHandle.into_resource()), None)
                 }
@@ -3950,11 +4089,12 @@ async fn vm_config_from_command_line(
         }
     }
     if let Some(backend) = microvm_control_console_backend {
+        let broker_config = microvm_control_broker_config
+            .context("control-console backend is missing broker authentication configuration")?;
         let resource: Resource<VirtioDeviceHandle> =
             virtio_resources::console::VirtioControlConsoleHandle {
                 backend,
-                disconnect_policy:
-                    virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                broker_config,
                 attachment: microvm_control_console
                     .as_ref()
                     .map(|(_, attachment, _)| attachment.clone()),
