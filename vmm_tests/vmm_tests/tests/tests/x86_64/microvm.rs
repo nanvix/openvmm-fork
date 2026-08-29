@@ -523,6 +523,121 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     vm.teardown().await
 }
 
+async fn microvm_v3_smp(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    processor_count: u32,
+) -> anyhow::Result<()> {
+    use openvmm_defs::config::LoadMode;
+
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    let workload = format!(
+        r#"#!/bin/sh
+set -eu
+fail() {{ echo SMP-PROBE-FAIL code=$1; nvx-exit "$1"; exit 1; }}
+expected={processor_count}
+online=$(getconf _NPROCESSORS_ONLN) || fail 20
+[ "$online" -eq "$expected" ] || fail 21
+loc_before=$(awk -v expected="$expected" '/^LOC:/ {{ for (cpu = 0; cpu < expected; cpu++) printf "%s%s", $(cpu + 2), (cpu + 1 == expected ? "" : " "); exit }}' /proc/interrupts)
+[ "$(printf "%s\n" "$loc_before" | awk '{{ print NF }}')" -eq "$expected" ] || fail 31
+uptime_before=$(awk '{{ print int($1 * 100); exit }}' /proc/uptime)
+cpu=0
+workers=0
+while [ "$cpu" -lt "$expected" ]; do
+        topology=/sys/devices/system/cpu/cpu${{cpu}}/topology
+        [ "$(cat "$topology/physical_package_id")" -eq 0 ] || fail 22
+        [ "$(cat "$topology/die_id")" -eq 0 ] || fail 23
+        [ "$(cat "$topology/core_id")" -eq "$cpu" ] || fail 24
+        [ "$(cat "$topology/thread_siblings_list")" = "$cpu" ] || fail 25
+        apic_id=$(awk -v target="$cpu" '$1 == "processor" {{ processor = $3 }} $1 == "apicid" && processor == target {{ print $3; exit }}' /proc/cpuinfo) || fail 26
+        [ "$apic_id" -eq "$cpu" ] || fail 27
+        actual=$(taskset -c "$cpu" sh -c 'awk "{{print \$39}}" /proc/self/stat') || fail 28
+        [ "$actual" -eq "$cpu" ] || fail 29
+        taskset -c "$cpu" sleep 0.1 &
+        echo SMP-WORKER-OK cpu=$cpu apic=$apic_id
+        workers=$((workers + 1))
+        cpu=$((cpu + 1))
+done
+wait
+loc_after=$(awk -v expected="$expected" '/^LOC:/ {{ for (cpu = 0; cpu < expected; cpu++) printf "%s%s", $(cpu + 2), (cpu + 1 == expected ? "" : " "); exit }}' /proc/interrupts)
+cpu=0
+while [ "$cpu" -lt "$expected" ]; do
+    field=$((cpu + 1))
+    before=$(printf "%s\n" "$loc_before" | awk -v field="$field" '{{ print $field }}')
+    after=$(printf "%s\n" "$loc_after" | awk -v field="$field" '{{ print $field }}')
+    [ "$after" -gt "$before" ] || fail 32
+    if [ "$cpu" -gt 0 ]; then
+        ipi=$(awk -v field=$((cpu + 2)) '/^(RES|CAL):/ {{ total += $field }} END {{ print total + 0 }}' /proc/interrupts)
+        [ "$ipi" -gt 0 ] || fail 33
+    fi
+    cpu=$((cpu + 1))
+done
+uptime_after=$(awk '{{ print int($1 * 100); exit }}' /proc/uptime)
+[ "$uptime_after" -gt "$uptime_before" ] || fail 34
+[ "$workers" -eq "$expected" ] || fail 30
+echo SMP-INTERRUPTS-OK loc_before=$loc_before loc_after=$loc_after
+echo SMP-TOPOLOGY-OK requested=$expected online=$online sockets=1 cores=$expected threads=1 bsp=0 workers=$workers
+echo NVX-SMP-PROBE-OK
+nvx-exit 37
+"#
+    );
+    let modified_initrd =
+        config.prepare_initrd_with_file("microvm-v3-smp-test.sh", workload.as_bytes(), 0o100755)?;
+    let mut vm = config
+        .with_prebuilt_initrd(modified_initrd.to_path_buf())
+        .with_microvm_v3_machine(processor_count)
+        .modify_backend(|backend| {
+            backend.with_custom_config(|config| {
+                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
+                    panic!("microVM v3 SMP test did not produce PVH load mode");
+                };
+                cmdline.push_str(" nvx_exec=/microvm-v3-smp-test.sh");
+            })
+        })
+        .run_without_agent()
+        .await?;
+
+    CancelContext::new()
+        .with_timeout(TIMEOUT)
+        .until_cancelled(
+            vm.backend()
+                .wait_for_microvm_portb_output("NVX-SMP-PROBE-OK"),
+        )
+        .await
+        .context("timed out waiting for microVM v3 SMP probe marker")??;
+    let halt = CancelContext::new()
+        .with_timeout(TIMEOUT)
+        .until_cancelled(vm.wait_for_halt())
+        .await
+        .context("timed out waiting for microVM v3 SMP shutdown")??;
+    assert_eq!(halt.reason, PetriHaltReason::PowerOff);
+    assert!(
+        halt.detail.contains("code: 37"),
+        "microVM v3 SMP workload failed: {}",
+        halt.detail
+    );
+    vm.teardown().await
+}
+
+#[openvmm_test_no_agent(microvm_pvh_x64)]
+async fn microvm_v3_smp_1(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v3_smp(config, 1).await
+}
+
+#[openvmm_test_no_agent(microvm_pvh_x64)]
+async fn microvm_v3_smp_2(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v3_smp(config, 2).await
+}
+
+#[openvmm_test_no_agent(microvm_pvh_x64)]
+async fn microvm_v3_smp_4(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v3_smp(config, 4).await
+}
+
+#[openvmm_test_no_agent(microvm_pvh_x64)]
+async fn microvm_v3_smp_8(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v3_smp(config, 8).await
+}
+
 #[vmm_test_with(
     openvmm,
     noagent,

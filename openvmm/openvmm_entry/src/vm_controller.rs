@@ -589,9 +589,9 @@ impl VmController {
             anyhow::ensure!(
                 matches!(
                     self.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1 | 2 }
+                    MachineProfile::Microvm { abi_version: 1..=3 }
                 ),
-                "guest-requested snapshot capture requires microVM ABI version 1 or 2"
+                "guest-requested snapshot capture requires microVM ABI version 1, 2, or 3"
             );
             anyhow::ensure!(
                 matches!(self.source_hypervisor.as_str(), "kvm" | "mshv" | "whp"),
@@ -612,6 +612,18 @@ impl VmController {
                                     == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
                             }),
                     "microVM ABI version 2 snapshot requires at least one lower layer and scratch"
+                ),
+                MachineProfile::Microvm { abi_version: 3 } => anyhow::ensure!(
+                    self.microvm_sandbox_block_sources.is_empty()
+                        || (self.microvm_sandbox_block_sources.len() >= 2
+                            && self
+                                .microvm_sandbox_block_sources
+                                .last()
+                                .is_some_and(|source| {
+                                    source.role
+                                        == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                                })),
+                    "microVM ABI version 3 snapshot requires either no blocks or at least one lower layer and scratch"
                 ),
                 _ => unreachable!(),
             }
@@ -762,6 +774,27 @@ impl VmController {
                         response.cpu_contract,
                     )?
                 }
+                MachineProfile::Microvm { abi_version: 3 } => {
+                    let blocks = crate::storage_builder::snapshot_block_contract(
+                        &self.microvm_sandbox_block_sources,
+                        scratch_policy,
+                    )?;
+                    openvmm_helpers::snapshot::microvm_v3_machine_contract(
+                        &self.source_hypervisor,
+                        command_line,
+                        network,
+                        filesystem,
+                        self.microvm_console_attachment.clone(),
+                        blocks,
+                        self.processors,
+                        self.memory,
+                        response.state_unit_names,
+                        response.capture_wall_clock,
+                        response.tsc_frequency_hz,
+                        Some(response.apic_frequency_hz),
+                        response.cpu_contract,
+                    )?
+                }
                 _ => unreachable!(),
             };
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
@@ -814,9 +847,10 @@ impl VmController {
                 .context("failed to flush snapshot RAM handle")?;
             let scratch_file = (matches!(
                 self.machine_profile,
-                MachineProfile::Microvm { abi_version: 2 }
-            ) && scratch_policy
-                == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
+                MachineProfile::Microvm { abi_version: 2 | 3 }
+            ) && !self.microvm_sandbox_block_sources.is_empty()
+                && scratch_policy
+                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
                 .then(|| {
                     self.microvm_sandbox_block_sources
                         .iter()

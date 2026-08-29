@@ -1410,6 +1410,26 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         self
     }
 
+    /// Select the microVM ABI version 3 machine profile with deterministic SMP topology.
+    pub fn with_microvm_v3_machine(mut self, processor_count: u32) -> Self {
+        assert!(
+            openvmm_defs::config::microvm_processor_count_supported(
+                openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                processor_count
+            ),
+            "microVM ABI version 3 supports only 1, 2, 4, or 8 vCPUs"
+        );
+        self = self.with_microvm_machine();
+        self.config.machine_profile = MachineProfile::Microvm {
+            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3,
+        };
+        self.config.proc_topology.vp_count = processor_count;
+        self.config.proc_topology.vps_per_socket = Some(processor_count);
+        self.config.proc_topology.enable_smt = Some(false);
+        self.config.proc_topology.apic_mode = Some(ApicMode::Xapic);
+        self
+    }
+
     /// Sets a custom OpenHCL IGVM VTL2 address type. This controls the behavior
     /// of where VTL2 is placed in address space, and also the total size of memory
     /// allocated for VTL2. VTL2 start will fail if `address_type` is specified

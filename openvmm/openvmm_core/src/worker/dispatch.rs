@@ -539,7 +539,10 @@ struct X86TopologyResult {
 }
 
 #[cfg(guest_arch = "x86_64")]
-fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86TopologyResult> {
+fn build_x86_topology(
+    config: &ProcessorTopologyConfig,
+    machine_profile: MachineProfile,
+) -> anyhow::Result<X86TopologyResult> {
     use vm_topology::processor::x86::X2ApicState;
 
     let arch = match &config.arch {
@@ -547,7 +550,16 @@ fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86Top
         Some(ArchTopologyConfig::X86(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
-    let mut builder = TopologyBuilder::from_host_topology()?;
+    let mut builder = if matches!(
+        machine_profile,
+        MachineProfile::Microvm {
+            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3
+        }
+    ) {
+        TopologyBuilder::new_x86()
+    } else {
+        TopologyBuilder::from_host_topology()?
+    };
     builder.apic_id_offset(arch.apic_id_offset);
     if let Some(smt) = config.enable_smt {
         builder.smt_enabled(smt);
@@ -1077,7 +1089,7 @@ impl InitializedVm {
         };
         #[cfg(not(guest_arch = "aarch64"))]
         let mut processor_topology = {
-            let result = build_x86_topology(&cfg.processor_topology)?;
+            let result = build_x86_topology(&cfg.processor_topology, cfg.machine_profile)?;
             result.processor_topology
         };
 
@@ -2936,7 +2948,9 @@ impl InitializedVm {
                                     openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
                                 ),
                                 MachineProfile::Microvm {
-                                    abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
+                                    abi_version:
+                                        openvmm_defs::config::MICROVM_ABI_VERSION_2
+                                        | openvmm_defs::config::MICROVM_ABI_VERSION_3,
                                 } => {
                                     let block = microvm_sandbox_blocks.next().context(
                                         "microVM ABI version 2 virtio-blk device has no sandbox role",
@@ -2967,6 +2981,7 @@ impl InitializedVm {
                                     cfg.machine_profile,
                                     MachineProfile::Microvm {
                                         abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
+                                            | openvmm_defs::config::MICROVM_ABI_VERSION_3
                                     }
                                 ) =>
                             {
@@ -3355,6 +3370,25 @@ impl LoadedVmInner {
                 initrd,
                 cmdline,
             } => {
+                let abi_version = match self.machine_profile {
+                    MachineProfile::Microvm { abi_version } => abi_version,
+                    MachineProfile::Standard => {
+                        anyhow::bail!("PVH load mode requires the microVM profile")
+                    }
+                };
+                let pvh_layout = match abi_version {
+                    openvmm_defs::config::MICROVM_ABI_VERSION_1
+                    | openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
+                        loader::pvh::PvhBootLayout::Legacy
+                    }
+                    openvmm_defs::config::MICROVM_ABI_VERSION_3 => loader::pvh::PvhBootLayout::Smp,
+                    _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+                };
+                let apic_ids = self
+                    .processor_topology
+                    .vps_arch()
+                    .map(|vp| vp.apic_id)
+                    .collect::<Vec<_>>();
                 let tables = acpi_builder.build_acpi_tables(loader::pvh::ACPI_RSDP_ADDR, |dsdt| {
                     add_devices_to_dsdt_x64(
                         dsdt,
@@ -3377,6 +3411,12 @@ impl LoadedVmInner {
                         acpi_tables: loader::pvh::AcpiTables {
                             rsdp: tables.rsdp,
                             tables: tables.tables,
+                        },
+                        boot_config: loader::pvh::BootConfig {
+                            layout: pvh_layout,
+                            apic_ids: &apic_ids,
+                            level_triggered_irqs:
+                                openvmm_defs::config::microvm_pvh_level_triggered_irqs(abi_version)?,
                         },
                     },
                     &self.gm,

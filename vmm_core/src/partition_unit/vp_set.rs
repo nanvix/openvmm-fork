@@ -884,6 +884,57 @@ struct Vp {
     vp_info: TargetVpInfo,
 }
 
+fn validate_restore_vp_indices(
+    vp_count: usize,
+    indices: impl IntoIterator<Item = VpIndex>,
+) -> Result<(), RestoreError> {
+    let mut present = vec![false; vp_count];
+    for vp_index in indices {
+        let index = vp_index.index() as usize;
+        let slot = present
+            .get_mut(index)
+            .ok_or_else(|| RestoreError::UnknownEntryId(format!("vp{}", vp_index.index())))?;
+        if std::mem::replace(slot, true) {
+            return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+                "snapshot contains duplicate state for vp{}",
+                vp_index.index()
+            )));
+        }
+    }
+    if let Some(index) = present.iter().position(|present| !present) {
+        return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+            "snapshot is missing state for vp{index}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod restore_vp_index_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn requires_exactly_one_restore_entry_per_vp() {
+        validate_restore_vp_indices(4, (0..4).map(VpIndex::new)).unwrap();
+
+        let missing = validate_restore_vp_indices(4, [0, 1, 3].map(VpIndex::new)).unwrap_err();
+        let RestoreError::InvalidSavedState(missing) = missing else {
+            panic!("expected invalid saved state");
+        };
+        assert!(missing.to_string().contains("missing state for vp2"));
+
+        let duplicate = validate_restore_vp_indices(4, [0, 1, 1, 3].map(VpIndex::new)).unwrap_err();
+        let RestoreError::InvalidSavedState(duplicate) = duplicate else {
+            panic!("expected invalid saved state");
+        };
+        assert!(duplicate.to_string().contains("duplicate state for vp1"));
+
+        let unknown = validate_restore_vp_indices(4, [0, 1, 2, 4].map(VpIndex::new)).unwrap_err();
+        assert!(unknown.to_string().contains("unknown entry id: vp4"));
+    }
+}
+
 impl VpSet {
     pub fn new(vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS], halt: Arc<Halt>) -> Self {
         let inner = Inner {
@@ -1053,6 +1104,8 @@ impl VpSet {
         states: impl IntoIterator<Item = (VpIndex, SavedStateBlob)>,
     ) -> Result<(), RestoreError> {
         assert!(!self.started);
+        let states = states.into_iter().collect::<Vec<_>>();
+        validate_restore_vp_indices(self.vps.len(), states.iter().map(|(vp_index, _)| *vp_index))?;
         states
             .into_iter()
             .map(|(vp_index, data)| {

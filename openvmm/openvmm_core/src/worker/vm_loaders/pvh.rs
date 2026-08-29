@@ -16,6 +16,7 @@ pub struct KernelConfig<'a> {
     pub cmdline: &'a str,
     pub mem_layout: &'a MemoryLayout,
     pub acpi_tables: loader::pvh::AcpiTables,
+    pub boot_config: loader::pvh::BootConfig<'a>,
 }
 
 #[derive(Debug, Error)]
@@ -46,13 +47,14 @@ pub fn load_pvh(
     });
 
     let mut loader = Loader::new(gm.clone(), cfg.mem_layout, hvdef::Vtl::Vtl0);
-    loader::pvh::load(
+    loader::pvh::load_with_boot_config(
         &mut loader,
         &mut kernel,
         initrd,
         cfg.cmdline,
         cfg.mem_layout,
         Some(&cfg.acpi_tables),
+        &cfg.boot_config,
     )
     .map_err(Error::Loader)?;
     Ok(loader.initial_regs_and_page_imports())

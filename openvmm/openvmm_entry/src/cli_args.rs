@@ -162,6 +162,8 @@ pub enum MachineProfileCli {
     Microvm,
     /// The microVM ABI version 2 sandbox-block machine.
     MicrovmV2,
+    /// The microVM ABI version 3 deterministic SMP machine.
+    MicrovmV3,
 }
 
 /// Required host-network implementation contract for a microVM NIC.
@@ -224,6 +226,9 @@ impl From<MachineProfileCli> for MachineProfile {
             },
             MachineProfileCli::MicrovmV2 => Self::Microvm {
                 abi_version: MICROVM_ABI_VERSION_2,
+            },
+            MachineProfileCli::MicrovmV3 => Self::Microvm {
+                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3,
             },
         }
     }
@@ -1549,7 +1554,9 @@ impl Options {
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
         if !matches!(
             self.machine,
-            MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+            MachineProfileCli::Microvm
+                | MachineProfileCli::MicrovmV2
+                | MachineProfileCli::MicrovmV3
         ) {
             anyhow::ensure!(
                 self.net_tap.is_none()
@@ -1567,6 +1574,7 @@ impl Options {
         let abi_version = match self.machine {
             MachineProfileCli::Microvm => MICROVM_ABI_VERSION_1,
             MachineProfileCli::MicrovmV2 => MICROVM_ABI_VERSION_2,
+            MachineProfileCli::MicrovmV3 => openvmm_defs::config::MICROVM_ABI_VERSION_3,
             MachineProfileCli::Standard => unreachable!("non-microVM profile returned above"),
         };
         anyhow::ensure!(
@@ -1574,8 +1582,9 @@ impl Options {
             "microVM ABI version {abi_version} requires an x86-64 guest"
         );
         anyhow::ensure!(
-            self.processors == 1,
-            "microVM ABI version 1 requires exactly one vCPU"
+            openvmm_defs::config::microvm_processor_count_supported(abi_version, self.processors),
+            "microVM ABI version {abi_version} does not support {} vCPUs",
+            self.processors
         );
         anyhow::ensure!(
             self.numa.is_none() && self.numa_distance.is_none(),
@@ -1708,7 +1717,7 @@ impl Options {
         if abi_version == MICROVM_ABI_VERSION_1 {
             anyhow::ensure!(
                 self.microvm_sandbox_block.is_empty(),
-                "--microvm-sandbox-block requires --machine microvm-v2"
+                "--microvm-sandbox-block requires --machine microvm-v2 or microvm-v3"
             );
             anyhow::ensure!(
                 self.virtio_blk.len() <= 1,
@@ -1721,7 +1730,7 @@ impl Options {
         } else {
             anyhow::ensure!(
                 self.virtio_blk.is_empty(),
-                "microVM ABI version 2 requires --microvm-sandbox-block instead of --virtio-blk"
+                "microVM ABI version {abi_version} requires --microvm-sandbox-block instead of --virtio-blk"
             );
             anyhow::ensure!(
                 self.microvm_sandbox_block.len() <= 4,
@@ -5518,8 +5527,72 @@ mod tests {
             }
         );
 
+        let opt = Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).unwrap();
+        assert_eq!(opt.machine, MachineProfileCli::MicrovmV3);
+        assert_eq!(
+            MachineProfile::from(opt.machine),
+            MachineProfile::Microvm {
+                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3
+            }
+        );
+
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn test_microvm_v3_processor_validation() {
+        for processors in [1, 2, 4, 8] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm-v3",
+                "--processors",
+                &processors.to_string(),
+            ])
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+        }
+
+        for processors in [0, 3, 5, 16] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm-v3",
+                "--processors",
+                &processors.to_string(),
+            ])
+            .unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
+
+        let old_abi =
+            Options::try_parse_from(["openvmm", "--machine", "microvm-v2", "--processors", "2"])
+                .unwrap();
+        assert!(old_abi.validate_microvm_options().is_err());
+
+        for args in [
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm-v3",
+                "--vps-per-socket",
+                "1",
+            ],
+            vec!["openvmm", "--machine", "microvm-v3", "--smt", "off"],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm-v3",
+                "--apic-id-offset",
+                "1",
+            ],
+            vec!["openvmm", "--machine", "microvm-v3", "--x2apic", "on"],
+            vec!["openvmm", "--machine", "microvm-v3", "--numa", "size=128M"],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
     }
 
     #[test]

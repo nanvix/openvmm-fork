@@ -1437,6 +1437,7 @@ mod test {
     use virt::VpIndex;
     use virt::VpInfo;
     use vm_topology::processor::TopologyBuilder;
+    use vm_topology::processor::x86::X2ApicState;
     use vm_topology::processor::x86::X86VpInfo;
 
     const KB: u64 = 1024;
@@ -1518,6 +1519,47 @@ mod test {
             entries,
             apic_ids.iter().map(|e| Some(*e)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_microvm_smp_madt_matches_pvh_mp_table() {
+        for processor_count in [1, 2, 4, 8] {
+            let mut topology_builder = TopologyBuilder::new_x86();
+            topology_builder
+                .vps_per_socket(processor_count)
+                .smt_enabled(false)
+                .x2apic(X2ApicState::Unsupported);
+            let topology = topology_builder.build(processor_count).unwrap();
+            let apic_ids = topology.vps_arch().map(|vp| vp.apic_id).collect::<Vec<_>>();
+
+            let mem = new_mem();
+            let pcie = vec![];
+            let madt = new_builder(&mem, &topology, &pcie).build_madt();
+            let madt_ids = MadtParser::new(&madt)
+                .unwrap()
+                .parse_apic_ids()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+
+            let mp_table = loader::pvh::build_mp_config_table(&loader::pvh::BootConfig {
+                layout: loader::pvh::PvhBootLayout::Smp,
+                apic_ids: &apic_ids,
+                level_triggered_irqs: &[],
+            })
+            .unwrap();
+            let mp_ids = mp_table[44..44 + apic_ids.len() * 20]
+                .chunks_exact(20)
+                .map(|entry| {
+                    assert_eq!(entry[0], 0);
+                    u32::from(entry[1])
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(mp_ids, apic_ids);
+            assert_eq!(madt_ids, apic_ids);
+        }
     }
 
     #[test]

@@ -1545,8 +1545,9 @@ async fn vm_config_from_command_line(
 ) -> anyhow::Result<(Config, VmResources)> {
     let is_microvm = matches!(
         opt.machine,
-        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2 | MachineProfileCli::MicrovmV3
     );
+    let is_microvm_v3 = opt.machine == MachineProfileCli::MicrovmV3;
     opt.validate_microvm_options()?;
     let effective_microvm_network = if is_microvm {
         effective_microvm_network(opt, restore_machine_contract)?
@@ -3207,8 +3208,12 @@ async fn vm_config_from_command_line(
     #[cfg(guest_arch = "x86_64")]
     let topology_arch =
         openvmm_defs::config::ArchTopologyConfig::X86(openvmm_defs::config::X86TopologyConfig {
-            apic_id_offset: opt.apic_id_offset,
-            x2apic: opt.x2apic,
+            apic_id_offset: if is_microvm_v3 { 0 } else { opt.apic_id_offset },
+            x2apic: if is_microvm_v3 {
+                openvmm_defs::config::X2ApicConfig::Unsupported
+            } else {
+                opt.x2apic
+            },
         });
 
     let with_isolation = if let Some(isolation) = &opt.isolation {
@@ -3634,11 +3639,19 @@ async fn vm_config_from_command_line(
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: opt.processors,
-            vps_per_socket: opt.vps_per_socket,
-            enable_smt: match opt.smt {
-                cli_args::SmtConfigCli::Auto => None,
-                cli_args::SmtConfigCli::Force => Some(true),
-                cli_args::SmtConfigCli::Off => Some(false),
+            vps_per_socket: if is_microvm_v3 {
+                Some(opt.processors)
+            } else {
+                opt.vps_per_socket
+            },
+            enable_smt: if is_microvm_v3 {
+                Some(false)
+            } else {
+                match opt.smt {
+                    cli_args::SmtConfigCli::Auto => None,
+                    cli_args::SmtConfigCli::Force => Some(true),
+                    cli_args::SmtConfigCli::Off => Some(false),
+                }
             },
             arch: Some(topology_arch),
         },
@@ -3746,7 +3759,9 @@ async fn vm_config_from_command_line(
                     .any(|(_, device)| device.id() == "virtio-blk"),
             )?,
             MachineProfile::Microvm {
-                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
+                abi_version:
+                    openvmm_defs::config::MICROVM_ABI_VERSION_2
+                    | openvmm_defs::config::MICROVM_ABI_VERSION_3,
             } => openvmm_defs::config::append_microvm_v2_virtio_discovery(
                 cmdline,
                 network,
@@ -4192,14 +4207,19 @@ fn prepare_snapshot_restore(
 )> {
     let expected_microvm_contract = if matches!(
         opt.machine,
-        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2 | MachineProfileCli::MicrovmV3
     ) {
         let abi_version = match opt.machine {
             MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
             MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            MachineProfileCli::MicrovmV3 => openvmm_defs::config::MICROVM_ABI_VERSION_3,
             MachineProfileCli::Standard => unreachable!(),
         };
-        let sandbox_blocks = if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+        let sandbox_blocks = if matches!(
+            abi_version,
+            openvmm_defs::config::MICROVM_ABI_VERSION_2
+                | openvmm_defs::config::MICROVM_ABI_VERSION_3
+        ) {
             let scratch_policy = if manifest
                 .machine_contract
                 .as_ref()
@@ -4338,6 +4358,23 @@ pub(crate) fn prepare_snapshot_restore_for_config(
                     filesystem,
                     console_attachment.cloned(),
                     sandbox_blocks,
+                    expected_memory_size,
+                    saved_contract.state_unit_names.clone(),
+                    saved_contract.capture_wall_clock,
+                    saved_contract.tsc_frequency_hz,
+                    saved_contract.apic_frequency_hz,
+                    saved_contract.cpu_contract.clone(),
+                )?
+            }
+            openvmm_defs::config::MICROVM_ABI_VERSION_3 => {
+                openvmm_helpers::snapshot::microvm_v3_machine_contract(
+                    expected_hypervisor,
+                    effective_command_line.to_owned(),
+                    network,
+                    filesystem,
+                    console_attachment.cloned(),
+                    sandbox_blocks,
+                    expected_vp_count,
                     expected_memory_size,
                     saved_contract.state_unit_names.clone(),
                     saved_contract.capture_wall_clock,
@@ -4509,8 +4546,11 @@ async fn run_control_inner(
         let requested_abi_version = match opt.machine {
             MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
             MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            MachineProfileCli::MicrovmV3 => openvmm_defs::config::MICROVM_ABI_VERSION_3,
             MachineProfileCli::Standard => {
-                anyhow::bail!("microVM snapshot restore requires --machine microvm or microvm-v2")
+                anyhow::bail!(
+                    "microVM snapshot restore requires --machine microvm, microvm-v2, or microvm-v3"
+                )
             }
         };
         anyhow::ensure!(
@@ -4520,14 +4560,14 @@ async fn run_control_inner(
     }
     let restore_machine_contract = if matches!(
         opt.machine,
-        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2 | MachineProfileCli::MicrovmV3
     ) && let Some(manifest) = restore_manifest.as_ref()
     {
         let snapshot_dir = opt
             .restore_snapshot
             .as_deref()
             .expect("restore manifest requires a snapshot path");
-        restore_gate_required = openvmm_helpers::snapshot::requires_post_restore_gate(&manifest);
+        restore_gate_required = openvmm_helpers::snapshot::requires_post_restore_gate(manifest);
         let contract = manifest
             .machine_contract
             .as_ref()
@@ -4535,6 +4575,7 @@ async fn run_control_inner(
         let expected_abi_version = match opt.machine {
             MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
             MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            MachineProfileCli::MicrovmV3 => openvmm_defs::config::MICROVM_ABI_VERSION_3,
             MachineProfileCli::Standard => unreachable!(),
         };
         anyhow::ensure!(
@@ -4555,7 +4596,12 @@ async fn run_control_inner(
             "restore-time memory overrides are not allowed"
         );
         opt.memory.size = Some(vmm_cli::MemorySize(manifest.memory_size_bytes));
-        if expected_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+        if matches!(
+            expected_abi_version,
+            openvmm_defs::config::MICROVM_ABI_VERSION_2
+                | openvmm_defs::config::MICROVM_ABI_VERSION_3
+        ) && !contract.microvm_sandbox_blocks.is_empty()
+        {
             let scratch = contract
                 .microvm_sandbox_blocks
                 .last()
@@ -4844,7 +4890,9 @@ async fn run_control_inner(
         Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
         None if matches!(
             opt.machine,
-            MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
+            MachineProfileCli::Microvm
+                | MachineProfileCli::MicrovmV2
+                | MachineProfileCli::MicrovmV3
         ) =>
         {
             openvmm_helpers::hypervisor::choose_microvm_hypervisor()?

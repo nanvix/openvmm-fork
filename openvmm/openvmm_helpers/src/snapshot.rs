@@ -31,8 +31,10 @@ const LEGACY_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V2\0";
 pub const SAVED_STATE_SCHEMA_VERSION: u32 = 1;
 /// Protobuf root type stored in `state.bin`.
 pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
-/// Xen PVH memory/boot layout version owned by microVM ABI v1.
+/// Xen PVH memory/boot layout version used by microVM ABI versions 1 and 2.
 pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 1;
+/// SMP-safe Xen PVH memory/boot layout version used by microVM ABI version 3.
+pub const MICROVM_SMP_PVH_LAYOUT_VERSION: u32 = 2;
 /// Clock policy applied when a snapshot is restored.
 pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
 /// Fleet-wide snapshot captured before image and sandbox configuration is consumed.
@@ -478,6 +480,7 @@ pub fn microvm_v1_machine_contract(
         filesystem,
         console_attachment,
         Vec::new(),
+        1,
         memory_size,
         state_unit_names,
         capture_wall_clock,
@@ -517,6 +520,7 @@ pub fn microvm_v2_machine_contract(
         filesystem,
         console_attachment,
         sandbox_blocks,
+        1,
         memory_size,
         state_unit_names,
         capture_wall_clock,
@@ -524,6 +528,73 @@ pub fn microvm_v2_machine_contract(
         apic_frequency_hz,
         cpu_contract,
     )
+}
+
+/// Builds the authoritative SMP-capable microVM ABI-v3 machine contract.
+pub fn microvm_v3_machine_contract(
+    source_hypervisor: &str,
+    effective_command_line: String,
+    network: Option<(
+        &openvmm_defs::config::MicrovmNetworkConfig,
+        &net_backend_resources::egress::EgressPolicy,
+        SnapshotAttachment,
+    )>,
+    filesystem: Option<(
+        &openvmm_defs::config::MicrovmFilesystemConfig,
+        SnapshotAttachment,
+    )>,
+    console_attachment: Option<SnapshotAttachment>,
+    sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
+    processor_count: u32,
+    memory_size: u64,
+    state_unit_names: Vec<String>,
+    capture_wall_clock: Timestamp,
+    tsc_frequency_hz: u64,
+    apic_frequency_hz: Option<u64>,
+    cpu_contract: Vec<u8>,
+) -> anyhow::Result<SnapshotMachineContract> {
+    microvm_machine_contract(
+        openvmm_defs::config::MICROVM_ABI_VERSION_3,
+        source_hypervisor,
+        effective_command_line,
+        network,
+        filesystem,
+        console_attachment,
+        sandbox_blocks,
+        processor_count,
+        memory_size,
+        state_unit_names,
+        capture_wall_clock,
+        tsc_frequency_hz,
+        apic_frequency_hz,
+        cpu_contract,
+    )
+}
+
+fn microvm_snapshot_topology(
+    abi_version: u32,
+    processor_count: u32,
+) -> anyhow::Result<SnapshotProcessorTopology> {
+    anyhow::ensure!(
+        openvmm_defs::config::microvm_processor_count_supported(abi_version, processor_count),
+        "microVM ABI version {abi_version} does not support {processor_count} vCPUs"
+    );
+    Ok(SnapshotProcessorTopology {
+        sockets: 1,
+        dies_per_socket: 1,
+        cores_per_die: processor_count,
+        threads_per_core: 1,
+        apic_ids: (0..processor_count).collect(),
+    })
+}
+
+fn microvm_pvh_layout_version(abi_version: u32) -> anyhow::Result<u32> {
+    match abi_version {
+        openvmm_defs::config::MICROVM_ABI_VERSION_1
+        | openvmm_defs::config::MICROVM_ABI_VERSION_2 => Ok(MICROVM_PVH_LAYOUT_VERSION),
+        openvmm_defs::config::MICROVM_ABI_VERSION_3 => Ok(MICROVM_SMP_PVH_LAYOUT_VERSION),
+        _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+    }
 }
 
 fn microvm_machine_contract(
@@ -541,6 +612,7 @@ fn microvm_machine_contract(
     )>,
     console_attachment: Option<SnapshotAttachment>,
     sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
+    processor_count: u32,
     memory_size: u64,
     state_unit_names: Vec<String>,
     capture_wall_clock: Timestamp,
@@ -554,6 +626,8 @@ fn microvm_machine_contract(
     );
     const LOW_RAM_END: u64 = 3 * 1024 * 1024 * 1024;
     const HIGH_RAM_START: u64 = 4 * 1024 * 1024 * 1024;
+    let topology = microvm_snapshot_topology(abi_version, processor_count)?;
+    let pvh_layout_version = microvm_pvh_layout_version(abi_version)?;
 
     let low_length = memory_size.min(LOW_RAM_END);
     let mut memory_ranges = vec![SnapshotMemoryRange {
@@ -881,13 +955,7 @@ fn microvm_machine_contract(
         effective_command_line: String::new(),
         effective_command_line_sha256: Vec::new(),
         memory_ranges,
-        topology: SnapshotProcessorTopology {
-            sockets: 1,
-            dies_per_socket: 1,
-            cores_per_die: 1,
-            threads_per_core: 1,
-            apic_ids: vec![0],
-        },
+        topology,
         devices,
         state_unit_names,
         attachments,
@@ -896,7 +964,7 @@ fn microvm_machine_contract(
         tsc_tolerance_ppm: 0,
         cpu_contract: Vec::new(),
         cpu_contract_sha256: Vec::new(),
-        pvh_layout_version: MICROVM_PVH_LAYOUT_VERSION,
+        pvh_layout_version,
         clock_policy: ADVANCE_BY_HOST_DOWNTIME.to_owned(),
         microvm_network,
         microvm_filesystem,
@@ -905,7 +973,7 @@ fn microvm_machine_contract(
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
-    validate_machine_contract_shape(&contract, memory_size, 1)?;
+    validate_machine_contract_shape(&contract, memory_size, processor_count)?;
     Ok(contract)
 }
 
@@ -2196,8 +2264,9 @@ fn validate_machine_contract_shape(
     memory_size: u64,
     vp_count: u32,
 ) -> anyhow::Result<()> {
+    let expected_pvh_layout_version = microvm_pvh_layout_version(contract.microvm_abi_version)?;
     anyhow::ensure!(
-        contract.pvh_layout_version == MICROVM_PVH_LAYOUT_VERSION,
+        contract.pvh_layout_version == expected_pvh_layout_version,
         "snapshot PVH layout version {} is unsupported",
         contract.pvh_layout_version
     );
@@ -2299,6 +2368,13 @@ fn validate_machine_contract_shape(
         "snapshot processor topology doesn't describe {vp_count} virtual processors"
     );
     ensure_unique(&topology.apic_ids, "APIC ID")?;
+    if contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_3 {
+        anyhow::ensure!(
+            *topology == microvm_snapshot_topology(contract.microvm_abi_version, vp_count)?,
+            "snapshot processor topology is not canonical for microVM ABI version {}",
+            contract.microvm_abi_version
+        );
+    }
 
     if let Some(network) = &contract.microvm_network {
         anyhow::ensure!(
@@ -2352,84 +2428,93 @@ fn validate_machine_contract_shape(
             contract.microvm_sandbox_blocks.is_empty(),
             "microVM ABI version 1 snapshot contains ABI-v2 sandbox blocks"
         ),
-        openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
-            anyhow::ensure!(
-                contract.microvm_sandbox_blocks.len() >= 2
-                    && contract.microvm_sandbox_blocks.len() <= 4,
-                "microVM ABI version 2 snapshot must contain one to three layers and scratch"
-            );
-            let mut previous_role = None;
-            for block in &contract.microvm_sandbox_blocks {
-                let role = match block.role.as_str() {
-                    "distro" => openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
-                    "runtime" => openvmm_defs::config::MicrovmSandboxBlockRole::Runtime,
-                    "custom" => openvmm_defs::config::MicrovmSandboxBlockRole::Custom,
-                    "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
-                    role => anyhow::bail!("snapshot sandbox block role '{role}' is unsupported"),
-                };
+        openvmm_defs::config::MICROVM_ABI_VERSION_2
+        | openvmm_defs::config::MICROVM_ABI_VERSION_3 => {
+            if contract.microvm_abi_version != openvmm_defs::config::MICROVM_ABI_VERSION_3
+                || !contract.microvm_sandbox_blocks.is_empty()
+            {
                 anyhow::ensure!(
-                    previous_role.is_none_or(|previous| previous < role),
-                    "snapshot sandbox block roles are duplicated or out of order"
+                    contract.microvm_sandbox_blocks.len() >= 2
+                        && contract.microvm_sandbox_blocks.len() <= 4,
+                    "microVM ABI version {} snapshot must contain one to three layers and scratch",
+                    contract.microvm_abi_version
                 );
-                previous_role = Some(role);
-                anyhow::ensure!(
-                    block.read_only == role.is_read_only(),
-                    "snapshot sandbox block '{}' has an invalid access mode",
-                    block.role
-                );
-                anyhow::ensure!(
-                    block.length != 0 && block.length % 512 == 0,
-                    "snapshot sandbox block '{}' has invalid geometry",
-                    block.role
-                );
-                anyhow::ensure!(
-                    block.logical_block_size >= 512
-                        && block.logical_block_size.is_power_of_two()
-                        && block.physical_block_size >= block.logical_block_size
-                        && block.physical_block_size.is_power_of_two()
-                        && block.length % u64::from(block.logical_block_size) == 0,
-                    "snapshot sandbox block '{}' has invalid block geometry",
-                    block.role
-                );
-                if role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch {
+                let mut previous_role = None;
+                for block in &contract.microvm_sandbox_blocks {
+                    let role = match block.role.as_str() {
+                        "distro" => openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
+                        "runtime" => openvmm_defs::config::MicrovmSandboxBlockRole::Runtime,
+                        "custom" => openvmm_defs::config::MicrovmSandboxBlockRole::Custom,
+                        "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+                        role => {
+                            anyhow::bail!("snapshot sandbox block role '{role}' is unsupported")
+                        }
+                    };
                     anyhow::ensure!(
-                        block.artifact.is_empty() || block.artifact == SCRATCH_FILE_NAME,
-                        "snapshot scratch artifact name is invalid"
+                        previous_role.is_none_or(|previous| previous < role),
+                        "snapshot sandbox block roles are duplicated or out of order"
                     );
-                    if block.artifact.is_empty() {
-                        anyhow::ensure!(
-                            block.identity_kind == "fresh" && block.identity.is_empty(),
-                            "snapshot fresh scratch policy is invalid"
-                        );
-                    } else {
-                        anyhow::ensure!(
-                            block.identity_kind == "sha256",
-                            "snapshot paired scratch has an unsupported identity kind"
-                        );
-                        validate_sha256(&block.identity, "scratch block")?;
-                    }
-                } else {
+                    previous_role = Some(role);
                     anyhow::ensure!(
-                        block.artifact.is_empty()
-                            && matches!(block.identity_kind.as_str(), "sha256" | "unbound"),
-                        "snapshot read-only layer '{}' has an invalid identity policy",
+                        block.read_only == role.is_read_only(),
+                        "snapshot sandbox block '{}' has an invalid access mode",
                         block.role
                     );
-                    if block.identity_kind == "sha256" {
-                        validate_sha256(&block.identity, &format!("{} block", block.role))?;
+                    anyhow::ensure!(
+                        block.length != 0 && block.length % 512 == 0,
+                        "snapshot sandbox block '{}' has invalid geometry",
+                        block.role
+                    );
+                    anyhow::ensure!(
+                        block.logical_block_size >= 512
+                            && block.logical_block_size.is_power_of_two()
+                            && block.physical_block_size >= block.logical_block_size
+                            && block.physical_block_size.is_power_of_two()
+                            && block.length % u64::from(block.logical_block_size) == 0,
+                        "snapshot sandbox block '{}' has invalid block geometry",
+                        block.role
+                    );
+                    if role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch {
+                        anyhow::ensure!(
+                            block.artifact.is_empty() || block.artifact == SCRATCH_FILE_NAME,
+                            "snapshot scratch artifact name is invalid"
+                        );
+                        if block.artifact.is_empty() {
+                            anyhow::ensure!(
+                                block.identity_kind == "fresh" && block.identity.is_empty(),
+                                "snapshot fresh scratch policy is invalid"
+                            );
+                        } else {
+                            anyhow::ensure!(
+                                block.identity_kind == "sha256",
+                                "snapshot paired scratch has an unsupported identity kind"
+                            );
+                            validate_sha256(&block.identity, "scratch block")?;
+                        }
                     } else {
                         anyhow::ensure!(
-                            block.identity.is_empty(),
-                            "snapshot unbound layer '{}' carries an identity",
+                            block.artifact.is_empty()
+                                && matches!(block.identity_kind.as_str(), "sha256" | "unbound"),
+                            "snapshot read-only layer '{}' has an invalid identity policy",
                             block.role
                         );
+                        if block.identity_kind == "sha256" {
+                            validate_sha256(&block.identity, &format!("{} block", block.role))?;
+                        } else {
+                            anyhow::ensure!(
+                                block.identity.is_empty(),
+                                "snapshot unbound layer '{}' carries an identity",
+                                block.role
+                            );
+                        }
                     }
                 }
+                anyhow::ensure!(
+                    previous_role == Some(openvmm_defs::config::MicrovmSandboxBlockRole::Scratch),
+                    "microVM ABI version {} snapshot is missing its scratch role",
+                    contract.microvm_abi_version
+                );
             }
-            anyhow::ensure!(
-                previous_role == Some(openvmm_defs::config::MicrovmSandboxBlockRole::Scratch),
-                "microVM ABI version 2 snapshot is missing its scratch role"
-            );
         }
         version => anyhow::bail!("snapshot microVM ABI version {version} is unsupported"),
     }
@@ -3481,6 +3566,49 @@ mod tests {
         expected.pvh_layout_version += 1;
         let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
         assert!(err.to_string().contains("PVH layout"));
+    }
+
+    #[test]
+    fn microvm_v3_snapshot_topology_is_canonical() {
+        for processor_count in [1, 2, 4, 8] {
+            let topology = microvm_snapshot_topology(
+                openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                processor_count,
+            )
+            .unwrap();
+            assert_eq!(topology.sockets, 1);
+            assert_eq!(topology.dies_per_socket, 1);
+            assert_eq!(topology.cores_per_die, processor_count);
+            assert_eq!(topology.threads_per_core, 1);
+            assert_eq!(topology.apic_ids, (0..processor_count).collect::<Vec<_>>());
+            assert_eq!(
+                microvm_pvh_layout_version(openvmm_defs::config::MICROVM_ABI_VERSION_3).unwrap(),
+                MICROVM_SMP_PVH_LAYOUT_VERSION
+            );
+        }
+
+        for processor_count in [0, 3, 5, 16] {
+            assert!(
+                microvm_snapshot_topology(
+                    openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                    processor_count,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_microvm_v3_snapshot_rejects_noncanonical_apic_ids() {
+        let mut manifest = test_manifest();
+        let mut contract = test_machine_contract();
+        contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_3;
+        contract.pvh_layout_version = MICROVM_SMP_PVH_LAYOUT_VERSION;
+        contract.topology.apic_ids = vec![0, 2];
+        manifest.machine_contract = Some(contract.clone());
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("not canonical"));
     }
 
     #[test]
