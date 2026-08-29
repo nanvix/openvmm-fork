@@ -30,6 +30,17 @@
 
 #![forbid(unsafe_code)]
 
+// The physical console adapter is intentionally a follow-up.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the physical adapter is a follow-up")
+)]
+pub(crate) mod control_session_broker;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the physical adapter is a follow-up")
+)]
+pub(crate) mod control_session_protocol;
 pub mod resolver;
 mod spec;
 #[cfg(test)]
