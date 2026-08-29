@@ -46,6 +46,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
   are rejected. Host-driven save/restore, pulse-save/restore, and worker
   restart remain unavailable.
 
+  `microvm` may also expose a dedicated control virtio-console at MMIO
+  `0xd0007000`, IRQ 3. It requires the boot virtio-console, preserves
+  `console=hvc1`, and publishes `nvx_control_tty=hvc2`. The profile fixes
+  boot-before-control discovery order and rejects user overrides that could
+  change it.
+
   `microvm` uses one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
@@ -503,6 +509,18 @@ Serial devices can be configured to appear as different devices inside the guest
   A generic byte stream guarantees no replay up to OpenVMM's backend write
   boundary; it cannot prove that the remote application consumed bytes without
   its own acknowledgment protocol.
+
+* `--microvm-control-console <BACKEND>`: With `--machine microvm-v2`, expose a
+  second independent single-port virtio console at fixed MMIO `0xd0007000`, IRQ
+  3. `--virtio-console` is required on a fresh boot and remains the only kernel
+  console. The control device normally appears as the profile-owned
+  `nvx_control_tty=hvc2`.
+
+  The accepted backends are `listen=PATH`, `connect=PATH`, and `none`. TCP,
+  terminal, file, and inherited-console backends are rejected. Boot and control
+  endpoints must be distinct. Snapshot capture records a separate
+  `console:microvm-control0` attachment and restores it independently from the
+  boot console.
 
 The `BACKEND` argument is the same for all serial devices:
 
