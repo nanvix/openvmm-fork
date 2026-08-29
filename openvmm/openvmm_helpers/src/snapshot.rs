@@ -1110,7 +1110,7 @@ pub fn microvm_machine_contract(
     }
     if let Some(attachment) = control_console_attachment {
         let policy_is_valid = match attachment.reconnect_policy.as_str() {
-            "recreate-listener" => {
+            "broker-authenticated-listener" => {
                 !attachment.required
                     && attachment.reconnect_timeout_ms == 0
                     && matches!(
@@ -1118,16 +1118,7 @@ pub fn microvm_machine_contract(
                         "unix-socket" | "named-pipe"
                     )
             }
-            "reconnect-client" => {
-                attachment.required
-                    && attachment.reconnect_timeout_ms
-                        == openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS
-                    && matches!(
-                        attachment.identity_kind.as_str(),
-                        "unix-socket" | "named-pipe"
-                    )
-            }
-            "discard-while-disconnected" => {
+            "broker-disconnected" => {
                 !attachment.required
                     && attachment.reconnect_timeout_ms == 0
                     && attachment.identity_kind == "disconnected"
@@ -3916,6 +3907,20 @@ fn validate_machine_contract_shape(
                 "discard-while-disconnected" => {
                     !attachment.required && attachment.reconnect_timeout_ms == 0
                 }
+                "broker-authenticated-listener" => {
+                    !attachment.required
+                        && attachment.reconnect_timeout_ms == 0
+                        && matches!(
+                            attachment.identity_kind.as_str(),
+                            "unix-socket" | "named-pipe"
+                        )
+                }
+                "broker-disconnected" => {
+                    !attachment.required
+                        && attachment.reconnect_timeout_ms == 0
+                        && attachment.identity_kind == "disconnected"
+                        && attachment.identity == b"discard"
+                }
                 "recreate-endpoint" => {
                     !attachment.required && attachment.reconnect_timeout_ms == 0
                 }
@@ -4494,9 +4499,22 @@ mod tests {
             stable_id: "console:microvm-control0".to_owned(),
             kind: "virtio-control-console".to_owned(),
             required: false,
-            reconnect_policy: "discard-while-disconnected".to_owned(),
+            reconnect_policy: "broker-disconnected".to_owned(),
             identity_kind: "disconnected".to_owned(),
             identity: b"discard".to_vec(),
+            length: 0,
+            reconnect_timeout_ms: 0,
+        }
+    }
+
+    fn microvm_control_console_listener_attachment() -> SnapshotAttachment {
+        SnapshotAttachment {
+            stable_id: "console:microvm-control0".to_owned(),
+            kind: "virtio-control-console".to_owned(),
+            required: false,
+            reconnect_policy: "broker-authenticated-listener".to_owned(),
+            identity_kind: "unix-socket".to_owned(),
+            identity: b"/run/nvx/control.sock".to_vec(),
             length: 0,
             reconnect_timeout_ms: 0,
         }
@@ -4625,7 +4643,9 @@ mod tests {
         .unwrap()
     }
 
-    fn generated_control_console_contract() -> SnapshotMachineContract {
+    fn generated_control_console_contract_with_attachment(
+        control_console_attachment: SnapshotAttachment,
+    ) -> SnapshotMachineContract {
         microvm_machine_contract(
             "whp",
             "earlycon=xe9 console=hvc1 reboot=t panic=-1 \
@@ -4639,7 +4659,7 @@ mod tests {
             false,
             None,
             Some(microvm_console_attachment()),
-            Some(microvm_control_console_attachment()),
+            Some(control_console_attachment),
             vec![
                 SnapshotMicrovmSandboxBlock {
                     role: "distro".to_owned(),
@@ -4688,6 +4708,10 @@ mod tests {
             vec![1, 2, 3],
         )
         .unwrap()
+    }
+
+    fn generated_control_console_contract() -> SnapshotMachineContract {
+        generated_control_console_contract_with_attachment(microvm_control_console_attachment())
     }
 
     fn generated_filesystem_contract(source_hypervisor: &str) -> SnapshotMachineContract {
@@ -4822,6 +4846,14 @@ mod tests {
                 microvm_control_console_attachment()
             ]
         );
+    }
+
+    #[test]
+    fn generated_microvm_control_console_contract_accepts_broker_listener() {
+        let attachment = microvm_control_console_listener_attachment();
+        let contract = generated_control_console_contract_with_attachment(attachment.clone());
+        assert_eq!(contract.attachments[1], attachment);
+        validate_machine_contract_shape(&contract, 1024, 1).unwrap();
     }
 
     #[test]
