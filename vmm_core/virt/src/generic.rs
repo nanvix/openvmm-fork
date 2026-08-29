@@ -394,6 +394,11 @@ pub struct HvConfig {
 
 /// Methods for manipulating a VM partition.
 pub trait Partition: 'static + Hv1 + Inspect + Send + Sync {
+    /// Completes partition initialization after all guest memory is attached.
+    fn finalize_memory(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Returns the effective x86 CPU compatibility contract.
     #[cfg(guest_arch = "x86_64")]
     fn cpu_compatibility_contract(&self) -> crate::x86::CpuCompatibilityContract;

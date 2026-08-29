@@ -10,6 +10,7 @@ use crate::Error;
 use crate::ErrorInner;
 use crate::KernelError;
 use crate::LinuxMshv;
+use crate::MshvFinalizedPartition;
 use crate::MshvPartition;
 use crate::MshvPartitionInner;
 use crate::MshvProcessor;
@@ -19,6 +20,8 @@ use crate::MshvVpRunner;
 use crate::VcpuFdExt;
 use crate::common_synthetic_features;
 use crate::create_vm_with_retry;
+use crate::finalize_memory_once;
+use crate::finalized_partition;
 
 use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
@@ -142,10 +145,50 @@ impl virt::Hypervisor for LinuxMshv {
     }
 }
 
-impl MshvProtoPartition<'_> {
+impl MshvPartitionInner {
+    fn finalized(&self) -> Result<&MshvFinalizedPartition, Error> {
+        finalized_partition(&self.finalized)
+    }
+
+    fn caps(&self) -> &virt::PartitionCapabilities {
+        &self
+            .finalized
+            .get()
+            .expect("partition memory must be finalized before capability access")
+            .caps
+    }
+
+    fn build_caps(&self, bsp: &VcpuFd) -> Result<virt::PartitionCapabilities, Error> {
+        let mut caps = match bsp.get_cpuid_values(0, 0, 0, 0) {
+            Ok(_) => virt::PartitionCapabilities::from_cpuid(
+                &self.processor_topology,
+                &mut |function, index| {
+                    bsp.get_cpuid_values(function, index, 0, 0)
+                        .map_err(KernelError::from)
+                        .expect("cpuid should not fail")
+                },
+            )
+            .map_err(ErrorInner::Capabilities)?,
+            Err(_) => {
+                tracing::warn!(
+                    "failed to query CPUID, falling back to partition properties, some features may be unavailable"
+                );
+                self.caps_from_properties(bsp)?
+            }
+        };
+        caps.tsc_deadline = false;
+        caps.xsaves_state_bv_broken = true;
+        // TimeFreeze stops reference time but not the virtual TSC.
+        caps.can_freeze_time = false;
+        Ok(caps)
+    }
+
     /// Build partition capabilities from partition properties instead of
     /// CPUID.
-    fn caps_from_properties(&self) -> Result<virt::x86::X86PartitionCapabilities, Error> {
+    fn caps_from_properties(
+        &self,
+        bsp: &VcpuFd,
+    ) -> Result<virt::x86::X86PartitionCapabilities, Error> {
         use virt::x86::X86PartitionCapabilities;
         use virt::x86::XsaveCapabilities;
         use x86defs::cpuid::Vendor;
@@ -175,26 +218,25 @@ impl MshvProtoPartition<'_> {
 
         let reset_rdx = {
             let mut assoc = [HvRegisterAssoc::from((HvX64RegisterName::Rdx, 0u64))];
-            self.bsp
-                .get_hvdef_regs(&mut assoc)
+            bsp.get_hvdef_regs(&mut assoc)
                 .map_err(ErrorInner::Register)?;
             assoc[0].value.as_u64()
         };
 
         let x2apic = matches!(
-            self.config.processor_topology.apic_mode(),
+            self.processor_topology.apic_mode(),
             vm_topology::processor::x86::ApicMode::X2ApicSupported
                 | vm_topology::processor::x86::ApicMode::X2ApicEnabled
         );
         let x2apic_enabled = matches!(
-            self.config.processor_topology.apic_mode(),
+            self.processor_topology.apic_mode(),
             vm_topology::processor::x86::ApicMode::X2ApicEnabled
         );
 
         Ok(X86PartitionCapabilities {
             vendor,
-            hv1: self.config.hv_config.is_some(),
-            hv1_reference_tsc_page: self.config.hv_config.is_some(),
+            hv1: self.hv_configured,
+            hv1_reference_tsc_page: self.hv_configured,
             xsave: XsaveCapabilities {
                 features: xsave_states,
                 supervisor_features: 0,
@@ -214,7 +256,11 @@ impl MshvProtoPartition<'_> {
             tsc_deadline: false,
             kvm_clock: false,
             vtom: None,
-            physical_address_width: self.max_physical_address_size(),
+            physical_address_width: self
+                .vmfd
+                .get_partition_property(HvPartitionPropertyCode::PhysicalAddressWidth.0)
+                .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))?
+                as u8,
             can_freeze_time: false,
             xsaves_state_bv_broken: false,
             dr6_tsx_broken: false,
@@ -222,7 +268,9 @@ impl MshvProtoPartition<'_> {
             nested_virt: false,
         })
     }
+}
 
+impl MshvProtoPartition<'_> {
     fn max_physical_address_size(&self) -> u8 {
         self.vmfd
             .get_partition_property(HvPartitionPropertyCode::PhysicalAddressWidth.0)
@@ -302,32 +350,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 .hvcall(&mut args)
                 .map_err(|e| ErrorInner::RegisterCpuid(e.into()))?;
         }
-        let caps = {
-            let mut caps = match self.bsp.get_cpuid_values(0, 0, 0, 0) {
-                Ok(_) => virt::PartitionCapabilities::from_cpuid(
-                    self.config.processor_topology,
-                    &mut |function, index| {
-                        self.bsp
-                            .get_cpuid_values(function, index, 0, 0)
-                            .map_err(KernelError::from)
-                            .expect("cpuid should not fail")
-                    },
-                )
-                .map_err(ErrorInner::Capabilities)?,
-                Err(_) => {
-                    tracing::warn!(
-                        "failed to query CPUID, falling back to partition properties, some features may be unavailable"
-                    );
-                    self.caps_from_properties()?
-                }
-            };
-            caps.tsc_deadline = false;
-            caps.xsaves_state_bv_broken = true;
-            // TimeFreeze stops reference time but not the virtual TSC.
-            caps.can_freeze_time = false;
-            caps
-        };
-
         let apic_id_map = self
             .config
             .processor_topology
@@ -337,7 +359,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
 
         let inner = Arc::new(MshvPartitionInner {
             vmfd: self.vmfd,
-            bsp_vcpufd: self.bsp,
+            finalized: Default::default(),
             memory: Default::default(),
             gm: config.guest_memory.clone(),
             mem_layout: config.mem_layout.clone(),
@@ -346,9 +368,10 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             gsi_states: Mutex::new(Box::new(
                 [crate::irqfd::GsiState::Unallocated; crate::irqfd::NUM_GSIS],
             )),
-            caps,
             synic_ports: Default::default(),
             cpuid,
+            processor_topology: (*self.config.processor_topology).clone(),
+            hv_configured: self.config.hv_config.is_some(),
             software_devices: ApicSoftwareDevices::new(apic_id_map),
             time_frozen: Mutex::new(false),
         });
@@ -378,8 +401,26 @@ impl ProtoPartition for MshvProtoPartition<'_> {
 // ---------------------------------------------------------------------------
 
 impl virt::Partition for MshvPartition {
+    fn finalize_memory(&self) -> Result<(), Self::Error> {
+        let memory_attached = self.inner.memory.lock().ranges.iter().any(Option::is_some);
+
+        finalize_memory_once(&self.inner.finalized, memory_attached, || {
+            let _span = tracing::info_span!("mshv create BSP", vp_index = 0).entered();
+            let started = std::time::Instant::now();
+            let result = self.inner.vmfd.create_vcpu(0);
+            tracing::info!(
+                elapsed_us = started.elapsed().as_micros() as u64,
+                success = result.is_ok(),
+                "MSHV_CREATE_VCPU completed"
+            );
+            let bsp_vcpufd = result.map_err(|e| ErrorInner::CreateVcpu(e.into()))?;
+            let caps = self.inner.build_caps(&bsp_vcpufd)?;
+            Ok(MshvFinalizedPartition { bsp_vcpufd, caps })
+        })
+    }
+
     fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract {
-        virt::x86::CpuCompatibilityContract::new(&self.inner.caps, &self.inner.cpuid)
+        virt::x86::CpuCompatibilityContract::new(self.inner.caps(), &self.inner.cpuid)
     }
 
     fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
@@ -428,7 +469,7 @@ impl virt::Partition for MshvPartition {
     }
 
     fn caps(&self) -> &virt::PartitionCapabilities {
-        &self.inner.caps
+        self.inner.caps()
     }
 
     fn request_msi(&self, _vtl: Vtl, request: MsiRequest) {
@@ -592,9 +633,10 @@ impl virt::BindProcessor for MshvProcessorBinder {
 
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
         let inner = &self.partition.vps[self.vpindex.index() as usize];
+        let finalized = self.partition.finalized()?;
 
         let vcpufd = if self.vpindex.is_bsp() {
-            &self.partition.bsp_vcpufd
+            &finalized.bsp_vcpufd
         } else {
             if self.vcpufd.is_none() {
                 let vcpufd = self
@@ -627,8 +669,7 @@ impl virt::BindProcessor for MshvProcessorBinder {
         };
 
         // Set the APIC state.
-        let apic_base =
-            virt::vp::Apic::at_reset(&this.partition.caps, &this.inner.vp_info).apic_base;
+        let apic_base = virt::vp::Apic::at_reset(&finalized.caps, &this.inner.vp_info).apic_base;
 
         let regs = &[
             HvRegisterAssoc::from((
@@ -639,7 +680,7 @@ impl virt::BindProcessor for MshvProcessorBinder {
             HvRegisterAssoc::from((HvX64RegisterName::ApicId, u64::from(inner.vp_info.apic_id))),
         ];
 
-        let reg_count = if this.partition.caps.x2apic { 2 } else { 3 };
+        let reg_count = if finalized.caps.x2apic { 2 } else { 3 };
 
         vcpufd
             .set_hvdef_regs(&regs[..reg_count])
@@ -830,7 +871,7 @@ impl EmulatorSupport for MshvEmulationState<'_> {
     }
 
     fn vendor(&self) -> x86defs::cpuid::Vendor {
-        self.partition.caps.vendor
+        self.partition.caps().vendor
     }
 
     fn gp(&mut self, reg: x86emu::Gp) -> u64 {
