@@ -230,10 +230,19 @@ pub mod console {
         const ID: &'static str = "virtio-console";
     }
 
+    #[derive(Clone, MeshPayload)]
+    pub struct VirtioControlConsoleBrokerConfig {
+        pub instance_id: [u8; 16],
+        pub capability: [u8; 32],
+        pub expected_peer_identity: serial_core::LocalPeerIdentity,
+        pub auth_timeout_ms: u64,
+    }
+
     #[derive(MeshPayload)]
     pub struct VirtioControlConsoleHandle {
+        /// Reconnectable host endpoint used by the VMM-resident broker.
         pub backend: Resource<SerialBackendHandle>,
-        pub disconnect_policy: VirtioConsoleDisconnectPolicy,
+        pub broker_config: VirtioControlConsoleBrokerConfig,
         pub attachment: Option<VirtioConsoleAttachment>,
     }
 

@@ -160,6 +160,10 @@ impl SerialIo for WindowsPipeSerialBackend {
             }
         }
     }
+
+    fn disconnect_current(&mut self) -> io::Result<()> {
+        self.disconnect()
+    }
 }
 
 impl AsyncRead for WindowsPipeSerialBackend {
