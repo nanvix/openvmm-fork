@@ -2181,7 +2181,7 @@ async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
                 !status.success()
                     && contains_bytes(
                         &output,
-                        b"microVM snapshot restore requires --machine microvm or microvm-v2"
+                        b"microVM snapshot restore requires --machine microvm, microvm-v2, or microvm-v3"
                     )
                     && !snapshot_dir.join("resume.claim").exists(),
                 "wrong-profile restore consumed or entered an instance checkpoint: {}",
