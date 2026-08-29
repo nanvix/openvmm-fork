@@ -55,6 +55,9 @@ use vmm_core::partition_unit::VpRunner;
 
 /// A base partition, with methods needed at rutnime along with methods to initialize the vm.
 pub trait HvlitePartition: Inspect + Send + Sync + RequestYield {
+    /// Completes backend partition initialization after guest memory is attached.
+    fn finalize_memory(&self) -> anyhow::Result<()>;
+
     /// Returns the effective x86 CPU compatibility contract.
     #[cfg(guest_arch = "x86_64")]
     fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract;
@@ -200,6 +203,11 @@ impl<T> HvlitePartition for T
 where
     T: BasicPartitionStateAccess + ArchPartition + PartitionMemoryMapper + PartitionAccessState,
 {
+    fn finalize_memory(&self) -> anyhow::Result<()> {
+        Partition::finalize_memory(self)?;
+        Ok(())
+    }
+
     #[cfg(guest_arch = "x86_64")]
     fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract {
         Partition::cpu_compatibility_contract(self)
