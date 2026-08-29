@@ -338,7 +338,28 @@ const TTRPC_SMP_PROBE: &[u8] = br#"set -eu
 [ "$(getconf _NPROCESSORS_ONLN)" -eq 2 ]
 loc_before=$(awk '/^LOC:/ { print $2, $3; exit }' /proc/interrupts)
 [ "$(printf "%s\n" "$loc_before" | awk '{ print NF }')" -eq 2 ]
-uptime_before=$(awk '{ print int($1 * 100); exit }' /proc/uptime)
+worker_dir=/tmp/ttrpc-smp-probe-$$
+worker_script=$worker_dir/worker
+rm -rf "$worker_dir"
+mkdir -p "$worker_dir"
+cat >"$worker_script" <<'TTRPC_SMP_WORKER'
+#!/bin/sh
+set -eu
+cpu=$1
+before=$2
+result=$3
+apic_id=$4
+field=$((cpu + 2))
+actual=$(awk '{ print $39 }' /proc/self/stat)
+[ "$actual" -eq "$cpu" ]
+while :; do
+    current=$(awk -v field="$field" '/^LOC:/ { print $field; exit }' /proc/interrupts)
+    [ "$current" -gt "$before" ] && break
+done
+printf '%s %s %s\n' "$actual" "$current" "$apic_id" >"$result"
+TTRPC_SMP_WORKER
+chmod +x "$worker_script"
+worker_pids=
 for cpu in 0 1; do
     topology=/sys/devices/system/cpu/cpu${cpu}/topology
     [ "$(cat "$topology/physical_package_id")" -eq 0 ]
@@ -347,12 +368,19 @@ for cpu in 0 1; do
     [ "$(cat "$topology/thread_siblings_list")" = "$cpu" ]
     apic_id=$(awk -v target="$cpu" '$1 == "processor" { processor = $3 } $1 == "apicid" && processor == target { print $3; exit }' /proc/cpuinfo)
     [ "$apic_id" -eq "$cpu" ]
-    actual=$(taskset -c "$cpu" sh -c 'awk "{print \$39}" /proc/self/stat')
-    [ "$actual" -eq "$cpu" ]
-    taskset -c "$cpu" sleep 0.1 &
-    echo "TTRPC-SMP-WORKER-OK cpu=$cpu apic=$apic_id"
+    field=$((cpu + 1))
+    before=$(printf "%s\n" "$loc_before" | awk -v field="$field" '{ print $field }')
+    result=$worker_dir/$cpu
+    taskset -c "$cpu" "$worker_script" "$cpu" "$before" "$result" "$apic_id" &
+    worker_pids="$worker_pids $!"
 done
-wait
+for pid in $worker_pids; do
+    wait "$pid"
+done
+for cpu in 0 1; do
+    read -r actual current apic_id <"$worker_dir/$cpu"
+    echo "TTRPC-SMP-WORKER-OK cpu=$cpu apic=$apic_id actual=$actual loc_after=$current"
+done
 loc_after=$(awk '/^LOC:/ { print $2, $3; exit }' /proc/interrupts)
 for cpu in 0 1; do
     field=$((cpu + 1))
@@ -362,9 +390,8 @@ for cpu in 0 1; do
 done
 ipi=$(awk '/^(RES|CAL):/ { total += $3 } END { print total + 0 }' /proc/interrupts)
 [ "$ipi" -gt 0 ]
-uptime_after=$(awk '{ print int($1 * 100); exit }' /proc/uptime)
-[ "$uptime_after" -gt "$uptime_before" ]
 echo TTRPC-SMP-INTERRUPTS-OK loc_before=$loc_before loc_after=$loc_after ipi=$ipi
+rm -rf "$worker_dir"
 echo TTRPC-SMP-PROBE-OK
 "#;
 
