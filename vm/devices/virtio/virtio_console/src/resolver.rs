@@ -11,6 +11,7 @@ use virtio::resolve::VirtioResolveInput;
 use virtio_resources::console::VirtioConsoleAttachmentMode;
 use virtio_resources::console::VirtioConsoleHandle;
 use virtio_resources::console::VirtioConsoleReconnectPolicy;
+use virtio_resources::console::VirtioControlConsoleHandle;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
 use vm_resource::declare_static_async_resolver;
@@ -18,10 +19,17 @@ use vm_resource::kind::VirtioDeviceHandle;
 
 /// Resolver for virtio-console devices.
 pub struct VirtioConsoleResolver;
+/// Resolver for the microVM control console resource identity.
+pub struct VirtioControlConsoleResolver;
 
 declare_static_async_resolver! {
     VirtioConsoleResolver,
     (VirtioDeviceHandle, VirtioConsoleHandle),
+}
+
+declare_static_async_resolver! {
+    VirtioControlConsoleResolver,
+    (VirtioDeviceHandle, VirtioControlConsoleHandle),
 }
 
 #[async_trait]
@@ -35,70 +43,114 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioConsoleHandle> for VirtioCon
         resource: VirtioConsoleHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some(attachment) = &resource.attachment {
-            anyhow::ensure!(
-                !attachment.stable_id.is_empty() && attachment.stable_id.len() <= 128,
-                "virtio-console attachment has an invalid stable ID"
-            );
-            anyhow::ensure!(
-                !attachment.endpoint_identity.is_empty()
-                    && attachment.endpoint_identity.len() <= 4096,
-                "virtio-console attachment has an invalid endpoint identity"
-            );
-            anyhow::ensure!(
-                matches!(
-                    (attachment.mode, attachment.reconnect_policy),
-                    (
-                        VirtioConsoleAttachmentMode::Listen,
-                        VirtioConsoleReconnectPolicy::RecreateListener
-                    ) | (
-                        VirtioConsoleAttachmentMode::Connect,
-                        VirtioConsoleReconnectPolicy::ReconnectClient
-                    ) | (
-                        VirtioConsoleAttachmentMode::Inherited,
-                        VirtioConsoleReconnectPolicy::RequireInheritedAttachment
-                    ) | (
-                        VirtioConsoleAttachmentMode::Inherited,
-                        VirtioConsoleReconnectPolicy::DiscardWhileDisconnected
-                    )
-                ),
-                "virtio-console attachment mode and reconnect policy conflict"
-            );
-            match attachment.reconnect_policy {
-                VirtioConsoleReconnectPolicy::RecreateListener => anyhow::ensure!(
-                    !attachment.required && attachment.reconnect_timeout_ms == 0,
-                    "listener console attachments must be optional and have no reconnect timeout"
-                ),
-                VirtioConsoleReconnectPolicy::ReconnectClient => anyhow::ensure!(
-                    attachment.required && attachment.reconnect_timeout_ms != 0,
-                    "client console attachments must be required with a bounded timeout"
-                ),
-                VirtioConsoleReconnectPolicy::RequireInheritedAttachment => anyhow::ensure!(
-                    attachment.required && attachment.reconnect_timeout_ms == 0,
-                    "inherited console attachments must be required with no reconnect timeout"
-                ),
-                VirtioConsoleReconnectPolicy::DiscardWhileDisconnected => anyhow::ensure!(
-                    !attachment.required && attachment.reconnect_timeout_ms == 0,
-                    "discarding console attachments must be optional with no reconnect timeout"
-                ),
-            }
-        }
-        let io = resolver
-            .resolve(
-                resource.backend,
-                ResolveSerialBackendParams {
-                    driver: Box::new(input.driver_source.simple()),
-                    _async_trait_workaround: &(),
-                },
-            )
-            .await?;
-
-        let device = VirtioConsoleDevice::new_with_policy(
-            input.driver_source,
-            io.0.into_io(),
+        resolve_console(
+            resolver,
+            input,
+            resource.backend,
             resource.disconnect_policy,
-        );
-
-        Ok(device.into())
+            resource.attachment,
+            "virtio-console",
+        )
+        .await
     }
+}
+
+#[async_trait]
+impl AsyncResolveResource<VirtioDeviceHandle, VirtioControlConsoleHandle>
+    for VirtioControlConsoleResolver
+{
+    type Output = ResolvedVirtioDevice;
+    type Error = anyhow::Error;
+
+    async fn resolve(
+        &self,
+        resolver: &ResourceResolver,
+        resource: VirtioControlConsoleHandle,
+        input: VirtioResolveInput<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        resolve_console(
+            resolver,
+            input,
+            resource.backend,
+            resource.disconnect_policy,
+            resource.attachment,
+            "virtio-control-console",
+        )
+        .await
+    }
+}
+
+async fn resolve_console(
+    resolver: &ResourceResolver,
+    input: VirtioResolveInput<'_>,
+    backend: vm_resource::Resource<vm_resource::kind::SerialBackendHandle>,
+    disconnect_policy: virtio_resources::console::VirtioConsoleDisconnectPolicy,
+    attachment: Option<virtio_resources::console::VirtioConsoleAttachment>,
+    worker_name: &'static str,
+) -> anyhow::Result<ResolvedVirtioDevice> {
+    if let Some(attachment) = &attachment {
+        anyhow::ensure!(
+            !attachment.stable_id.is_empty() && attachment.stable_id.len() <= 128,
+            "virtio-console attachment has an invalid stable ID"
+        );
+        anyhow::ensure!(
+            !attachment.endpoint_identity.is_empty() && attachment.endpoint_identity.len() <= 4096,
+            "virtio-console attachment has an invalid endpoint identity"
+        );
+        anyhow::ensure!(
+            matches!(
+                (attachment.mode, attachment.reconnect_policy),
+                (
+                    VirtioConsoleAttachmentMode::Listen,
+                    VirtioConsoleReconnectPolicy::RecreateListener
+                ) | (
+                    VirtioConsoleAttachmentMode::Connect,
+                    VirtioConsoleReconnectPolicy::ReconnectClient
+                ) | (
+                    VirtioConsoleAttachmentMode::Inherited,
+                    VirtioConsoleReconnectPolicy::RequireInheritedAttachment
+                ) | (
+                    VirtioConsoleAttachmentMode::Inherited,
+                    VirtioConsoleReconnectPolicy::DiscardWhileDisconnected
+                )
+            ),
+            "virtio-console attachment mode and reconnect policy conflict"
+        );
+        match attachment.reconnect_policy {
+            VirtioConsoleReconnectPolicy::RecreateListener => anyhow::ensure!(
+                !attachment.required && attachment.reconnect_timeout_ms == 0,
+                "listener console attachments must be optional and have no reconnect timeout"
+            ),
+            VirtioConsoleReconnectPolicy::ReconnectClient => anyhow::ensure!(
+                attachment.required && attachment.reconnect_timeout_ms != 0,
+                "client console attachments must be required with a bounded timeout"
+            ),
+            VirtioConsoleReconnectPolicy::RequireInheritedAttachment => anyhow::ensure!(
+                attachment.required && attachment.reconnect_timeout_ms == 0,
+                "inherited console attachments must be required with no reconnect timeout"
+            ),
+            VirtioConsoleReconnectPolicy::DiscardWhileDisconnected => anyhow::ensure!(
+                !attachment.required && attachment.reconnect_timeout_ms == 0,
+                "discarding console attachments must be optional with no reconnect timeout"
+            ),
+        }
+    }
+    let io = resolver
+        .resolve(
+            backend,
+            ResolveSerialBackendParams {
+                driver: Box::new(input.driver_source.simple()),
+                _async_trait_workaround: &(),
+            },
+        )
+        .await?;
+
+    let device = VirtioConsoleDevice::new_with_name_and_policy(
+        input.driver_source,
+        io.0.into_io(),
+        worker_name,
+        disconnect_policy,
+    );
+
+    Ok(device.into())
 }
