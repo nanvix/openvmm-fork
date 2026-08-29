@@ -83,7 +83,7 @@ use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::X86TopologyConfig;
-use openvmm_defs::config::build_microvm_command_line;
+use openvmm_defs::config::build_microvm_v2_command_line;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -1070,6 +1070,7 @@ impl VmService {
                         .attachments
                         .iter()
                         .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
+                    None,
                     restore.machine_contract.microvm_sandbox_blocks.clone(),
                 )),
             )?;
@@ -1272,7 +1273,7 @@ impl VmService {
                         LoadMode::Pvh {
                             kernel,
                             initrd,
-                            cmdline: build_microvm_command_line(
+                            cmdline: build_microvm_v2_command_line(
                                 &[boot.kernel_cmdline],
                                 has_requested_microvm_console,
                             )?,
@@ -1968,6 +1969,9 @@ impl VmService {
                 microvm_filesystem_slot,
                 config.microvm_filesystem.as_ref(),
                 has_console,
+                config.virtio_devices.iter().any(|(_, device)| {
+                    device.id() == openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_ID
+                }),
                 &config.microvm_sandbox_blocks,
             )?;
         }
@@ -2145,6 +2149,7 @@ impl VmService {
             effective_command_line,
             microvm_sandbox_block_sources: Vec::new(),
             microvm_console_attachment,
+            microvm_control_console_attachment: None,
             microvm_network: None,
             microvm_network_attachment: None,
             microvm_egress_policy: None,
@@ -2153,6 +2158,7 @@ impl VmService {
             microvm_filesystem_root_path,
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
+            microvm_control_console_socket_cleanup: None,
             snapshot_memory_file,
             _private_scratch_dir: None,
             guest_power_actions,

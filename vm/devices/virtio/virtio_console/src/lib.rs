@@ -89,6 +89,16 @@ impl VirtioConsoleDevice {
         io: Box<dyn SerialIo>,
         disconnect_policy: VirtioConsoleDisconnectPolicy,
     ) -> Self {
+        Self::new_with_name_and_policy(driver_source, io, "virtio-console", disconnect_policy)
+    }
+
+    /// Create a named console with explicit disconnected-backend behavior.
+    pub fn new_with_name_and_policy(
+        driver_source: &VmTaskDriverSource,
+        io: Box<dyn SerialIo>,
+        worker_name: &'static str,
+        disconnect_policy: VirtioConsoleDisconnectPolicy,
+    ) -> Self {
         let driver = driver_source.simple();
         let mut worker = TaskControl::new(ConsoleWorker {
             io,
@@ -96,7 +106,7 @@ impl VirtioConsoleDevice {
         });
         worker.insert(
             &driver,
-            "virtio-console",
+            worker_name,
             ConsoleWorkerState {
                 receiveq: None,
                 transmitq: None,
