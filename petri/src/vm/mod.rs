@@ -1410,18 +1410,18 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         self
     }
 
-    /// Select the microVM ABI version 3 machine profile with deterministic SMP topology.
-    pub fn with_microvm_v3_machine(mut self, processor_count: u32) -> Self {
+    /// Select the microVM ABI version 2 machine profile with deterministic SMP topology.
+    pub fn with_microvm_v2_machine(mut self, processor_count: u32) -> Self {
         assert!(
             openvmm_defs::config::microvm_processor_count_supported(
-                openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                openvmm_defs::config::MICROVM_ABI_VERSION_2,
                 processor_count
             ),
-            "microVM ABI version 3 supports only 1, 2, 4, or 8 vCPUs"
+            "microVM ABI version 2 supports only 1, 2, 4, or 8 vCPUs"
         );
         self = self.with_microvm_machine();
         self.config.machine_profile = MachineProfile::Microvm {
-            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3,
+            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
         };
         self.config.proc_topology.vp_count = processor_count;
         self.config.proc_topology.vps_per_socket = Some(processor_count);

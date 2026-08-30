@@ -503,9 +503,9 @@ message VMConfig {
         STANDARD = 0;
         // Original one-vCPU microVM ABI. This value is retained for compatibility.
         MICROVM = 1;
-        reserved 2;
         // Deterministic SMP-capable microVM ABI.
-        MICROVM_V3 = 3;
+        MICROVM_V2 = 2;
+        reserved 3;
     }
 
     // Action for the VMM to take when the guest triggers a power event.

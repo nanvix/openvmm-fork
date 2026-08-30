@@ -104,9 +104,9 @@ pub struct AcpiTables {
 /// Versioned placement of Xen PVH boot metadata in the first guest page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PvhBootLayout {
-    /// Original one-vCPU layout used by microVM ABI versions 1 and 2.
+    /// Original one-vCPU layout used by microVM ABI version 1.
     Legacy,
-    /// SMP-safe layout used by microVM ABI version 3.
+    /// SMP-safe layout used by microVM ABI version 2.
     Smp,
 }
 

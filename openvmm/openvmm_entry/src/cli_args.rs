@@ -160,10 +160,8 @@ pub enum MachineProfileCli {
     Standard,
     /// The microVM ABI version 1 machine.
     Microvm,
-    /// The microVM ABI version 2 sandbox-block machine.
+    /// The microVM ABI version 2 sandbox-block and deterministic SMP machine.
     MicrovmV2,
-    /// The microVM ABI version 3 deterministic SMP machine.
-    MicrovmV3,
 }
 
 /// Required host-network implementation contract for a microVM NIC.
@@ -226,9 +224,6 @@ impl From<MachineProfileCli> for MachineProfile {
             },
             MachineProfileCli::MicrovmV2 => Self::Microvm {
                 abi_version: MICROVM_ABI_VERSION_2,
-            },
-            MachineProfileCli::MicrovmV3 => Self::Microvm {
-                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3,
             },
         }
     }
@@ -1554,9 +1549,7 @@ impl Options {
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
         if !matches!(
             self.machine,
-            MachineProfileCli::Microvm
-                | MachineProfileCli::MicrovmV2
-                | MachineProfileCli::MicrovmV3
+            MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
         ) {
             anyhow::ensure!(
                 self.net_tap.is_none()
@@ -1574,7 +1567,6 @@ impl Options {
         let abi_version = match self.machine {
             MachineProfileCli::Microvm => MICROVM_ABI_VERSION_1,
             MachineProfileCli::MicrovmV2 => MICROVM_ABI_VERSION_2,
-            MachineProfileCli::MicrovmV3 => openvmm_defs::config::MICROVM_ABI_VERSION_3,
             MachineProfileCli::Standard => unreachable!("non-microVM profile returned above"),
         };
         anyhow::ensure!(
@@ -1615,8 +1607,8 @@ impl Options {
                 "microVM ABI version 1 snapshot capture with virtio-blk requires immutable media identity"
             );
             anyhow::ensure!(
-                (abi_version == MICROVM_ABI_VERSION_2) == self.snapshot_tier.is_some(),
-                "--snapshot-tier is required exactly for microVM ABI-v2 snapshot capture"
+                self.snapshot_tier.is_some() == !self.microvm_sandbox_block.is_empty(),
+                "--snapshot-tier is required exactly for microVM ABI-v2 snapshot capture with sandbox blocks"
             );
         }
         if self.restore_snapshot.is_some() {
@@ -1717,7 +1709,7 @@ impl Options {
         if abi_version == MICROVM_ABI_VERSION_1 {
             anyhow::ensure!(
                 self.microvm_sandbox_block.is_empty(),
-                "--microvm-sandbox-block requires --machine microvm-v2 or microvm-v3"
+                "--microvm-sandbox-block requires --machine microvm-v2"
             );
             anyhow::ensure!(
                 self.virtio_blk.len() <= 1,
@@ -5527,26 +5519,19 @@ mod tests {
             }
         );
 
-        let opt = Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).unwrap();
-        assert_eq!(opt.machine, MachineProfileCli::MicrovmV3);
-        assert_eq!(
-            MachineProfile::from(opt.machine),
-            MachineProfile::Microvm {
-                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3
-            }
-        );
+        assert!(Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).is_err());
 
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
     }
 
     #[test]
-    fn test_microvm_v3_processor_validation() {
+    fn test_microvm_v2_processor_validation() {
         for processors in [1, 2, 4, 8] {
             let options = Options::try_parse_from([
                 "openvmm",
                 "--machine",
-                "microvm-v3",
+                "microvm-v2",
                 "--processors",
                 &processors.to_string(),
             ])
@@ -5558,7 +5543,7 @@ mod tests {
             let options = Options::try_parse_from([
                 "openvmm",
                 "--machine",
-                "microvm-v3",
+                "microvm-v2",
                 "--processors",
                 &processors.to_string(),
             ])
@@ -5566,29 +5551,29 @@ mod tests {
             assert!(options.validate_microvm_options().is_err());
         }
 
-        let old_abi =
-            Options::try_parse_from(["openvmm", "--machine", "microvm-v2", "--processors", "2"])
+        let abi_v1 =
+            Options::try_parse_from(["openvmm", "--machine", "microvm", "--processors", "2"])
                 .unwrap();
-        assert!(old_abi.validate_microvm_options().is_err());
+        assert!(abi_v1.validate_microvm_options().is_err());
 
         for args in [
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v3",
+                "microvm-v2",
                 "--vps-per-socket",
                 "1",
             ],
-            vec!["openvmm", "--machine", "microvm-v3", "--smt", "off"],
+            vec!["openvmm", "--machine", "microvm-v2", "--smt", "off"],
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v3",
+                "microvm-v2",
                 "--apic-id-offset",
                 "1",
             ],
-            vec!["openvmm", "--machine", "microvm-v3", "--x2apic", "on"],
-            vec!["openvmm", "--machine", "microvm-v3", "--numa", "size=128M"],
+            vec!["openvmm", "--machine", "microvm-v2", "--x2apic", "on"],
+            vec!["openvmm", "--machine", "microvm-v2", "--numa", "size=128M"],
         ] {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
@@ -5695,6 +5680,18 @@ mod tests {
         ])
         .unwrap();
         assert!(missing.validate_microvm_options().is_err());
+
+        let blockless = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm-v2",
+            "--processors",
+            "2",
+            "--snapshot-destination",
+            "snapshot",
+        ])
+        .unwrap();
+        blockless.validate_microvm_options().unwrap();
 
         assert!(
             Options::try_parse_from([

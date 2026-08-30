@@ -48,7 +48,7 @@ In other words: This API is _very_ WIP, and user discretion is advised.
 restore flow over both transports:
 
 * `destination_path` configures guest-requested capture. Supply an ABI-v1 or
-  ABI-v3 microVM configuration, including PVH boot files, memory, and the
+  ABI-v2 microVM configuration, including PVH boot files, memory, and the
   processor count. The path
 	must not exist. `quiesce_timeout_ms` defaults to five seconds when zero.
 * `restore_path` selects manifest-authoritative restore. `config` may be
@@ -91,8 +91,8 @@ The readiness endpoint is a process-local orchestration attachment and is not
 part of saved state. Each successful restore publishes one event; validation,
 attachment, or worker-start failure publishes none.
 
-`VMConfig.MICROVM` remains ABI v1. `VMConfig.MICROVM_V3` selects ABI v3 and
-accepts exactly 1, 2, 4, or 8 processors. TTRPC ABI-v3 construction is
+`VMConfig.MICROVM` remains ABI v1. `VMConfig.MICROVM_V2` selects ABI v2 and
+accepts exactly 1, 2, 4, or 8 processors. TTRPC ABI-v2 construction is
 currently no-block; role-bearing sandbox blocks remain CLI-only.
 
 The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,

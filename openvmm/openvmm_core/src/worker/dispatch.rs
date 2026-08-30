@@ -553,7 +553,7 @@ fn build_x86_topology(
     let mut builder = if matches!(
         machine_profile,
         MachineProfile::Microvm {
-            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_3
+            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
         }
     ) {
         TopologyBuilder::new_x86()
@@ -2948,9 +2948,7 @@ impl InitializedVm {
                                     openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
                                 ),
                                 MachineProfile::Microvm {
-                                    abi_version:
-                                        openvmm_defs::config::MICROVM_ABI_VERSION_2
-                                        | openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                                    abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
                                 } => {
                                     let block = microvm_sandbox_blocks.next().context(
                                         "microVM ABI version 2 virtio-blk device has no sandbox role",
@@ -2981,7 +2979,6 @@ impl InitializedVm {
                                     cfg.machine_profile,
                                     MachineProfile::Microvm {
                                         abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
-                                            | openvmm_defs::config::MICROVM_ABI_VERSION_3
                                     }
                                 ) =>
                             {
@@ -3377,11 +3374,10 @@ impl LoadedVmInner {
                     }
                 };
                 let pvh_layout = match abi_version {
-                    openvmm_defs::config::MICROVM_ABI_VERSION_1
-                    | openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
+                    openvmm_defs::config::MICROVM_ABI_VERSION_1 => {
                         loader::pvh::PvhBootLayout::Legacy
                     }
-                    openvmm_defs::config::MICROVM_ABI_VERSION_3 => loader::pvh::PvhBootLayout::Smp,
+                    openvmm_defs::config::MICROVM_ABI_VERSION_2 => loader::pvh::PvhBootLayout::Smp,
                     _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
                 };
                 let apic_ids = self

@@ -74,16 +74,14 @@ pub struct Config {
 
 /// The initial microVM guest ABI version.
 pub const MICROVM_ABI_VERSION_1: u32 = 1;
-/// The microVM ABI version with fixed sandbox block-device roles.
+/// The microVM ABI version with fixed sandbox block-device roles and deterministic SMP topology.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
-/// The microVM ABI version with deterministic SMP topology.
-pub const MICROVM_ABI_VERSION_3: u32 = 3;
 
 /// Returns whether a processor count is valid for the selected microVM ABI.
 pub const fn microvm_processor_count_supported(abi_version: u32, processor_count: u32) -> bool {
     match abi_version {
-        MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2 => processor_count == 1,
-        MICROVM_ABI_VERSION_3 => matches!(processor_count, 1 | 2 | 4 | 8),
+        MICROVM_ABI_VERSION_1 => processor_count == 1,
+        MICROVM_ABI_VERSION_2 => matches!(processor_count, 1 | 2 | 4 | 8),
         _ => false,
     }
 }
@@ -249,9 +247,7 @@ pub const fn microvm_sandbox_block_features(role: MicrovmSandboxBlockRole) -> u6
 pub fn microvm_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static [u32]> {
     match abi_version {
         MICROVM_ABI_VERSION_1 => Ok(&MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS),
-        MICROVM_ABI_VERSION_2 | MICROVM_ABI_VERSION_3 => {
-            Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS)
-        }
+        MICROVM_ABI_VERSION_2 => Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS),
         _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
     }
 }
@@ -259,10 +255,8 @@ pub fn microvm_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static
 /// Returns the level-triggered ISA IRQs encoded in the Xen PVH MP table.
 pub fn microvm_pvh_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static [u32]> {
     match abi_version {
-        MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2 => {
-            Ok(&MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS)
-        }
-        MICROVM_ABI_VERSION_3 => Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS),
+        MICROVM_ABI_VERSION_1 => Ok(&MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS),
+        MICROVM_ABI_VERSION_2 => Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS),
         _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
     }
 }
@@ -502,7 +496,7 @@ pub fn microvm_virtio_net_irq(hypervisor_id: Option<&str>) -> anyhow::Result<u32
 fn validate_microvm_virtio_reservations(abi_version: u32) -> anyhow::Result<()> {
     let bases: &[u64] = match abi_version {
         MICROVM_ABI_VERSION_1 => &MICROVM_VIRTIO_MMIO_BASES,
-        MICROVM_ABI_VERSION_2 | MICROVM_ABI_VERSION_3 => &[
+        MICROVM_ABI_VERSION_2 => &[
             MICROVM_VIRTIO_NET_MMIO_BASE,
             MICROVM_VIRTIO_FS_MMIO_BASE,
             MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
@@ -738,7 +732,7 @@ fn validate_microvm_command_line(
             config.microvm_sandbox_blocks.is_empty() && block_count <= 1,
             "microVM ABI version 1 permits at most one unroled virtio-blk device"
         ),
-        MICROVM_ABI_VERSION_2 | MICROVM_ABI_VERSION_3 => {
+        MICROVM_ABI_VERSION_2 => {
             validate_microvm_sandbox_blocks(&config.microvm_sandbox_blocks)?;
             anyhow::ensure!(
                 block_count == config.microvm_sandbox_blocks.len(),
@@ -826,7 +820,7 @@ fn validate_microvm_command_line(
                 "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_BLK_MMIO_BASE:#x}:{MICROVM_VIRTIO_BLK_IRQ}"
             ));
         }
-        MICROVM_ABI_VERSION_2 | MICROVM_ABI_VERSION_3 => {
+        MICROVM_ABI_VERSION_2 => {
             expected_discovery.extend(config.microvm_sandbox_blocks.iter().map(|block| {
                 format!(
                     "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
@@ -948,10 +942,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     };
 
     anyhow::ensure!(
-        matches!(
-            abi_version,
-            MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2 | MICROVM_ABI_VERSION_3
-        ),
+        matches!(abi_version, MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2),
         "unsupported microVM ABI version {abi_version}"
     );
     validate_microvm_virtio_reservations(abi_version)?;
@@ -971,7 +962,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "microVM ABI version {abi_version} does not support {} vCPUs",
         config.processor_topology.proc_count
     );
-    let has_expected_topology = if abi_version == MICROVM_ABI_VERSION_3 {
+    let has_expected_topology = if abi_version == MICROVM_ABI_VERSION_2 {
         config.processor_topology.vps_per_socket == Some(config.processor_topology.proc_count)
             && config.processor_topology.enable_smt == Some(false)
             && matches!(
@@ -1088,7 +1079,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
 
     let max_virtio_devices = match abi_version {
         MICROVM_ABI_VERSION_1 => 4,
-        MICROVM_ABI_VERSION_2 | MICROVM_ABI_VERSION_3 => 7,
+        MICROVM_ABI_VERSION_2 => 7,
         _ => unreachable!("unsupported ABI was rejected above"),
     };
     anyhow::ensure!(
@@ -1591,12 +1582,9 @@ mod tests {
         );
         assert_eq!(
             microvm_pvh_level_triggered_irqs(MICROVM_ABI_VERSION_2).unwrap(),
-            &MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS
-        );
-        assert_eq!(
-            microvm_pvh_level_triggered_irqs(MICROVM_ABI_VERSION_3).unwrap(),
             &MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS
         );
+        assert!(microvm_pvh_level_triggered_irqs(3).is_err());
     }
 
     #[test]

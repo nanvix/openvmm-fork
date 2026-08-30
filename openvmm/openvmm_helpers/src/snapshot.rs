@@ -31,9 +31,9 @@ const LEGACY_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V2\0";
 pub const SAVED_STATE_SCHEMA_VERSION: u32 = 1;
 /// Protobuf root type stored in `state.bin`.
 pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
-/// Xen PVH memory/boot layout version used by microVM ABI versions 1 and 2.
+/// Xen PVH memory/boot layout version used by microVM ABI version 1.
 pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 1;
-/// SMP-safe Xen PVH memory/boot layout version used by microVM ABI version 3.
+/// SMP-safe Xen PVH memory/boot layout version used by microVM ABI version 2.
 pub const MICROVM_SMP_PVH_LAYOUT_VERSION: u32 = 2;
 /// Clock policy applied when a snapshot is restored.
 pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
@@ -490,48 +490,8 @@ pub fn microvm_v1_machine_contract(
     )
 }
 
-/// Builds the authoritative fixed-block microVM ABI-v2 machine contract.
+/// Builds the authoritative SMP-capable microVM ABI-v2 machine contract.
 pub fn microvm_v2_machine_contract(
-    source_hypervisor: &str,
-    effective_command_line: String,
-    network: Option<(
-        &openvmm_defs::config::MicrovmNetworkConfig,
-        &net_backend_resources::egress::EgressPolicy,
-        SnapshotAttachment,
-    )>,
-    filesystem: Option<(
-        &openvmm_defs::config::MicrovmFilesystemConfig,
-        SnapshotAttachment,
-    )>,
-    console_attachment: Option<SnapshotAttachment>,
-    sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
-    memory_size: u64,
-    state_unit_names: Vec<String>,
-    capture_wall_clock: Timestamp,
-    tsc_frequency_hz: u64,
-    apic_frequency_hz: Option<u64>,
-    cpu_contract: Vec<u8>,
-) -> anyhow::Result<SnapshotMachineContract> {
-    microvm_machine_contract(
-        openvmm_defs::config::MICROVM_ABI_VERSION_2,
-        source_hypervisor,
-        effective_command_line,
-        network,
-        filesystem,
-        console_attachment,
-        sandbox_blocks,
-        1,
-        memory_size,
-        state_unit_names,
-        capture_wall_clock,
-        tsc_frequency_hz,
-        apic_frequency_hz,
-        cpu_contract,
-    )
-}
-
-/// Builds the authoritative SMP-capable microVM ABI-v3 machine contract.
-pub fn microvm_v3_machine_contract(
     source_hypervisor: &str,
     effective_command_line: String,
     network: Option<(
@@ -554,7 +514,7 @@ pub fn microvm_v3_machine_contract(
     cpu_contract: Vec<u8>,
 ) -> anyhow::Result<SnapshotMachineContract> {
     microvm_machine_contract(
-        openvmm_defs::config::MICROVM_ABI_VERSION_3,
+        openvmm_defs::config::MICROVM_ABI_VERSION_2,
         source_hypervisor,
         effective_command_line,
         network,
@@ -590,9 +550,8 @@ fn microvm_snapshot_topology(
 
 fn microvm_pvh_layout_version(abi_version: u32) -> anyhow::Result<u32> {
     match abi_version {
-        openvmm_defs::config::MICROVM_ABI_VERSION_1
-        | openvmm_defs::config::MICROVM_ABI_VERSION_2 => Ok(MICROVM_PVH_LAYOUT_VERSION),
-        openvmm_defs::config::MICROVM_ABI_VERSION_3 => Ok(MICROVM_SMP_PVH_LAYOUT_VERSION),
+        openvmm_defs::config::MICROVM_ABI_VERSION_1 => Ok(MICROVM_PVH_LAYOUT_VERSION),
+        openvmm_defs::config::MICROVM_ABI_VERSION_2 => Ok(MICROVM_SMP_PVH_LAYOUT_VERSION),
         _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
     }
 }
@@ -2368,7 +2327,7 @@ fn validate_machine_contract_shape(
         "snapshot processor topology doesn't describe {vp_count} virtual processors"
     );
     ensure_unique(&topology.apic_ids, "APIC ID")?;
-    if contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_3 {
+    if contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
         anyhow::ensure!(
             *topology == microvm_snapshot_topology(contract.microvm_abi_version, vp_count)?,
             "snapshot processor topology is not canonical for microVM ABI version {}",
@@ -2428,11 +2387,8 @@ fn validate_machine_contract_shape(
             contract.microvm_sandbox_blocks.is_empty(),
             "microVM ABI version 1 snapshot contains ABI-v2 sandbox blocks"
         ),
-        openvmm_defs::config::MICROVM_ABI_VERSION_2
-        | openvmm_defs::config::MICROVM_ABI_VERSION_3 => {
-            if contract.microvm_abi_version != openvmm_defs::config::MICROVM_ABI_VERSION_3
-                || !contract.microvm_sandbox_blocks.is_empty()
-            {
+        openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
+            if !contract.microvm_sandbox_blocks.is_empty() {
                 anyhow::ensure!(
                     contract.microvm_sandbox_blocks.len() >= 2
                         && contract.microvm_sandbox_blocks.len() <= 4,
@@ -2731,6 +2687,15 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    if contract.microvm_sandbox_blocks.is_empty() {
+        anyhow::ensure!(
+            manifest.snapshot_tier.is_empty()
+                && manifest.restore_policy.is_empty()
+                && manifest.consumed_config_sections == 0,
+            "snapshot tier metadata requires microVM ABI-v2 sandbox blocks"
+        );
+        return Ok(());
+    }
 
     let paired_scratch = paired_scratch_block(manifest).is_some();
     let expected_consumed_sections = match manifest.snapshot_tier.as_str() {
@@ -2936,6 +2901,7 @@ mod tests {
         let mut manifest = test_manifest();
         let mut contract = test_machine_contract();
         contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_2;
+        contract.pvh_layout_version = MICROVM_SMP_PVH_LAYOUT_VERSION;
         contract.microvm_sandbox_blocks = vec![
             SnapshotMicrovmSandboxBlock {
                 role: "distro".to_owned(),
@@ -3569,10 +3535,10 @@ mod tests {
     }
 
     #[test]
-    fn microvm_v3_snapshot_topology_is_canonical() {
+    fn microvm_v2_snapshot_topology_is_canonical() {
         for processor_count in [1, 2, 4, 8] {
             let topology = microvm_snapshot_topology(
-                openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                openvmm_defs::config::MICROVM_ABI_VERSION_2,
                 processor_count,
             )
             .unwrap();
@@ -3582,7 +3548,7 @@ mod tests {
             assert_eq!(topology.threads_per_core, 1);
             assert_eq!(topology.apic_ids, (0..processor_count).collect::<Vec<_>>());
             assert_eq!(
-                microvm_pvh_layout_version(openvmm_defs::config::MICROVM_ABI_VERSION_3).unwrap(),
+                microvm_pvh_layout_version(openvmm_defs::config::MICROVM_ABI_VERSION_2).unwrap(),
                 MICROVM_SMP_PVH_LAYOUT_VERSION
             );
         }
@@ -3590,7 +3556,7 @@ mod tests {
         for processor_count in [0, 3, 5, 16] {
             assert!(
                 microvm_snapshot_topology(
-                    openvmm_defs::config::MICROVM_ABI_VERSION_3,
+                    openvmm_defs::config::MICROVM_ABI_VERSION_2,
                     processor_count,
                 )
                 .is_err()
@@ -3599,10 +3565,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_microvm_v3_snapshot_rejects_noncanonical_apic_ids() {
+    fn validate_microvm_v2_snapshot_rejects_noncanonical_apic_ids() {
         let mut manifest = test_manifest();
         let mut contract = test_machine_contract();
-        contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_3;
+        contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_2;
         contract.pvh_layout_version = MICROVM_SMP_PVH_LAYOUT_VERSION;
         contract.topology.apic_ids = vec![0, 2];
         manifest.machine_contract = Some(contract.clone());

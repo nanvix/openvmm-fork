@@ -22,7 +22,7 @@ as well as the generated CLI help (via `cargo run -- --help`).
     --kernel vmlinux --initrd initramfs.cpio.gz
   openvmm --machine microvm --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz
-  openvmm --machine microvm-v3 --processors 8 --hypervisor whp \
+  openvmm --machine microvm-v2 --processors 8 --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz
   ```
 
@@ -43,10 +43,10 @@ as well as the generated CLI help (via `cargo run -- --help`).
   are rejected. Host-driven save/restore, pulse-save/restore, and worker
   restart remain unavailable.
 
-  `microvm-v3` accepts exactly 1, 2, 4, or 8 vCPUs in one socket and one die,
+  `microvm-v2` accepts exactly 1, 2, 4, or 8 vCPUs in one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
-  the no-block ABI-v1/v3 machines and fixed-block ABI-v2/v3 machines on
+  the no-block ABI-v1/v2 machines and fixed-block ABI-v2 machine on
   Linux/KVM, Linux/MSHV, and Windows/WHP. ABI-v1 capture with its optional
   unroled virtio-blk device remains unsupported.
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
@@ -125,8 +125,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
   timeout and defaults to 5000. A request with no configured destination is
   ignored and the guest continues. Capture requires microVM ABI v1 or v2, one
-  vCPU for v1/v2 or 1/2/4/8 vCPUs for v3, KVM, MSHV, or WHP, and shared
-  file-backed RAM. ABI-v2/v3 block media must
+  vCPU for v1 or 1/2/4/8 vCPUs for v2, KVM, MSHV, or WHP, and shared
+  file-backed RAM. ABI-v2 block media must
   be cached regular raw files with nonzero 512-byte-aligned geometry. An
   attached virtio console saves accepted but undelivered input and the offset
   of a partially forwarded guest transmit descriptor. An attached microVM
@@ -151,7 +151,7 @@ as well as the generated CLI help (via `cargo run -- --help`).
   The manifest supplies the authoritative RAM size, topology, ABI,
   fixed device inventory, effective kernel command line, source backend, CPU
   contract, and TSC frequency. Kernel, initrd, command-line, memory, processor,
-  device, and topology overrides are not accepted. For ABI v3, repeat the
+  device, and topology overrides are not accepted. For ABI v2, repeat the
   snapshot's exact `--processors` count; a mismatch is rejected before any VP
   starts. Restore requires the same
   backend kind as capture. ABI-v1 WHP microVMs use a 1 GHz virtual TSC that is

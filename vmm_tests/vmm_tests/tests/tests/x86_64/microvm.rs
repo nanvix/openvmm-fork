@@ -523,7 +523,7 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     vm.teardown().await
 }
 
-async fn microvm_v3_smp(
+async fn microvm_v2_smp(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     processor_count: u32,
 ) -> anyhow::Result<()> {
@@ -581,16 +581,16 @@ nvx-exit 37
 "#
     );
     let modified_initrd =
-        config.prepare_initrd_with_file("microvm-v3-smp-test.sh", workload.as_bytes(), 0o100755)?;
+        config.prepare_initrd_with_file("microvm-v2-smp-test.sh", workload.as_bytes(), 0o100755)?;
     let mut vm = config
         .with_prebuilt_initrd(modified_initrd.to_path_buf())
-        .with_microvm_v3_machine(processor_count)
+        .with_microvm_v2_machine(processor_count)
         .modify_backend(|backend| {
             backend.with_custom_config(|config| {
                 let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
-                    panic!("microVM v3 SMP test did not produce PVH load mode");
+                    panic!("microVM v2 SMP test did not produce PVH load mode");
                 };
-                cmdline.push_str(" nvx_exec=/microvm-v3-smp-test.sh");
+                cmdline.push_str(" nvx_exec=/microvm-v2-smp-test.sh");
             })
         })
         .run_without_agent()
@@ -603,39 +603,39 @@ nvx-exit 37
                 .wait_for_microvm_portb_output("NVX-SMP-PROBE-OK"),
         )
         .await
-        .context("timed out waiting for microVM v3 SMP probe marker")??;
+        .context("timed out waiting for microVM v2 SMP probe marker")??;
     let halt = CancelContext::new()
         .with_timeout(TIMEOUT)
         .until_cancelled(vm.wait_for_halt())
         .await
-        .context("timed out waiting for microVM v3 SMP shutdown")??;
+        .context("timed out waiting for microVM v2 SMP shutdown")??;
     assert_eq!(halt.reason, PetriHaltReason::PowerOff);
     assert!(
         halt.detail.contains("code: 37"),
-        "microVM v3 SMP workload failed: {}",
+        "microVM v2 SMP workload failed: {}",
         halt.detail
     );
     vm.teardown().await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v3_smp_1(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v3_smp(config, 1).await
+async fn microvm_v2_smp_1(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v2_smp(config, 1).await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v3_smp_2(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v3_smp(config, 2).await
+async fn microvm_v2_smp_2(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v2_smp(config, 2).await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v3_smp_4(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v3_smp(config, 4).await
+async fn microvm_v2_smp_4(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v2_smp(config, 4).await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v3_smp_8(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v3_smp(config, 8).await
+async fn microvm_v2_smp_8(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_v2_smp(config, 8).await
 }
 
 #[vmm_test_with(
@@ -2181,7 +2181,7 @@ async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
                 !status.success()
                     && contains_bytes(
                         &output,
-                        b"microVM snapshot restore requires --machine microvm, microvm-v2, or microvm-v3"
+                        b"microVM snapshot restore requires --machine microvm or microvm-v2"
                     )
                     && !snapshot_dir.join("resume.claim").exists(),
                 "wrong-profile restore consumed or entered an instance checkpoint: {}",
@@ -2417,7 +2417,7 @@ while :; do sleep 3600; done
 
     let mut vm = config
         .with_prebuilt_initrd(modified_initrd.to_path_buf())
-        .with_microvm_machine()
+        .with_microvm_v2_machine(1)
         .modify_backend(move |backend| {
             backend.with_custom_config(|config| {
                 config.machine_profile = MachineProfile::Microvm {

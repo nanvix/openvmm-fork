@@ -65,7 +65,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MICROVM_ABI_VERSION_1;
-use openvmm_defs::config::MICROVM_ABI_VERSION_3;
+use openvmm_defs::config::MICROVM_ABI_VERSION_2;
 use openvmm_defs::config::MachineProfile as OpenvmmMachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
@@ -535,8 +535,8 @@ fn openvmm_machine_profile(profile: vmservice::vm_config::MachineProfile) -> Ope
         vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm {
             abi_version: MICROVM_ABI_VERSION_1,
         },
-        vmservice::vm_config::MachineProfile::MicrovmV3 => OpenvmmMachineProfile::Microvm {
-            abi_version: MICROVM_ABI_VERSION_3,
+        vmservice::vm_config::MachineProfile::MicrovmV2 => OpenvmmMachineProfile::Microvm {
+            abi_version: MICROVM_ABI_VERSION_2,
         },
     }
 }
@@ -544,7 +544,7 @@ fn openvmm_machine_profile(profile: vmservice::vm_config::MachineProfile) -> Ope
 fn ttrpc_machine_profile(abi_version: u32) -> anyhow::Result<vmservice::vm_config::MachineProfile> {
     match abi_version {
         MICROVM_ABI_VERSION_1 => Ok(vmservice::vm_config::MachineProfile::Microvm),
-        MICROVM_ABI_VERSION_3 => Ok(vmservice::vm_config::MachineProfile::MicrovmV3),
+        MICROVM_ABI_VERSION_2 => Ok(vmservice::vm_config::MachineProfile::MicrovmV2),
         _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
     }
 }
@@ -808,9 +808,13 @@ impl VmService {
                 machine_contract.machine_profile == "microvm"
                     && matches!(
                         machine_contract.microvm_abi_version,
-                        MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_3
+                        MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2
                     ),
                 "snapshot is not a supported microVM snapshot"
+            );
+            anyhow::ensure!(
+                machine_contract.microvm_sandbox_blocks.is_empty(),
+                "TTRPC restore does not support microVM sandbox-block snapshots"
             );
             Some(AuthoritativeMicrovmRestore {
                 path,
@@ -1431,14 +1435,14 @@ impl VmService {
                 vps_per_socket: matches!(
                     machine_profile,
                     OpenvmmMachineProfile::Microvm {
-                        abi_version: MICROVM_ABI_VERSION_3
+                        abi_version: MICROVM_ABI_VERSION_2
                     }
                 )
                 .then_some(config_proc_count),
                 enable_smt: matches!(
                     machine_profile,
                     OpenvmmMachineProfile::Microvm {
-                        abi_version: MICROVM_ABI_VERSION_3
+                        abi_version: MICROVM_ABI_VERSION_2
                     }
                 )
                 .then_some(false),
@@ -1447,7 +1451,7 @@ impl VmService {
                         if matches!(
                             machine_profile,
                             OpenvmmMachineProfile::Microvm {
-                                abi_version: MICROVM_ABI_VERSION_3
+                                abi_version: MICROVM_ABI_VERSION_2
                             }
                         ) {
                             X86TopologyConfig {
@@ -1869,7 +1873,7 @@ impl VmService {
                     has_block,
                 )?,
                 OpenvmmMachineProfile::Microvm {
-                    abi_version: MICROVM_ABI_VERSION_3,
+                    abi_version: MICROVM_ABI_VERSION_2,
                 } => openvmm_defs::config::append_microvm_v2_virtio_discovery(
                     cmdline,
                     None,
@@ -3076,8 +3080,8 @@ mod machine_profile_tests {
                 MICROVM_ABI_VERSION_1,
             ),
             (
-                vmservice::vm_config::MachineProfile::MicrovmV3,
-                MICROVM_ABI_VERSION_3,
+                vmservice::vm_config::MachineProfile::MicrovmV2,
+                MICROVM_ABI_VERSION_2,
             ),
         ] {
             assert_eq!(
@@ -3097,13 +3101,13 @@ mod machine_profile_tests {
         ));
         for processor_count in [1, 2, 4, 8] {
             assert!(openvmm_defs::config::microvm_processor_count_supported(
-                MICROVM_ABI_VERSION_3,
+                MICROVM_ABI_VERSION_2,
                 processor_count
             ));
         }
         for processor_count in [0, 3, 5, 16] {
             assert!(!openvmm_defs::config::microvm_processor_count_supported(
-                MICROVM_ABI_VERSION_3,
+                MICROVM_ABI_VERSION_2,
                 processor_count
             ));
         }
