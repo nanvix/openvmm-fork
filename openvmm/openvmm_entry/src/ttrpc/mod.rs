@@ -65,6 +65,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MICROVM_ABI_VERSION_1;
+use openvmm_defs::config::MICROVM_ABI_VERSION_2;
 use openvmm_defs::config::MachineProfile as OpenvmmMachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
@@ -528,6 +529,26 @@ struct AuthoritativeMicrovmRestore {
     machine_contract: openvmm_helpers::snapshot::SnapshotMachineContract,
 }
 
+fn openvmm_machine_profile(profile: vmservice::vm_config::MachineProfile) -> OpenvmmMachineProfile {
+    match profile {
+        vmservice::vm_config::MachineProfile::Standard => OpenvmmMachineProfile::Standard,
+        vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm {
+            abi_version: MICROVM_ABI_VERSION_1,
+        },
+        vmservice::vm_config::MachineProfile::MicrovmV2 => OpenvmmMachineProfile::Microvm {
+            abi_version: MICROVM_ABI_VERSION_2,
+        },
+    }
+}
+
+fn ttrpc_machine_profile(abi_version: u32) -> anyhow::Result<vmservice::vm_config::MachineProfile> {
+    match abi_version {
+        MICROVM_ABI_VERSION_1 => Ok(vmservice::vm_config::MachineProfile::Microvm),
+        MICROVM_ABI_VERSION_2 => Ok(vmservice::vm_config::MachineProfile::MicrovmV2),
+        _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+    }
+}
+
 enum VmLifecycle {
     Uninitialized,
     Running,
@@ -776,7 +797,7 @@ impl VmService {
                 &manifest,
                 crate::GUEST_ARCH,
                 manifest.memory_size_bytes,
-                1,
+                manifest.vp_count,
                 crate::system_page_size(),
             )?;
             let machine_contract = manifest
@@ -785,8 +806,15 @@ impl VmService {
                 .context("microVM snapshot is missing its authoritative machine contract")?;
             anyhow::ensure!(
                 machine_contract.machine_profile == "microvm"
-                    && machine_contract.microvm_abi_version == MICROVM_ABI_VERSION_1,
-                "snapshot is not a supported microVM ABI-v1 snapshot"
+                    && matches!(
+                        machine_contract.microvm_abi_version,
+                        MICROVM_ABI_VERSION_1 | MICROVM_ABI_VERSION_2
+                    ),
+                "snapshot is not a supported microVM snapshot"
+            );
+            anyhow::ensure!(
+                machine_contract.microvm_sandbox_blocks.is_empty(),
+                "TTRPC restore does not support microVM sandbox-block snapshots"
             );
             Some(AuthoritativeMicrovmRestore {
                 path,
@@ -801,25 +829,34 @@ impl VmService {
 
         let mut restore_console_config = None;
         let mut restore_filesystem_config = None;
-        let mut req_config = if authoritative_restore.is_some() {
+        let mut req_config = if let Some(restore) = &authoritative_restore {
+            let restore_profile =
+                ttrpc_machine_profile(restore.machine_contract.microvm_abi_version)?;
             let requested = requested_config.unwrap_or_else(|| vmservice::VmConfig {
-                machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
+                machine_profile: restore_profile as i32,
                 ..Default::default()
             });
             anyhow::ensure!(
-                requested.machine_profile == vmservice::vm_config::MachineProfile::Microvm as i32,
-                "microVM snapshot restore requires the microVM machine profile"
+                requested.machine_profile == restore_profile as i32,
+                "microVM snapshot restore requires the matching microVM ABI profile"
             );
             anyhow::ensure!(
                 requested.memory_config.is_none()
-                    && requested.processor_config.is_none()
                     && requested.boot_config.is_none()
                     && requested.windows_options.is_none()
                     && requested.hvsocket_config.is_none()
                     && requested.numa_config.is_none()
                     && requested.pcie.is_none(),
-                "restore configuration may contain only serial attachments and guest power actions"
+                "restore configuration may contain only processor identity, serial attachments, and guest power actions"
             );
+            if let Some(processors) = &requested.processor_config {
+                anyhow::ensure!(
+                    processors.processor_count == restore.vp_count
+                        && processors.processor_weight == 0
+                        && processors.processor_limit == 0,
+                    "restore processor count does not match the snapshot"
+                );
+            }
             if let Some(devices) = &requested.devices_config {
                 anyhow::ensure!(
                     devices.scsi_disks.is_empty()
@@ -836,7 +873,7 @@ impl VmService {
             vmservice::VmConfig {
                 serial_config: requested.serial_config,
                 guest_power_actions: requested.guest_power_actions,
-                machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
+                machine_profile: restore_profile as i32,
                 ..Default::default()
             }
         } else {
@@ -848,13 +885,18 @@ impl VmService {
                 .with_context(|| {
                     format!("unknown machine profile {}", req_config.machine_profile)
                 })?;
-        let machine_profile = match requested_profile {
-            vmservice::vm_config::MachineProfile::Standard => OpenvmmMachineProfile::Standard,
-            vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm {
-                abi_version: MICROVM_ABI_VERSION_1,
-            },
-        };
+        let machine_profile = openvmm_machine_profile(requested_profile);
         let is_microvm = matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. });
+        let effective_processor_count = authoritative_restore
+            .as_ref()
+            .map(|restore| restore.vp_count)
+            .or_else(|| {
+                req_config
+                    .processor_config
+                    .as_ref()
+                    .map(|config| config.processor_count)
+            })
+            .unwrap_or(1);
         anyhow::ensure!(
             is_microvm || (snapshot_destination.is_none() && authoritative_restore.is_none()),
             "microVM snapshot options require the microVM machine profile"
@@ -946,8 +988,8 @@ impl VmService {
                         .attachments
                         .iter()
                         .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
-                    MICROVM_ABI_VERSION_1,
-                    Vec::new(),
+                    restore.machine_contract.microvm_abi_version,
+                    restore.machine_contract.microvm_sandbox_blocks.clone(),
                 )),
             )?;
             let restore_time =
@@ -996,14 +1038,16 @@ impl VmService {
                     "the microVM profile requires pvh_boot"
                 );
             }
+            let abi_version = match machine_profile {
+                OpenvmmMachineProfile::Microvm { abi_version } => abi_version,
+                OpenvmmMachineProfile::Standard => unreachable!(),
+            };
             anyhow::ensure!(
-                req_config
-                    .processor_config
-                    .as_ref()
-                    .map(|config| config.processor_count)
-                    .unwrap_or(1)
-                    == 1,
-                "microVM ABI version 1 requires exactly one vCPU"
+                openvmm_defs::config::microvm_processor_count_supported(
+                    abi_version,
+                    effective_processor_count
+                ),
+                "microVM ABI version {abi_version} does not support {effective_processor_count} vCPUs"
             );
             anyhow::ensure!(
                 req_config.numa_config.is_none(),
@@ -1035,6 +1079,10 @@ impl VmService {
                         && devices.windows_device.is_empty()
                         && devices.virtiofs_config.len() <= 1,
                     "microVM ABI version 1 supports only one fixed virtio-fs, one fixed virtio-console, and optional virtio-blk devices"
+                );
+                anyhow::ensure!(
+                    abi_version == MICROVM_ABI_VERSION_1 || devices.virtio_blk.is_none(),
+                    "microVM ABI version {abi_version} does not accept the ABI-v1 unroled virtio-blk field"
                 );
                 if let Some(filesystem) = devices.virtiofs_config.first() {
                     anyhow::ensure!(
@@ -1359,16 +1407,7 @@ impl VmService {
             (numa, mem_size)
         };
 
-        let config_proc_count = authoritative_restore
-            .as_ref()
-            .map(|restore| restore.vp_count)
-            .or_else(|| {
-                req_config
-                    .processor_config
-                    .as_ref()
-                    .map(|config| config.processor_count)
-            })
-            .unwrap_or(1);
+        let config_proc_count = effective_processor_count;
 
         // Build the PCIe topology (root complexes, switches, and the devices
         // attached behind their ports).
@@ -1393,10 +1432,36 @@ impl VmService {
             chipset: chipset.chipset,
             processor_topology: ProcessorTopologyConfig {
                 proc_count: config_proc_count,
-                vps_per_socket: None,
-                enable_smt: None,
+                vps_per_socket: matches!(
+                    machine_profile,
+                    OpenvmmMachineProfile::Microvm {
+                        abi_version: MICROVM_ABI_VERSION_2
+                    }
+                )
+                .then_some(config_proc_count),
+                enable_smt: matches!(
+                    machine_profile,
+                    OpenvmmMachineProfile::Microvm {
+                        abi_version: MICROVM_ABI_VERSION_2
+                    }
+                )
+                .then_some(false),
                 arch: if is_microvm {
-                    Some(ArchTopologyConfig::X86(X86TopologyConfig::default()))
+                    Some(ArchTopologyConfig::X86(
+                        if matches!(
+                            machine_profile,
+                            OpenvmmMachineProfile::Microvm {
+                                abi_version: MICROVM_ABI_VERSION_2
+                            }
+                        ) {
+                            X86TopologyConfig {
+                                apic_id_offset: 0,
+                                x2apic: openvmm_defs::config::X2ApicConfig::Unsupported,
+                            }
+                        } else {
+                            X86TopologyConfig::default()
+                        },
+                    ))
                 } else {
                     None
                 },
@@ -1797,13 +1862,27 @@ impl VmService {
             let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
                 unreachable!("microVM was validated with pvh_boot");
             };
-            openvmm_defs::config::append_microvm_virtio_discovery(
-                cmdline,
-                None,
-                config.microvm_filesystem.as_ref(),
-                has_console,
-                has_block,
-            )?;
+            match machine_profile {
+                OpenvmmMachineProfile::Microvm {
+                    abi_version: MICROVM_ABI_VERSION_1,
+                } => openvmm_defs::config::append_microvm_virtio_discovery(
+                    cmdline,
+                    None,
+                    config.microvm_filesystem.as_ref(),
+                    has_console,
+                    has_block,
+                )?,
+                OpenvmmMachineProfile::Microvm {
+                    abi_version: MICROVM_ABI_VERSION_2,
+                } => openvmm_defs::config::append_microvm_v2_virtio_discovery(
+                    cmdline,
+                    None,
+                    config.microvm_filesystem.as_ref(),
+                    has_console,
+                    &config.microvm_sandbox_blocks,
+                )?,
+                _ => unreachable!("microVM profile has an unsupported ABI version"),
+            }
         }
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
@@ -2987,6 +3066,52 @@ fn build_vhost_user_device(
     _vhost_user: vmservice::VhostUser,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     anyhow::bail!("vhost-user is only supported on unix hosts")
+}
+
+#[cfg(test)]
+mod machine_profile_tests {
+    use super::*;
+
+    #[test]
+    fn ttrpc_microvm_profiles_preserve_abi_identity_and_processor_policy() {
+        for (profile, abi_version) in [
+            (
+                vmservice::vm_config::MachineProfile::Microvm,
+                MICROVM_ABI_VERSION_1,
+            ),
+            (
+                vmservice::vm_config::MachineProfile::MicrovmV2,
+                MICROVM_ABI_VERSION_2,
+            ),
+        ] {
+            assert_eq!(
+                openvmm_machine_profile(profile),
+                OpenvmmMachineProfile::Microvm { abi_version }
+            );
+            assert_eq!(ttrpc_machine_profile(abi_version).unwrap(), profile);
+        }
+
+        assert!(openvmm_defs::config::microvm_processor_count_supported(
+            MICROVM_ABI_VERSION_1,
+            1
+        ));
+        assert!(!openvmm_defs::config::microvm_processor_count_supported(
+            MICROVM_ABI_VERSION_1,
+            2
+        ));
+        for processor_count in [1, 2, 4, 8] {
+            assert!(openvmm_defs::config::microvm_processor_count_supported(
+                MICROVM_ABI_VERSION_2,
+                processor_count
+            ));
+        }
+        for processor_count in [0, 3, 5, 16] {
+            assert!(!openvmm_defs::config::microvm_processor_count_supported(
+                MICROVM_ABI_VERSION_2,
+                processor_count
+            ));
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -1095,7 +1095,7 @@ impl StorageBuilder {
                     vtl0_virtio_blk_disks
                         .iter()
                         .all(|disk| disk.microvm_sandbox_role.is_some()),
-                    "microVM ABI version 2 requires roles for every virtio-blk device"
+                    "microVM ABI version {abi_version} requires roles for every virtio-blk device"
                 );
                 vtl0_virtio_blk_disks.sort_by_key(|disk| disk.microvm_sandbox_role);
             }

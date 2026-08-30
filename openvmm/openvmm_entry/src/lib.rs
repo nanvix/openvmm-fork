@@ -1547,6 +1547,7 @@ async fn vm_config_from_command_line(
         opt.machine,
         MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
     );
+    let is_microvm_v2 = opt.machine == MachineProfileCli::MicrovmV2;
     opt.validate_microvm_options()?;
     let effective_microvm_network = if is_microvm {
         effective_microvm_network(opt, restore_machine_contract)?
@@ -3207,8 +3208,12 @@ async fn vm_config_from_command_line(
     #[cfg(guest_arch = "x86_64")]
     let topology_arch =
         openvmm_defs::config::ArchTopologyConfig::X86(openvmm_defs::config::X86TopologyConfig {
-            apic_id_offset: opt.apic_id_offset,
-            x2apic: opt.x2apic,
+            apic_id_offset: if is_microvm_v2 { 0 } else { opt.apic_id_offset },
+            x2apic: if is_microvm_v2 {
+                openvmm_defs::config::X2ApicConfig::Unsupported
+            } else {
+                opt.x2apic
+            },
         });
 
     let with_isolation = if let Some(isolation) = &opt.isolation {
@@ -3634,11 +3639,19 @@ async fn vm_config_from_command_line(
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: opt.processors,
-            vps_per_socket: opt.vps_per_socket,
-            enable_smt: match opt.smt {
-                cli_args::SmtConfigCli::Auto => None,
-                cli_args::SmtConfigCli::Force => Some(true),
-                cli_args::SmtConfigCli::Off => Some(false),
+            vps_per_socket: if is_microvm_v2 {
+                Some(opt.processors)
+            } else {
+                opt.vps_per_socket
+            },
+            enable_smt: if is_microvm_v2 {
+                Some(false)
+            } else {
+                match opt.smt {
+                    cli_args::SmtConfigCli::Auto => None,
+                    cli_args::SmtConfigCli::Force => Some(true),
+                    cli_args::SmtConfigCli::Off => Some(false),
+                }
             },
             arch: Some(topology_arch),
         },
@@ -4338,6 +4351,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
                     filesystem,
                     console_attachment.cloned(),
                     sandbox_blocks,
+                    expected_vp_count,
                     expected_memory_size,
                     saved_contract.state_unit_names.clone(),
                     saved_contract.capture_wall_clock,
@@ -4527,7 +4541,7 @@ async fn run_control_inner(
             .restore_snapshot
             .as_deref()
             .expect("restore manifest requires a snapshot path");
-        restore_gate_required = openvmm_helpers::snapshot::requires_post_restore_gate(&manifest);
+        restore_gate_required = openvmm_helpers::snapshot::requires_post_restore_gate(manifest);
         let contract = manifest
             .machine_contract
             .as_ref()
@@ -4555,7 +4569,9 @@ async fn run_control_inner(
             "restore-time memory overrides are not allowed"
         );
         opt.memory.size = Some(vmm_cli::MemorySize(manifest.memory_size_bytes));
-        if expected_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+        if expected_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2
+            && !contract.microvm_sandbox_blocks.is_empty()
+        {
             let scratch = contract
                 .microvm_sandbox_blocks
                 .last()

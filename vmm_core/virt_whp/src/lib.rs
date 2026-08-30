@@ -123,6 +123,10 @@ struct WhpPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     cpuid: virt::CpuidLeafSet,
     #[cfg(guest_arch = "x86_64")]
+    reserved_vps_per_socket: u32,
+    #[cfg(guest_arch = "x86_64")]
+    smt_enabled: bool,
+    #[cfg(guest_arch = "x86_64")]
     tsc_frequency_hz: u64,
     vtl0_alias_map_offset: Option<u64>,
     monitor_page: MonitorPage,
@@ -1358,6 +1362,10 @@ impl WhpPartitionInner {
             #[cfg(guest_arch = "x86_64")]
             cpuid,
             #[cfg(guest_arch = "x86_64")]
+            reserved_vps_per_socket: proto_config.processor_topology.reserved_vps_per_socket(),
+            #[cfg(guest_arch = "x86_64")]
+            smt_enabled: proto_config.processor_topology.smt_enabled(),
+            #[cfg(guest_arch = "x86_64")]
             tsc_frequency_hz,
             vtl0_alias_map_offset,
             monitor_page: MonitorPage::new(),
@@ -1541,6 +1549,12 @@ impl VtlPartition {
             extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::X64CpuidExit;
             let cpuid_exit_list = [
                 x86defs::cpuid::CpuidFunction::VendorAndMaxFunction.0,
+                x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
+                x86defs::cpuid::CpuidFunction::CacheParameters.0,
+                x86defs::cpuid::CpuidFunction::ExtendedTopologyEnumeration.0,
+                x86defs::cpuid::CpuidFunction::V2ExtendedTopologyEnumeration.0,
+                x86defs::cpuid::CpuidFunction::ExtendedAddressSpaceSizes.0,
+                x86defs::cpuid::CpuidFunction::ProcessorTopologyDefinition.0,
                 x86defs::cpuid::CpuidFunction::CoreCrystalClockInformation.0,
             ];
             whp_config

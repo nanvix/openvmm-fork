@@ -47,15 +47,17 @@ In other words: This API is _very_ WIP, and user discretion is advised.
 `CreateVMRequest.microvm_snapshot` exposes the microVM capture and
 restore flow over both transports:
 
-* `destination_path` configures guest-requested capture. Supply the normal
-	ABI-v1 microVM configuration, including PVH boot files and memory. The path
+* `destination_path` configures guest-requested capture. Supply an ABI-v1 or
+  ABI-v2 microVM configuration, including PVH boot files, memory, and the
+  processor count. The path
 	must not exist. `quiesce_timeout_ms` defaults to five seconds when zero.
 * `restore_path` selects manifest-authoritative restore. `config` may be
-  absent, or may contain only the microVM profile, serial port 0 host
+  absent, or may contain only the matching microVM profile, an optional exact
+  processor-count assertion, serial port 0 host
   attachment, matching `DevicesConfig.virtio_console` and
   `DevicesConfig.virtiofs_config` attachments, and guest power actions.
-  Guest-visible boot, memory, processor, other device, NUMA, and PCIe fields
-  are rejected. A saved listener is reconstructed from the manifest; a saved
+  Guest-visible boot, memory, processor topology, other device, NUMA, and PCIe
+  fields are rejected. A saved listener is reconstructed from the manifest; a saved
   client requires the matching path configuration.
 * `restore_entropy` requests fresh entropy and is valid only with
 	`restore_path`.
@@ -89,8 +91,12 @@ The readiness endpoint is a process-local orchestration attachment and is not
 part of saved state. Each successful restore publishes one event; validation,
 attachment, or worker-start failure publishes none.
 
-The API has the same KVM/WHP backend, no-block device, artifact integrity, and
-security restrictions documented under [`--snapshot-destination`].
+`VMConfig.MICROVM` remains ABI v1. `VMConfig.MICROVM_V2` selects ABI v2 and
+accepts exactly 1, 2, 4, or 8 processors. TTRPC ABI-v2 construction is
+currently no-block; role-bearing sandbox blocks remain CLI-only.
+
+The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,
+and security restrictions documented under [`--snapshot-destination`].
 
 [`vmservice.proto`]: https://github.com/microsoft/openvmm/blob/main/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
 [`--snapshot-destination`]: ./cli.md

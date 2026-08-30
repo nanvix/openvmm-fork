@@ -32,8 +32,8 @@ const HIMEM_START: u64 = 0x10_0000;
 const MP_FLOATING_POINTER_ADDR: usize = 0;
 const MP_CONFIG_TABLE_ADDR: usize = 0x400;
 const MP_IRQ_FLAGS_LEVEL_HIGH: u16 = 0x000d;
-const BOOT_GDT_ADDR: u64 = 0x500;
-const BOOT_IDT_ADDR: u64 = 0x520;
+const LEGACY_BOOT_GDT_ADDR: u64 = 0x500;
+const SMP_BOOT_GDT_ADDR: u64 = 0x800;
 const START_INFO_ADDR: u64 = 0x6000;
 const MODLIST_ADDR: u64 = 0x6040;
 const MEMMAP_ADDR: u64 = 0x7000;
@@ -101,6 +101,35 @@ pub struct AcpiTables {
     pub tables: Vec<u8>,
 }
 
+/// Versioned placement of Xen PVH boot metadata in the first guest page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PvhBootLayout {
+    /// Original one-vCPU layout used by microVM ABI version 1.
+    Legacy,
+    /// SMP-safe layout used by microVM ABI version 2.
+    Smp,
+}
+
+impl PvhBootLayout {
+    const fn gdt_addr(self) -> u64 {
+        match self {
+            Self::Legacy => LEGACY_BOOT_GDT_ADDR,
+            Self::Smp => SMP_BOOT_GDT_ADDR,
+        }
+    }
+}
+
+/// Guest-visible processor and interrupt data for Xen PVH boot tables.
+#[derive(Debug, Clone, Copy)]
+pub struct BootConfig<'a> {
+    /// Versioned placement for the GDT and IDT.
+    pub layout: PvhBootLayout,
+    /// APIC IDs in virtual-processor order. The first entry is the BSP.
+    pub apic_ids: &'a [u32],
+    /// ISA IRQs described as active-high, level-triggered.
+    pub level_triggered_irqs: &'a [u32],
+}
+
 /// Guest placement selected by the loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadInfo {
@@ -156,6 +185,20 @@ pub enum Error {
     MemoryMapTooLarge,
     #[error("PVH ACPI data does not fit in its reserved boot metadata region")]
     AcpiTablesTooLarge,
+    #[error("PVH processor topology must contain at least one processor")]
+    NoProcessors,
+    #[error("PVH processor {index} has APIC ID {apic_id}; expected {expected}")]
+    InvalidApicId {
+        index: usize,
+        apic_id: u32,
+        expected: u32,
+    },
+    #[error("PVH MP table has too many processor or interrupt entries")]
+    TooManyMpEntries,
+    #[error("PVH MP table IRQ {0} is outside the ISA range")]
+    InvalidMpIrq(u32),
+    #[error("PVH MP table ending at {table_end:#x} overlaps the GDT at {gdt_addr:#x}")]
+    MpTableOverlap { table_end: usize, gdt_addr: u64 },
     #[error("initramfs is empty")]
     EmptyInitrd,
     #[error("initramfs does not fit above the kernel in low RAM")]
@@ -211,6 +254,37 @@ pub fn load<F, R>(
     cmdline: &str,
     memory_layout: &MemoryLayout,
     acpi_tables: Option<&AcpiTables>,
+) -> Result<LoadInfo, Error>
+where
+    F: Read + Seek,
+    R: Read + Seek,
+{
+    const LEGACY_APIC_IDS: &[u32] = &[0];
+    const LEGACY_LEVEL_TRIGGERED_IRQS: &[u32] = &[4, 5, 6, 7, 10];
+    load_with_boot_config(
+        importer,
+        kernel,
+        initrd,
+        cmdline,
+        memory_layout,
+        acpi_tables,
+        &BootConfig {
+            layout: PvhBootLayout::Legacy,
+            apic_ids: LEGACY_APIC_IDS,
+            level_triggered_irqs: LEGACY_LEVEL_TRIGGERED_IRQS,
+        },
+    )
+}
+
+/// Loads an x86-64 Xen PVH ELF image with explicit boot-table configuration.
+pub fn load_with_boot_config<F, R>(
+    importer: &mut dyn ImageLoad<X86Register>,
+    kernel: &mut F,
+    initrd: Option<InitrdConfig<'_, R>>,
+    cmdline: &str,
+    memory_layout: &MemoryLayout,
+    acpi_tables: Option<&AcpiTables>,
+    boot_config: &BootConfig<'_>,
 ) -> Result<LoadInfo, Error>
 where
     F: Read + Seek,
@@ -277,8 +351,15 @@ where
         None => None,
     };
 
-    import_boot_structures(importer, cmdline, memory_layout, initrd, acpi_tables)?;
-    import_registers(importer, entrypoint)?;
+    import_boot_structures(
+        importer,
+        cmdline,
+        memory_layout,
+        initrd,
+        acpi_tables,
+        boot_config,
+    )?;
+    import_registers(importer, entrypoint, boot_config.layout)?;
 
     Ok(LoadInfo { entrypoint, initrd })
 }
@@ -488,9 +569,11 @@ fn import_boot_structures(
     memory_layout: &MemoryLayout,
     initrd: Option<(u64, u64)>,
     acpi_tables: Option<&AcpiTables>,
+    boot_config: &BootConfig<'_>,
 ) -> Result<(), Error> {
     let mut boot_page = [0u8; HV_PAGE_SIZE as usize];
-    write_mp_tables(&mut boot_page);
+    write_mp_tables(&mut boot_page, boot_config)?;
+    let boot_gdt_addr = boot_config.layout.gdt_addr();
     let gdt = [
         0,
         gdt_entry(SEG_ATTR_CODE, 0, 0x000f_ffff),
@@ -498,7 +581,7 @@ fn import_boot_structures(
         gdt_entry(SEG_ATTR_TSS, 0, 0x67),
     ];
     for (index, entry) in gdt.into_iter().enumerate() {
-        let offset = BOOT_GDT_ADDR as usize + index * size_of::<u64>();
+        let offset = boot_gdt_addr as usize + index * size_of::<u64>();
         boot_page[offset..offset + size_of::<u64>()].copy_from_slice(&entry.to_le_bytes());
     }
     import_pages(importer, 0, 1, "pvh-boot-tables", &boot_page)?;
@@ -616,12 +699,58 @@ fn import_boot_structures(
     Ok(())
 }
 
-fn write_mp_tables(page: &mut [u8; HV_PAGE_SIZE as usize]) {
+fn write_mp_tables(
+    page: &mut [u8; HV_PAGE_SIZE as usize],
+    boot_config: &BootConfig<'_>,
+) -> Result<(), Error> {
+    let table = build_mp_config_table(boot_config)?;
+    let table_end = MP_CONFIG_TABLE_ADDR + table.len();
+    let gdt_addr = boot_config.layout.gdt_addr();
+    if table_end > gdt_addr as usize {
+        return Err(Error::MpTableOverlap {
+            table_end,
+            gdt_addr,
+        });
+    }
+    page[MP_CONFIG_TABLE_ADDR..table_end].copy_from_slice(&table);
+
+    let mut floating_pointer = [0u8; 16];
+    floating_pointer[..4].copy_from_slice(b"_MP_");
+    floating_pointer[4..8].copy_from_slice(&(MP_CONFIG_TABLE_ADDR as u32).to_le_bytes());
+    floating_pointer[8] = 1;
+    floating_pointer[9] = 4;
+    floating_pointer[10] = checksum(&floating_pointer);
+    page[MP_FLOATING_POINTER_ADDR..MP_FLOATING_POINTER_ADDR + floating_pointer.len()]
+        .copy_from_slice(&floating_pointer);
+    Ok(())
+}
+
+/// Builds the Intel MP configuration table for the selected PVH boot contract.
+pub fn build_mp_config_table(boot_config: &BootConfig<'_>) -> Result<Vec<u8>, Error> {
     const MP_CONFIG_HEADER_SIZE: usize = 44;
     const MP_PROCESSOR_SIZE: usize = 20;
-    const MP_ENTRY_COUNT: u16 = 18;
+    const MP_NON_PROCESSOR_ENTRY_COUNT: usize = 17;
 
-    let mut table = Vec::with_capacity(200);
+    if boot_config.apic_ids.is_empty() {
+        return Err(Error::NoProcessors);
+    }
+    if let Some(&irq) = boot_config
+        .level_triggered_irqs
+        .iter()
+        .find(|irq| **irq >= 16)
+    {
+        return Err(Error::InvalidMpIrq(irq));
+    }
+    let entry_count = u16::try_from(
+        boot_config
+            .apic_ids
+            .len()
+            .checked_add(MP_NON_PROCESSOR_ENTRY_COUNT)
+            .ok_or(Error::TooManyMpEntries)?,
+    )
+    .map_err(|_| Error::TooManyMpEntries)?;
+
+    let mut table = Vec::with_capacity(180 + MP_PROCESSOR_SIZE * boot_config.apic_ids.len());
     table.extend_from_slice(b"PCMP");
     table.extend_from_slice(&0u16.to_le_bytes());
     table.push(4);
@@ -630,16 +759,30 @@ fn write_mp_tables(page: &mut [u8; HV_PAGE_SIZE as usize]) {
     table.extend_from_slice(b"MICROVM     ");
     table.extend_from_slice(&0u32.to_le_bytes());
     table.extend_from_slice(&0u16.to_le_bytes());
-    table.extend_from_slice(&MP_ENTRY_COUNT.to_le_bytes());
+    table.extend_from_slice(&entry_count.to_le_bytes());
     table.extend_from_slice(&0xfee0_0000u32.to_le_bytes());
     table.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(table.len(), MP_CONFIG_HEADER_SIZE);
 
-    table.extend_from_slice(&[0, 0, 0x14, 3]);
-    table.extend_from_slice(&0u32.to_le_bytes());
-    table.extend_from_slice(&0u32.to_le_bytes());
-    table.extend_from_slice(&[0; 8]);
-    assert_eq!(table.len(), MP_CONFIG_HEADER_SIZE + MP_PROCESSOR_SIZE);
+    for (index, &apic_id) in boot_config.apic_ids.iter().enumerate() {
+        let expected = u32::try_from(index).map_err(|_| Error::TooManyMpEntries)?;
+        if apic_id != expected {
+            return Err(Error::InvalidApicId {
+                index,
+                apic_id,
+                expected,
+            });
+        }
+        let apic_id = u8::try_from(apic_id).map_err(|_| Error::TooManyMpEntries)?;
+        table.extend_from_slice(&[0, apic_id, 0x14, if index == 0 { 3 } else { 1 }]);
+        table.extend_from_slice(&0u32.to_le_bytes());
+        table.extend_from_slice(&0u32.to_le_bytes());
+        table.extend_from_slice(&[0; 8]);
+    }
+    assert_eq!(
+        table.len(),
+        MP_CONFIG_HEADER_SIZE + MP_PROCESSOR_SIZE * boot_config.apic_ids.len()
+    );
 
     table.extend_from_slice(&[1, 0]);
     table.extend_from_slice(b"ISA   ");
@@ -648,7 +791,7 @@ fn write_mp_tables(page: &mut [u8; HV_PAGE_SIZE as usize]) {
 
     for irq in (0u8..16).filter(|irq| *irq != 2) {
         let pin = if irq == 0 { 2 } else { irq };
-        let flags = if matches!(irq, 4 | 5 | 6 | 7 | 10) {
+        let flags = if boot_config.level_triggered_irqs.contains(&u32::from(irq)) {
             MP_IRQ_FLAGS_LEVEL_HIGH
         } else {
             0
@@ -661,18 +804,7 @@ fn write_mp_tables(page: &mut [u8; HV_PAGE_SIZE as usize]) {
     let table_len = u16::try_from(table.len()).expect("MP table fits in one page");
     table[4..6].copy_from_slice(&table_len.to_le_bytes());
     table[7] = checksum(&table);
-    let table_end = MP_CONFIG_TABLE_ADDR + table.len();
-    assert!(table_end <= BOOT_GDT_ADDR as usize);
-    page[MP_CONFIG_TABLE_ADDR..table_end].copy_from_slice(&table);
-
-    let mut floating_pointer = [0u8; 16];
-    floating_pointer[..4].copy_from_slice(b"_MP_");
-    floating_pointer[4..8].copy_from_slice(&(MP_CONFIG_TABLE_ADDR as u32).to_le_bytes());
-    floating_pointer[8] = 1;
-    floating_pointer[9] = 4;
-    floating_pointer[10] = checksum(&floating_pointer);
-    page[MP_FLOATING_POINTER_ADDR..MP_FLOATING_POINTER_ADDR + floating_pointer.len()]
-        .copy_from_slice(&floating_pointer);
+    Ok(table)
 }
 
 fn checksum(bytes: &[u8]) -> u8 {
@@ -687,7 +819,9 @@ fn checksum(bytes: &[u8]) -> u8 {
 fn import_registers(
     importer: &mut dyn ImageLoad<X86Register>,
     entrypoint: u64,
+    boot_layout: PvhBootLayout,
 ) -> Result<(), Error> {
+    let boot_gdt_addr = boot_layout.gdt_addr();
     let data_segment = SegmentRegister {
         base: 0,
         limit: u32::MAX,
@@ -702,11 +836,11 @@ fn import_registers(
     };
     let registers = [
         X86Register::Gdtr(TableRegister {
-            base: BOOT_GDT_ADDR,
+            base: boot_gdt_addr,
             limit: 31,
         }),
         X86Register::Idtr(TableRegister {
-            base: BOOT_IDT_ADDR,
+            base: boot_gdt_addr + 0x20,
             limit: 0,
         }),
         X86Register::Ds(data_segment),
@@ -1099,6 +1233,91 @@ mod tests {
                 MP_IRQ_FLAGS_LEVEL_HIGH
             );
         }
+    }
+
+    #[test]
+    fn emits_smp_mp_processor_entries() {
+        const LEVEL_TRIGGERED_IRQS: &[u32] = &[4, 5, 6, 7, 9, 10, 11, 12];
+
+        for processor_count in [1usize, 2, 4, 8] {
+            let apic_ids = (0..processor_count as u32).collect::<Vec<_>>();
+            let boot_config = BootConfig {
+                layout: PvhBootLayout::Smp,
+                apic_ids: &apic_ids,
+                level_triggered_irqs: LEVEL_TRIGGERED_IRQS,
+            };
+            let mut boot_page = [0; HV_PAGE_SIZE as usize];
+            write_mp_tables(&mut boot_page, &boot_config).unwrap();
+
+            let table_length = u16::from_le_bytes(
+                boot_page[MP_CONFIG_TABLE_ADDR + 4..MP_CONFIG_TABLE_ADDR + 6]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            assert_eq!(table_length, 180 + 20 * processor_count);
+            assert!(MP_CONFIG_TABLE_ADDR + table_length <= SMP_BOOT_GDT_ADDR as usize);
+
+            let table = &boot_page[MP_CONFIG_TABLE_ADDR..MP_CONFIG_TABLE_ADDR + table_length];
+            assert_eq!(
+                u16::from_le_bytes(table[34..36].try_into().unwrap()),
+                u16::try_from(17 + processor_count).unwrap()
+            );
+            assert_eq!(
+                table
+                    .iter()
+                    .copied()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(byte)),
+                0
+            );
+
+            for (index, entry) in table[44..44 + 20 * processor_count]
+                .chunks_exact(20)
+                .enumerate()
+            {
+                assert_eq!(entry[0], 0);
+                assert_eq!(entry[1], index as u8);
+                assert_eq!(entry[2], 0x14);
+                assert_eq!(entry[3], if index == 0 { 3 } else { 1 });
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_smp_mp_topology_and_legacy_overlap() {
+        let mut boot_page = [0; HV_PAGE_SIZE as usize];
+        assert!(matches!(
+            write_mp_tables(
+                &mut boot_page,
+                &BootConfig {
+                    layout: PvhBootLayout::Smp,
+                    apic_ids: &[],
+                    level_triggered_irqs: &[],
+                }
+            ),
+            Err(Error::NoProcessors)
+        ));
+        assert!(matches!(
+            write_mp_tables(
+                &mut boot_page,
+                &BootConfig {
+                    layout: PvhBootLayout::Smp,
+                    apic_ids: &[0, 2],
+                    level_triggered_irqs: &[],
+                }
+            ),
+            Err(Error::InvalidApicId { .. })
+        ));
+        assert!(matches!(
+            write_mp_tables(
+                &mut boot_page,
+                &BootConfig {
+                    layout: PvhBootLayout::Legacy,
+                    apic_ids: &[0, 1, 2, 3],
+                    level_triggered_irqs: &[],
+                }
+            ),
+            Err(Error::MpTableOverlap { .. })
+        ));
     }
 
     #[test]

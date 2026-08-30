@@ -589,7 +589,7 @@ impl VmController {
             anyhow::ensure!(
                 matches!(
                     self.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1 | 2 }
+                    MachineProfile::Microvm { abi_version: 1..=2 }
                 ),
                 "guest-requested snapshot capture requires microVM ABI version 1 or 2"
             );
@@ -603,34 +603,42 @@ impl VmController {
                     "microVM ABI version 1 snapshot cannot contain sandbox blocks"
                 ),
                 MachineProfile::Microvm { abi_version: 2 } => anyhow::ensure!(
-                    self.microvm_sandbox_block_sources.len() >= 2
-                        && self
-                            .microvm_sandbox_block_sources
-                            .last()
-                            .is_some_and(|source| {
-                                source.role
-                                    == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
-                            }),
-                    "microVM ABI version 2 snapshot requires at least one lower layer and scratch"
+                    self.microvm_sandbox_block_sources.is_empty()
+                        || (self.microvm_sandbox_block_sources.len() >= 2
+                            && self
+                                .microvm_sandbox_block_sources
+                                .last()
+                                .is_some_and(|source| {
+                                    source.role
+                                        == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                                })),
+                    "microVM ABI version 2 snapshot requires either no blocks or at least one lower layer and scratch"
                 ),
                 _ => unreachable!(),
             }
             if let MachineProfile::Microvm { abi_version: 2 } = self.machine_profile {
-                let tier = self
-                    .snapshot_tier
-                    .context("microVM ABI-v2 snapshot capture requires a tier")?;
-                let paired_scratch = scratch_policy
-                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
-                anyhow::ensure!(
-                    paired_scratch == tier.requires_paired_scratch(),
-                    "snapshot tier '{}' requires {} scratch capture",
-                    tier.manifest_name(),
-                    if tier.requires_paired_scratch() {
-                        "paired"
-                    } else {
-                        "fresh"
-                    }
-                );
+                if self.microvm_sandbox_block_sources.is_empty() {
+                    anyhow::ensure!(
+                        self.snapshot_tier.is_none(),
+                        "blockless microVM ABI-v2 snapshot capture does not use a tier"
+                    );
+                } else {
+                    let tier = self
+                        .snapshot_tier
+                        .context("microVM ABI-v2 sandbox snapshot capture requires a tier")?;
+                    let paired_scratch = scratch_policy
+                        == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
+                    anyhow::ensure!(
+                        paired_scratch == tier.requires_paired_scratch(),
+                        "snapshot tier '{}' requires {} scratch capture",
+                        tier.manifest_name(),
+                        if tier.requires_paired_scratch() {
+                            "paired"
+                        } else {
+                            "fresh"
+                        }
+                    );
+                }
             }
             anyhow::ensure!(
                 fs_err::symlink_metadata(&destination)
@@ -754,6 +762,7 @@ impl VmController {
                         filesystem,
                         self.microvm_console_attachment.clone(),
                         blocks,
+                        self.processors,
                         self.memory,
                         response.state_unit_names,
                         response.capture_wall_clock,
@@ -815,8 +824,9 @@ impl VmController {
             let scratch_file = (matches!(
                 self.machine_profile,
                 MachineProfile::Microvm { abi_version: 2 }
-            ) && scratch_policy
-                == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
+            ) && !self.microvm_sandbox_block_sources.is_empty()
+                && scratch_policy
+                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
                 .then(|| {
                     self.microvm_sandbox_block_sources
                         .iter()

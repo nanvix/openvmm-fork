@@ -74,8 +74,18 @@ pub struct Config {
 
 /// The initial microVM guest ABI version.
 pub const MICROVM_ABI_VERSION_1: u32 = 1;
-/// The microVM ABI version with fixed sandbox block-device roles.
+/// The microVM ABI version with fixed sandbox block-device roles and deterministic SMP topology.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
+
+/// Returns whether a processor count is valid for the selected microVM ABI.
+pub const fn microvm_processor_count_supported(abi_version: u32, processor_count: u32) -> bool {
+    match abi_version {
+        MICROVM_ABI_VERSION_1 => processor_count == 1,
+        MICROVM_ABI_VERSION_2 => matches!(processor_count, 1 | 2 | 4 | 8),
+        _ => false,
+    }
+}
+
 /// ABI-v1 command line owned by the microVM profile.
 pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
 /// ABI-v1 command line when the virtio console is present.
@@ -235,6 +245,15 @@ pub const fn microvm_sandbox_block_features(role: MicrovmSandboxBlockRole) -> u6
 /// Returns the IRQs that must be described as level-triggered in a microVM
 /// ABI's x86 MADT.
 pub fn microvm_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static [u32]> {
+    match abi_version {
+        MICROVM_ABI_VERSION_1 => Ok(&MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS),
+        MICROVM_ABI_VERSION_2 => Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS),
+        _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
+    }
+}
+
+/// Returns the level-triggered ISA IRQs encoded in the Xen PVH MP table.
+pub fn microvm_pvh_level_triggered_irqs(abi_version: u32) -> anyhow::Result<&'static [u32]> {
     match abi_version {
         MICROVM_ABI_VERSION_1 => Ok(&MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS),
         MICROVM_ABI_VERSION_2 => Ok(&MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS),
@@ -717,7 +736,7 @@ fn validate_microvm_command_line(
             validate_microvm_sandbox_blocks(&config.microvm_sandbox_blocks)?;
             anyhow::ensure!(
                 block_count == config.microvm_sandbox_blocks.len(),
-                "microVM ABI version 2 sandbox block roles do not match the virtio-blk device inventory"
+                "microVM ABI version {abi_version} sandbox block roles do not match the virtio-blk device inventory"
             );
         }
         _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
@@ -939,10 +958,21 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         );
     }
     anyhow::ensure!(
-        config.processor_topology.proc_count == 1,
-        "microVM ABI version 1 requires exactly one vCPU"
+        microvm_processor_count_supported(abi_version, config.processor_topology.proc_count),
+        "microVM ABI version {abi_version} does not support {} vCPUs",
+        config.processor_topology.proc_count
     );
-    anyhow::ensure!(
+    let has_expected_topology = if abi_version == MICROVM_ABI_VERSION_2 {
+        config.processor_topology.vps_per_socket == Some(config.processor_topology.proc_count)
+            && config.processor_topology.enable_smt == Some(false)
+            && matches!(
+                &config.processor_topology.arch,
+                Some(ArchTopologyConfig::X86(X86TopologyConfig {
+                    apic_id_offset: 0,
+                    x2apic: X2ApicConfig::Unsupported,
+                }))
+            )
+    } else {
         config.processor_topology.vps_per_socket.is_none()
             && config.processor_topology.enable_smt.is_none()
             && matches!(
@@ -951,8 +981,11 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
                     apic_id_offset: 0,
                     x2apic: X2ApicConfig::Auto,
                 }))
-            ),
-        "microVM ABI version 1 requires its fixed x86 APIC topology"
+            )
+    };
+    anyhow::ensure!(
+        has_expected_topology,
+        "microVM ABI version {abi_version} requires its fixed x86 APIC topology"
     );
     anyhow::ensure!(
         config.numa.nodes.len() == 1 && config.numa.distances.is_empty(),
@@ -1090,7 +1123,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         validate_microvm_sandbox_blocks(&config.microvm_sandbox_blocks)?;
         anyhow::ensure!(
             block_count == config.microvm_sandbox_blocks.len(),
-            "microVM ABI version 2 sandbox block roles do not match the virtio-blk device inventory"
+            "microVM ABI version {abi_version} sandbox block roles do not match the virtio-blk device inventory"
         );
     }
     anyhow::ensure!(
@@ -1547,6 +1580,11 @@ mod tests {
                 MICROVM_VIRTIO_NET_KVM_IRQ,
             ]
         );
+        assert_eq!(
+            microvm_pvh_level_triggered_irqs(MICROVM_ABI_VERSION_2).unwrap(),
+            &MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS
+        );
+        assert!(microvm_pvh_level_triggered_irqs(3).is_err());
     }
 
     #[test]
