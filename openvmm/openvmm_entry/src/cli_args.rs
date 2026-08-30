@@ -1815,6 +1815,11 @@ impl Options {
             }),
             "microVM --net requires a bare IPv4/prefix and does not permit queue, VTL, Underhill, or PCIe modifiers"
         );
+        if let [network] = self.net.as_slice()
+            && let EndpointConfigCli::Microvm(config) = &network.endpoint
+        {
+            self.microvm_egress_policy(config)?;
+        }
         anyhow::ensure!(
             self.net_tap.is_none(),
             "--net-tap is incompatible with the portable microVM network profile"
@@ -1855,7 +1860,10 @@ impl Options {
     pub(crate) fn microvm_egress_policy(
         &self,
         network: &openvmm_defs::config::MicrovmNetworkConfig,
-    ) -> net_backend_resources::egress::EgressPolicy {
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
         use net_backend_resources::egress::EgressPolicyMode;
 
         let mode = if !self.allow_host.is_empty() {
@@ -1867,8 +1875,10 @@ impl Options {
         } else {
             EgressPolicyMode::AllowAll
         };
-        net_backend_resources::egress::EgressPolicy::new(
+        net_backend_resources::egress::EgressPolicy::bind(
             network.guest_ipv4,
+            network.prefix_length,
+            network.guest_mac,
             network.derived_gateway_ipv4,
             mode,
         )
@@ -5938,7 +5948,7 @@ mod tests {
         .unwrap();
         options.validate_microvm_options().unwrap();
         let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
-        let policy = options.microvm_egress_policy(&network);
+        let policy = options.microvm_egress_policy(&network).unwrap();
         let net_backend_resources::egress::EgressPolicyMode::AllowList(rules) = policy.mode()
         else {
             panic!("expected allow-list policy")
@@ -5957,10 +5967,22 @@ mod tests {
             "--network-profile",
             "portable",
             "--allow-endpoint",
+            "10.0.0.9:8443",
+            "--allow-endpoint",
             "192.0.2.7:443",
+            "--allow-endpoint",
+            "10.0.0.9:443",
         ])
         .unwrap();
         endpoint.validate_microvm_options().unwrap();
+        let endpoint_policy = endpoint.microvm_egress_policy(&network).unwrap();
+        assert_eq!(
+            endpoint_policy.next_hops(),
+            &[
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                std::net::Ipv4Addr::new(10, 0, 0, 9),
+            ]
+        );
 
         assert!(
             Options::try_parse_from([
@@ -5988,6 +6010,37 @@ mod tests {
         let standard =
             Options::try_parse_from(["openvmm", "--allow-endpoint", "192.0.2.7:443"]).unwrap();
         assert!(standard.validate_microvm_options().is_err());
+    }
+
+    #[test]
+    fn test_microvm_endpoint_policy_rejects_invalid_identities_before_resources() {
+        for address in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "10.0.0.0",
+            "10.0.0.2",
+            "10.0.0.255",
+        ] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--allow-endpoint",
+                &format!("{address}:443"),
+            ])
+            .unwrap();
+            assert!(
+                options.validate_microvm_options().is_err(),
+                "invalid endpoint address {address} was accepted"
+            );
+        }
     }
 
     #[test]

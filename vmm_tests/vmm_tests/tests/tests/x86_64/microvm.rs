@@ -1329,6 +1329,166 @@ async fn phase_4_network_snapshot_restore<OpenvmmArtifact>(
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
 )]
+async fn phase_4_endpoint_policy_snapshot_restore<OpenvmmArtifact>(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
+) -> anyhow::Result<()> {
+    const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+    const BEFORE_MARKER: &[u8] = b"PHASE4-ENDPOINT-BEFORE";
+    const AFTER_MARKER: &[u8] = b"PHASE4-ENDPOINT-AFTER";
+
+    let (openvmm,) = artifacts;
+    let (kernel, initrd) = config
+        .linux_direct_boot_files()
+        .context("phase-4 endpoint test requires direct-boot Linux artifacts")?;
+    let hypervisor = microvm_hypervisor()?;
+    let temp_dir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-phase4-endpoint-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }
+    .context("failed to create phase-4 endpoint test directory")?;
+    let snapshot_dir = temp_dir.path().join("snapshot");
+
+    let endpoint_args = [
+        "--allow-endpoint",
+        "10.0.0.9:8443",
+        "--allow-endpoint",
+        "192.0.2.7:443",
+        "--allow-endpoint",
+        "10.0.0.9:443",
+    ];
+    let mut capture_args = phase_2_args(hypervisor);
+    capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--net".into(),
+        "10.0.0.2/24".into(),
+        "--network-profile".into(),
+        "portable".into(),
+    ]);
+    capture_args.extend(endpoint_args.map(Into::into));
+
+    let neighbor_checks = "\
+        arp -d 10.0.0.9 2>/dev/null || true; \
+        arp -d 10.0.0.1 2>/dev/null || true; \
+        arp -d 10.0.0.10 2>/dev/null || true; \
+        ping -c 1 -W 1 10.0.0.9 >/dev/null 2>&1 || true; \
+        arp -n 10.0.0.9 | grep -Eqi '10\\.0\\.0\\.9.*52:54:00:00:00:01' || fail 20; \
+        ping -c 1 -W 1 192.0.2.7 >/dev/null 2>&1 || true; \
+        arp -n 10.0.0.1 | grep -Eqi '10\\.0\\.0\\.1.*52:54:00:00:00:01' || fail 21; \
+        ping -c 1 -W 1 10.0.0.10 >/dev/null 2>&1 || true; \
+        if arp -n 10.0.0.10 2>/dev/null | grep -qi '52:54:00:00:00:01'; then fail 22; fi";
+    let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    source.send_line(&format!(
+        "set -eu; fail() {{ nvx-exit \"$1\"; exit 1; }}; \
+         {neighbor_checks}; \
+         echo PHASE4-ENDPOINT-BEFORE; nvx-snapshot; \
+         {neighbor_checks}; \
+         echo PHASE4-ENDPOINT-AFTER; nvx-exit 37"
+    ))?;
+    source.wait_for(MICROVM_BOOT_MARKER)?;
+    source.wait_for(MICROVM_SHELL_PROMPT)?;
+    let (status, source_output) = source.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "phase-4 endpoint snapshot source exited with {status}; output: {}",
+        output_tail(&source_output)
+    );
+    anyhow::ensure!(
+        count_output_lines(&source_output, BEFORE_MARKER) == 1
+            && count_output_lines(&source_output, AFTER_MARKER) == 0,
+        "phase-4 endpoint source crossed the snapshot boundary"
+    );
+    openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
+    let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
+
+    let mut missing_policy_args = phase_2_args(hypervisor);
+    missing_policy_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--network-profile".into(),
+        "portable".into(),
+    ]);
+    let missing_policy = OpenvmmTestProcess::launch(openvmm.get(), &missing_policy_args)?;
+    let (status, output) = missing_policy.wait()?;
+    anyhow::ensure!(
+        !status.success() && contains_bytes(&output, b"restore-time egress policy does not match"),
+        "phase-4 endpoint restore without policy was not rejected: {}",
+        output_tail(&output)
+    );
+
+    let mut changed_policy_args = phase_2_args(hypervisor);
+    changed_policy_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--network-profile".into(),
+        "portable".into(),
+        "--allow-endpoint".into(),
+        "10.0.0.9:9443".into(),
+        "--allow-endpoint".into(),
+        "192.0.2.7:443".into(),
+        "--allow-endpoint".into(),
+        "10.0.0.9:443".into(),
+    ]);
+    let changed_policy = OpenvmmTestProcess::launch(openvmm.get(), &changed_policy_args)?;
+    let (status, output) = changed_policy.wait()?;
+    anyhow::ensure!(
+        !status.success() && contains_bytes(&output, b"restore-time egress policy does not match"),
+        "phase-4 endpoint restore with changed port was not rejected: {}",
+        output_tail(&output)
+    );
+
+    for restore_index in 0..2 {
+        let mut restore_args = phase_2_args(hypervisor);
+        restore_args.extend([
+            "--restore-snapshot".into(),
+            snapshot_dir.as_os_str().to_owned(),
+            "--network-profile".into(),
+            "portable".into(),
+            "--restore-entropy".into(),
+            "--allow-endpoint".into(),
+            "192.0.2.7:443".into(),
+            "--allow-endpoint".into(),
+            "10.0.0.9:443".into(),
+            "--allow-endpoint".into(),
+            "10.0.0.9:8443".into(),
+        ]);
+        let mut restore = OpenvmmTestProcess::launch(openvmm.get(), &restore_args)?;
+        restore.wait_for_output_line(AFTER_MARKER)?;
+        let (status, output) = restore.wait()?;
+        anyhow::ensure!(
+            status.code() == Some(37),
+            "phase-4 endpoint restore {restore_index} exited with {status}; output: {}",
+            output_tail(&output)
+        );
+        anyhow::ensure!(
+            count_output_lines(&output, AFTER_MARKER) == 1,
+            "phase-4 endpoint restore {restore_index} did not re-resolve its bound next hops"
+        );
+        anyhow::ensure!(
+            snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
+            "phase-4 endpoint restore {restore_index} modified snapshot payloads"
+        );
+    }
+    Ok(())
+}
+
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    configs(microvm_pvh_x64[
+        petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
+    ])
+)]
 async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
@@ -2499,7 +2659,17 @@ grep -q 'virtnet_gw=10.0.0.1' /proc/cmdline || fail 24
 grep -qi 'd0000000-d0000fff.*virtio' /proc/iomem || fail 26
 ifconfig "$device" 10.0.0.2 netmask 255.255.255.0 up || fail 27
 route add default gw 10.0.0.1 dev "$device" 2>/dev/null || true
-ping -c 1 -W 5 10.0.0.1 >/dev/null || fail 28
+arp -d 10.0.0.9 2>/dev/null || true
+arp -d 10.0.0.1 2>/dev/null || true
+arp -d 10.0.0.10 2>/dev/null || true
+ping -c 1 -W 1 10.0.0.9 >/dev/null 2>&1 || true
+arp -n 10.0.0.9 | grep -Eqi '10\.0\.0\.9.*52:54:00:00:00:01' || fail 28
+ping -c 1 -W 1 192.0.2.7 >/dev/null 2>&1 || true
+arp -n 10.0.0.1 | grep -Eqi '10\.0\.0\.1.*52:54:00:00:00:01' || fail 29
+ping -c 1 -W 1 10.0.0.10 >/dev/null 2>&1 || true
+if arp -n 10.0.0.10 2>/dev/null | grep -qi '52:54:00:00:00:01'; then
+    fail 30
+fi
 nvx-exit 37
 "#;
 
@@ -2517,11 +2687,18 @@ nvx-exit 37
         static_ipv4: Some(static_ipv4.clone()),
     }
     .into_resource();
-    let policy = EgressPolicy::new(
+    let policy = EgressPolicy::bind(
         network.guest_ipv4,
+        network.prefix_length,
+        network.guest_mac,
         network.derived_gateway_ipv4,
-        EgressPolicyMode::AllowAll,
-    );
+        EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:8443".parse()?,
+            "192.0.2.7:443".parse()?,
+            "10.0.0.9:443".parse()?,
+        ]),
+    )?;
+    let gateway_dns = policy.allows_gateway_dns();
     let irq = microvm_virtio_net_irq(None)?;
 
     let mut vm = config
@@ -2533,7 +2710,7 @@ nvx-exit 37
                 };
                 append_microvm_virtio_discovery(
                     cmdline,
-                    Some((&network, irq, cfg!(windows))),
+                    Some((&network, irq, gateway_dns)),
                     None,
                     false,
                     false,

@@ -841,11 +841,14 @@ use futures::StreamExt;
 
 #[async_test]
 async fn denied_tx_completes_without_backend_ownership(driver: DefaultDriver) {
-    let policy = EgressPolicy::new(
+    let policy = EgressPolicy::bind(
         std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
         std::net::Ipv4Addr::new(10, 0, 0, 1),
         EgressPolicyMode::TcpEndpoints(vec!["192.0.2.7:443".parse().unwrap()]),
-    );
+    )
+    .unwrap();
     let mut harness = TestHarness::new_with_egress_policy(&driver, Some(policy));
     let handle = harness.enable_and_get_handle().await;
 
@@ -856,6 +859,7 @@ async fn denied_tx_completes_without_backend_ownership(driver: DefaultDriver) {
 
 fn policy_tcp_frame(destination_port: u16) -> Vec<u8> {
     let mut frame = vec![0u8; 14 + 20 + 20];
+    frame[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
     frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
     let ip = &mut frame[14..];
     ip[0] = 0x45;
@@ -878,18 +882,80 @@ fn policy_tcp_frame(destination_port: u16) -> Vec<u8> {
     frame
 }
 
+fn policy_arp_frame(target: std::net::Ipv4Addr) -> Vec<u8> {
+    let guest_mac = [0x52, 0x54, 0, 0, 0, 2];
+    let mut frame = vec![0u8; 42];
+    frame[..6].fill(0xff);
+    frame[6..12].copy_from_slice(&guest_mac);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&1u16.to_be_bytes());
+    frame[22..28].copy_from_slice(&guest_mac);
+    frame[28..32].copy_from_slice(&[10, 0, 0, 2]);
+    frame[38..42].copy_from_slice(&target.octets());
+    frame
+}
+
+fn endpoint_policy() -> EgressPolicy {
+    EgressPolicy::bind(
+        std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
+        std::net::Ipv4Addr::new(10, 0, 0, 1),
+        EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:443".parse().unwrap(),
+            "192.0.2.7:443".parse().unwrap(),
+        ]),
+    )
+    .unwrap()
+}
+
+#[async_test]
+async fn endpoint_policy_forwards_only_bound_arp_targets(driver: DefaultDriver) {
+    let mut allowed_harness = TestHarness::new_with_egress_policy(&driver, Some(endpoint_policy()));
+    let allowed_handle = allowed_harness.enable_and_get_handle().await;
+    allowed_harness
+        .post_tx_frame_and_signal(0, &policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 9)));
+    assert_eq!(allowed_harness.wait_for_used().await, (0, 0));
+    assert!(!allowed_handle.take_tx_avail_log().is_empty());
+
+    let mut denied_harness = TestHarness::new_with_egress_policy(&driver, Some(endpoint_policy()));
+    let denied_handle = denied_harness.enable_and_get_handle().await;
+    denied_harness
+        .post_tx_frame_and_signal(0, &policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 10)));
+    assert_eq!(denied_harness.wait_for_used().await, (0, 0));
+    assert!(denied_handle.take_tx_avail_log().is_empty());
+}
+
 #[async_test]
 async fn endpoint_policy_checks_transmitted_bytes_after_guest_mutation(driver: DefaultDriver) {
-    let policy = EgressPolicy::new(
+    let policy = EgressPolicy::bind(
         std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
         std::net::Ipv4Addr::new(10, 0, 0, 1),
         EgressPolicyMode::TcpEndpoints(vec!["192.0.2.7:443".parse().unwrap()]),
-    );
+    )
+    .unwrap();
     let mut harness = TestHarness::new_with_egress_policy(&driver, Some(policy));
     let handle = harness.enable_and_get_handle().await;
     handle.replace_next_tx(policy_tcp_frame(80));
 
     harness.post_tx_frame_and_signal(0, &policy_tcp_frame(443));
+    assert_eq!(harness.wait_for_used().await, (0, 0));
+    assert!(handle.take_tx_avail_log().is_empty());
+}
+
+#[async_test]
+async fn endpoint_policy_rechecks_mutated_arp_target_at_backend(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_with_egress_policy(&driver, Some(endpoint_policy()));
+    let handle = harness.enable_and_get_handle().await;
+    handle.replace_next_tx(policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 10)));
+
+    harness.post_tx_frame_and_signal(0, &policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 9)));
     assert_eq!(harness.wait_for_used().await, (0, 0));
     assert!(handle.take_tx_avail_log().is_empty());
 }

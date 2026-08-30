@@ -3,10 +3,17 @@
 
 //! Canonical microVM IPv4 egress policy and packet validation.
 
+use crate::mac_address::MacAddress;
 use mesh::MeshPayload;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use thiserror::Error;
+
+/// Current encoding version used for snapshot egress-policy digests.
+pub const EGRESS_POLICY_ENCODING_VERSION: u32 = 2;
+const LEGACY_EGRESS_POLICY_ENCODING_VERSION: u32 = 1;
+const ETHERNET_BROADCAST: [u8; 6] = [0xff; 6];
+const ETHERNET_UNSPECIFIED: [u8; 6] = [0; 6];
 
 /// A canonical IPv4 network prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, MeshPayload)]
@@ -150,17 +157,138 @@ pub enum EgressPolicyMode {
     TcpEndpoints(Vec<TcpEndpoint>),
 }
 
+/// Reason an endpoint address cannot be used by exact endpoint policy.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum InvalidEndpointAddress {
+    /// The address is `0.0.0.0`.
+    #[error("it is unspecified")]
+    Unspecified,
+    /// The address belongs to the reserved current-network block.
+    #[error("it belongs to the reserved 0.0.0.0/8 current-network block")]
+    CurrentNetwork,
+    /// The address belongs to IPv4 loopback.
+    #[error("it is loopback")]
+    Loopback,
+    /// The address is IPv4 link-local.
+    #[error("it is link-local")]
+    LinkLocal,
+    /// The address is multicast.
+    #[error("it is multicast")]
+    Multicast,
+    /// The address is the limited broadcast address.
+    #[error("it is the limited broadcast address")]
+    LimitedBroadcast,
+    /// The address belongs to the reserved high-address block.
+    #[error("it belongs to the reserved 240.0.0.0/4 block")]
+    Reserved,
+    /// The address is the guest itself.
+    #[error("it matches the guest IPv4 address")]
+    Guest,
+    /// The address is the guest subnet's network address.
+    #[error("it is the guest subnet network address")]
+    SubnetNetwork,
+    /// The address is the guest subnet's broadcast address.
+    #[error("it is the guest subnet broadcast address")]
+    SubnetBroadcast,
+}
+
+/// Error returned when binding an egress policy to a static network identity.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum InvalidEgressPolicy {
+    /// The prefix cannot describe a microVM subnet.
+    #[error("IPv4 prefix /{0} is outside the supported range /1 through /30")]
+    PrefixOutOfRange(u8),
+    /// The guest address is the subnet network address.
+    #[error("guest IPv4 address {0} is the subnet network address")]
+    GuestNetworkAddress(Ipv4Addr),
+    /// The guest address is the subnet broadcast address.
+    #[error("guest IPv4 address {0} is the subnet broadcast address")]
+    GuestBroadcastAddress(Ipv4Addr),
+    /// The guest address collides with the canonical gateway.
+    #[error("guest IPv4 address {0} collides with the canonical gateway")]
+    GuestGatewayCollision(Ipv4Addr),
+    /// The gateway is not the first usable address in the guest subnet.
+    #[error("gateway IPv4 address {actual} does not match canonical gateway {expected}")]
+    GatewayMismatch {
+        /// Supplied gateway address.
+        actual: Ipv4Addr,
+        /// Canonical first usable subnet address.
+        expected: Ipv4Addr,
+    },
+    /// The guest MAC cannot identify a transmitting endpoint.
+    #[error("guest MAC address {0} is not a nonzero unicast address")]
+    InvalidGuestMac(MacAddress),
+    /// The gateway cannot serve as an endpoint next hop.
+    #[error("gateway IPv4 address {address} is not a valid endpoint next hop: {reason}")]
+    InvalidGateway {
+        /// Invalid gateway address.
+        address: Ipv4Addr,
+        /// Reason the address is invalid.
+        reason: InvalidEndpointAddress,
+    },
+    /// An exact endpoint address is invalid.
+    #[error("endpoint IPv4 address {address} is invalid: {reason}")]
+    InvalidEndpoint {
+        /// Invalid endpoint address.
+        address: Ipv4Addr,
+        /// Reason the address is invalid.
+        reason: InvalidEndpointAddress,
+    },
+    /// A decoded policy did not preserve canonical rule order and uniqueness.
+    #[error("egress policy rules are not canonical")]
+    NonCanonicalRules,
+    /// A decoded policy carried next hops that do not match its bound rules.
+    #[error("egress policy next hops do not match the bound endpoint rules")]
+    InvalidNextHops,
+}
+
 /// Egress policy bound to one static microVM link.
 #[derive(Clone, Debug, PartialEq, Eq, MeshPayload)]
 pub struct EgressPolicy {
     guest_ipv4: Ipv4Addr,
+    prefix_length: u8,
+    guest_mac: MacAddress,
     gateway_ipv4: Ipv4Addr,
+    next_hops: Vec<Ipv4Addr>,
     mode: EgressPolicyMode,
 }
 
 impl EgressPolicy {
-    /// Creates a policy and canonicalizes rule order and duplicates.
-    pub fn new(guest_ipv4: Ipv4Addr, gateway_ipv4: Ipv4Addr, mut mode: EgressPolicyMode) -> Self {
+    /// Binds a policy to a validated static identity and canonicalizes its rules.
+    pub fn bind(
+        guest_ipv4: Ipv4Addr,
+        prefix_length: u8,
+        guest_mac: MacAddress,
+        gateway_ipv4: Ipv4Addr,
+        mut mode: EgressPolicyMode,
+    ) -> Result<Self, InvalidEgressPolicy> {
+        if !(1..=30).contains(&prefix_length) {
+            return Err(InvalidEgressPolicy::PrefixOutOfRange(prefix_length));
+        }
+        let mask = prefix_mask(prefix_length);
+        let network = Ipv4Addr::from(u32::from(guest_ipv4) & mask);
+        let broadcast = Ipv4Addr::from(u32::from(network) | !mask);
+        if guest_ipv4 == network {
+            return Err(InvalidEgressPolicy::GuestNetworkAddress(guest_ipv4));
+        }
+        if guest_ipv4 == broadcast {
+            return Err(InvalidEgressPolicy::GuestBroadcastAddress(guest_ipv4));
+        }
+        let expected_gateway = Ipv4Addr::from(u32::from(network) + 1);
+        if guest_ipv4 == expected_gateway {
+            return Err(InvalidEgressPolicy::GuestGatewayCollision(guest_ipv4));
+        }
+        if gateway_ipv4 != expected_gateway {
+            return Err(InvalidEgressPolicy::GatewayMismatch {
+                actual: gateway_ipv4,
+                expected: expected_gateway,
+            });
+        }
+        let guest_mac_bytes = guest_mac.to_bytes();
+        if guest_mac_bytes == ETHERNET_UNSPECIFIED || guest_mac_bytes[0] & 1 != 0 {
+            return Err(InvalidEgressPolicy::InvalidGuestMac(guest_mac));
+        }
+
         match &mut mode {
             EgressPolicyMode::AllowList(rules) | EgressPolicyMode::BlockList(rules) => {
                 rules.sort_unstable();
@@ -172,11 +300,72 @@ impl EgressPolicy {
             }
             EgressPolicyMode::AllowAll => {}
         }
-        Self {
+
+        let next_hops = match &mode {
+            EgressPolicyMode::AllowAll => Vec::new(),
+            EgressPolicyMode::AllowList(_) | EgressPolicyMode::BlockList(_) => {
+                vec![gateway_ipv4]
+            }
+            EgressPolicyMode::TcpEndpoints(endpoints) => {
+                if let Some(reason) =
+                    invalid_special_endpoint_address(gateway_ipv4, guest_ipv4, network, broadcast)
+                {
+                    return Err(InvalidEgressPolicy::InvalidGateway {
+                        address: gateway_ipv4,
+                        reason,
+                    });
+                }
+                let mut next_hops = Vec::with_capacity(endpoints.len());
+                for endpoint in endpoints {
+                    if let Some(reason) = invalid_special_endpoint_address(
+                        endpoint.address,
+                        guest_ipv4,
+                        network,
+                        broadcast,
+                    ) {
+                        return Err(InvalidEgressPolicy::InvalidEndpoint {
+                            address: endpoint.address,
+                            reason,
+                        });
+                    }
+                    next_hops.push(if contains_address(network, mask, endpoint.address) {
+                        endpoint.address
+                    } else {
+                        gateway_ipv4
+                    });
+                }
+                next_hops.sort_unstable();
+                next_hops.dedup();
+                next_hops
+            }
+        };
+
+        Ok(Self {
             guest_ipv4,
+            prefix_length,
+            guest_mac,
             gateway_ipv4,
+            next_hops,
             mode,
+        })
+    }
+
+    /// Revalidates canonical fields after a serialized policy crosses a boundary.
+    pub fn validate(&self) -> Result<(), InvalidEgressPolicy> {
+        let rebound = Self::bind(
+            self.guest_ipv4,
+            self.prefix_length,
+            self.guest_mac,
+            self.gateway_ipv4,
+            self.mode.clone(),
+        )?;
+        if rebound.mode != self.mode {
+            return Err(InvalidEgressPolicy::NonCanonicalRules);
         }
+        if rebound.next_hops != self.next_hops {
+            return Err(InvalidEgressPolicy::InvalidNextHops);
+        }
+        Ok(())
     }
 
     /// Returns the canonical policy mode.
@@ -192,6 +381,11 @@ impl EgressPolicy {
             EgressPolicyMode::BlockList(_) => "block-list",
             EgressPolicyMode::TcpEndpoints(_) => "endpoint",
         }
+    }
+
+    /// Returns the canonical next hops that ARP may resolve.
+    pub fn next_hops(&self) -> &[Ipv4Addr] {
+        &self.next_hops
     }
 
     /// Returns whether packet parsing and filtering are active.
@@ -215,30 +409,39 @@ impl EgressPolicy {
 
     /// Returns stable bytes suitable for a policy digest.
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.canonical_bytes_v2()
+    }
+
+    /// Returns canonical bytes for a supported snapshot encoding version.
+    pub fn canonical_bytes_for_version(&self, version: u32) -> Option<Vec<u8>> {
+        match version {
+            LEGACY_EGRESS_POLICY_ENCODING_VERSION => Some(self.canonical_bytes_v1()),
+            EGRESS_POLICY_ENCODING_VERSION => Some(self.canonical_bytes_v2()),
+            _ => None,
+        }
+    }
+
+    fn canonical_bytes_v1(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.push(1);
+        bytes.push(LEGACY_EGRESS_POLICY_ENCODING_VERSION as u8);
         bytes.extend_from_slice(&self.guest_ipv4.octets());
         bytes.extend_from_slice(&self.gateway_ipv4.octets());
-        match &self.mode {
-            EgressPolicyMode::AllowAll => bytes.push(0),
-            EgressPolicyMode::AllowList(rules) => {
-                bytes.push(1);
-                append_cidrs(&mut bytes, rules);
-            }
-            EgressPolicyMode::BlockList(rules) => {
-                bytes.push(2);
-                append_cidrs(&mut bytes, rules);
-            }
-            EgressPolicyMode::TcpEndpoints(endpoints) => {
-                bytes.push(3);
-                let mut endpoints = endpoints.clone();
-                endpoints.sort_unstable();
-                endpoints.dedup();
-                for endpoint in endpoints {
-                    bytes.extend_from_slice(&endpoint.address.octets());
-                    bytes.extend_from_slice(&endpoint.port.to_be_bytes());
-                }
-            }
+        append_policy_mode(&mut bytes, &self.mode);
+        bytes
+    }
+
+    fn canonical_bytes_v2(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(EGRESS_POLICY_ENCODING_VERSION as u8);
+        bytes.extend_from_slice(&self.guest_ipv4.octets());
+        bytes.push(self.prefix_length);
+        bytes.extend_from_slice(&self.guest_mac.to_bytes());
+        bytes.extend_from_slice(&self.gateway_ipv4.octets());
+        append_policy_mode(&mut bytes, &self.mode);
+        bytes.push(0xff);
+        bytes.extend_from_slice(&(self.next_hops.len() as u64).to_be_bytes());
+        for next_hop in &self.next_hops {
+            bytes.extend_from_slice(&next_hop.octets());
         }
         bytes
     }
@@ -253,6 +456,9 @@ impl EgressPolicy {
             return Ok(());
         }
         ensure_available(frame_prefix, frame_length, 14, "Ethernet header")?;
+        if frame_prefix[6..12] != self.guest_mac.to_bytes() {
+            return Err(EgressDenied::SourceMacDenied);
+        }
         let mut ether_type = read_u16(frame_prefix, 12);
         let mut l3_offset = 14;
         let vlan = matches!(ether_type, 0x8100 | 0x88a8);
@@ -286,13 +492,25 @@ impl EgressPolicy {
             || read_u16(frame, offset + 2) != 0x0800
             || frame[offset + 4] != 6
             || frame[offset + 5] != 4
-            || !matches!(read_u16(frame, offset + 6), 1 | 2)
+            || read_u16(frame, offset + 6) != 1
         {
-            return Err(EgressDenied::Malformed("ARP packet"));
+            return Err(EgressDenied::Malformed("ARP request"));
         }
+        let ethernet_destination = &frame[..6];
+        let sender_hardware = &frame[offset + 8..offset + 14];
+        let target_hardware = &frame[offset + 18..offset + 24];
+        let broadcast_request =
+            ethernet_destination == ETHERNET_BROADCAST && target_hardware == ETHERNET_UNSPECIFIED;
+        let unicast_refresh = ethernet_destination[0] & 1 == 0
+            && ethernet_destination != ETHERNET_UNSPECIFIED
+            && target_hardware == ethernet_destination;
         let sender = read_ipv4(frame, offset + 14);
         let target = read_ipv4(frame, offset + 24);
-        if sender != self.guest_ipv4 || target != self.gateway_ipv4 {
+        if sender_hardware != self.guest_mac.to_bytes()
+            || sender != self.guest_ipv4
+            || !self.next_hops.contains(&target)
+            || (!broadcast_request && !unicast_refresh)
+        {
             return Err(EgressDenied::ArpDenied);
         }
         Ok(())
@@ -401,8 +619,11 @@ pub enum EgressDenied {
     /// Exact endpoint mode does not permit VLAN encapsulation.
     #[error("VLAN traffic is denied by exact endpoint policy")]
     VlanDenied,
-    /// ARP was not a valid exchange with the configured gateway.
-    #[error("ARP traffic is not limited to the configured gateway")]
+    /// The Ethernet source does not match the bound guest identity.
+    #[error("Ethernet source does not match the configured guest")]
+    SourceMacDenied,
+    /// ARP was not a canonical request for an authorized next hop.
+    #[error("ARP request does not resolve an authorized next hop")]
     ArpDenied,
     /// The packet tried to spoof another source IPv4 address.
     #[error("IPv4 source does not match the configured guest")]
@@ -424,6 +645,66 @@ fn prefix_mask(prefix_length: u8) -> u32 {
         0
     } else {
         u32::MAX << (32 - prefix_length)
+    }
+}
+
+fn contains_address(network: Ipv4Addr, mask: u32, address: Ipv4Addr) -> bool {
+    u32::from(address) & mask == u32::from(network)
+}
+
+fn invalid_special_endpoint_address(
+    address: Ipv4Addr,
+    guest: Ipv4Addr,
+    network: Ipv4Addr,
+    broadcast: Ipv4Addr,
+) -> Option<InvalidEndpointAddress> {
+    let first = address.octets()[0];
+    if address.is_unspecified() {
+        Some(InvalidEndpointAddress::Unspecified)
+    } else if first == 0 {
+        Some(InvalidEndpointAddress::CurrentNetwork)
+    } else if address.is_loopback() {
+        Some(InvalidEndpointAddress::Loopback)
+    } else if address.is_link_local() {
+        Some(InvalidEndpointAddress::LinkLocal)
+    } else if address.is_multicast() {
+        Some(InvalidEndpointAddress::Multicast)
+    } else if address.is_broadcast() {
+        Some(InvalidEndpointAddress::LimitedBroadcast)
+    } else if first >= 240 {
+        Some(InvalidEndpointAddress::Reserved)
+    } else if address == guest {
+        Some(InvalidEndpointAddress::Guest)
+    } else if address == network {
+        Some(InvalidEndpointAddress::SubnetNetwork)
+    } else if address == broadcast {
+        Some(InvalidEndpointAddress::SubnetBroadcast)
+    } else {
+        None
+    }
+}
+
+fn append_policy_mode(bytes: &mut Vec<u8>, mode: &EgressPolicyMode) {
+    match mode {
+        EgressPolicyMode::AllowAll => bytes.push(0),
+        EgressPolicyMode::AllowList(rules) => {
+            bytes.push(1);
+            append_cidrs(bytes, rules);
+        }
+        EgressPolicyMode::BlockList(rules) => {
+            bytes.push(2);
+            append_cidrs(bytes, rules);
+        }
+        EgressPolicyMode::TcpEndpoints(endpoints) => {
+            bytes.push(3);
+            let mut endpoints = endpoints.clone();
+            endpoints.sort_unstable();
+            endpoints.dedup();
+            for endpoint in endpoints {
+                bytes.extend_from_slice(&endpoint.address.octets());
+                bytes.extend_from_slice(&endpoint.port.to_be_bytes());
+            }
+        }
     }
 }
 
@@ -520,6 +801,22 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    const GUEST_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PREFIX_LENGTH: u8 = 24;
+    const GATEWAY_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const GUEST_MAC_BYTES: [u8; 6] = [0x52, 0x54, 0, 0, 0, 2];
+
+    fn bind(mode: EgressPolicyMode) -> EgressPolicy {
+        EgressPolicy::bind(
+            GUEST_IPV4,
+            PREFIX_LENGTH,
+            MacAddress::new(GUEST_MAC_BYTES),
+            GATEWAY_IPV4,
+            mode,
+        )
+        .unwrap()
+    }
+
     fn set_ipv4_checksum(frame: &mut [u8], ip_offset: usize) {
         frame[ip_offset + 10..ip_offset + 12].fill(0);
         let header_length = usize::from(frame[ip_offset] & 0x0f) * 4;
@@ -535,6 +832,7 @@ mod tests {
 
     fn tcp_frame(destination: Ipv4Addr, destination_port: u16) -> Vec<u8> {
         let mut frame = vec![0u8; 14 + 20 + 20];
+        frame[6..12].copy_from_slice(&GUEST_MAC_BYTES);
         frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
         let ip = &mut frame[14..];
         ip[0] = 0x45;
@@ -553,6 +851,7 @@ mod tests {
 
     fn udp_frame(destination: Ipv4Addr, destination_port: u16) -> Vec<u8> {
         let mut frame = vec![0u8; 14 + 20 + 8];
+        frame[6..12].copy_from_slice(&GUEST_MAC_BYTES);
         frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
         let ip = &mut frame[14..];
         ip[0] = 0x45;
@@ -569,45 +868,55 @@ mod tests {
         frame
     }
 
-    fn gateway_arp(target: Ipv4Addr) -> Vec<u8> {
+    fn arp_request(
+        target: Ipv4Addr,
+        ethernet_destination: [u8; 6],
+        target_hardware: [u8; 6],
+    ) -> Vec<u8> {
         let mut frame = vec![0u8; 42];
+        frame[..6].copy_from_slice(&ethernet_destination);
+        frame[6..12].copy_from_slice(&GUEST_MAC_BYTES);
         frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
         frame[14..16].copy_from_slice(&1u16.to_be_bytes());
         frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
         frame[18] = 6;
         frame[19] = 4;
         frame[20..22].copy_from_slice(&1u16.to_be_bytes());
-        frame[28..32].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 2).octets());
+        frame[22..28].copy_from_slice(&GUEST_MAC_BYTES);
+        frame[28..32].copy_from_slice(&GUEST_IPV4.octets());
+        frame[32..38].copy_from_slice(&target_hardware);
         frame[38..42].copy_from_slice(&target.octets());
         frame
     }
 
     #[test]
     fn policy_rules_are_parsed_and_canonicalized() {
-        let policy = EgressPolicy::new(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 1),
-            EgressPolicyMode::AllowList(vec![
-                "192.168.1.9/24".parse().unwrap(),
-                "10.0.0.1".parse().unwrap(),
-                "192.168.1.0/24".parse().unwrap(),
-            ]),
-        );
+        let policy = bind(EgressPolicyMode::AllowList(vec![
+            "192.168.1.9/24".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "192.168.1.0/24".parse().unwrap(),
+        ]));
         let EgressPolicyMode::AllowList(rules) = policy.mode() else {
             panic!("unexpected policy mode")
         };
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1].network(), Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(policy.next_hops(), &[GATEWAY_IPV4]);
         assert!(policy.allows_gateway_dns());
+        assert!(policy.validate().is_ok());
+        assert_ne!(
+            policy
+                .canonical_bytes_for_version(LEGACY_EGRESS_POLICY_ENCODING_VERSION)
+                .unwrap(),
+            policy.canonical_bytes()
+        );
     }
 
     #[test]
     fn exact_endpoint_policy_filters_before_transmission() {
-        let policy = EgressPolicy::new(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 1),
-            EgressPolicyMode::TcpEndpoints(vec!["192.0.2.7:443".parse().unwrap()]),
-        );
+        let policy = bind(EgressPolicyMode::TcpEndpoints(vec![
+            "192.0.2.7:443".parse().unwrap(),
+        ]));
         let allowed = tcp_frame(Ipv4Addr::new(192, 0, 2, 7), 443);
         policy.authorize_frame(&allowed, allowed.len()).unwrap();
 
@@ -621,6 +930,12 @@ mod tests {
         assert_eq!(
             policy.authorize_frame(&malformed, malformed.len()),
             Err(EgressDenied::Malformed("IPv4 checksum"))
+        );
+        let mut spoofed_mac = allowed.clone();
+        spoofed_mac[11] ^= 1;
+        assert_eq!(
+            policy.authorize_frame(&spoofed_mac, spoofed_mac.len()),
+            Err(EgressDenied::SourceMacDenied)
         );
 
         let mut with_options = allowed.clone();
@@ -639,6 +954,7 @@ mod tests {
             Err(EgressDenied::EndpointDenied)
         );
         let mut ipv6 = vec![0u8; 14 + 40];
+        ipv6[6..12].copy_from_slice(&GUEST_MAC_BYTES);
         ipv6[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
         assert_eq!(
             policy.authorize_frame(&ipv6, ipv6.len()),
@@ -656,14 +972,189 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_policy_resolves_only_required_next_hops_without_widening_ipv4() {
+        let on_link = Ipv4Addr::new(10, 0, 0, 9);
+        let off_subnet = Ipv4Addr::new(192, 0, 2, 7);
+        let unrelated = Ipv4Addr::new(10, 0, 0, 10);
+        let policy = bind(EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:8443".parse().unwrap(),
+            "192.0.2.7:443".parse().unwrap(),
+            "10.0.0.9:443".parse().unwrap(),
+            "10.0.0.9:443".parse().unwrap(),
+        ]));
+
+        assert_eq!(policy.next_hops(), &[GATEWAY_IPV4, on_link]);
+        for target in [GATEWAY_IPV4, on_link] {
+            let request = arp_request(target, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED);
+            policy
+                .authorize_frame(&request, request.len())
+                .expect("required next hop must be resolvable");
+        }
+        let unrelated_request = arp_request(unrelated, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED);
+        assert_eq!(
+            policy.authorize_frame(&unrelated_request, unrelated_request.len()),
+            Err(EgressDenied::ArpDenied)
+        );
+
+        policy
+            .authorize_frame(&tcp_frame(on_link, 443), 54)
+            .unwrap();
+        policy
+            .authorize_frame(&tcp_frame(off_subnet, 443), 54)
+            .unwrap();
+        let wrong_port = tcp_frame(on_link, 80);
+        assert_eq!(
+            policy.authorize_frame(&wrong_port, wrong_port.len()),
+            Err(EgressDenied::EndpointDenied)
+        );
+        let unrelated_ipv4 = tcp_frame(unrelated, 443);
+        assert_eq!(
+            policy.authorize_frame(&unrelated_ipv4, unrelated_ipv4.len()),
+            Err(EgressDenied::EndpointDenied)
+        );
+    }
+
+    #[test]
+    fn endpoint_policy_rejects_invalid_destination_identities() {
+        let invalid = [
+            (Ipv4Addr::UNSPECIFIED, InvalidEndpointAddress::Unspecified),
+            (
+                Ipv4Addr::new(0, 1, 2, 3),
+                InvalidEndpointAddress::CurrentNetwork,
+            ),
+            (
+                Ipv4Addr::new(127, 0, 0, 1),
+                InvalidEndpointAddress::Loopback,
+            ),
+            (
+                Ipv4Addr::new(169, 254, 1, 1),
+                InvalidEndpointAddress::LinkLocal,
+            ),
+            (
+                Ipv4Addr::new(224, 0, 0, 1),
+                InvalidEndpointAddress::Multicast,
+            ),
+            (
+                Ipv4Addr::BROADCAST,
+                InvalidEndpointAddress::LimitedBroadcast,
+            ),
+            (
+                Ipv4Addr::new(240, 0, 0, 1),
+                InvalidEndpointAddress::Reserved,
+            ),
+            (GUEST_IPV4, InvalidEndpointAddress::Guest),
+            (
+                Ipv4Addr::new(10, 0, 0, 0),
+                InvalidEndpointAddress::SubnetNetwork,
+            ),
+            (
+                Ipv4Addr::new(10, 0, 0, 255),
+                InvalidEndpointAddress::SubnetBroadcast,
+            ),
+        ];
+
+        for (address, reason) in invalid {
+            let endpoint = format!("{address}:443").parse().unwrap();
+            assert_eq!(
+                EgressPolicy::bind(
+                    GUEST_IPV4,
+                    PREFIX_LENGTH,
+                    MacAddress::new(GUEST_MAC_BYTES),
+                    GATEWAY_IPV4,
+                    EgressPolicyMode::TcpEndpoints(vec![endpoint]),
+                ),
+                Err(InvalidEgressPolicy::InvalidEndpoint { address, reason })
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_policy_must_preserve_canonical_rules_and_next_hops() {
+        let mut noncanonical_rules = bind(EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:443".parse().unwrap(),
+        ]));
+        let EgressPolicyMode::TcpEndpoints(endpoints) = &mut noncanonical_rules.mode else {
+            panic!("expected endpoint policy")
+        };
+        endpoints.push("10.0.0.9:443".parse().unwrap());
+        assert_eq!(
+            noncanonical_rules.validate(),
+            Err(InvalidEgressPolicy::NonCanonicalRules)
+        );
+
+        let mut invalid_next_hops = bind(EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:443".parse().unwrap(),
+        ]));
+        invalid_next_hops
+            .next_hops
+            .push(Ipv4Addr::new(10, 0, 0, 10));
+        assert_eq!(
+            invalid_next_hops.validate(),
+            Err(InvalidEgressPolicy::InvalidNextHops)
+        );
+    }
+
+    #[test]
+    fn arp_requires_canonical_guest_requests() {
+        let on_link = Ipv4Addr::new(10, 0, 0, 9);
+        let peer_mac = [0x52, 0x54, 0, 0, 0, 9];
+        let policy = bind(EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:443".parse().unwrap(),
+        ]));
+
+        let broadcast = arp_request(on_link, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED);
+        policy.authorize_frame(&broadcast, broadcast.len()).unwrap();
+        let unicast_refresh = arp_request(on_link, peer_mac, peer_mac);
+        policy
+            .authorize_frame(&unicast_refresh, unicast_refresh.len())
+            .unwrap();
+
+        let mut ethernet_spoof = broadcast.clone();
+        ethernet_spoof[11] ^= 1;
+        assert_eq!(
+            policy.authorize_frame(&ethernet_spoof, ethernet_spoof.len()),
+            Err(EgressDenied::SourceMacDenied)
+        );
+        let mut sender_hardware_spoof = broadcast.clone();
+        sender_hardware_spoof[27] ^= 1;
+        assert_eq!(
+            policy.authorize_frame(&sender_hardware_spoof, sender_hardware_spoof.len()),
+            Err(EgressDenied::ArpDenied)
+        );
+        let mut sender_ip_spoof = broadcast.clone();
+        sender_ip_spoof[31] ^= 1;
+        assert_eq!(
+            policy.authorize_frame(&sender_ip_spoof, sender_ip_spoof.len()),
+            Err(EgressDenied::ArpDenied)
+        );
+        let mut noncanonical_target_hardware = broadcast.clone();
+        noncanonical_target_hardware[37] = 1;
+        assert_eq!(
+            policy.authorize_frame(
+                &noncanonical_target_hardware,
+                noncanonical_target_hardware.len()
+            ),
+            Err(EgressDenied::ArpDenied)
+        );
+        let mut reply = broadcast.clone();
+        reply[20..22].copy_from_slice(&2u16.to_be_bytes());
+        assert_eq!(
+            policy.authorize_frame(&reply, reply.len()),
+            Err(EgressDenied::Malformed("ARP request"))
+        );
+        assert_eq!(
+            policy.authorize_frame(&broadcast[..40], broadcast.len()),
+            Err(EgressDenied::Malformed("ARP packet"))
+        );
+    }
+
+    #[test]
     fn list_policies_filter_destinations_and_allow_only_gateway_arp() {
         let allowed_destination = Ipv4Addr::new(192, 0, 2, 7);
         let blocked_destination = Ipv4Addr::new(198, 51, 100, 9);
-        let allow = EgressPolicy::new(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 1),
-            EgressPolicyMode::AllowList(vec!["192.0.2.0/24".parse().unwrap()]),
-        );
+        let allow = bind(EgressPolicyMode::AllowList(vec![
+            "192.0.2.0/24".parse().unwrap(),
+        ]));
         let allowed = tcp_frame(allowed_destination, 80);
         allow.authorize_frame(&allowed, allowed.len()).unwrap();
         let denied = tcp_frame(blocked_destination, 80);
@@ -672,22 +1163,24 @@ mod tests {
             Err(EgressDenied::DestinationDenied)
         );
 
-        let block = EgressPolicy::new(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 1),
-            EgressPolicyMode::BlockList(vec!["198.51.100.0/24".parse().unwrap()]),
-        );
+        let block = bind(EgressPolicyMode::BlockList(vec![
+            "198.51.100.0/24".parse().unwrap(),
+        ]));
         block.authorize_frame(&allowed, allowed.len()).unwrap();
         assert_eq!(
             block.authorize_frame(&denied, denied.len()),
             Err(EgressDenied::DestinationDenied)
         );
 
-        let gateway_request = gateway_arp(Ipv4Addr::new(10, 0, 0, 1));
+        let gateway_request = arp_request(GATEWAY_IPV4, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED);
         allow
             .authorize_frame(&gateway_request, gateway_request.len())
             .unwrap();
-        let other_arp = gateway_arp(Ipv4Addr::new(10, 0, 0, 9));
+        let other_arp = arp_request(
+            Ipv4Addr::new(10, 0, 0, 9),
+            ETHERNET_BROADCAST,
+            ETHERNET_UNSPECIFIED,
+        );
         assert_eq!(
             allow.authorize_frame(&other_arp, other_arp.len()),
             Err(EgressDenied::ArpDenied)
@@ -696,11 +1189,7 @@ mod tests {
 
     #[test]
     fn allow_all_does_not_parse_guest_frames() {
-        let policy = EgressPolicy::new(
-            Ipv4Addr::UNSPECIFIED,
-            Ipv4Addr::UNSPECIFIED,
-            EgressPolicyMode::AllowAll,
-        );
+        let policy = bind(EgressPolicyMode::AllowAll);
         policy.authorize_frame(&[], 0).unwrap();
     }
 }
