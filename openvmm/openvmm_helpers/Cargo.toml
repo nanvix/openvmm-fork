@@ -28,12 +28,16 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-nix = { workspace = true, features = ["fs"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["dir", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 disk_vhdmp.workspace = true
 sparse_mmap.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+workspace = true
+features = ["Win32_Storage_FileSystem"]
 
 [dev-dependencies]
 sparse_mmap.workspace = true

@@ -33,7 +33,7 @@ sections.
 The default format is a local machine-state contract, not an authenticated
 container. All versions receive the same regular-file, no-follow/no-reparse,
 bounded decoding, exact-length, inventory, and machine-contract validation,
-but same-length changes to `state.bin` or `memory.bin` are not detected.
+but the on-disk format does not authenticate same-length payload changes.
 Versions 4 and 5 record the SHA-256 and exact length of `scratch.img`, because guest
 RAM and a mounted writable filesystem must be restored as one exact pair.
 Export or transport layers must provide broader integrity and authentication
@@ -61,6 +61,17 @@ during publication. Clone support is used when available, with allocated-range
 or zero-scan copying as a fallback. The independently owned clone is flushed in
 the private staging directory before publication, and later source writes
 cannot change it.
+
+Restore likewise opens the snapshot directory once and resolves its artifacts
+relative to that handle. Windows uses read-only handles with `FILE_SHARE_READ`
+only, rejects reparse points, compares `FILE_ID_INFO` and EOF before and after
+creating the private COW section, and keeps the directory and artifact guards
+in the VM worker until teardown. Linux keeps the exact `O_NOFOLLOW` directory
+and regular-file descriptors and rejects observable metadata changes before
+handoff, so renaming or replacing the original path cannot substitute another
+generation. Linux file descriptors do not provide mandatory write exclusion;
+deployments that need authenticated or write-proof local artifacts must add a
+stronger mode such as a lease, fs-verity, or a verified artifact broker.
 
 ## Scratch (`scratch.img`)
 

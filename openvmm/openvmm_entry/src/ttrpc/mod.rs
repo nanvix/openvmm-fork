@@ -523,7 +523,7 @@ struct Vm {
 
 struct AuthoritativeMicrovmRestore {
     path: PathBuf,
-    manifest: openvmm_helpers::snapshot::SnapshotManifest,
+    snapshot: Option<openvmm_helpers::snapshot::OpenedSnapshot>,
     memory_size: u64,
     vp_count: u32,
     machine_contract: openvmm_helpers::snapshot::SnapshotMachineContract,
@@ -791,10 +791,11 @@ impl VmService {
             quiesce_timeout_ms
         });
 
-        let authoritative_restore = if let Some(path) = restore_path {
-            let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(&path)?;
+        let mut authoritative_restore = if let Some(path) = restore_path {
+            let snapshot = openvmm_helpers::snapshot::OpenedSnapshot::open(&path)?;
+            let manifest = snapshot.manifest();
             openvmm_helpers::snapshot::validate_manifest(
-                &manifest,
+                manifest,
                 crate::GUEST_ARCH,
                 manifest.memory_size_bytes,
                 manifest.vp_count,
@@ -816,12 +817,15 @@ impl VmService {
                 machine_contract.microvm_sandbox_blocks.is_empty(),
                 "TTRPC restore does not support microVM sandbox-block snapshots"
             );
+            let memory_size = manifest.memory_size_bytes;
+            let vp_count = manifest.vp_count;
+            let machine_contract = machine_contract.clone();
             Some(AuthoritativeMicrovmRestore {
                 path,
-                manifest: manifest.clone(),
-                memory_size: manifest.memory_size_bytes,
-                vp_count: manifest.vp_count,
-                machine_contract: machine_contract.clone(),
+                snapshot: Some(snapshot),
+                memory_size,
+                vp_count,
+                machine_contract,
             })
         } else {
             None
@@ -966,14 +970,16 @@ impl VmService {
         } else {
             None
         };
-        let prepared_restore = if let Some(restore) = &authoritative_restore {
+        let prepared_restore = if let Some(restore) = &mut authoritative_restore {
             anyhow::ensure!(
                 restore.machine_contract.microvm_network.is_none(),
                 "ttrpc restore does not yet expose microVM network attachments"
             );
-            let (fd, state, restore_time) = crate::prepare_snapshot_restore_for_config(
-                &restore.path,
-                &restore.manifest,
+            let prepared = crate::prepare_snapshot_restore_for_config(
+                restore
+                    .snapshot
+                    .take()
+                    .context("snapshot restore is missing its opened generation")?,
                 restore.memory_size,
                 restore.vp_count,
                 Some((
@@ -992,14 +998,20 @@ impl VmService {
                     restore.machine_contract.microvm_sandbox_blocks.clone(),
                 )),
             )?;
-            let restore_time =
-                restore_time.context("microVM snapshot is missing its restore-time contract")?;
+            let restore_time = prepared
+                .restore_time
+                .context("microVM snapshot is missing its restore-time contract")?;
             if !restore_entropy {
                 tracing::warn!(
                     "restoring cloned guest RNG state without fresh entropy injection; cryptographic workloads are unsafe"
                 );
             }
-            Some((fd, state, restore_time))
+            Some((
+                prepared.shared_memory,
+                prepared.guards,
+                prepared.saved_state,
+                restore_time,
+            ))
         } else {
             None
         };
@@ -1956,18 +1968,29 @@ impl VmService {
             })
             .transpose()?;
 
-        let (shared_memory, saved_state, shared_memory_copy_on_write, restore_time) =
-            if let Some((fd, state, restore_time)) = prepared_restore {
-                (Some(fd), Some(state), true, Some(restore_time))
-            } else if let Some(file) = &snapshot_memory_handle {
-                let file = file
-                    .try_clone()
-                    .context("failed to duplicate snapshot RAM handle for worker")?;
-                let shared_memory = openvmm_helpers::shared_memory::file_to_shared_memory_fd(file)?;
-                (Some(shared_memory), None, false, None)
-            } else {
-                (None, None, false, None)
-            };
+        let (
+            shared_memory,
+            saved_state,
+            shared_memory_copy_on_write,
+            restore_time,
+            snapshot_restore_guards,
+        ) = if let Some((fd, guards, state, restore_time)) = prepared_restore {
+            (
+                Some(fd),
+                Some(state),
+                true,
+                Some(restore_time),
+                Some(guards),
+            )
+        } else if let Some(file) = &snapshot_memory_handle {
+            let file = file
+                .try_clone()
+                .context("failed to duplicate snapshot RAM handle for worker")?;
+            let shared_memory = openvmm_helpers::shared_memory::file_to_shared_memory_fd(file)?;
+            (Some(shared_memory), None, false, None, None)
+        } else {
+            (None, None, false, None, None)
+        };
 
         let (send, recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
@@ -1988,6 +2011,7 @@ impl VmService {
                     saved_state,
                     shared_memory,
                     shared_memory_copy_on_write,
+                    snapshot_restore_guards,
                     snapshot_boundary_requests: microvm_snapshot_requests,
                     snapshot_ready,
                     restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),

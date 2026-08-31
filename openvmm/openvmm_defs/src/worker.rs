@@ -27,6 +27,19 @@ pub const VM_WORKER: WorkerId<VmWorkerParameters> = WorkerId::new("VmWorker");
 /// Complete event written before a restored VM can execute.
 pub const RESTORE_READY_EVENT_V1: &[u8] = b"OPENVMM_RESTORE_READY_V1\n";
 
+/// Exact snapshot-generation handles retained for a restored VM's lifetime.
+#[derive(MeshPayload)]
+pub struct SnapshotRestoreGuards {
+    /// Open snapshot directory used for relative artifact access and resume claims.
+    pub directory: std::fs::File,
+    /// Open manifest artifact.
+    pub manifest: std::fs::File,
+    /// Open saved-state artifact.
+    pub state: std::fs::File,
+    /// Open memory artifact backing the copy-on-write section.
+    pub memory: std::fs::File,
+}
+
 /// Complete saved state consumed by the VM worker.
 #[derive(Protobuf, SavedStateRoot)]
 #[mesh(package = "openvmm")]
@@ -52,6 +65,8 @@ pub struct VmWorkerParameters {
     pub shared_memory: Option<SharedMemoryFd>,
     /// Whether writes to `shared_memory` must remain private to this VM.
     pub shared_memory_copy_on_write: bool,
+    /// Snapshot generation handles that must outlive the restored VM.
+    pub snapshot_restore_guards: Option<SnapshotRestoreGuards>,
     /// Deferred microVM PMIO requests awaiting an exact post-OUT boundary.
     pub snapshot_boundary_requests:
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
