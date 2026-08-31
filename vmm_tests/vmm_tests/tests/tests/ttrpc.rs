@@ -335,9 +335,11 @@ fn microvm_v2_restore_request(
 }
 
 const TTRPC_SMP_PROBE: &[u8] = br#"set -eu
-[ "$(getconf _NPROCESSORS_ONLN)" -eq 2 ]
+trap 'status=$?; if [ "$status" -ne 0 ]; then echo "TTRPC-SMP-PROBE-FAIL status=$status"; nvx-exit "$status"; fi' EXIT
+online=$(getconf _NPROCESSORS_ONLN)
+[ "$online" -eq 2 ] || { echo "TTRPC-SMP-ONLINE-FAIL expected=2 actual=$online"; exit 81; }
 loc_before=$(awk '/^LOC:/ { print $2, $3; exit }' /proc/interrupts)
-[ "$(printf "%s\n" "$loc_before" | awk '{ print NF }')" -eq 2 ]
+[ "$(printf "%s\n" "$loc_before" | awk '{ print NF }')" -eq 2 ] || { echo "TTRPC-SMP-LAPIC-FAIL missing-local-timer-counters"; exit 87; }
 worker_dir=/tmp/ttrpc-smp-probe-$$
 worker_script=$worker_dir/worker
 rm -rf "$worker_dir"
@@ -349,11 +351,23 @@ cpu=$1
 before=$2
 result=$3
 apic_id=$4
-field=$((cpu + 2))
 actual=$(awk '{ print $39 }' /proc/self/stat)
-[ "$actual" -eq "$cpu" ]
+[ "$actual" -eq "$cpu" ] || { echo "TTRPC-SMP-WORKER-FAIL requested=$cpu actual=$actual"; exit 87; }
+read_loc_counter() {
+    while read -r label cpu0 cpu1 rest; do
+        if [ "$label" = "LOC:" ]; then
+            case "$cpu" in
+                0) current=$cpu0 ;;
+                1) current=$cpu1 ;;
+                *) return 1 ;;
+            esac
+            return 0
+        fi
+    done </proc/interrupts
+    return 1
+}
 while :; do
-    current=$(awk -v field="$field" '/^LOC:/ { print $field; exit }' /proc/interrupts)
+    read_loc_counter
     [ "$current" -gt "$before" ] && break
 done
 printf '%s %s %s\n' "$actual" "$current" "$apic_id" >"$result"
@@ -362,12 +376,16 @@ chmod +x "$worker_script"
 worker_pids=
 for cpu in 0 1; do
     topology=/sys/devices/system/cpu/cpu${cpu}/topology
-    [ "$(cat "$topology/physical_package_id")" -eq 0 ]
-    [ "$(cat "$topology/die_id")" -eq 0 ]
-    [ "$(cat "$topology/core_id")" -eq "$cpu" ]
-    [ "$(cat "$topology/thread_siblings_list")" = "$cpu" ]
+    actual=$(cat "$topology/physical_package_id")
+    [ "$actual" -eq 0 ] || { echo "TTRPC-SMP-TOPOLOGY-FAIL cpu=$cpu field=physical_package_id expected=0 actual=$actual"; exit 82; }
+    actual=$(cat "$topology/die_id")
+    [ "$actual" -eq 0 ] || { echo "TTRPC-SMP-TOPOLOGY-FAIL cpu=$cpu field=die_id expected=0 actual=$actual"; exit 83; }
+    actual=$(cat "$topology/core_id")
+    [ "$actual" -eq "$cpu" ] || { echo "TTRPC-SMP-TOPOLOGY-FAIL cpu=$cpu field=core_id expected=$cpu actual=$actual"; exit 84; }
+    actual=$(cat "$topology/thread_siblings_list")
+    [ "$actual" = "$cpu" ] || { echo "TTRPC-SMP-TOPOLOGY-FAIL cpu=$cpu field=thread_siblings_list expected=$cpu actual=$actual"; exit 85; }
     apic_id=$(awk -v target="$cpu" '$1 == "processor" { processor = $3 } $1 == "apicid" && processor == target { print $3; exit }' /proc/cpuinfo)
-    [ "$apic_id" -eq "$cpu" ]
+    [ "$apic_id" -eq "$cpu" ] || { echo "TTRPC-SMP-APIC-FAIL cpu=$cpu apic=$apic_id"; exit 86; }
     field=$((cpu + 1))
     before=$(printf "%s\n" "$loc_before" | awk -v field="$field" '{ print $field }')
     result=$worker_dir/$cpu
@@ -375,7 +393,7 @@ for cpu in 0 1; do
     worker_pids="$worker_pids $!"
 done
 for pid in $worker_pids; do
-    wait "$pid"
+    wait "$pid" || { status=$?; echo "TTRPC-SMP-WORKER-FAIL pid=$pid status=$status"; exit "$status"; }
 done
 for cpu in 0 1; do
     read -r actual current apic_id <"$worker_dir/$cpu"
@@ -386,10 +404,10 @@ for cpu in 0 1; do
     field=$((cpu + 1))
     before=$(printf "%s\n" "$loc_before" | awk -v field="$field" '{ print $field }')
     after=$(printf "%s\n" "$loc_after" | awk -v field="$field" '{ print $field }')
-    [ "$after" -gt "$before" ]
+    [ "$after" -gt "$before" ] || { echo "TTRPC-SMP-LAPIC-FAIL cpu=$cpu before=$before after=$after"; exit 88; }
 done
 ipi=$(awk '/^(RES|CAL):/ { total += $3 } END { print total + 0 }' /proc/interrupts)
-[ "$ipi" -gt 0 ]
+[ "$ipi" -gt 0 ] || { echo "TTRPC-SMP-IPI-FAIL cpu=1 count=$ipi"; exit 89; }
 echo TTRPC-SMP-INTERRUPTS-OK loc_before=$loc_before loc_after=$loc_after ipi=$ipi
 rm -rf "$worker_dir"
 echo TTRPC-SMP-PROBE-OK
@@ -475,14 +493,28 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
         let mut output = Vec::new();
         wait_for_bytes(&mut portb_read, &mut output, BOOT_MARKER).await?;
         portb_write.write_all(TTRPC_SMP_PROBE).await?;
-        wait_for_bytes(&mut portb_read, &mut output, b"TTRPC-SMP-PROBE-OK").await?;
+        wait_for_bytes(&mut portb_read, &mut output, b"TTRPC-SMP-PROBE-OK")
+            .await
+            .with_context(|| {
+                format!(
+                    "initial SMP probe did not complete; portb output: {}",
+                    String::from_utf8_lossy(&output)
+                )
+            })?;
         output.clear();
         portb_write.write_all(b"reboot -f\n").await?;
         portb_write.flush().await?;
         wait_for_bytes(&mut portb_read, &mut output, BOOT_MARKER).await?;
         output.clear();
         portb_write.write_all(TTRPC_SMP_PROBE).await?;
-        wait_for_bytes(&mut portb_read, &mut output, b"TTRPC-SMP-PROBE-OK").await?;
+        wait_for_bytes(&mut portb_read, &mut output, b"TTRPC-SMP-PROBE-OK")
+            .await
+            .with_context(|| {
+                format!(
+                    "post-reboot SMP probe did not complete; portb output: {}",
+                    String::from_utf8_lossy(&output)
+                )
+            })?;
         portb_write.write_all(b"nvx-snapshot\n").await?;
         portb_write.flush().await?;
         CancelContext::new()
@@ -715,11 +747,20 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 "v2 restore did not publish its readiness event"
             );
             portb_write.write_all(TTRPC_SMP_PROBE).await?;
+            let mut output = Vec::new();
+            wait_for_bytes(&mut portb_read, &mut output, b"TTRPC-SMP-PROBE-OK")
+                .await
+                .with_context(|| {
+                    format!(
+                        "restored SMP probe did not complete; portb output: {}",
+                        String::from_utf8_lossy(&output)
+                    )
+                })?;
+            output.clear();
             portb_write
                 .write_all(b"echo TTRPC-V2-RESTORED; nvx-exit 37\n")
                 .await?;
             portb_write.flush().await?;
-            let mut output = Vec::new();
             wait_for_bytes(&mut portb_read, &mut output, RESTORE_MARKER).await?;
             drain_until_closed(&mut portb_read, &mut output).await?;
             anyhow::ensure!(child.wait().await?.success(), "v2 restore server failed");
