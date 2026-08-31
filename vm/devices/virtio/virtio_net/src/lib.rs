@@ -1052,6 +1052,9 @@ impl NicBuilder {
             );
         }
         if let Some(policy) = &self.egress_policy {
+            policy
+                .validate()
+                .context("network device received an invalid egress policy")?;
             endpoint
                 .set_egress_policy(policy.clone())
                 .with_context(|| {

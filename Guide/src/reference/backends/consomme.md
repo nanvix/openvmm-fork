@@ -201,8 +201,11 @@ are not relayed — see limitations).
 
 ### ARP and NDP
 
-- **ARP** — Responds to requests for the gateway MAC address. All other
-  ARP traffic is dropped.
+- **ARP** — Responds to requests for the gateway and for on-link next hops
+  admitted by exact endpoint policy, using the gateway MAC as the proxy
+  address. The shared egress policy accepts only guest-identity requests for
+  its canonical next-hop set, so resolving an endpoint does not authorize
+  unrelated IPv4 traffic.
 - **NDP** — Responds to Router Solicitations (advertising the IPv6
   prefix and DNS servers) and Neighbor Solicitations for the gateway's
   link-local address. DAD is silently ignored.

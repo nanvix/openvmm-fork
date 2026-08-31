@@ -81,15 +81,24 @@ as well as the generated CLI help (via `cargo run -- --help`).
   egress modes. Filtering runs before host socket creation. Active policy
   fails closed for malformed packets, non-IPv4 traffic, and IPv4 options.
   Exact endpoint mode also rejects UDP, ICMP, VLAN, fragments, and every TCP
-  destination not listed. No implicit DNS exception is added.
+  destination not listed. Endpoint addresses must be usable unicast identities;
+  unspecified, current-network, loopback, link-local, multicast, reserved,
+  guest-self, subnet-network, and subnet-broadcast addresses are rejected before
+  host resources are opened. For each endpoint, ARP may resolve the endpoint
+  itself when it is on-link, or the gateway otherwise. Duplicate endpoint
+  addresses share one canonical next hop. This layer-2 permission does not relax
+  the independent destination, TCP, or port check. No implicit DNS exception is
+  added.
 
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
   descriptors, and recreate a fresh Consomme endpoint generation on restore.
   Restore of a networked snapshot requires `--network-profile portable` and
-  the same active egress policy rules. Native sockets and NAT flow tables are
-  not serialized. The capture protocol does not retain pre-capture endpoint
-  completions; restored guest software must establish new host-side flows.
+  the same active egress policy rules. The policy digest binds the saved static
+  identity and its derived ARP next hops, which are reconstructed before vCPUs
+  start. Native sockets and NAT flow tables are not serialized. The capture
+  protocol does not retain pre-capture endpoint completions; restored guest
+  software must establish new host-side flows.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
   one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
   The default mode is read-only; `rw` must be explicit. The guest target must
