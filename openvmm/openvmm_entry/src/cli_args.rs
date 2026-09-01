@@ -902,8 +902,9 @@ options:
 
     /// attach the microVM ABI-v1 virtio-fs device
     ///
-    /// The guest target and access mode are snapshot-authoritative. Restore
-    /// requires a fresh attachment whose target and mode match the snapshot.
+    /// An active snapshot requires the same canonical host path, guest target,
+    /// and mode. A dormant-slot snapshot may bind a new attachment on restore;
+    /// the resumed guest must mount the `microvm` tag explicitly.
     #[clap(
         long = "mount",
         value_name = "GUEST_TARGET,HOST_PATH[,ro|rw]",
@@ -5743,7 +5744,7 @@ mod tests {
         );
 
         let mut with_devices = build_microvm_command_line(&[], true).unwrap();
-        append_microvm_virtio_discovery(&mut with_devices, None, None, true, true).unwrap();
+        append_microvm_virtio_discovery(&mut with_devices, None, false, None, true, true).unwrap();
         assert_eq!(
             with_devices,
             format!(
@@ -5760,6 +5761,7 @@ mod tests {
                 openvmm_defs::config::MICROVM_VIRTIO_NET_KVM_IRQ,
                 false,
             )),
+            false,
             None,
             false,
             false,
@@ -5779,6 +5781,7 @@ mod tests {
                 openvmm_defs::config::MICROVM_VIRTIO_NET_WHP_IRQ,
                 true,
             )),
+            false,
             None,
             false,
             false,
@@ -5795,6 +5798,7 @@ mod tests {
         append_microvm_virtio_discovery(
             &mut with_filesystem,
             None,
+            true,
             Some(&filesystem),
             false,
             false,

@@ -75,13 +75,15 @@ Client mode is required and uses the ABI-v1 five-second connection timeout
 before vCPUs start. The device uses MMIO `0xd0002000`, IRQ 7, and selects
 `hvc1`; its canonical path and policy become the stable restore attachment.
 
-`DevicesConfig.virtiofs_config` may configure one microVM HostFs attachment.
-Set `tag` to `microvm`, supply `root_path`, and set
+`DevicesConfig.virtiofs_config` may bind one HostFs attachment to the fixed
+microVM slot. Set `tag` to `microvm`, supply `root_path`, and set
 `guest_mount_target` to an absolute Linux path. `read_write=false` selects the
-default read-only policy. Restore requires the same tag, guest target, and
-access mode with a freshly supplied live root whose identity matches the
-snapshot. The fixed device uses MMIO `0xd0001000`, IRQ 6, one request queue,
-and no DAX window.
+default read-only policy. Restoring an active attachment requires the exact
+same canonical root path, tag, guest target, and access mode, and the live root
+must retain its saved identity. A snapshot captured with the slot dormant may
+omit the attachment or supply a new one; after `ResumeVM`, the guest explicitly
+mounts tag `microvm`. The fixed device uses MMIO `0xd0001000`, IRQ 6, one
+request queue, and no DAX window.
 
 Capture and restore paths are mutually exclusive. A successful capture halts
 the managed source VM at the committed boundary and terminates the OpenVMM

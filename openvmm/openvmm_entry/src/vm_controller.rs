@@ -143,7 +143,9 @@ pub struct VmController {
     pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
     pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+    pub(crate) microvm_filesystem_slot: bool,
     pub(crate) microvm_filesystem: Option<openvmm_defs::config::MicrovmFilesystemConfig>,
+    pub(crate) microvm_filesystem_root_path: Option<PathBuf>,
     pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
@@ -727,13 +729,16 @@ impl VmController {
             let filesystem = self
                 .microvm_filesystem
                 .as_ref()
-                .zip(self.microvm_filesystem_attachment.clone());
+                .zip(self.microvm_filesystem_root_path.as_deref())
+                .zip(self.microvm_filesystem_attachment.clone())
+                .map(|((filesystem, root_path), attachment)| (filesystem, root_path, attachment));
             let machine_contract = match self.machine_profile {
                 MachineProfile::Microvm { abi_version: 1 } => {
                     openvmm_helpers::snapshot::microvm_v1_machine_contract(
                         &self.source_hypervisor,
                         command_line,
                         network,
+                        self.microvm_filesystem_slot,
                         filesystem,
                         self.microvm_console_attachment.clone(),
                         self.memory,
@@ -759,6 +764,7 @@ impl VmController {
                         &self.source_hypervisor,
                         command_line,
                         network,
+                        self.microvm_filesystem_slot,
                         filesystem,
                         self.microvm_console_attachment.clone(),
                         blocks,

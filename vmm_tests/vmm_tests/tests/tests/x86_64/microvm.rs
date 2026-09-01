@@ -1496,6 +1496,7 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
     const BEFORE_MARKER: &[u8] = b"PHASE5-FS-BEFORE";
     const AFTER_MARKER: &[u8] = b"PHASE5-FS-AFTER";
+    const DORMANT_BEFORE_MARKER: &[u8] = b"PHASE5-DORMANT-BEFORE";
 
     let (openvmm,) = artifacts;
     let (kernel, initrd) = config
@@ -1511,6 +1512,7 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
     }
     .context("failed to create phase-5 test directory")?;
     let snapshot_dir = temp_dir.path().join("snapshot");
+    let dormant_snapshot_dir = temp_dir.path().join("dormant-snapshot");
 
     let read_only_root = temp_dir.path().join("read-only");
     fs_err::create_dir(&read_only_root)?;
@@ -1542,6 +1544,97 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         status.code() == Some(38) && !read_only_root.join("mutation").exists(),
         "phase-5 read-only enforcement failed with {status}: {}",
         output_tail(&output)
+    );
+
+    let mut dormant_capture_args = phase_2_args(hypervisor);
+    dormant_capture_args.extend([
+        "--memory".into(),
+        "128M".into(),
+        "--kernel".into(),
+        kernel.as_os_str().to_owned(),
+        "--initrd".into(),
+        initrd.as_os_str().to_owned(),
+        "--snapshot-destination".into(),
+        dormant_snapshot_dir.as_os_str().to_owned(),
+    ]);
+    let mut dormant_source = OpenvmmTestProcess::launch(openvmm.get(), &dormant_capture_args)?;
+    dormant_source.send_line(
+        "set -eu; grep -q 'virtio_mmio.device=0x1000@0xd0001000:6' /proc/cmdline; \
+         ! grep -q 'virtfs_tag=' /proc/cmdline; \
+         echo PHASE5-DORMANT-BEFORE; nvx-snapshot; \
+         read action; sh -c \"$action\"",
+    )?;
+    dormant_source.wait_for(MICROVM_BOOT_MARKER)?;
+    dormant_source.wait_for(MICROVM_SHELL_PROMPT)?;
+    let (status, dormant_source_output) = dormant_source.wait()?;
+    anyhow::ensure!(
+        status.success() && count_output_lines(&dormant_source_output, DORMANT_BEFORE_MARKER) == 1,
+        "phase-5 dormant snapshot source failed with {status}: {}",
+        output_tail(&dormant_source_output)
+    );
+    let (dormant_manifest, _) =
+        openvmm_helpers::snapshot::read_snapshot(&dormant_snapshot_dir, MEMORY_BYTES)?;
+    let dormant_contract = dormant_manifest
+        .machine_contract
+        .as_ref()
+        .context("phase-5 dormant snapshot is missing its machine contract")?;
+    anyhow::ensure!(
+        dormant_contract.microvm_filesystem_slot_version
+            == openvmm_helpers::snapshot::MICROVM_FILESYSTEM_SLOT_VERSION
+            && dormant_contract.microvm_filesystem.is_none()
+            && dormant_contract
+                .devices
+                .iter()
+                .any(|device| device.stable_id == "fs:microvm0")
+            && !dormant_contract
+                .attachments
+                .iter()
+                .any(|attachment| attachment.stable_id == "fs:microvm0"),
+        "phase-5 snapshot did not encode a dormant filesystem slot"
+    );
+    let dormant_fingerprint = snapshot_payload_fingerprint(&dormant_snapshot_dir)?;
+
+    let mut dormant_restore_args = phase_2_args(hypervisor);
+    dormant_restore_args.extend([
+        "--restore-snapshot".into(),
+        dormant_snapshot_dir.as_os_str().to_owned(),
+        "--restore-entropy".into(),
+    ]);
+    let mut dormant_restore = OpenvmmTestProcess::launch(openvmm.get(), &dormant_restore_args)?;
+    dormant_restore.send_line("echo PHASE5-DORMANT-NO-MOUNT; nvx-exit 40")?;
+    let (status, output) = dormant_restore.wait()?;
+    anyhow::ensure!(
+        status.code() == Some(40) && contains_bytes(&output, b"PHASE5-DORMANT-NO-MOUNT"),
+        "phase-5 dormant restore without mount failed with {status}: {}",
+        output_tail(&output)
+    );
+
+    let late_root = temp_dir.path().join("late-root");
+    fs_err::create_dir(&late_root)?;
+    fs_err::write(late_root.join("host-seed"), b"PHASE5-HOST-TO-GUEST")?;
+    let mut attached_restore_args = dormant_restore_args;
+    attached_restore_args.extend([
+        "--mount".into(),
+        format!("/mnt/late,{},rw", late_root.display()).into(),
+    ]);
+    let mut attached_restore = OpenvmmTestProcess::launch(openvmm.get(), &attached_restore_args)?;
+    attached_restore.send_line(
+        "set -eu; mkdir -p /mnt/late; mount -t virtiofs microvm /mnt/late; \
+         [ \"$(cat /mnt/late/host-seed)\" = PHASE5-HOST-TO-GUEST ]; \
+         printf PHASE5-GUEST-TO-HOST > /mnt/late/guest-result; \
+         echo PHASE5-DORMANT-ATTACHED; nvx-exit 41",
+    )?;
+    let (status, output) = attached_restore.wait()?;
+    anyhow::ensure!(
+        status.code() == Some(41)
+            && contains_bytes(&output, b"PHASE5-DORMANT-ATTACHED")
+            && fs_err::read(late_root.join("guest-result"))? == b"PHASE5-GUEST-TO-HOST",
+        "phase-5 dormant restore-time attachment failed with {status}: {}",
+        output_tail(&output)
+    );
+    anyhow::ensure!(
+        snapshot_payload_fingerprint(&dormant_snapshot_dir)? == dormant_fingerprint,
+        "phase-5 dormant restores modified snapshot payloads"
     );
 
     let root = temp_dir.path().join("live-root");
@@ -1607,14 +1700,15 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         output_tail(&output)
     );
 
-    let replacement_root = temp_dir.path().join("replacement-root");
-    fs_err::create_dir(&replacement_root)?;
+    let saved_root = temp_dir.path().join("saved-live-root");
+    fs_err::rename(&root, &saved_root)?;
+    fs_err::create_dir(&root)?;
     let mut replacement_args = phase_2_args(hypervisor);
     replacement_args.extend([
         "--restore-snapshot".into(),
         snapshot_dir.as_os_str().to_owned(),
         "--mount".into(),
-        format!("/mnt/share,{},rw", replacement_root.display()).into(),
+        format!("/mnt/share,{},rw", root.display()).into(),
     ]);
     let replacement = OpenvmmTestProcess::launch(openvmm.get(), &replacement_args)?;
     let (status, output) = replacement.wait()?;
@@ -1623,6 +1717,26 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         "phase-5 restore accepted a replacement root: {}",
         output_tail(&output)
     );
+    fs_err::remove_dir(&root)?;
+    fs_err::rename(&saved_root, &root)?;
+
+    let moved_root = temp_dir.path().join("moved-live-root");
+    fs_err::rename(&root, &moved_root)?;
+    let mut moved_root_args = phase_2_args(hypervisor);
+    moved_root_args.extend([
+        "--restore-snapshot".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--mount".into(),
+        format!("/mnt/share,{},rw", moved_root.display()).into(),
+    ]);
+    let moved_root_restore = OpenvmmTestProcess::launch(openvmm.get(), &moved_root_args)?;
+    let (status, output) = moved_root_restore.wait()?;
+    anyhow::ensure!(
+        !status.success() && contains_bytes(&output, b"canonical host path does not match"),
+        "phase-5 restore accepted the captured root at a new canonical path: {}",
+        output_tail(&output)
+    );
+    fs_err::rename(&moved_root, &root)?;
 
     let original = root.join("open-handle");
     let saved_original = root.join("saved-open-handle");
@@ -2477,7 +2591,7 @@ exit 37
                     panic!("microVM test did not produce PVH load mode");
                 };
                 cmdline.push_str(" nvx_exec=/microvm-block-test.sh");
-                append_microvm_virtio_discovery(cmdline, None, None, false, true).unwrap();
+                append_microvm_virtio_discovery(cmdline, None, false, None, false, true).unwrap();
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
                     VirtioBlkHandle {
@@ -2587,7 +2701,8 @@ while :; do sleep 3600; done
                     panic!("microVM test did not produce PVH load mode");
                 };
                 cmdline.push_str(" nvx_exec=/microvm-v2-sandbox-blocks.sh");
-                append_microvm_v2_virtio_discovery(cmdline, None, None, false, &roles).unwrap();
+                append_microvm_v2_virtio_discovery(cmdline, None, false, None, false, &roles)
+                    .unwrap();
                 config.microvm_sandbox_blocks = roles.to_vec();
                 config
                     .virtio_devices
@@ -2711,6 +2826,7 @@ nvx-exit 37
                 append_microvm_virtio_discovery(
                     cmdline,
                     Some((&network, irq, gateway_dns)),
+                    false,
                     None,
                     false,
                     false,

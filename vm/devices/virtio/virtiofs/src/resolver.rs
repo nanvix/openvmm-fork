@@ -34,6 +34,9 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
     ) -> Result<Self::Output, Self::Error> {
         let device = match resource.profile {
             VirtioFsProfile::Standard => match &resource.fs {
+                VirtioFsBackend::Dormant => {
+                    anyhow::bail!("standard virtio-fs requires an active backend")
+                }
                 VirtioFsBackend::HostFs {
                     root_path,
                     mount_options,
@@ -78,6 +81,18 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
                     VirtioFsDevice::new(input.driver_source, &resource.tag, fs, 0, None)
                 }
             },
+            VirtioFsProfile::MicrovmV1Dormant { stable_id } => {
+                anyhow::ensure!(
+                    resource.tag == crate::profile::MICROVM_MOUNT_TAG,
+                    "microVM virtio-fs tag must be '{}'",
+                    crate::profile::MICROVM_MOUNT_TAG
+                );
+                anyhow::ensure!(
+                    matches!(resource.fs, VirtioFsBackend::Dormant),
+                    "dormant microVM virtio-fs cannot have an active backend"
+                );
+                VirtioFsDevice::new_microvm_dormant(input.driver_source, stable_id, None)?
+            }
             VirtioFsProfile::MicrovmV1 {
                 stable_id,
                 root_identity,

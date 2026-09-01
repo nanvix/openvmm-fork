@@ -60,6 +60,9 @@ pub mod fs {
             root_identity: Vec<u8>,
             read_only: bool,
         },
+        MicrovmV1Dormant {
+            stable_id: String,
+        },
     }
 
     #[derive(MeshPayload)]
@@ -77,6 +80,7 @@ pub mod fs {
         Aggregate {
             children: Vec<VirtioFsAggregateChild>,
         },
+        Dormant,
     }
 
     /// A single host folder exposed as a named child of a [`VirtioFsBackend::Aggregate`].

@@ -161,19 +161,23 @@ guest transmit offset live in the device-private virtio payload, preserving
 their order across a new-process restore. Host input is gated before the vCPU
 snapshot boundary and resumed only if capture rolls back.
 
-For microVM virtio-fs, the manifest records the stable attachment ID, pinned
-root identity, guest mount target, access mode, no-DAX queue policy, and
-`live-revalidate` restore mode. The device-private payload records FUSE
-negotiation, namespace IDs and aliases, lookup counts, reopenable handles,
-bounded directory-entry snapshots and cookies, and queue progress. Native file
-descriptors and Windows handles are never serialized. An already-open
-directory continues through its captured entry list; a newly opened directory
-observes the current host tree.
+For microVM virtio-fs, the manifest always records the fixed, guest-discoverable
+slot. A dormant slot has no host attachment or filesystem policy and carries
+explicit dormant device-private state. An active slot also records the stable
+attachment ID, exact canonical host path, pinned root identity, guest mount
+target, access mode, no-DAX queue policy, and `live-revalidate` restore mode.
+Its device-private payload records FUSE negotiation, namespace IDs and aliases,
+lookup counts, reopenable handles, bounded directory-entry snapshots and
+cookies, and queue progress. Native file descriptors and Windows handles are
+never serialized.
 
-Restore requires a fresh
-`--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>` attachment. The target and mode must
-match the manifest. OpenVMM validates the new root and every saved object
-identity before starting a vCPU.
+Restoring an active slot requires a fresh
+`--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>` attachment with the same canonical
+host path, target, and mode. OpenVMM independently validates the root and every
+saved object identity before starting a vCPU. A dormant-slot snapshot may
+restore without an attachment or bind a new one. For a new attachment, the
+resumed guest explicitly mounts tag `microvm`; the cold-boot mount hook does not
+run again.
 
 ```admonish warning
 The host directory is external live state, not snapshot content. Host
@@ -187,6 +191,7 @@ The rules are:
 | Scenario | Result |
 |---|---|
 | Device set matches exactly | Restore succeeds |
+| Dormant microVM virtio-fs slot becomes attached | **Restore succeeds** — the only additive transition |
 | Snapshot contains a device not in current config | **Restore fails** — unknown unit name |
 | Current config has a device not in snapshot | **Restore fails** — inventory mismatch |
 

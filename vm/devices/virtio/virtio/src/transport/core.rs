@@ -128,6 +128,11 @@ impl VirtioTransportCore {
         disabled_features: u64,
     ) -> std::io::Result<Self> {
         let traits = device.traits();
+        let doorbell_registration = if device.supports_accelerated_doorbells() {
+            doorbell_registration
+        } else {
+            None
+        };
         let queues: Vec<QueueData> = (0..traits.max_queues)
             .map(|i| {
                 let size = device.queue_size(i);
