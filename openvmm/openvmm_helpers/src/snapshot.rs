@@ -1147,17 +1147,21 @@ fn write_snapshot_with_memory_publication(
         scratch_file,
         memory_publication,
     )?;
+    let commit = openvmm_defs::profile::ProfileSpan::start();
     if let Err(error) =
         ensure_path_absent(dir, "snapshot destination").and_then(|()| staging.publish(dir))
     {
         return Err(staging.rollback(error));
     }
+    commit.complete("capture", "publication_commit", Default::default());
 
     let parent = snapshot_parent(dir);
+    let parent_sync = openvmm_defs::profile::ProfileSpan::start();
     sync_directory(parent).map_err(|error| SnapshotWriteError::Committed {
         path: dir.to_owned(),
         error,
     })?;
+    parent_sync.complete("capture", "publication_parent_sync", Default::default());
     Ok(())
 }
 
@@ -1199,8 +1203,15 @@ fn stage_snapshot(
     let manifest_path = staging.path().join(MANIFEST_FILE_NAME);
 
     let result = (|| -> anyhow::Result<()> {
+        let state_write = openvmm_defs::profile::ProfileSpan::start();
         write_bytes(&state_path, saved_state_bytes, "saved state")?;
+        state_write.complete(
+            "capture",
+            "publication_state",
+            profile_path_counters(&state_path, saved_state_bytes.len() as u64),
+        );
         if memory_publication == MemoryPublication::IndependentCopy {
+            let memory_publish = openvmm_defs::profile::ProfileSpan::start();
             copy_exact(
                 memory_file,
                 &memory_path,
@@ -1208,10 +1219,16 @@ fn stage_snapshot(
                 "memory backing file",
                 "snapshot memory",
             )?;
+            memory_publish.complete(
+                "capture",
+                "publication_memory",
+                profile_path_counters(&memory_path, manifest.memory_size_bytes),
+            );
         }
         match (paired_scratch_block(manifest), scratch_file) {
             (Some(scratch), Some(scratch_file)) => {
                 let scratch_path = staging.path().join(SCRATCH_FILE_NAME);
+                let scratch_publish = openvmm_defs::profile::ProfileSpan::start();
                 copy_exact(
                     scratch_file,
                     &scratch_path,
@@ -1225,6 +1242,11 @@ fn stage_snapshot(
                     &scratch.identity,
                     "scratch.img",
                 )?;
+                scratch_publish.complete(
+                    "capture",
+                    "publication_scratch",
+                    profile_path_counters(&scratch_path, scratch.length),
+                );
             }
             (Some(_), None) => anyhow::bail!("snapshot contract requires a paired scratch image"),
             (None, Some(_)) => {
@@ -1245,13 +1267,27 @@ fn stage_snapshot(
             manifest_bytes.len() as u64 <= MAX_MANIFEST_SIZE_BYTES,
             "snapshot manifest exceeds the maximum size of {MAX_MANIFEST_SIZE_BYTES} bytes",
         );
+        let manifest_write = openvmm_defs::profile::ProfileSpan::start();
         write_bytes(&manifest_path, &manifest_bytes, "snapshot manifest")?;
+        manifest_write.complete(
+            "capture",
+            "publication_manifest",
+            profile_path_counters(&manifest_path, manifest_bytes.len() as u64),
+        );
 
         if memory_publication == MemoryPublication::OwnedExactFile {
+            let memory_publish = openvmm_defs::profile::ProfileSpan::start();
             publish_owned_memory_file(&mut staging, memory_file, manifest.memory_size_bytes)?;
+            memory_publish.complete(
+                "capture",
+                "publication_memory",
+                profile_path_counters(&memory_path, manifest.memory_size_bytes),
+            );
         }
 
+        let staging_sync = openvmm_defs::profile::ProfileSpan::start();
         sync_directory(staging.path())?;
+        staging_sync.complete("capture", "publication_staging_sync", Default::default());
         Ok(())
     })();
     match result {
@@ -1311,6 +1347,26 @@ impl OpenedSnapshot {
     /// Returns the saved-state bytes read from this opened generation.
     pub fn state_bytes(&self) -> &[u8] {
         &self.state_bytes
+    }
+
+    /// Returns total logical and allocated bytes for the opened artifacts.
+    ///
+    /// This is intended for opt-in profiling. Restore validation does not
+    /// depend on allocation accounting being available.
+    pub fn artifact_size_counters(&self) -> anyhow::Result<(u64, u64)> {
+        [&self.manifest_file, &self.state_file, &self.memory_file]
+            .into_iter()
+            .try_fold((0_u64, 0_u64), |(logical, allocated), file| {
+                let length = file.metadata()?.len();
+                Ok((
+                    logical
+                        .checked_add(length)
+                        .context("logical byte count overflow")?,
+                    allocated
+                        .checked_add(allocated_file_bytes(file, length)?)
+                        .context("allocated byte count overflow")?,
+                ))
+            })
     }
 
     /// Opens the paired scratch artifact relative to this snapshot generation.
@@ -1845,6 +1901,23 @@ fn write_bytes(path: &Path, bytes: &[u8], description: &str) -> anyhow::Result<(
     file.sync_all()
         .with_context(|| format!("failed to flush {description}"))?;
     Ok(())
+}
+
+fn profile_path_counters(
+    path: &Path,
+    logical_bytes: u64,
+) -> openvmm_defs::profile::ProfileCounters {
+    if !openvmm_defs::profile::enabled() {
+        return Default::default();
+    }
+    let allocated_bytes = std::fs::File::open(path)
+        .ok()
+        .and_then(|file| allocated_file_bytes(&file, logical_bytes).ok());
+    openvmm_defs::profile::ProfileCounters {
+        logical_bytes: Some(logical_bytes),
+        allocated_bytes,
+        ..Default::default()
+    }
 }
 
 fn publish_owned_memory_file(

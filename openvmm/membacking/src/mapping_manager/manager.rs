@@ -61,6 +61,7 @@ impl MappingManager {
         max_addr: u64,
         minimum_va_alignment: Option<usize>,
         supports_memory_fault_resolution: bool,
+        track_memory_faults: bool,
     ) -> Result<(Self, Arc<VaMapper>), VaMapperError> {
         let this = Self::new_bare(spawn, max_addr, minimum_va_alignment);
         // Create the primary mapper as part of construction. Being first, it is
@@ -72,6 +73,7 @@ impl MappingManager {
                 true,
                 MapperRole::Primary {
                     supports_memory_fault_resolution,
+                    track_memory_faults,
                 },
             )
             .await?;
@@ -1524,6 +1526,7 @@ mod tests {
             true, // eager
             MapperRole::Primary {
                 supports_memory_fault_resolution: false,
+                track_memory_faults: false,
             },
         );
         let (mapper, _) = futures::join!(mapper_future, async {
@@ -1564,6 +1567,7 @@ mod tests {
             true, // eager
             MapperRole::Primary {
                 supports_memory_fault_resolution: false,
+                track_memory_faults: false,
             },
         );
         let (mapper, mapper_req_send) = futures::join!(mapper_future, async {

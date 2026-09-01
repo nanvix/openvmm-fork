@@ -818,9 +818,18 @@ impl VmController {
                 .snapshot_memory_handle
                 .as_ref()
                 .context("microVM snapshot capture lost its exact RAM handle")?;
+            let memory_handle_flush = openvmm_defs::profile::ProfileSpan::start();
             memory_file
                 .sync_all()
                 .context("failed to flush snapshot RAM handle")?;
+            memory_handle_flush.complete(
+                "capture",
+                "memory_handle_flush",
+                openvmm_defs::profile::ProfileCounters {
+                    logical_bytes: Some(self.memory),
+                    ..Default::default()
+                },
+            );
             let scratch_file = (matches!(
                 self.machine_profile,
                 MachineProfile::Microvm { abi_version: 2 }
@@ -837,7 +846,8 @@ impl VmController {
                         .context("paired snapshot lost its scratch backing handle")
                 })
                 .transpose()?;
-            if self.snapshot_memory_file.is_some() {
+            let publication = openvmm_defs::profile::ProfileSpan::start();
+            let write_result = if self.snapshot_memory_file.is_some() {
                 openvmm_helpers::snapshot::write_snapshot_from_owned_memory_and_scratch_files(
                     &destination,
                     &manifest,
@@ -853,8 +863,18 @@ impl VmController {
                     memory_file,
                     scratch_file,
                 )
+            };
+            if write_result.is_ok() {
+                publication.complete_milestone(
+                    "capture",
+                    "publication",
+                    openvmm_defs::profile::ProfileCounters {
+                        logical_bytes: Some(self.memory),
+                        ..Default::default()
+                    },
+                );
             }
-            .map_err(anyhow::Error::new)
+            write_result.map_err(anyhow::Error::new)
         })();
 
         match result {

@@ -63,6 +63,15 @@ pub struct GuestMemoryManager {
     supports_memory_fault_resolution: bool,
 }
 
+/// Aggregate guest-physical fault counters for a memory manager.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryFaultCounters {
+    /// Guest memory faults resolved through the VMM.
+    pub guest_faults: u64,
+    /// Bytes returned to the backend while resolving those faults.
+    pub populated_bytes: u64,
+}
+
 /// A single RAM backing allocation — one memfd or anonymous region.
 #[derive(Debug)]
 struct RamBacking {
@@ -362,6 +371,7 @@ pub struct GuestMemoryBuilder {
     pin_mappings: bool,
     x86_legacy_support: bool,
     supports_memory_fault_resolution: bool,
+    track_memory_faults: bool,
     backing_requests: Vec<RamBackingRequest>,
 }
 
@@ -373,6 +383,7 @@ impl GuestMemoryBuilder {
             pin_mappings: false,
             x86_legacy_support: false,
             supports_memory_fault_resolution: false,
+            track_memory_faults: false,
             backing_requests: Vec::new(),
         }
     }
@@ -415,6 +426,12 @@ impl GuestMemoryBuilder {
     /// via [`GuestMemoryManager::memory_fault_resolver`].
     pub fn supports_memory_fault_resolution(mut self, enable: bool) -> Self {
         self.supports_memory_fault_resolution = enable;
+        self
+    }
+
+    /// Enables guest-memory fault accounting for diagnostics.
+    pub fn track_memory_faults(mut self, enable: bool) -> Self {
+        self.track_memory_faults = enable;
         self
     }
 
@@ -596,6 +613,7 @@ impl GuestMemoryBuilder {
             max_addr,
             max_hugepage_size,
             self.supports_memory_fault_resolution,
+            self.track_memory_faults,
         )
         .await
         .map_err(MemoryBuildError::VaMapper)?;
@@ -787,6 +805,15 @@ impl GuestMemoryManager {
     /// Flushes guest writes from the primary shared file mappings.
     pub fn flush_shared_file_backing(&self) -> io::Result<()> {
         self.va_mapper.flush_shared_file_mappings()
+    }
+
+    /// Returns aggregate guest-physical fault and population counters.
+    pub fn fault_counters(&self) -> MemoryFaultCounters {
+        let counters = self.va_mapper.fault_counters();
+        MemoryFaultCounters {
+            guest_faults: counters.guest_faults,
+            populated_bytes: counters.populated_bytes,
+        }
     }
 
     /// Returns a resolver that prepares guest-memory backing on demand in

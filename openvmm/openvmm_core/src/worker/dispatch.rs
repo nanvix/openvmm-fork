@@ -319,6 +319,7 @@ impl Worker for VmWorker {
     const ID: WorkerId<Self::Parameters> = VM_WORKER;
 
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+        let worker_construct = openvmm_defs::profile::ProfileSpan::start();
         let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
         let snapshot_ready = parameters.snapshot_ready;
         let snapshot_restore_guards = parameters.snapshot_restore_guards;
@@ -399,12 +400,14 @@ impl Worker for VmWorker {
 
         LOADED_VM.store(&vm);
 
-        Ok(Self {
+        let worker = Self {
             vm,
             rpc: parameters.rpc,
             device_thread,
             snapshot_restore_guards,
-        })
+        };
+        worker_construct.complete_milestone("startup", "worker_construct", Default::default());
+        Ok(worker)
     }
 
     fn restart(state: Self::State) -> anyhow::Result<Self> {
@@ -796,6 +799,7 @@ pub(crate) struct LoadedVm {
     restore_gate_timeout: Option<Duration>,
     restore_gate_deadline: Option<Instant>,
     restore_input_gated: bool,
+    restored_from_snapshot: bool,
     snapshot_boundary_requests:
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     snapshot_ready: Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
@@ -1134,6 +1138,7 @@ impl InitializedVm {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
 
+        let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
@@ -1151,6 +1156,7 @@ impl InitializedVm {
                 ),
             })
             .context("failed to create the prototype partition")?;
+        partition_prototype.complete("startup", "partition_prototype", Default::default());
 
         let physical_address_size = proto.max_physical_address_size();
 
@@ -1233,6 +1239,7 @@ impl InitializedVm {
         })
         .context("invalid memory configuration")?;
         let mem_layout = resolved_layout.memory_layout;
+        let guest_memory_bytes = mem_layout.ram().iter().map(|range| range.range.len()).sum();
         let resolved_pcie_root_complex_ranges = resolved_layout.pcie_root_complex_ranges;
         let virtio_mmio_region = resolved_layout.virtio_mmio_region;
         let chipset_mmio = resolved_layout.chipset_mmio;
@@ -1307,6 +1314,7 @@ impl InitializedVm {
         memory_builder = memory_builder
             .vtl0_alias_map(vtl0_alias_map)
             .supports_memory_fault_resolution(supports_memory_fault_resolution)
+            .track_memory_faults(openvmm_defs::profile::enabled())
             .x86_legacy_support(
                 matches!(cfg.load_mode, LoadMode::Pcat { .. }) || cfg.chipset.with_hyperv_vga,
             );
@@ -1368,10 +1376,19 @@ impl InitializedVm {
             .end_of_layout()
             .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
 
+        let cow_map_view = openvmm_defs::profile::ProfileSpan::start();
         let mut memory_manager = memory_builder
             .build(max_addr)
             .await
             .context("failed to build guest memory")?;
+        cow_map_view.complete(
+            "startup",
+            "cow_map_view",
+            openvmm_defs::profile::ProfileCounters {
+                logical_bytes: Some(guest_memory_bytes),
+                ..Default::default()
+            },
+        );
 
         let gm = memory_manager
             .client()
@@ -1391,6 +1408,7 @@ impl InitializedVm {
             ));
         }
 
+        let partition_build = openvmm_defs::profile::ProfileSpan::start();
         let (partition, vps) = proto
             .build(virt::PartitionConfig {
                 mem_layout: &mem_layout,
@@ -1401,11 +1419,13 @@ impl InitializedVm {
                     .then(|| memory_manager.memory_fault_resolver()),
             })
             .context("failed to create the partition")?;
+        partition_build.complete("startup", "partition_build", Default::default());
 
         let vps = vps.into_iter().map(|vp| Box::new(vp) as _).collect();
 
         let partition = Arc::new(partition);
 
+        let gpa_registration = openvmm_defs::profile::ProfileSpan::start();
         memory_manager
             .attach_partition(Vtl::Vtl0, &partition.memory_mapper(Vtl::Vtl0), None)
             .await
@@ -1421,7 +1441,16 @@ impl InitializedVm {
                 .await
                 .context("failed to attach memory to VTL2")?;
         }
+        gpa_registration.complete(
+            "startup",
+            "gpa_registration",
+            openvmm_defs::profile::ProfileCounters {
+                logical_bytes: Some(guest_memory_bytes),
+                ..Default::default()
+            },
+        );
 
+        let partition_finalize = openvmm_defs::profile::ProfileSpan::start();
         let finalize_result = {
             let _span = tracing::info_span!("post-memory partition finalization").entered();
             let started = std::time::Instant::now();
@@ -1434,6 +1463,7 @@ impl InitializedVm {
             result
         };
         finalize_result.context("failed to finalize partition memory")?;
+        partition_finalize.complete("startup", "partition_finalize", Default::default());
 
         Ok(Self {
             partition,
@@ -1466,6 +1496,8 @@ impl InitializedVm {
         restore_time: Option<(Duration, u64, Option<u64>)>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
+
+        let restored_from_snapshot = saved_state.is_some();
 
         let Self {
             partition,
@@ -3131,6 +3163,7 @@ impl InitializedVm {
             restore_gate_timeout: None,
             restore_gate_deadline: None,
             restore_input_gated: false,
+            restored_from_snapshot,
             snapshot_boundary_requests: None,
             snapshot_ready: None,
             snapshot_stop_guard: None,
@@ -3216,9 +3249,11 @@ impl InitializedVm {
                     );
                 }
             }
+            let saved_state_restore = openvmm_defs::profile::ProfileSpan::start();
             this.restore(saved_state)
                 .await
                 .context("loadedvm restore failed")?;
+            saved_state_restore.complete("restore", "saved_state_restore", Default::default());
             if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
                 this.state_units
                     .advance_time(downtime)
@@ -3704,10 +3739,23 @@ impl LoadedVm {
                 .context("failed to establish post-restore input gate")?;
             self.restore_input_gated = true;
         }
+        let device_start = openvmm_defs::profile::ProfileSpan::start();
         self.state_units
             .start()
             .await
             .context("VM state units failed to start")?;
+        if self.restored_from_snapshot && openvmm_defs::profile::enabled() {
+            let faults = self.inner.memory_manager.fault_counters();
+            device_start.complete(
+                "restore",
+                "device_start",
+                openvmm_defs::profile::ProfileCounters {
+                    gpa_faults: Some(faults.guest_faults),
+                    populated_bytes: Some(faults.populated_bytes),
+                    ..Default::default()
+                },
+            );
+        }
         if let Some(mut sink) = self.restore_ready_sink.take() {
             let signal_result = sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
                 #[cfg(windows)]
@@ -4079,6 +4127,7 @@ impl LoadedVm {
                                 ));
                             }
 
+                            let quiesce = openvmm_defs::profile::ProfileSpan::start();
                             if let Err(error) = self.state_units.quiesce_for_save(timeout).await {
                                 return Err(if error.has_uncertain_state() {
                                     openvmm_defs::rpc::SnapshotQuiesceError::Uncertain(
@@ -4090,13 +4139,18 @@ impl LoadedVm {
                                     )
                                 });
                             }
+                            quiesce.complete("capture", "quiesce", Default::default());
                             self.running = false;
 
+                            let save_state = openvmm_defs::profile::ProfileSpan::start();
                             let saved_state = self.save().await.map_err(|error| {
                                 openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
                                     RemoteError::new(error),
                                 )
                             })?;
+                            save_state.complete("capture", "save_state", Default::default());
+                            let mapped_memory_flush =
+                                openvmm_defs::profile::ProfileSpan::start();
                             self.inner
                                 .memory_manager
                                 .flush_shared_file_backing()
@@ -4106,6 +4160,11 @@ impl LoadedVm {
                                         RemoteError::new(error),
                                     )
                                 })?;
+                            mapped_memory_flush.complete(
+                                "capture",
+                                "mapped_memory_flush",
+                                Default::default(),
+                            );
                             let tsc_frequency_hz = self
                                 .inner
                                 .partition
