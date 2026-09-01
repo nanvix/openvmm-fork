@@ -837,13 +837,23 @@ impl VmController {
                         .context("paired snapshot lost its scratch backing handle")
                 })
                 .transpose()?;
-            openvmm_helpers::snapshot::write_snapshot_from_memory_and_scratch_files(
-                &destination,
-                &manifest,
-                &saved_state_bytes,
-                memory_file,
-                scratch_file,
-            )
+            if self.snapshot_memory_file.is_some() {
+                openvmm_helpers::snapshot::write_snapshot_from_owned_memory_and_scratch_files(
+                    &destination,
+                    &manifest,
+                    &saved_state_bytes,
+                    memory_file,
+                    scratch_file,
+                )
+            } else {
+                openvmm_helpers::snapshot::write_snapshot_from_memory_and_scratch_files(
+                    &destination,
+                    &manifest,
+                    &saved_state_bytes,
+                    memory_file,
+                    scratch_file,
+                )
+            }
             .map_err(anyhow::Error::new)
         })();
 
@@ -865,10 +875,9 @@ impl VmController {
                 GuestSnapshotAction::Terminate { exit_code: 0 }
             }
             Err(error) => {
-                let committed = error
-                    .downcast_ref::<openvmm_helpers::snapshot::SnapshotWriteError>()
-                    .is_some_and(|error| error.is_committed());
-                if committed {
+                let write_error =
+                    error.downcast_ref::<openvmm_helpers::snapshot::SnapshotWriteError>();
+                if write_error.is_some_and(|error| error.is_committed()) {
                     if let Some(cleanup) = self.microvm_console_socket_cleanup.take()
                         && let Err(cleanup_error) = cleanup.remove_if_owned()
                     {
@@ -881,6 +890,12 @@ impl VmController {
                         error = error.as_ref() as &dyn std::error::Error,
                         path = %destination.display(),
                         "snapshot committed but final durability reporting failed; terminating source"
+                    );
+                    GuestSnapshotAction::Terminate { exit_code: 1 }
+                } else if write_error.is_some_and(|error| !error.is_rollback_safe()) {
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot failed before commit but automatic RAM alias cleanup is uncertain; terminating source"
                     );
                     GuestSnapshotAction::Terminate { exit_code: 1 }
                 } else {

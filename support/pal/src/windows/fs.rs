@@ -9,6 +9,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::io;
 use std::mem::zeroed;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsHandle;
 use std::os::windows::io::AsRawHandle;
@@ -29,7 +30,10 @@ use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO;
 use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
 use windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
@@ -68,8 +72,26 @@ pub fn open_relative_read_only(
         directory,
         name,
         FILE_GENERIC_READ,
+        FILE_SHARE_READ,
         ntioapi::FILE_OPEN,
         "open",
+    )
+}
+
+/// Opens an existing file relative to a directory without denying access to
+/// other handles. This is intended for identity checks during publication,
+/// not for retaining an immutable restore generation.
+pub fn open_relative_for_identity(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> io::Result<fs::File> {
+    open_relative_file(
+        directory,
+        name,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ntioapi::FILE_OPEN,
+        "open for identity check",
     )
 }
 
@@ -79,6 +101,7 @@ pub fn create_relative_new(directory: &fs::File, name: &std::ffi::OsStr) -> io::
         directory,
         name,
         FILE_GENERIC_WRITE,
+        FILE_SHARE_READ,
         ntioapi::FILE_CREATE,
         "create",
     )
@@ -88,6 +111,7 @@ fn open_relative_file(
     directory: &fs::File,
     name: &std::ffi::OsStr,
     desired_access: u32,
+    share_access: u32,
     create_disposition: u32,
     operation: &str,
 ) -> io::Result<fs::File> {
@@ -109,7 +133,7 @@ fn open_relative_file(
             &mut io_status,
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ,
+            share_access,
             create_disposition,
             ntioapi::FILE_NON_DIRECTORY_FILE
                 | ntioapi::FILE_OPEN_REPARSE_POINT
@@ -125,6 +149,68 @@ fn open_relative_file(
         )
     })?;
     Ok(unsafe { fs::File::from_raw_handle(handle) })
+}
+
+/// Creates a hard link to `source` relative to an exact opened directory.
+pub fn hard_link_relative(
+    source: &fs::File,
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    let name: Vec<u16> = name.encode_wide().collect();
+    if name.is_empty()
+        || name.iter().any(|character| *character == 0)
+        || name.as_slice() == ['.' as u16]
+        || name.as_slice() == ['.' as u16, '.' as u16]
+        || name
+            .iter()
+            .any(|character| *character == b'/' as u16 || *character == b'\\' as u16)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hard-link name must be one non-special path component",
+        ));
+    }
+
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hard-link name is too long"))?;
+    let header_bytes = std::mem::offset_of!(ntioapi::FILE_LINK_INFORMATION, FileName);
+    let information_bytes = header_bytes
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hard-link name is too long"))?
+        .max(size_of::<ntioapi::FILE_LINK_INFORMATION>());
+    let information_length = u32::try_from(information_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "hard-link name is too long"))?;
+    let mut information = vec![0_u64; information_bytes.div_ceil(size_of::<u64>())];
+    let information = information
+        .as_mut_ptr()
+        .cast::<ntioapi::FILE_LINK_INFORMATION>();
+    let mut io_status = IO_STATUS_BLOCK::default();
+
+    // SAFETY: `information` is aligned and sized for FILE_LINK_INFORMATION
+    // followed by the exact UTF-16 name. Both handles remain live for the
+    // duration of the synchronous call, which does not retain the buffer.
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = directory.as_raw_handle();
+        (*information).FileNameLength = name_bytes;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (&raw mut (*information).FileName).cast::<u16>(),
+            name.len(),
+        );
+        chk_status(ntioapi::NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut io_status,
+            information.cast(),
+            information_length,
+            ntioapi::FileLinkInformation,
+        ))?;
+    }
+    Ok(())
 }
 
 /// Enumerates names relative to an opened directory handle.
