@@ -919,12 +919,12 @@ impl VmService {
                 source_hypervisor
             );
         }
+        let microvm_filesystem_slot = if let Some(restore) = &authoritative_restore {
+            crate::microvm_filesystem_slot_from_snapshot(&restore.machine_contract)?
+        } else {
+            is_microvm
+        };
         let restored_microvm_filesystem = if let Some(restore) = &authoritative_restore {
-            let has_device = restore
-                .machine_contract
-                .devices
-                .iter()
-                .any(|device| device.stable_id == "fs:microvm0");
             let saved_policy = restore.machine_contract.microvm_filesystem.as_ref();
             let saved_attachment = restore
                 .machine_contract
@@ -932,8 +932,11 @@ impl VmService {
                 .iter()
                 .find(|attachment| attachment.stable_id == "fs:microvm0");
             anyhow::ensure!(
-                has_device == saved_policy.is_some() && has_device == saved_attachment.is_some(),
-                "snapshot microVM filesystem device, policy, and attachment inventories disagree"
+                saved_policy.is_some() == saved_attachment.is_some()
+                    && (restore.machine_contract.microvm_filesystem_slot_version
+                        == openvmm_helpers::snapshot::MICROVM_FILESYSTEM_SLOT_VERSION
+                        || microvm_filesystem_slot == saved_policy.is_some()),
+                "snapshot microVM filesystem slot, policy, and attachment inventories disagree"
             );
             match (saved_policy, saved_attachment) {
                 (Some(saved_policy), Some(saved_attachment)) => {
@@ -951,17 +954,44 @@ impl VmService {
                     let (root_path, attachment) =
                         crate::microvm_filesystem_attachment(Path::new(&requested.root_path))?;
                     anyhow::ensure!(
+                        !saved_policy.canonical_host_path.is_empty(),
+                        "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
+                    );
+                    anyhow::ensure!(
+                        root_path == saved_policy.canonical_host_path,
+                        "restore-time filesystem canonical host path does not match the snapshot contract"
+                    );
+                    anyhow::ensure!(
                         &attachment == saved_attachment,
                         "restore-time filesystem root identity does not match the snapshot attachment"
                     );
                     Some((config, root_path, attachment))
                 }
                 (None, None) => {
-                    anyhow::ensure!(
-                        restore_filesystem_config.is_none(),
-                        "a restore-time virtiofs_config cannot be added to a snapshot without virtio-fs"
-                    );
-                    None
+                    if let Some(requested) = restore_filesystem_config.as_ref() {
+                        anyhow::ensure!(
+                            restore.machine_contract.microvm_filesystem_slot_version
+                                == openvmm_helpers::snapshot::MICROVM_FILESYSTEM_SLOT_VERSION,
+                            "snapshot does not support restore-time microVM filesystem attachment"
+                        );
+                        anyhow::ensure!(
+                            requested.tag == "microvm" && !requested.root_path.is_empty(),
+                            "restore-time virtiofs_config does not match the fixed microVM slot"
+                        );
+                        let config = openvmm_defs::config::MicrovmFilesystemConfig::new(
+                            requested.guest_mount_target.clone(),
+                            if requested.read_write {
+                                openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+                            } else {
+                                openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+                            },
+                        )?;
+                        let (root_path, attachment) =
+                            crate::microvm_filesystem_attachment(Path::new(&requested.root_path))?;
+                        Some((config, root_path, attachment))
+                    } else {
+                        None
+                    }
                 }
                 _ => anyhow::bail!(
                     "snapshot microVM filesystem policy and attachment inventories disagree"
@@ -988,7 +1018,9 @@ impl VmService {
                     None,
                     restored_microvm_filesystem
                         .as_ref()
-                        .map(|(config, _, attachment)| (config, attachment)),
+                        .map(|(config, root_path, attachment)| {
+                            (config, Path::new(root_path), attachment)
+                        }),
                     restore
                         .machine_contract
                         .attachments
@@ -1505,6 +1537,9 @@ impl VmService {
             layout: layout_config,
             rtc_delta_milliseconds: 0,
             microvm_network: None,
+            microvm_filesystem_bootstrap: authoritative_restore
+                .as_ref()
+                .is_some_and(|restore| restore.machine_contract.microvm_filesystem.is_some()),
             microvm_filesystem: None,
             microvm_sandbox_blocks: Vec::new(),
         };
@@ -1742,6 +1777,7 @@ impl VmService {
                         );
                     }
                     config.microvm_filesystem = Some(filesystem);
+                    config.microvm_filesystem_bootstrap = true;
                     microvm_filesystem_attachment = Some(attachment);
                     config.virtio_devices.push((VirtioBus::Mmio, resource));
                 } else {
@@ -1862,6 +1898,25 @@ impl VmService {
             }
         }
 
+        if microvm_filesystem_slot
+            && !config
+                .virtio_devices
+                .iter()
+                .any(|(_, device)| device.id() == "virtiofs")
+        {
+            config.virtio_devices.push((
+                VirtioBus::Mmio,
+                virtio_resources::fs::VirtioFsHandle {
+                    tag: "microvm".to_owned(),
+                    fs: virtio_resources::fs::VirtioFsBackend::Dormant,
+                    profile: virtio_resources::fs::VirtioFsProfile::MicrovmV1Dormant {
+                        stable_id: "fs:microvm0".to_owned(),
+                    },
+                }
+                .into_resource(),
+            ));
+        }
+
         if is_microvm && authoritative_restore.is_none() {
             let has_console = config
                 .virtio_devices
@@ -1880,6 +1935,7 @@ impl VmService {
                 } => openvmm_defs::config::append_microvm_virtio_discovery(
                     cmdline,
                     None,
+                    microvm_filesystem_slot,
                     config.microvm_filesystem.as_ref(),
                     has_console,
                     has_block,
@@ -1889,6 +1945,7 @@ impl VmService {
                 } => openvmm_defs::config::append_microvm_v2_virtio_discovery(
                     cmdline,
                     None,
+                    microvm_filesystem_slot,
                     config.microvm_filesystem.as_ref(),
                     has_console,
                     &config.microvm_sandbox_blocks,
@@ -2067,7 +2124,9 @@ impl VmService {
             microvm_network: None,
             microvm_network_attachment: None,
             microvm_egress_policy: None,
+            microvm_filesystem_slot,
             microvm_filesystem,
+            microvm_filesystem_root_path,
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
             snapshot_memory_file,

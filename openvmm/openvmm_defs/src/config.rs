@@ -70,6 +70,8 @@ pub struct Config {
     ///
     /// This list is in virtio-blk device order and is empty for ABI version 1.
     pub microvm_sandbox_blocks: Vec<MicrovmSandboxBlockConfig>,
+    /// Whether the effective command line bootstraps the active microVM filesystem.
+    pub microvm_filesystem_bootstrap: bool,
 }
 
 /// The initial microVM guest ABI version.
@@ -560,6 +562,7 @@ fn validate_microvm_sandbox_blocks(blocks: &[MicrovmSandboxBlockConfig]) -> anyh
 pub fn append_microvm_virtio_discovery(
     cmdline: &mut String,
     network: Option<(&MicrovmNetworkConfig, u32, bool)>,
+    filesystem_slot: bool,
     filesystem: Option<&MicrovmFilesystemConfig>,
     has_console: bool,
     has_block: bool,
@@ -569,6 +572,10 @@ pub fn append_microvm_virtio_discovery(
             .split_ascii_whitespace()
             .any(|token| token.starts_with("virtio_mmio.device=")),
         "microVM command line already contains virtio-mmio discovery"
+    );
+    anyhow::ensure!(
+        filesystem.is_none() || filesystem_slot,
+        "microVM filesystem policy requires the fixed virtio-fs slot"
     );
     use std::fmt::Write as _;
     if let Some((_, irq, _)) = network {
@@ -582,7 +589,7 @@ pub fn append_microvm_virtio_discovery(
         )?;
     }
 
-    if filesystem.is_some() {
+    if filesystem_slot {
         write!(
             cmdline,
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
@@ -621,6 +628,7 @@ pub fn append_microvm_virtio_discovery(
 pub fn append_microvm_v2_virtio_discovery(
     cmdline: &mut String,
     network: Option<(&MicrovmNetworkConfig, u32, bool)>,
+    filesystem_slot: bool,
     filesystem: Option<&MicrovmFilesystemConfig>,
     has_console: bool,
     blocks: &[MicrovmSandboxBlockConfig],
@@ -631,6 +639,10 @@ pub fn append_microvm_v2_virtio_discovery(
             .split_ascii_whitespace()
             .any(|token| token.starts_with("virtio_mmio.device=")),
         "microVM command line already contains virtio-mmio discovery"
+    );
+    anyhow::ensure!(
+        filesystem.is_none() || filesystem_slot,
+        "microVM filesystem policy requires the fixed virtio-fs slot"
     );
 
     use std::fmt::Write as _;
@@ -644,7 +656,7 @@ pub fn append_microvm_v2_virtio_discovery(
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
         )?;
     }
-    if filesystem.is_some() {
+    if filesystem_slot {
         write!(
             cmdline,
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
@@ -724,8 +736,12 @@ fn validate_microvm_command_line(
         "microVM virtio-net device and static network identity must be configured together"
     );
     anyhow::ensure!(
-        has_filesystem == config.microvm_filesystem.is_some(),
-        "microVM virtio-fs device and filesystem policy must be configured together"
+        config.microvm_filesystem.is_none() || has_filesystem,
+        "microVM filesystem policy requires a virtio-fs device"
+    );
+    anyhow::ensure!(
+        !config.microvm_filesystem_bootstrap || config.microvm_filesystem.is_some(),
+        "microVM filesystem bootstrap requires an active filesystem policy"
     );
     match abi_version {
         MICROVM_ABI_VERSION_1 => anyhow::ensure!(
@@ -770,7 +786,9 @@ fn validate_microvm_command_line(
         let expected = match prefix {
             "virtio_mmio.device=" => config.virtio_devices.len(),
             "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => usize::from(has_network),
-            "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => usize::from(has_filesystem),
+            "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => {
+                usize::from(config.microvm_filesystem_bootstrap)
+            }
             _ => 1,
         };
         anyhow::ensure!(
@@ -839,7 +857,11 @@ fn validate_microvm_command_line(
                 .map(str::to_owned),
         );
     }
-    if let Some(filesystem) = &config.microvm_filesystem {
+    if config.microvm_filesystem_bootstrap {
+        let filesystem = config
+            .microvm_filesystem
+            .as_ref()
+            .expect("filesystem bootstrap policy was validated above");
         expected_discovery.extend(
             filesystem
                 .command_line_fragment()
@@ -1131,8 +1153,12 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "microVM virtio-net device and static network identity must be configured together"
     );
     anyhow::ensure!(
-        has_filesystem == config.microvm_filesystem.is_some(),
-        "microVM virtio-fs device and filesystem policy must be configured together"
+        config.microvm_filesystem.is_none() || has_filesystem,
+        "microVM filesystem policy requires a virtio-fs device"
+    );
+    anyhow::ensure!(
+        !config.microvm_filesystem_bootstrap || config.microvm_filesystem.is_some(),
+        "microVM filesystem bootstrap requires an active filesystem policy"
     );
     anyhow::ensure!(
         config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024
@@ -1536,7 +1562,8 @@ mod tests {
         validate_microvm_sandbox_blocks(&blocks).unwrap();
 
         let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
-        append_microvm_v2_virtio_discovery(&mut cmdline, None, None, false, &blocks).unwrap();
+        append_microvm_v2_virtio_discovery(&mut cmdline, None, false, None, false, &blocks)
+            .unwrap();
         assert_eq!(
             cmdline,
             format!(

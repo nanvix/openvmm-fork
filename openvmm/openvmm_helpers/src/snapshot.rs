@@ -31,6 +31,8 @@ const LEGACY_SNAPSHOT_FORMAT_MAGIC: &[u8] = b"OPENVMM_SNAPSHOT_V2\0";
 pub const SAVED_STATE_SCHEMA_VERSION: u32 = 1;
 /// Protobuf root type stored in `state.bin`.
 pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
+/// Capability version for the always-present dormant microVM virtio-fs slot.
+pub const MICROVM_FILESYSTEM_SLOT_VERSION: u32 = 1;
 /// Xen PVH memory/boot layout version used by microVM ABI version 1.
 pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 1;
 /// SMP-safe Xen PVH memory/boot layout version used by microVM ABI version 2.
@@ -309,6 +311,9 @@ pub struct SnapshotMicrovmFilesystem {
     /// Guest attribute-cache lifetime in nanoseconds.
     #[mesh(10)]
     pub attribute_cache_timeout_ns: u64,
+    /// Canonical absolute host export path.
+    #[mesh(11)]
+    pub canonical_host_path: String,
 }
 
 /// Authoritative identity and snapshot policy for an ABI-v2 sandbox block.
@@ -342,7 +347,10 @@ pub struct SnapshotMicrovmSandboxBlock {
 }
 
 impl SnapshotMicrovmFilesystem {
-    fn new(config: &openvmm_defs::config::MicrovmFilesystemConfig) -> Self {
+    fn new(
+        config: &openvmm_defs::config::MicrovmFilesystemConfig,
+        canonical_host_path: &str,
+    ) -> Self {
         Self {
             guest_mount_target: config.guest_mount_target.clone(),
             access_mode: config.access.as_str().to_owned(),
@@ -354,6 +362,7 @@ impl SnapshotMicrovmFilesystem {
             direct_io: true,
             entry_cache_timeout_ns: 0,
             attribute_cache_timeout_ns: 0,
+            canonical_host_path: canonical_host_path.to_owned(),
         }
     }
 }
@@ -470,6 +479,9 @@ pub struct SnapshotMachineContract {
     /// Fixed-role ABI-v2 sandbox blocks in guest-visible order.
     #[mesh(21)]
     pub microvm_sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
+    /// Version of the reserved restore-attachable microVM virtio-fs slot.
+    #[mesh(22)]
+    pub microvm_filesystem_slot_version: u32,
 }
 
 impl SnapshotMachineContract {
@@ -495,8 +507,10 @@ pub fn microvm_v1_machine_contract(
         &net_backend_resources::egress::EgressPolicy,
         SnapshotAttachment,
     )>,
+    filesystem_slot: bool,
     filesystem: Option<(
         &openvmm_defs::config::MicrovmFilesystemConfig,
+        &Path,
         SnapshotAttachment,
     )>,
     console_attachment: Option<SnapshotAttachment>,
@@ -512,6 +526,7 @@ pub fn microvm_v1_machine_contract(
         source_hypervisor,
         effective_command_line,
         network,
+        filesystem_slot,
         filesystem,
         console_attachment,
         Vec::new(),
@@ -534,8 +549,10 @@ pub fn microvm_v2_machine_contract(
         &net_backend_resources::egress::EgressPolicy,
         SnapshotAttachment,
     )>,
+    filesystem_slot: bool,
     filesystem: Option<(
         &openvmm_defs::config::MicrovmFilesystemConfig,
+        &Path,
         SnapshotAttachment,
     )>,
     console_attachment: Option<SnapshotAttachment>,
@@ -553,6 +570,7 @@ pub fn microvm_v2_machine_contract(
         source_hypervisor,
         effective_command_line,
         network,
+        filesystem_slot,
         filesystem,
         console_attachment,
         sandbox_blocks,
@@ -600,8 +618,10 @@ fn microvm_machine_contract(
         &net_backend_resources::egress::EgressPolicy,
         SnapshotAttachment,
     )>,
+    filesystem_slot: bool,
     filesystem: Option<(
         &openvmm_defs::config::MicrovmFilesystemConfig,
+        &Path,
         SnapshotAttachment,
     )>,
     console_attachment: Option<SnapshotAttachment>,
@@ -780,39 +800,22 @@ fn microvm_machine_contract(
     } else {
         None
     };
-    let microvm_filesystem = if let Some((filesystem, attachment)) = filesystem {
-        anyhow::ensure!(
-            attachment.stable_id == "fs:microvm0"
-                && attachment.kind == "virtio-fs"
-                && attachment.required
-                && attachment.reconnect_policy == "live-revalidate"
-                && match source_hypervisor {
-                    "kvm" | "mshv" => attachment.identity_kind == "unix-device-inode-v1",
-                    "whp" => attachment.identity_kind == "windows-volume-file-id-v1",
-                    _ => false,
-                }
-                && !attachment.identity.is_empty()
-                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
-                && attachment.length == 0
-                && attachment.reconnect_timeout_ms == 0,
-            "microVM filesystem attachment has an unsupported live-revalidation policy"
-        );
+    anyhow::ensure!(
+        filesystem.is_none() || filesystem_slot,
+        "microVM filesystem policy requires the reserved virtio-fs slot"
+    );
+    if filesystem_slot {
         let discovery = format!(
             "virtio_mmio.device={:#x}@{:#x}:{}",
             openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
             openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
             openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
         );
-        let tokens = effective_command_line
-            .split_ascii_whitespace()
-            .collect::<HashSet<_>>();
         anyhow::ensure!(
-            tokens.contains(discovery.as_str())
-                && filesystem
-                    .command_line_fragment()
-                    .split_ascii_whitespace()
-                    .all(|token| tokens.contains(token)),
-            "microVM filesystem command line does not match its saved policy"
+            effective_command_line
+                .split_ascii_whitespace()
+                .any(|token| token == discovery),
+            "microVM virtio-fs slot is missing from the effective command line"
         );
         devices.push(SnapshotDevice {
             stable_id: "fs:microvm0".to_owned(),
@@ -835,8 +838,47 @@ fn microvm_machine_contract(
             queue_count: 2,
             queue_max_sizes: vec![256, 256],
         });
+    }
+    let microvm_filesystem = if let Some((filesystem, canonical_host_path, attachment)) = filesystem
+    {
+        let canonical_host_path = canonical_host_path
+            .to_str()
+            .context("microVM filesystem canonical host path is not valid UTF-8")?;
+        anyhow::ensure!(
+            !canonical_host_path.is_empty(),
+            "microVM filesystem canonical host path is empty"
+        );
+        anyhow::ensure!(
+            attachment.stable_id == "fs:microvm0"
+                && attachment.kind == "virtio-fs"
+                && attachment.required
+                && attachment.reconnect_policy == "live-revalidate"
+                && match source_hypervisor {
+                    "kvm" | "mshv" => attachment.identity_kind == "unix-device-inode-v1",
+                    "whp" => attachment.identity_kind == "windows-volume-file-id-v1",
+                    _ => false,
+                }
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0
+                && attachment.reconnect_timeout_ms == 0,
+            "microVM filesystem attachment has an unsupported live-revalidation policy"
+        );
+        let tokens = effective_command_line
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            filesystem
+                .command_line_fragment()
+                .split_ascii_whitespace()
+                .all(|token| tokens.contains(token)),
+            "microVM filesystem command line does not match its saved policy"
+        );
         attachments.push(attachment);
-        Some(SnapshotMicrovmFilesystem::new(filesystem))
+        Some(SnapshotMicrovmFilesystem::new(
+            filesystem,
+            canonical_host_path,
+        ))
     } else {
         None
     };
@@ -964,6 +1006,11 @@ fn microvm_machine_contract(
         microvm_filesystem,
         apic_frequency_hz,
         microvm_sandbox_blocks: sandbox_blocks,
+        microvm_filesystem_slot_version: if filesystem_slot {
+            MICROVM_FILESYSTEM_SLOT_VERSION
+        } else {
+            0
+        },
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
@@ -3125,6 +3172,10 @@ pub fn validate_microvm_machine_contract(
         expected.microvm_abi_version,
     );
     anyhow::ensure!(
+        contract.microvm_filesystem_slot_version == expected.microvm_filesystem_slot_version,
+        "snapshot microVM filesystem slot capability doesn't match the requested machine"
+    );
+    anyhow::ensure!(
         contract.source_hypervisor == expected.source_hypervisor,
         "snapshot source hypervisor '{}' doesn't match expected '{}'",
         contract.source_hypervisor,
@@ -3357,6 +3408,10 @@ fn validate_machine_contract_shape(
         validate_sha256(&network.egress_policy_sha256, "egress policy")?;
     }
     if let Some(filesystem) = &contract.microvm_filesystem {
+        anyhow::ensure!(
+            !filesystem.canonical_host_path.is_empty(),
+            "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
+        );
         let access = match filesystem.access_mode.as_str() {
             "ro" => openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
             "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
@@ -3368,9 +3423,33 @@ fn validate_machine_contract_shape(
         )
         .context("snapshot filesystem policy is invalid")?;
         anyhow::ensure!(
-            *filesystem == SnapshotMicrovmFilesystem::new(&parsed),
+            *filesystem == SnapshotMicrovmFilesystem::new(&parsed, &filesystem.canonical_host_path),
             "snapshot filesystem policy is not canonical"
         );
+    }
+
+    let has_filesystem_device = contract
+        .devices
+        .iter()
+        .any(|device| device.stable_id == "fs:microvm0");
+    let has_filesystem_attachment = contract
+        .attachments
+        .iter()
+        .any(|attachment| attachment.stable_id == "fs:microvm0");
+    match contract.microvm_filesystem_slot_version {
+        0 => anyhow::ensure!(
+            has_filesystem_device == contract.microvm_filesystem.is_some()
+                && has_filesystem_attachment == contract.microvm_filesystem.is_some(),
+            "legacy snapshot microVM filesystem device, policy, and attachment inventories disagree"
+        ),
+        MICROVM_FILESYSTEM_SLOT_VERSION => anyhow::ensure!(
+            has_filesystem_device
+                && has_filesystem_attachment == contract.microvm_filesystem.is_some(),
+            "snapshot reserved microVM filesystem slot, policy, and attachment inventories disagree"
+        ),
+        version => anyhow::bail!(
+            "snapshot microVM filesystem slot capability version {version} is unsupported"
+        ),
     }
 
     match contract.microvm_abi_version {
@@ -3882,6 +3961,7 @@ mod tests {
             microvm_filesystem: None,
             apic_frequency_hz: Some(1_000_000_000),
             microvm_sandbox_blocks: Vec::new(),
+            microvm_filesystem_slot_version: 0,
         };
         contract.set_effective_command_line("console=hvc0".to_owned());
         contract.set_cpu_compatibility_contract(vec![1, 2, 3]);
@@ -4155,6 +4235,7 @@ mod tests {
                 &egress_policy,
                 microvm_network_attachment(source_hypervisor),
             )),
+            false,
             None,
             None,
             1024,
@@ -4186,6 +4267,7 @@ mod tests {
             "earlycon=xe9 console=hvc1 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0002000:7"
                 .to_owned(),
             None,
+            false,
             None,
             Some(microvm_console_attachment()),
             1024,
@@ -4225,10 +4307,48 @@ mod tests {
             source_hypervisor,
             command_line,
             None,
+            true,
             Some((
                 &filesystem,
+                Path::new(if cfg!(windows) {
+                    r"C:\microvm-share"
+                } else {
+                    "/microvm-share"
+                }),
                 microvm_filesystem_attachment(source_hypervisor),
             )),
+            None,
+            1024,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtiofs-3489665024",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    fn generated_dormant_filesystem_contract() -> SnapshotMachineContract {
+        microvm_v1_machine_contract(
+            "whp",
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0001000:6"
+                .to_owned(),
+            None,
+            true,
+            None,
             None,
             1024,
             [
@@ -4356,6 +4476,14 @@ mod tests {
             let filesystem = contract.microvm_filesystem.unwrap();
             assert_eq!(filesystem.guest_mount_target, "/mnt/share");
             assert_eq!(filesystem.access_mode, "ro");
+            assert_eq!(
+                filesystem.canonical_host_path,
+                if cfg!(windows) {
+                    r"C:\microvm-share"
+                } else {
+                    "/microvm-share"
+                }
+            );
             assert_eq!(filesystem.restore_mode, "live-revalidate");
             assert_eq!(filesystem.tag, "microvm");
             assert_eq!(filesystem.high_priority_queue_count, 1);
@@ -4365,6 +4493,29 @@ mod tests {
             assert_eq!(filesystem.entry_cache_timeout_ns, 0);
             assert_eq!(filesystem.attribute_cache_timeout_ns, 0);
         }
+    }
+
+    #[test]
+    fn generated_dormant_microvm_filesystem_contract_reserves_fixed_slot() {
+        let contract = generated_dormant_filesystem_contract();
+        assert_eq!(
+            contract.microvm_filesystem_slot_version,
+            MICROVM_FILESYSTEM_SLOT_VERSION
+        );
+        assert!(contract.microvm_filesystem.is_none());
+        assert!(contract.attachments.is_empty());
+        let filesystem = contract.devices.last().unwrap();
+        assert_eq!(filesystem.stable_id, "fs:microvm0");
+        assert_eq!(filesystem.state_unit_name, "virtiofs-3489665024");
+        assert_eq!(filesystem.ranges[0].start, 0xd000_1000);
+        assert_eq!(filesystem.irq, Some(6));
+    }
+
+    #[test]
+    fn dormant_microvm_filesystem_capability_requires_fixed_device() {
+        let mut contract = generated_dormant_filesystem_contract();
+        contract.devices.pop();
+        assert!(validate_machine_contract_shape(&contract, 1024, 1).is_err());
     }
 
     #[test]

@@ -22,7 +22,9 @@ rules. It does not support snapshot and restore.
 
 ## microVM ABI version 1
 
-The microVM profile exposes at most one HostFs device. Configure it with:
+The microVM profile reserves one fixed virtio-fs slot. Without `--mount`, the
+slot is guest-discoverable but dormant and has no HostFs backend or filesystem
+policy. Configure an active attachment with:
 
 ```bash
 openvmm --machine microvm \
@@ -47,9 +49,10 @@ guest-visible configuration:
 | File policy | Direct I/O |
 | Maximum write | 1 MiB payload plus protocol headers |
 
-The profile adds `virtfs_dir`, `virtfs_tag`, and `virtfs_mode` bootstrap
-tokens to the kernel command line. These values, the fixed transport, and the
-access mode become snapshot-authoritative.
+For an active cold-boot attachment, the profile adds `virtfs_dir`,
+`virtfs_tag`, and `virtfs_mode` bootstrap tokens to the kernel command line.
+The fixed transport is always discoverable. Active attachment policy and the
+canonical absolute host path become snapshot-authoritative.
 
 `SectionFs`, aggregate roots, alternate tags, PCI transport, DAX, and extra
 queues are not part of microVM ABI version 1.
@@ -65,11 +68,25 @@ An open directory continues from its bounded captured entry snapshot, so
 later host additions do not appear midway through that enumeration. New
 lookups and newly opened directories still observe the live host tree.
 
-Restore therefore requires a fresh `--mount` argument. The guest target and
-mode must match the snapshot. Before any vCPU starts, OpenVMM pins the supplied
-root and validates its saved root and object identities. Missing, replaced,
-ambiguous, or no-longer-reopenable objects fail restore. The host path may
-change only when it still identifies the same saved root.
+Restoring a snapshot captured with an active attachment requires a fresh
+`--mount` argument with the exact same canonical host path, guest target, and
+mode. Identity validation remains independent: before any vCPU starts,
+OpenVMM pins the supplied root and validates its saved root and object
+identities. Missing, moved, replaced, ambiguous, or no-longer-reopenable
+objects fail restore.
+
+A snapshot captured without `--mount` records the fixed slot as dormant. It
+may restore without an attachment, or bind a new `--mount` attachment. Because
+execution resumes after the cold-boot mount hook, the guest must mount the
+newly attached backend explicitly:
+
+```bash
+mkdir -p /mnt/share
+mount -t virtiofs microvm /mnt/share
+```
+
+Snapshots created before the dormant-slot capability cannot add a restore-time
+attachment and fail with a compatibility error.
 
 ```admonish warning
 An ordinary host directory is live external state. Host changes after capture

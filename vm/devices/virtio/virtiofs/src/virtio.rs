@@ -2,9 +2,13 @@
 // Licensed under the MIT License.
 
 use crate::VirtioFs;
+use crate::profile::MICROVM_ATTACHMENT_ID;
 use crate::profile::MICROVM_MOUNT_TAG;
 use crate::profile::MICROVM_REQUEST_QUEUES;
 use crate::profile::MicroVmVirtioFsProfile;
+use crate::save_dormant_microvm_state;
+use crate::saved_state::SavedState;
+use crate::validate_dormant_microvm_state;
 use crate::validate_microvm_state;
 use crate::virtio_util::MAX_FUSE_REQUEST_BYTES;
 use crate::virtio_util::VirtioPayloadReader;
@@ -60,6 +64,10 @@ const DEFAULT_NUM_REQUEST_QUEUES: u32 = 2;
 /// costs a guest MSI-X vector plus a kernel worker thread.
 const MAX_REQUEST_QUEUES: u32 = 8;
 
+struct DormantMicrovmFs;
+
+impl fuse::Fuse for DormantMicrovmFs {}
+
 /// PCI configuration space values for virtio-fs devices.
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout)]
@@ -85,6 +93,8 @@ pub struct VirtioFsDevice {
     #[inspect(skip)]
     notify_corruption: Arc<dyn Fn() + Sync + Send>,
     num_request_queues: u32,
+    #[inspect(skip)]
+    microvm_attachment_id: Option<String>,
     #[inspect(skip)]
     microvm_profile: Option<MicroVmVirtioFsProfile>,
     #[inspect(skip)]
@@ -212,6 +222,7 @@ impl VirtioFsDevice {
             num_request_queues,
             None,
             None,
+            None,
         )
     }
 
@@ -230,6 +241,7 @@ impl VirtioFsDevice {
             fs.microvm_profile() == Some(&profile),
             "microVM device profile does not match the HostFs attachment"
         );
+        let attachment_id = profile.attachment_id().to_owned();
         Ok(Self::from_parts(
             driver_source,
             MICROVM_MOUNT_TAG,
@@ -237,8 +249,32 @@ impl VirtioFsDevice {
             0,
             notify_corruption,
             MICROVM_REQUEST_QUEUES,
+            Some(attachment_id),
             Some(profile),
             Some(fs),
+        ))
+    }
+
+    /// Creates the fixed no-DAX microVM virtio-fs device without a host attachment.
+    pub fn new_microvm_dormant(
+        driver_source: &VmTaskDriverSource,
+        stable_id: String,
+        notify_corruption: Option<Arc<dyn Fn() + Sync + Send>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            stable_id == MICROVM_ATTACHMENT_ID,
+            "microVM virtio-fs attachment ID must be '{MICROVM_ATTACHMENT_ID}'"
+        );
+        Ok(Self::from_parts(
+            driver_source,
+            MICROVM_MOUNT_TAG,
+            DormantMicrovmFs,
+            0,
+            notify_corruption,
+            MICROVM_REQUEST_QUEUES,
+            Some(stable_id),
+            None,
+            None,
         ))
     }
 
@@ -264,6 +300,7 @@ impl VirtioFsDevice {
         shmem_size: u64,
         notify_corruption: Option<Arc<dyn Fn() + Sync + Send>>,
         num_request_queues: u32,
+        microvm_attachment_id: Option<String>,
         microvm_profile: Option<MicroVmVirtioFsProfile>,
         stateful_fs: Option<VirtioFs>,
     ) -> Self
@@ -295,6 +332,7 @@ impl VirtioFsDevice {
             shared_memory_region: None,
             notify_corruption,
             num_request_queues,
+            microvm_attachment_id,
             microvm_profile,
             stateful_fs,
             admission: Arc::new(RequestAdmission::new()),
@@ -308,7 +346,7 @@ impl VirtioDevice for VirtioFsDevice {
         let mut device_features = VirtioDeviceFeatures::new()
             .with_ring_event_idx(true)
             .with_ring_indirect_desc(true);
-        if self.microvm_profile.is_none() {
+        if self.microvm_attachment_id.is_none() {
             device_features = device_features.with_ring_packed(true);
         }
         DeviceTraits {
@@ -342,7 +380,7 @@ impl VirtioDevice for VirtioFsDevice {
         region: &Arc<dyn MappedMemoryRegion>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.microvm_profile.is_none(),
+            self.microvm_attachment_id.is_none(),
             "the microVM virtio-fs profile does not expose shared memory"
         );
         self.shared_memory_region = Some(region.clone());
@@ -357,7 +395,7 @@ impl VirtioDevice for VirtioFsDevice {
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.microvm_profile.is_none() || !features.ring_packed(),
+            self.microvm_attachment_id.is_none() || !features.ring_packed(),
             "the microVM virtio-fs profile forbids packed virtqueues"
         );
         let mut tc = TaskControl::new(VirtioFsWorker {
@@ -433,14 +471,14 @@ impl VirtioDevice for VirtioFsDevice {
     }
 
     async fn quiesce_input(&mut self) -> anyhow::Result<()> {
-        if self.microvm_profile.is_some() {
+        if self.microvm_attachment_id.is_some() {
             self.admission.quiesce();
         }
         Ok(())
     }
 
     async fn resume_input(&mut self) -> anyhow::Result<()> {
-        if self.microvm_profile.is_some() {
+        if self.microvm_attachment_id.is_some() {
             self.admission.resume();
             self.save_error = None;
         }
@@ -448,11 +486,11 @@ impl VirtioDevice for VirtioFsDevice {
     }
 
     fn supports_save_restore(&self) -> bool {
-        self.microvm_profile.is_some()
+        self.microvm_attachment_id.is_some()
     }
 
     fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
-        let Some(profile) = self.microvm_profile.clone() else {
+        let Some(attachment_id) = self.microvm_attachment_id.as_deref() else {
             return Err(SaveError::NotSupported);
         };
         if let Some(error) = self.save_error.take() {
@@ -464,28 +502,45 @@ impl VirtioDevice for VirtioFsDevice {
             )));
         }
         self.admission.verify_drained().map_err(SaveError::Other)?;
-        let fs = self.stateful_fs.as_ref().ok_or_else(|| {
-            SaveError::Other(anyhow::anyhow!(
-                "microVM virtio-fs filesystem state is unavailable"
-            ))
-        })?;
-        let state = fs
-            .save_microvm_state(&profile, self.fs.save_state())
-            .map_err(SaveError::Other)?;
+        let state = match (&self.microvm_profile, &self.stateful_fs) {
+            (Some(profile), Some(fs)) => fs
+                .save_microvm_state(profile, self.fs.save_state())
+                .map_err(SaveError::Other)?,
+            (None, None) => save_dormant_microvm_state(attachment_id, self.fs.save_state())
+                .map_err(SaveError::Other)?,
+            _ => {
+                return Err(SaveError::Other(anyhow::anyhow!(
+                    "microVM virtio-fs profile and attachment state disagree"
+                )));
+            }
+        };
         Ok(Some(SavedStateBlob::new(state)))
     }
 
     fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
-        let profile = self
-            .microvm_profile
-            .as_ref()
+        let attachment_id = self
+            .microvm_attachment_id
+            .as_deref()
             .ok_or(RestoreError::SavedStateNotSupported)?;
         let state = state.ok_or_else(|| {
             RestoreError::InvalidSavedState(anyhow::anyhow!(
                 "microVM virtio-fs is missing device-private saved state"
             ))
         })?;
-        let state = state.parse().map_err(RestoreError::ProtobufDecode)?;
+        let state: SavedState = state.parse().map_err(RestoreError::ProtobufDecode)?;
+        if state.dormant {
+            let session_state = validate_dormant_microvm_state(&state, attachment_id)
+                .map_err(RestoreError::InvalidSavedState)?;
+            return self
+                .fs
+                .restore_state(session_state)
+                .map_err(|error| RestoreError::InvalidSavedState(error.into()));
+        }
+        let profile = self.microvm_profile.as_ref().ok_or_else(|| {
+            RestoreError::InvalidSavedState(anyhow::anyhow!(
+                "active microVM virtio-fs state requires a host attachment"
+            ))
+        })?;
         validate_microvm_state(&state, profile).map_err(RestoreError::InvalidSavedState)?;
         let fs = self.stateful_fs.as_ref().ok_or_else(|| {
             RestoreError::InvalidSavedState(anyhow::anyhow!(
@@ -497,11 +552,12 @@ impl VirtioDevice for VirtioFsDevice {
     }
 
     fn device_state_validator(&self) -> DeviceStateValidator {
+        let attachment_id = self.microvm_attachment_id.clone();
         let profile = self.microvm_profile.clone();
         Box::new(
             move |state, features, queues: &[DeviceQueueState], _guest_memory| {
-                let profile = profile
-                    .as_ref()
+                let attachment_id = attachment_id
+                    .as_deref()
                     .ok_or(RestoreError::SavedStateNotSupported)?;
                 if features.ring_packed() {
                     return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
@@ -518,8 +574,19 @@ impl VirtioDevice for VirtioFsDevice {
                         "microVM virtio-fs is missing device-private saved state"
                     ))
                 })?;
-                let state = state.parse().map_err(RestoreError::ProtobufDecode)?;
-                validate_microvm_state(&state, profile).map_err(RestoreError::InvalidSavedState)
+                let state: SavedState = state.parse().map_err(RestoreError::ProtobufDecode)?;
+                if state.dormant {
+                    validate_dormant_microvm_state(&state, attachment_id)
+                        .map(|_| ())
+                        .map_err(RestoreError::InvalidSavedState)
+                } else {
+                    let profile = profile.as_ref().ok_or_else(|| {
+                        RestoreError::InvalidSavedState(anyhow::anyhow!(
+                            "active microVM virtio-fs state requires a host attachment"
+                        ))
+                    })?;
+                    validate_microvm_state(&state, profile).map_err(RestoreError::InvalidSavedState)
+                }
             },
         )
     }
@@ -785,6 +852,56 @@ mod tests {
         assert!(!device.traits().device_features.ring_packed());
         assert!(device.supports_save_restore());
         assert_eq!(&device.config.tag[..7], b"microvm");
+    }
+
+    #[async_test]
+    async fn microvm_dormant_state_restores_into_active_attachment(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let mut source = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        source.quiesce_input().await.unwrap();
+        let state = source.save_device().unwrap().unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let mut destination = VirtioFsDevice::new_microvm_hostfs(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            microvm_root_identity(root.path()).unwrap(),
+            false,
+            root.path(),
+            None,
+        )
+        .unwrap();
+        destination.restore_device(Some(state)).unwrap();
+    }
+
+    #[async_test]
+    async fn microvm_active_state_rejects_dormant_destination(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let root = tempfile::tempdir().unwrap();
+        let mut source = VirtioFsDevice::new_microvm_hostfs(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            microvm_root_identity(root.path()).unwrap(),
+            false,
+            root.path(),
+            None,
+        )
+        .unwrap();
+        source.quiesce_input().await.unwrap();
+        let state = source.save_device().unwrap().unwrap();
+
+        let mut destination = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        assert!(destination.restore_device(Some(state)).is_err());
     }
 
     #[async_test]
