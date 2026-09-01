@@ -4216,10 +4216,16 @@ pub(crate) const GUEST_ARCH: &str = if cfg!(guest_arch = "x86_64") {
 };
 
 /// Open a snapshot directory and validate it against the current VM config.
-/// Returns the shared memory fd (from memory.bin) and the saved device state.
+/// Returns the shared memory handle, lifetime guards, and saved device state.
+pub(crate) struct PreparedSnapshotRestore {
+    shared_memory: openvmm_defs::worker::SharedMemoryFd,
+    guards: openvmm_defs::worker::SnapshotRestoreGuards,
+    saved_state: mesh::payload::message::ProtobufMessage,
+    restore_time: Option<(Duration, u64, Option<u64>, Vec<u8>)>,
+}
+
 fn prepare_snapshot_restore(
-    snapshot_dir: &Path,
-    manifest: &openvmm_helpers::snapshot::SnapshotManifest,
+    snapshot: openvmm_helpers::snapshot::OpenedSnapshot,
     opt: &Options,
     expected_hypervisor: &str,
     effective_command_line: Option<&str>,
@@ -4234,11 +4240,8 @@ fn prepare_snapshot_restore(
     )>,
     console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
     sandbox_block_sources: &[storage_builder::MicrovmSandboxBlockSource],
-) -> anyhow::Result<(
-    openvmm_defs::worker::SharedMemoryFd,
-    mesh::payload::message::ProtobufMessage,
-    Option<(Duration, u64, Option<u64>, Vec<u8>)>,
-)> {
+) -> anyhow::Result<PreparedSnapshotRestore> {
+    let manifest = snapshot.manifest();
     let expected_microvm_contract = if matches!(
         opt.machine,
         MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
@@ -4281,8 +4284,7 @@ fn prepare_snapshot_restore(
         None
     };
     prepare_snapshot_restore_for_config(
-        snapshot_dir,
-        manifest,
+        snapshot,
         opt.memory_size(),
         opt.processors,
         expected_microvm_contract,
@@ -4324,8 +4326,7 @@ fn align_legacy_network_policy_contract(
 }
 
 pub(crate) fn prepare_snapshot_restore_for_config(
-    snapshot_dir: &Path,
-    manifest: &openvmm_helpers::snapshot::SnapshotManifest,
+    snapshot: openvmm_helpers::snapshot::OpenedSnapshot,
     expected_memory_size: u64,
     expected_vp_count: u32,
     expected_microvm_contract: Option<(
@@ -4344,18 +4345,8 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         u32,
         Vec<openvmm_helpers::snapshot::SnapshotMicrovmSandboxBlock>,
     )>,
-) -> anyhow::Result<(
-    openvmm_defs::worker::SharedMemoryFd,
-    mesh::payload::message::ProtobufMessage,
-    Option<(Duration, u64, Option<u64>, Vec<u8>)>,
-)> {
-    let (state_bytes, memory_file) =
-        openvmm_helpers::snapshot::read_snapshot_artifacts_with_memory(
-            snapshot_dir,
-            manifest,
-            expected_memory_size,
-        )?;
-
+) -> anyhow::Result<PreparedSnapshotRestore> {
+    let manifest = snapshot.manifest();
     // Validate manifest against current VM config.
     openvmm_helpers::snapshot::validate_manifest(
         manifest,
@@ -4433,18 +4424,14 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         None
     };
 
-    // Map the exact handle that was hashed above. The worker uses a writable
-    // copy-on-write view so the reusable artifact remains immutable.
-    let shared_memory_fd =
-        openvmm_helpers::shared_memory::file_to_copy_on_write_memory_fd(memory_file)?;
-
     // The manifest and state.bin inventories describe the same machine boundary.
     // Require them to agree before worker and partition construction.
-    let state_msg: mesh::payload::message::ProtobufMessage = mesh::payload::decode(&state_bytes)
-        .context("failed to decode saved state from snapshot")?;
+    let state_msg: mesh::payload::message::ProtobufMessage =
+        mesh::payload::decode(snapshot.state_bytes())
+            .context("failed to decode saved state from snapshot")?;
     if let Some(contract) = &manifest.machine_contract {
         let inventory_msg: mesh::payload::message::ProtobufMessage =
-            mesh::payload::decode(&state_bytes)
+            mesh::payload::decode(snapshot.state_bytes())
                 .context("failed to decode saved state inventory from snapshot")?;
         let saved_state: openvmm_defs::worker::SavedState = inventory_msg
             .parse()
@@ -4455,9 +4442,23 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         );
     }
 
-    openvmm_helpers::snapshot::claim_snapshot_for_restore(snapshot_dir, manifest)?;
+    snapshot.claim_for_restore()?;
 
-    Ok((shared_memory_fd, state_msg, restore_time))
+    // Create the private mapping from a duplicate of the exact opened handle.
+    // The original file and directory handles move to the worker and keep this
+    // generation pinned until VM teardown.
+    let memory_file = snapshot.duplicate_memory_file_for_mapping(expected_memory_size)?;
+    let shared_memory =
+        openvmm_helpers::shared_memory::file_to_copy_on_write_memory_fd(memory_file)?;
+    snapshot.validate_memory_generation(expected_memory_size)?;
+    let (_, _, guards) = snapshot.into_parts();
+
+    Ok(PreparedSnapshotRestore {
+        shared_memory,
+        guards,
+        saved_state: state_msg,
+        restore_time,
+    })
 }
 
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
@@ -4565,14 +4566,14 @@ async fn run_control_inner(
     let mesh = mesh_slot.as_ref().unwrap();
     let mut private_scratch_dir = None;
     let mut restore_gate_required = false;
-    let restore_manifest = opt
+    let mut restore_snapshot = opt
         .restore_snapshot
         .as_deref()
-        .map(openvmm_helpers::snapshot::read_snapshot_manifest)
+        .map(openvmm_helpers::snapshot::OpenedSnapshot::open)
         .transpose()?;
-    if let Some(contract) = restore_manifest
+    if let Some(contract) = restore_snapshot
         .as_ref()
-        .and_then(|manifest| manifest.machine_contract.as_ref())
+        .and_then(|snapshot| snapshot.manifest().machine_contract.as_ref())
         && contract.machine_profile == "microvm"
     {
         let requested_abi_version = match opt.machine {
@@ -4590,8 +4591,9 @@ async fn run_control_inner(
     let restore_machine_contract = if matches!(
         opt.machine,
         MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
-    ) && let Some(manifest) = restore_manifest.as_ref()
+    ) && let Some(snapshot) = restore_snapshot.as_ref()
     {
+        let manifest = snapshot.manifest();
         let snapshot_dir = opt
             .restore_snapshot
             .as_deref()
@@ -4639,9 +4641,9 @@ async fn run_control_inner(
                     }),
                     "paired snapshot restore supplies scratch.img; do not pass a scratch block"
                 );
-                let source =
-                    openvmm_helpers::snapshot::open_paired_scratch_file(snapshot_dir, manifest)?
-                        .context("paired snapshot is missing scratch.img")?;
+                let source = snapshot
+                    .open_paired_scratch_file()?
+                    .context("paired snapshot is missing scratch.img")?;
                 let parent = snapshot_dir
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
@@ -4926,46 +4928,56 @@ async fn run_control_inner(
     let vm_worker = {
         let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
 
-        let (shared_memory, saved_state, shared_memory_copy_on_write, restore_time) =
-            if let Some(snapshot_dir) = &opt.restore_snapshot {
-                let (fd, state_msg, restore_time) = prepare_snapshot_restore(
-                    snapshot_dir,
-                    restore_manifest
-                        .as_ref()
-                        .context("snapshot restore is missing its validated manifest")?,
-                    &opt,
-                    &source_hypervisor,
-                    effective_command_line.as_deref(),
-                    microvm_network
-                        .as_ref()
-                        .zip(microvm_egress_policy.as_ref())
-                        .zip(microvm_network_attachment.as_ref())
-                        .map(|((network, policy), attachment)| (network, policy, attachment)),
-                    microvm_filesystem
-                        .as_ref()
-                        .zip(microvm_filesystem_attachment.as_ref()),
-                    microvm_console_attachment.as_ref(),
-                    &microvm_sandbox_block_sources,
-                )?;
-                (Some(fd), Some(state_msg), true, restore_time)
-            } else if let Some(file) = &snapshot_memory_handle {
-                let file = file
-                    .try_clone()
-                    .context("failed to duplicate snapshot RAM handle for worker")?;
-                let shared_memory = openvmm_helpers::shared_memory::file_to_shared_memory_fd(file)?;
-                (Some(shared_memory), None, false, None)
-            } else {
-                let shared_memory = opt
-                    .memory_backing_file()
-                    .map(|path| {
-                        openvmm_helpers::shared_memory::open_memory_backing_file(
-                            path,
-                            opt.memory_size(),
-                        )
-                    })
-                    .transpose()?;
-                (shared_memory, None, false, None)
-            };
+        let (
+            shared_memory,
+            saved_state,
+            shared_memory_copy_on_write,
+            restore_time,
+            snapshot_restore_guards,
+        ) = if opt.restore_snapshot.is_some() {
+            let prepared = prepare_snapshot_restore(
+                restore_snapshot
+                    .take()
+                    .context("snapshot restore is missing its opened generation")?,
+                &opt,
+                &source_hypervisor,
+                effective_command_line.as_deref(),
+                microvm_network
+                    .as_ref()
+                    .zip(microvm_egress_policy.as_ref())
+                    .zip(microvm_network_attachment.as_ref())
+                    .map(|((network, policy), attachment)| (network, policy, attachment)),
+                microvm_filesystem
+                    .as_ref()
+                    .zip(microvm_filesystem_attachment.as_ref()),
+                microvm_console_attachment.as_ref(),
+                &microvm_sandbox_block_sources,
+            )?;
+            (
+                Some(prepared.shared_memory),
+                Some(prepared.saved_state),
+                true,
+                prepared.restore_time,
+                Some(prepared.guards),
+            )
+        } else if let Some(file) = &snapshot_memory_handle {
+            let file = file
+                .try_clone()
+                .context("failed to duplicate snapshot RAM handle for worker")?;
+            let shared_memory = openvmm_helpers::shared_memory::file_to_shared_memory_fd(file)?;
+            (Some(shared_memory), None, false, None, None)
+        } else {
+            let shared_memory = opt
+                .memory_backing_file()
+                .map(|path| {
+                    openvmm_helpers::shared_memory::open_memory_backing_file(
+                        path,
+                        opt.memory_size(),
+                    )
+                })
+                .transpose()?;
+            (shared_memory, None, false, None, None)
+        };
         let restore_ready_sink = opt
             .restore_ready_path
             .as_deref()
@@ -4979,6 +4991,7 @@ async fn run_control_inner(
             saved_state,
             shared_memory,
             shared_memory_copy_on_write,
+            snapshot_restore_guards,
             snapshot_boundary_requests,
             snapshot_ready,
             restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),

@@ -1007,6 +1007,21 @@ pub struct SnapshotManifest {
     pub consumed_config_sections: u32,
 }
 
+/// One structurally validated snapshot generation opened for restore.
+///
+/// Artifact access is relative to the retained directory handle. The open
+/// artifact handles keep pathname replacement from substituting another
+/// generation after validation.
+pub struct OpenedSnapshot {
+    directory: OpenedSnapshotDirectory,
+    manifest_file: std::fs::File,
+    state_file: std::fs::File,
+    memory_file: std::fs::File,
+    memory_generation: OpenedFileGeneration,
+    manifest: SnapshotManifest,
+    state_bytes: Vec<u8>,
+}
+
 /// Write a snapshot to the given directory.
 ///
 /// The final directory must not already exist. The snapshot consists of:
@@ -1143,6 +1158,142 @@ fn stage_snapshot(
     Ok(staging)
 }
 
+impl OpenedSnapshot {
+    /// Opens and structurally validates one exact snapshot generation.
+    pub fn open(dir: &Path) -> anyhow::Result<Self> {
+        let directory = OpenedSnapshotDirectory::open(dir)?;
+        let manifest_file = directory.open_regular_file(MANIFEST_FILE_NAME, "snapshot manifest")?;
+        let state_file = directory.open_regular_file(STATE_FILE_NAME, "saved state")?;
+        let memory_file = directory.open_regular_file(MEMORY_FILE_NAME, "snapshot memory")?;
+        let manifest = decode_snapshot_manifest(&manifest_file)?;
+        validate_snapshot_directory(&directory, &manifest)?;
+        anyhow::ensure!(
+            manifest.state_size_bytes <= MAX_SAVED_STATE_SIZE_BYTES,
+            "state.bin length in the manifest exceeds the maximum size of \
+             {MAX_SAVED_STATE_SIZE_BYTES} bytes",
+        );
+
+        let state_bytes =
+            read_bounded_open_file(&state_file, MAX_SAVED_STATE_SIZE_BYTES, "saved state")?;
+        anyhow::ensure!(
+            state_bytes.len() as u64 == manifest.state_size_bytes,
+            "state.bin size ({} bytes) doesn't match manifest ({} bytes)",
+            state_bytes.len(),
+            manifest.state_size_bytes,
+        );
+
+        let memory_generation = opened_file_generation(&memory_file, MEMORY_FILE_NAME)?;
+        anyhow::ensure!(
+            memory_generation.length() == manifest.memory_size_bytes,
+            "memory.bin size ({} bytes) doesn't match manifest ({} bytes)",
+            memory_generation.length(),
+            manifest.memory_size_bytes,
+        );
+
+        Ok(Self {
+            directory,
+            manifest_file,
+            state_file,
+            memory_file,
+            memory_generation,
+            manifest,
+            state_bytes,
+        })
+    }
+
+    /// Returns the authoritative manifest read from this opened generation.
+    pub fn manifest(&self) -> &SnapshotManifest {
+        &self.manifest
+    }
+
+    /// Returns the saved-state bytes read from this opened generation.
+    pub fn state_bytes(&self) -> &[u8] {
+        &self.state_bytes
+    }
+
+    /// Opens the paired scratch artifact relative to this snapshot generation.
+    pub fn open_paired_scratch_file(&self) -> anyhow::Result<Option<std::fs::File>> {
+        open_paired_scratch_file_in_directory(&self.directory, &self.manifest)
+    }
+
+    /// Claims this exact opened generation for a single-use resume.
+    pub fn claim_for_restore(&self) -> anyhow::Result<()> {
+        claim_snapshot_for_restore_in_directory(&self.directory, &self.manifest)
+    }
+
+    /// Duplicates the exact memory handle used to create a private mapping.
+    pub fn duplicate_memory_file_for_mapping(
+        &self,
+        expected_memory_size: u64,
+    ) -> anyhow::Result<std::fs::File> {
+        self.validate_memory_generation(expected_memory_size)?;
+        let duplicate = self
+            .memory_file
+            .try_clone()
+            .context("failed to duplicate snapshot memory handle")?;
+        anyhow::ensure!(
+            opened_file_generation(&duplicate, MEMORY_FILE_NAME)? == self.memory_generation,
+            "snapshot memory duplicate does not refer to the opened generation",
+        );
+        Ok(duplicate)
+    }
+
+    /// Verifies that the opened memory generation and EOF are unchanged.
+    pub fn validate_memory_generation(&self, expected_memory_size: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.manifest.memory_size_bytes == expected_memory_size,
+            "memory.bin size in the manifest ({} bytes) doesn't match expected ({expected_memory_size} bytes)",
+            self.manifest.memory_size_bytes,
+        );
+        anyhow::ensure!(
+            opened_file_generation(&self.memory_file, MEMORY_FILE_NAME)? == self.memory_generation,
+            "snapshot memory generation changed after it was opened",
+        );
+        Ok(())
+    }
+
+    /// Consumes this snapshot into decoded data and lifetime guard handles.
+    pub fn into_parts(
+        self,
+    ) -> (
+        SnapshotManifest,
+        Vec<u8>,
+        openvmm_defs::worker::SnapshotRestoreGuards,
+    ) {
+        (
+            self.manifest,
+            self.state_bytes,
+            openvmm_defs::worker::SnapshotRestoreGuards {
+                directory: self.directory.into_file(),
+                manifest: self.manifest_file,
+                state: self.state_file,
+                memory: self.memory_file,
+            },
+        )
+    }
+}
+
+fn read_snapshot_manifest_from_directory(
+    directory: &OpenedSnapshotDirectory,
+) -> anyhow::Result<(SnapshotManifest, std::fs::File)> {
+    let manifest_file = directory.open_regular_file(MANIFEST_FILE_NAME, "snapshot manifest")?;
+    let manifest = decode_snapshot_manifest(&manifest_file)?;
+    Ok((manifest, manifest_file))
+}
+
+fn decode_snapshot_manifest(manifest_file: &std::fs::File) -> anyhow::Result<SnapshotManifest> {
+    let manifest_bytes =
+        read_bounded_open_file(manifest_file, MAX_MANIFEST_SIZE_BYTES, "snapshot manifest")?;
+    let manifest: SnapshotManifest =
+        mesh::payload::decode(&manifest_bytes).context("failed to decode snapshot manifest")?;
+    validate_manifest_header(&manifest)?;
+    validate_manifest_version(&manifest)?;
+    if let Some(contract) = &manifest.machine_contract {
+        validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
+    }
+    Ok(manifest)
+}
+
 /// Read a snapshot from the given directory.
 ///
 /// Returns the decoded manifest and raw saved-state bytes after structurally
@@ -1151,29 +1302,20 @@ pub fn read_snapshot(
     dir: &Path,
     expected_memory_size: u64,
 ) -> anyhow::Result<(SnapshotManifest, Vec<u8>)> {
-    let (manifest, state_bytes, _) = read_snapshot_with_memory(dir, expected_memory_size)?;
+    let snapshot = OpenedSnapshot::open(dir)?;
+    snapshot.validate_memory_generation(expected_memory_size)?;
+    let (manifest, state_bytes, _) = snapshot.into_parts();
     Ok((manifest, state_bytes))
 }
 
 /// Reads and structurally validates only `manifest.bin`.
 ///
-/// Restore uses this before machine composition; all artifacts are opened and
-/// structurally validated again before partition creation.
+/// Production restore should use [`OpenedSnapshot`] so later artifact access
+/// remains anchored to the same opened directory generation.
 pub fn read_snapshot_manifest(dir: &Path) -> anyhow::Result<SnapshotManifest> {
-    validate_directory(dir, "snapshot directory")?;
-    let manifest_bytes = read_bounded_file(
-        &dir.join(MANIFEST_FILE_NAME),
-        MAX_MANIFEST_SIZE_BYTES,
-        "snapshot manifest",
-    )?;
-    let manifest: SnapshotManifest =
-        mesh::payload::decode(&manifest_bytes).context("failed to decode snapshot manifest")?;
-    validate_manifest_header(&manifest)?;
-    validate_manifest_version(&manifest)?;
-    if let Some(contract) = &manifest.machine_contract {
-        validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
-    }
-    validate_snapshot_directory(dir, &manifest)?;
+    let directory = OpenedSnapshotDirectory::open(dir)?;
+    let (manifest, _) = read_snapshot_manifest_from_directory(&directory)?;
+    validate_snapshot_directory(&directory, &manifest)?;
     Ok(manifest)
 }
 
@@ -1185,39 +1327,38 @@ pub fn read_snapshot_with_memory(
     dir: &Path,
     expected_memory_size: u64,
 ) -> anyhow::Result<(SnapshotManifest, Vec<u8>, std::fs::File)> {
-    let manifest = read_snapshot_manifest(dir)?;
-    let (state_bytes, memory_file) =
-        read_snapshot_artifacts_with_memory(dir, &manifest, expected_memory_size)?;
-    Ok((manifest, state_bytes, memory_file))
+    let snapshot = OpenedSnapshot::open(dir)?;
+    snapshot.validate_memory_generation(expected_memory_size)?;
+    let (manifest, state_bytes, guards) = snapshot.into_parts();
+    let openvmm_defs::worker::SnapshotRestoreGuards { memory, .. } = guards;
+    Ok((manifest, state_bytes, memory))
 }
 
 /// Opens snapshot artifacts against an already validated manifest.
 ///
-/// Restore uses this to keep one manifest authoritative from machine
-/// composition through worker construction.
+/// This compatibility helper reopens the directory. Production restore should
+/// keep an [`OpenedSnapshot`] alive through worker construction instead.
 pub fn read_snapshot_artifacts_with_memory(
     dir: &Path,
     manifest: &SnapshotManifest,
     expected_memory_size: u64,
 ) -> anyhow::Result<(Vec<u8>, std::fs::File)> {
-    validate_directory(dir, "snapshot directory")?;
+    let directory = OpenedSnapshotDirectory::open(dir)?;
     validate_manifest_header(manifest)?;
     validate_manifest_version(manifest)?;
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
-    validate_snapshot_directory(dir, manifest)?;
+    validate_snapshot_directory(&directory, manifest)?;
     anyhow::ensure!(
         manifest.state_size_bytes <= MAX_SAVED_STATE_SIZE_BYTES,
         "state.bin length in the manifest exceeds the maximum size of \
          {MAX_SAVED_STATE_SIZE_BYTES} bytes",
     );
 
-    let state_bytes = read_bounded_file(
-        &dir.join(STATE_FILE_NAME),
-        MAX_SAVED_STATE_SIZE_BYTES,
-        "saved state",
-    )?;
+    let state_file = directory.open_regular_file(STATE_FILE_NAME, "saved state")?;
+    let state_bytes =
+        read_bounded_open_file(&state_file, MAX_SAVED_STATE_SIZE_BYTES, "saved state")?;
     anyhow::ensure!(
         state_bytes.len() as u64 == manifest.state_size_bytes,
         "state.bin size ({} bytes) doesn't match manifest ({} bytes)",
@@ -1229,8 +1370,11 @@ pub fn read_snapshot_artifacts_with_memory(
         "memory.bin size in the manifest ({} bytes) doesn't match expected ({expected_memory_size} bytes)",
         manifest.memory_size_bytes,
     );
-    let memory_path = dir.join(MEMORY_FILE_NAME);
-    let memory_file = open_file_with_length(&memory_path, expected_memory_size, MEMORY_FILE_NAME)?;
+    let memory_file = directory.open_file_with_length(
+        MEMORY_FILE_NAME,
+        expected_memory_size,
+        MEMORY_FILE_NAME,
+    )?;
 
     Ok((state_bytes, memory_file))
 }
@@ -1240,14 +1384,19 @@ pub fn open_paired_scratch_file(
     dir: &Path,
     manifest: &SnapshotManifest,
 ) -> anyhow::Result<Option<std::fs::File>> {
+    let directory = OpenedSnapshotDirectory::open(dir)?;
+    open_paired_scratch_file_in_directory(&directory, manifest)
+}
+
+fn open_paired_scratch_file_in_directory(
+    directory: &OpenedSnapshotDirectory,
+    manifest: &SnapshotManifest,
+) -> anyhow::Result<Option<std::fs::File>> {
     let Some(scratch) = paired_scratch_block(manifest) else {
         return Ok(None);
     };
-    let file = open_file_with_length(
-        &dir.join(SCRATCH_FILE_NAME),
-        scratch.length,
-        SCRATCH_FILE_NAME,
-    )?;
+    let file =
+        directory.open_file_with_length(SCRATCH_FILE_NAME, scratch.length, SCRATCH_FILE_NAME)?;
     verify_file_digest(&file, scratch.length, &scratch.identity, SCRATCH_FILE_NAME)?;
     Ok(Some(file))
 }
@@ -1283,22 +1432,21 @@ pub fn copy_verified_file(
 /// execution-owned workers. A later startup failure does not roll back the claim.
 /// Clone snapshots are unchanged.
 pub fn claim_snapshot_for_restore(dir: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
+    let directory = OpenedSnapshotDirectory::open(dir)?;
+    claim_snapshot_for_restore_in_directory(&directory, manifest)
+}
+
+fn claim_snapshot_for_restore_in_directory(
+    directory: &OpenedSnapshotDirectory,
+    manifest: &SnapshotManifest,
+) -> anyhow::Result<()> {
     validate_manifest_header(manifest)?;
     validate_manifest_version(manifest)?;
     if manifest.restore_policy != SNAPSHOT_RESTORE_POLICY_RESUME {
         return Ok(());
     }
 
-    validate_directory(dir, "snapshot directory")?;
-    let claim_path = dir.join(RESUME_CLAIM_FILE_NAME);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut claim = match options.open(&claim_path) {
+    let mut claim = match directory.create_new_file(RESUME_CLAIM_FILE_NAME) {
         Ok(claim) => claim,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             anyhow::bail!("resume snapshot has already been claimed")
@@ -1307,7 +1455,7 @@ pub fn claim_snapshot_for_restore(dir: &Path, manifest: &SnapshotManifest) -> an
             return Err(error).with_context(|| {
                 format!(
                     "failed to claim resume snapshot at {}",
-                    claim_path.display()
+                    directory.display_path(RESUME_CLAIM_FILE_NAME).display()
                 )
             });
         }
@@ -1318,7 +1466,9 @@ pub fn claim_snapshot_for_restore(dir: &Path, manifest: &SnapshotManifest) -> an
     claim
         .sync_all()
         .context("failed to flush resume snapshot claim")?;
-    sync_directory(dir).context("failed to commit resume snapshot claim")?;
+    directory
+        .sync()
+        .context("failed to commit resume snapshot claim")?;
     Ok(())
 }
 
@@ -1868,22 +2018,13 @@ fn allocated_file_bytes(file: &std::fs::File, _length: u64) -> anyhow::Result<u6
     Ok(file.metadata()?.len())
 }
 
-fn validate_snapshot_directory(dir: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
-    let metadata = fs_err::symlink_metadata(dir)
-        .with_context(|| format!("failed to inspect snapshot directory {}", dir.display()))?;
-    anyhow::ensure!(
-        metadata.file_type().is_dir(),
-        "snapshot path is not a directory: {}",
-        dir.display(),
-    );
-
+fn validate_snapshot_directory(
+    directory: &OpenedSnapshotDirectory,
+    manifest: &SnapshotManifest,
+) -> anyhow::Result<()> {
     let has_scratch = paired_scratch_block(manifest).is_some();
     let mut entries = HashSet::new();
-    for entry in fs_err::read_dir(dir)
-        .with_context(|| format!("failed to enumerate snapshot directory {}", dir.display()))?
-    {
-        let entry = entry.context("failed to inspect snapshot directory entry")?;
-        let name = entry.file_name();
+    for name in directory.entry_names()? {
         if name == RESUME_CLAIM_FILE_NAME
             && manifest.restore_policy == SNAPSHOT_RESTORE_POLICY_RESUME
         {
@@ -1895,7 +2036,7 @@ fn validate_snapshot_directory(dir: &Path, manifest: &SnapshotManifest) -> anyho
                 || name == MEMORY_FILE_NAME
                 || (has_scratch && name == SCRATCH_FILE_NAME),
             "unexpected artifact in snapshot directory: {}",
-            entry.path().display(),
+            directory.display_path(&name).display(),
         );
         entries.insert(name);
     }
@@ -1910,32 +2051,239 @@ fn validate_snapshot_directory(dir: &Path, manifest: &SnapshotManifest) -> anyho
     Ok(())
 }
 
-fn open_regular_file(path: &Path, description: &str) -> anyhow::Result<std::fs::File> {
-    let path_metadata = fs_err::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {description} at {}", path.display()))?;
-    anyhow::ensure!(
-        path_metadata.file_type().is_file(),
-        "{description} is not a regular file: {}",
-        path.display(),
-    );
+struct OpenedSnapshotDirectory {
+    file: std::fs::File,
+    path: PathBuf,
+}
 
+impl OpenedSnapshotDirectory {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+            options
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("failed to open snapshot directory {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect snapshot directory {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "snapshot path is not a directory: {}",
+            path.display(),
+        );
+        reject_windows_reparse_point(&metadata, "snapshot directory", path)?;
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+        })
+    }
+
+    fn open_regular_file(&self, name: &str, description: &str) -> anyhow::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        let file = {
+            use nix::fcntl::OFlag;
+            use nix::sys::stat::Mode;
+
+            let fd = nix::fcntl::openat(
+                &self.file,
+                name,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(nix_error)
+            .with_context(|| {
+                format!(
+                    "failed to open {description} at {}",
+                    self.display_path(name).display()
+                )
+            })?;
+            std::fs::File::from(fd)
+        };
+        #[cfg(windows)]
+        let file =
+            pal::windows::fs::open_relative_read_only(&self.file, std::ffi::OsStr::new(name))
+                .with_context(|| {
+                    format!(
+                        "failed to open {description} at {}",
+                        self.display_path(name).display()
+                    )
+                })?;
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let file = open_regular_file_impl(&self.path.join(name), description)?;
+
+        validate_opened_regular_file(&file, description, &self.display_path(name))?;
+        Ok(file)
+    }
+
+    fn open_file_with_length(
+        &self,
+        name: &str,
+        expected_length: u64,
+        artifact_name: &str,
+    ) -> anyhow::Result<std::fs::File> {
+        let file = self.open_regular_file(name, artifact_name)?;
+        let length = opened_file_generation(&file, artifact_name)?.length();
+        anyhow::ensure!(
+            length == expected_length,
+            "{artifact_name} size ({length} bytes) doesn't match manifest ({expected_length} bytes)",
+        );
+        Ok(file)
+    }
+
+    fn entry_names(&self) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::OwnedFd;
+            use std::os::unix::ffi::OsStrExt;
+
+            let directory: OwnedFd = self
+                .file
+                .try_clone()
+                .context("failed to duplicate snapshot directory handle")?
+                .into();
+            let mut directory = nix::dir::Dir::from_fd(directory).map_err(nix_error)?;
+            let mut names = Vec::new();
+            for entry in directory.iter() {
+                let entry = entry.map_err(nix_error)?;
+                let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+                if name != "." && name != ".." {
+                    names.push(name.to_owned());
+                }
+            }
+            Ok(names)
+        }
+        #[cfg(windows)]
+        {
+            pal::windows::fs::directory_entry_names(&self.file)
+                .context("failed to enumerate opened snapshot directory")
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            fs_err::read_dir(&self.path)
+                .with_context(|| {
+                    format!(
+                        "failed to enumerate snapshot directory {}",
+                        self.path.display()
+                    )
+                })?
+                .map(|entry| {
+                    entry
+                        .context("failed to inspect snapshot directory entry")
+                        .map(|entry| entry.file_name())
+                })
+                .collect()
+        }
+    }
+
+    fn create_new_file(&self, name: &str) -> std::io::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::OFlag;
+            use nix::sys::stat::Mode;
+
+            return nix::fcntl::openat(
+                &self.file,
+                name,
+                OFlag::O_WRONLY
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NOFOLLOW,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            )
+            .map(std::fs::File::from)
+            .map_err(nix_error);
+        }
+        #[cfg(windows)]
+        {
+            return pal::windows::fs::create_relative_new(&self.file, std::ffi::OsStr::new(name));
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(self.path.join(name))
+        }
+    }
+
+    fn sync(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            self.file.sync_all().context("failed to flush directory")
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
+    fn display_path(&self, name: impl AsRef<Path>) -> PathBuf {
+        self.path.join(name)
+    }
+
+    fn into_file(self) -> std::fs::File {
+        self.file
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn nix_error(error: nix::errno::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error as i32)
+}
+
+fn open_regular_file(path: &Path, description: &str) -> anyhow::Result<std::fs::File> {
+    open_regular_file_impl(path, description)
+}
+
+fn open_regular_file_impl(path: &Path, description: &str) -> anyhow::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
     let file = options
         .open(path)
         .with_context(|| format!("failed to open {description} at {}", path.display()))?;
+    validate_opened_regular_file(&file, description, path)?;
+    Ok(file)
+}
+
+fn validate_opened_regular_file(
+    file: &std::fs::File,
+    description: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
     let metadata = file
         .metadata()
         .with_context(|| format!("failed to inspect opened {description}"))?;
@@ -1944,26 +2292,140 @@ fn open_regular_file(path: &Path, description: &str) -> anyhow::Result<std::fs::
         "{description} is not a regular file: {}",
         path.display(),
     );
-    Ok(file)
+    reject_windows_reparse_point(&metadata, description, path)
 }
 
-fn read_bounded_file(path: &Path, maximum_size: u64, description: &str) -> anyhow::Result<Vec<u8>> {
-    let file = open_regular_file(path, description)?;
-    let length = file
+#[cfg(windows)]
+fn reject_windows_reparse_point(
+    metadata: &std::fs::Metadata,
+    description: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    anyhow::ensure!(
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "{description} is a reparse point: {}",
+        path.display(),
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_windows_reparse_point(
+    _metadata: &std::fs::Metadata,
+    _description: &str,
+    _path: &Path,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileGeneration {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileGeneration {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+    length: u64,
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileGeneration {
+    length: u64,
+}
+
+impl OpenedFileGeneration {
+    fn length(self) -> u64 {
+        self.length
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn opened_file_generation(
+    file: &std::fs::File,
+    description: &str,
+) -> anyhow::Result<OpenedFileGeneration> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
         .metadata()
-        .with_context(|| format!("failed to inspect opened {description}"))?
-        .len();
+        .with_context(|| format!("failed to inspect opened {description}"))?;
+    Ok(OpenedFileGeneration {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(windows)]
+fn opened_file_generation(
+    file: &std::fs::File,
+    description: &str,
+) -> anyhow::Result<OpenedFileGeneration> {
+    let identity = pal::windows::fs::file_identity(file)
+        .with_context(|| format!("failed to query {description} FILE_ID_INFO and EOF"))?;
+    Ok(OpenedFileGeneration {
+        volume_serial_number: identity.volume_serial_number,
+        file_id: identity.file_id,
+        length: identity.end_of_file,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn opened_file_generation(
+    file: &std::fs::File,
+    description: &str,
+) -> anyhow::Result<OpenedFileGeneration> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {description}"))?;
+    Ok(OpenedFileGeneration {
+        length: metadata.len(),
+    })
+}
+
+fn read_bounded_open_file(
+    file: &std::fs::File,
+    maximum_size: u64,
+    description: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let generation = opened_file_generation(file, description)?;
+    let length = generation.length();
     anyhow::ensure!(
         length <= maximum_size,
         "{description} is {length} bytes, exceeding the maximum of {maximum_size} bytes",
     );
     let capacity = usize::try_from(length).context("artifact length does not fit in usize")?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.take(maximum_size + 1)
+    let mut reader = file
+        .try_clone()
+        .with_context(|| format!("failed to duplicate {description} handle"))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind {description}"))?;
+    reader
+        .take(maximum_size + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {description}"))?;
     anyhow::ensure!(
-        bytes.len() as u64 == length,
+        bytes.len() as u64 == length && opened_file_generation(file, description)? == generation,
         "{description} changed while it was being read",
     );
     Ok(bytes)
@@ -2052,10 +2514,7 @@ fn open_file_with_length(
     artifact_name: &str,
 ) -> anyhow::Result<std::fs::File> {
     let file = open_regular_file(path, artifact_name)?;
-    let length = file
-        .metadata()
-        .with_context(|| format!("failed to inspect opened {artifact_name}"))?
-        .len();
+    let length = opened_file_generation(&file, artifact_name)?.length();
     anyhow::ensure!(
         length == expected_length,
         "{artifact_name} size ({length} bytes) doesn't match manifest ({expected_length} bytes)",
@@ -3774,6 +4233,7 @@ mod tests {
             file_sha256(&verified, 1024, SCRATCH_FILE_NAME).unwrap(),
             manifest.machine_contract.unwrap().microvm_sandbox_blocks[1].identity
         );
+        drop(verified);
 
         let published = snap_dir.join(SCRATCH_FILE_NAME);
         std::fs::write(&published, vec![0xa5_u8; 1024]).unwrap();
@@ -4386,9 +4846,11 @@ mod tests {
         assert!(
             err.to_string().contains("unexpected artifact")
                 || err.to_string().contains("not a regular file")
+                || err.to_string().contains("failed to open saved state")
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn opened_memory_handle_survives_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
@@ -4406,6 +4868,161 @@ mod tests {
         let mut bytes = Vec::new();
         opened_memory.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, vec![0x5a_u8; 1024]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opened_snapshot_survives_directory_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let moved_dir = dir.path().join("opened-snapshot");
+        let memory_source = dir.path().join("memory-source.bin");
+        std::fs::write(&memory_source, vec![0x5a_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"state", &memory_source).unwrap();
+
+        let snapshot = OpenedSnapshot::open(&snap_dir).unwrap();
+        std::fs::rename(&snap_dir, &moved_dir).unwrap();
+        std::fs::write(&memory_source, vec![0xa5_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"other", &memory_source).unwrap();
+
+        snapshot.validate_memory_generation(1024).unwrap();
+        let (_, state, guards) = snapshot.into_parts();
+        let mut memory = guards.memory;
+        let mut bytes = Vec::new();
+        memory.read_to_end(&mut bytes).unwrap();
+        assert_eq!(state, b"state");
+        assert_eq!(bytes, vec![0x5a_u8; 1024]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_claim_targets_opened_directory_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let moved_dir = dir.path().join("opened-snapshot");
+        let memory_source = dir.path().join("memory-source.bin");
+        let scratch_source = dir.path().join("scratch-source.bin");
+        let scratch = vec![0x5a_u8; 512];
+        std::fs::write(&memory_source, vec![0_u8; 1024]).unwrap();
+        std::fs::write(&scratch_source, &scratch).unwrap();
+        let memory_file = std::fs::File::open(&memory_source).unwrap();
+        let scratch_file = std::fs::File::open(&scratch_source).unwrap();
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.snapshot_tier = SNAPSHOT_TIER_INSTANCE_CHECKPOINT.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_RESUME.to_owned();
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=instance-checkpoint".to_owned(),
+            );
+        write_snapshot_from_memory_and_scratch_files(
+            &snap_dir,
+            &manifest,
+            b"state",
+            &memory_file,
+            Some(&scratch_file),
+        )
+        .unwrap();
+
+        let snapshot = OpenedSnapshot::open(&snap_dir).unwrap();
+        std::fs::rename(&snap_dir, &moved_dir).unwrap();
+        std::fs::create_dir(&snap_dir).unwrap();
+        snapshot.claim_for_restore().unwrap();
+
+        assert!(moved_dir.join(RESUME_CLAIM_FILE_NAME).exists());
+        assert!(!snap_dir.join(RESUME_CLAIM_FILE_NAME).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opened_snapshot_detects_same_length_memory_write_before_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_source = dir.path().join("memory-source.bin");
+        std::fs::write(&memory_source, vec![0_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"state", &memory_source).unwrap();
+
+        let snapshot = OpenedSnapshot::open(&snap_dir).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(snap_dir.join(MEMORY_FILE_NAME))
+            .unwrap();
+        writer.write_all(&[1]).unwrap();
+        writer.sync_all().unwrap();
+
+        let error = snapshot
+            .duplicate_memory_file_for_mapping(1024)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("memory generation changed after it was opened")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_snapshot_denies_mutation_until_guards_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let moved_dir = dir.path().join("moved");
+        let memory_source = dir.path().join("memory-source.bin");
+        std::fs::write(&memory_source, vec![0_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"state", &memory_source).unwrap();
+
+        let snapshot = OpenedSnapshot::open(&snap_dir).unwrap();
+        let memory_path = snap_dir.join(MEMORY_FILE_NAME);
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&memory_path)
+                .is_err()
+        );
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&memory_path)
+                .is_err()
+        );
+        assert!(std::fs::remove_file(&memory_path).is_err());
+        assert!(std::fs::rename(&snap_dir, &moved_dir).is_err());
+
+        drop(snapshot);
+        std::fs::rename(&snap_dir, &moved_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_snapshot_rejects_reparse_artifact() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_source = dir.path().join("memory-source.bin");
+        let replacement = dir.path().join("replacement.bin");
+        std::fs::write(&memory_source, vec![0_u8; 1024]).unwrap();
+        write_snapshot(&snap_dir, &test_manifest(), b"state", &memory_source).unwrap();
+        std::fs::rename(snap_dir.join(MEMORY_FILE_NAME), &replacement).unwrap();
+        match symlink_file(&replacement, snap_dir.join(MEMORY_FILE_NAME)) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to create test symlink: {error}"),
+        }
+
+        let error = OpenedSnapshot::open(&snap_dir).err().unwrap();
+        assert!(
+            error.to_string().contains("reparse point")
+                || error.to_string().contains("not a regular file")
+        );
     }
 
     #[test]

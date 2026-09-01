@@ -310,6 +310,7 @@ pub struct VmWorker {
     vm: LoadedVm,
     rpc: mesh::Receiver<VmRpc>,
     device_thread: JoinHandle<()>,
+    snapshot_restore_guards: Option<openvmm_defs::worker::SnapshotRestoreGuards>,
 }
 
 impl Worker for VmWorker {
@@ -320,6 +321,7 @@ impl Worker for VmWorker {
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
         let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
         let snapshot_ready = parameters.snapshot_ready;
+        let snapshot_restore_guards = parameters.snapshot_restore_guards;
         let restore_ready_sink = parameters.restore_ready_sink;
         let restore_gate_timeout = parameters.restore_gate_timeout;
         let restore_time = match (
@@ -401,6 +403,7 @@ impl Worker for VmWorker {
             vm,
             rpc: parameters.rpc,
             device_thread,
+            snapshot_restore_guards,
         })
     }
 
@@ -437,16 +440,24 @@ impl Worker for VmWorker {
                 vm,
                 rpc,
                 device_thread,
+                snapshot_restore_guards: None,
             })
         })
     }
 
     fn run(self, worker_rpc: mesh::Receiver<WorkerRpc<Self::State>>) -> anyhow::Result<()> {
+        let Self {
+            vm,
+            rpc,
+            device_thread,
+            snapshot_restore_guards,
+        } = self;
         DefaultPool::run_with(async |driver| {
             let driver = driver;
-            self.vm.run(&driver, self.rpc, worker_rpc).await
+            vm.run(&driver, rpc, worker_rpc).await
         });
-        self.device_thread.join().unwrap();
+        device_thread.join().unwrap();
+        drop(snapshot_restore_guards);
         Ok(())
     }
 }
