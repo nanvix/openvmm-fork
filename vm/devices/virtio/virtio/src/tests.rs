@@ -1425,6 +1425,7 @@ impl VirtioDevice for FailingTestDevice {
 #[inspect(skip)]
 struct TestDevice {
     traits: DeviceTraits,
+    supports_accelerated_doorbells: bool,
     queue_work: Option<TestDeviceQueueWorkFn>,
     driver: vmcore::vm_task::VmTaskDriver,
     workers: Vec<TaskControl<TestDeviceTask, TestDeviceQueue>>,
@@ -1438,16 +1439,26 @@ impl TestDevice {
     ) -> Self {
         Self {
             traits,
+            supports_accelerated_doorbells: true,
             queue_work,
             driver: driver_source.simple(),
             workers: Vec::new(),
         }
+    }
+
+    fn without_accelerated_doorbells(mut self) -> Self {
+        self.supports_accelerated_doorbells = false;
+        self
     }
 }
 
 impl VirtioDevice for TestDevice {
     fn traits(&self) -> DeviceTraits {
         self.traits.clone()
+    }
+
+    fn supports_accelerated_doorbells(&self) -> bool {
+        self.supports_accelerated_doorbells
     }
 
     async fn read_registers_u32(&mut self, offset: u16) -> u32 {
@@ -5340,6 +5351,47 @@ async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
     );
 
     dev2.stop().await;
+}
+
+#[async_test]
+async fn mmio_respects_accelerated_doorbell_opt_out(driver: DefaultDriver) {
+    let test_mem = VirtioTestMemoryAccess::new();
+    let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
+    let mem = GuestMemory::new("test", test_mem.clone());
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+
+    let device = TestDevice::new(
+        &driver_source,
+        DeviceTraits {
+            device_id: VirtioDeviceType::CONSOLE,
+            device_features: VirtioDeviceFeatures::new()
+                .with_bank(0, 2 | VIRTIO_F_RING_INDIRECT_DESC | VIRTIO_F_RING_EVENT_IDX),
+            max_queues: 1,
+            device_register_length: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .without_accelerated_doorbells();
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(device),
+        &driver,
+        mem,
+        LineInterrupt::detached(),
+        Some(doorbell_registration),
+        0,
+        1,
+    )
+    .unwrap();
+
+    guest
+        .setup_chipset_device(&mut dev, guest.queue_features())
+        .await;
+
+    assert!(test_mem.installed_doorbells().is_empty());
+    assert_eq!(test_mem.doorbell_count.load(Ordering::Relaxed), 0);
+    dev.stop().await;
 }
 
 // -- Tests for drain / stop / reset side-effects --

@@ -361,6 +361,10 @@ impl VirtioDevice for VirtioFsDevice {
         }
     }
 
+    fn supports_accelerated_doorbells(&self) -> bool {
+        self.microvm_attachment_id.is_none() || self.microvm_profile.is_some()
+    }
+
     async fn read_registers_u32(&mut self, offset: u16) -> u32 {
         let offset = offset as usize;
         let config = self.config.as_bytes();
@@ -802,6 +806,7 @@ mod tests {
             device.traits().max_queues,
             1 + DEFAULT_NUM_REQUEST_QUEUES as u16
         );
+        assert!(device.supports_accelerated_doorbells());
     }
 
     #[async_test]
@@ -851,7 +856,23 @@ mod tests {
         assert_eq!(device.traits().shared_memory.size, 0);
         assert!(!device.traits().device_features.ring_packed());
         assert!(device.supports_save_restore());
+        assert!(device.supports_accelerated_doorbells());
         assert_eq!(&device.config.tag[..7], b"microvm");
+    }
+
+    #[async_test]
+    async fn dormant_microvm_profile_uses_emulated_doorbells(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let device = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(device.traits().max_queues, 2);
+        assert!(device.supports_save_restore());
+        assert!(!device.supports_accelerated_doorbells());
     }
 
     #[async_test]
