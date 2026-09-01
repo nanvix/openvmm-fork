@@ -83,6 +83,22 @@ pub enum SnapshotWriteError {
     /// Nothing was published at the final destination.
     #[error(transparent)]
     BeforeCommit(#[from] anyhow::Error),
+    /// Publication did not commit, but an alias to live source RAM may remain.
+    ///
+    /// Callers must terminate rather than resume the source. The reported
+    /// private staging path may require operator cleanup after termination.
+    #[error(
+        "snapshot failed before commit at {path:?}, and automatic RAM staging alias cleanup is uncertain: publication error: {error:#}; cleanup error: {cleanup_error:#}"
+    )]
+    CleanupUncertain {
+        /// Staging directory that may retain an alias to live source RAM.
+        path: PathBuf,
+        /// Original publication failure.
+        error: anyhow::Error,
+        /// Failure removing or proving absence of the staging alias.
+        #[source]
+        cleanup_error: anyhow::Error,
+    },
     /// The directory rename committed, but its parent could not be flushed.
     #[error("snapshot committed to {path:?}, but flushing its parent directory failed: {error:#}")]
     Committed {
@@ -98,6 +114,11 @@ impl SnapshotWriteError {
     /// Returns whether the final snapshot directory has been published.
     pub fn is_committed(&self) -> bool {
         matches!(self, Self::Committed { .. })
+    }
+
+    /// Returns whether a quiesced source may safely roll back and resume.
+    pub fn is_rollback_safe(&self) -> bool {
+        matches!(self, Self::BeforeCommit(_))
     }
 }
 
@@ -1068,9 +1089,69 @@ pub fn write_snapshot_from_memory_and_scratch_files(
     memory_file: &std::fs::File,
     scratch_file: Option<&std::fs::File>,
 ) -> Result<(), SnapshotWriteError> {
-    let mut staging = stage_snapshot(dir, manifest, saved_state_bytes, memory_file, scratch_file)?;
-    ensure_path_absent(dir, "snapshot destination")?;
-    staging.publish(dir)?;
+    write_snapshot_with_memory_publication(
+        dir,
+        manifest,
+        saved_state_bytes,
+        memory_file,
+        scratch_file,
+        MemoryPublication::IndependentCopy,
+    )
+}
+
+/// Writes a snapshot by promoting OpenVMM-owned guest RAM as an exact file.
+///
+/// The caller must use this only for automatic backing whose lifetime it owns,
+/// and must stop all writers before calling. It must terminate the source after
+/// success or [`SnapshotWriteError::Committed`]. A
+/// [`SnapshotWriteError::BeforeCommit`] proves that staging was removed and the
+/// source may resume. [`SnapshotWriteError::CleanupUncertain`] requires source
+/// termination because a private staging alias may remain. Unsupported hard
+/// links fall back to an independent sparse-aware copy.
+pub fn write_snapshot_from_owned_memory_and_scratch_files(
+    dir: &Path,
+    manifest: &SnapshotManifest,
+    saved_state_bytes: &[u8],
+    memory_file: &std::fs::File,
+    scratch_file: Option<&std::fs::File>,
+) -> Result<(), SnapshotWriteError> {
+    write_snapshot_with_memory_publication(
+        dir,
+        manifest,
+        saved_state_bytes,
+        memory_file,
+        scratch_file,
+        MemoryPublication::OwnedExactFile,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryPublication {
+    IndependentCopy,
+    OwnedExactFile,
+}
+
+fn write_snapshot_with_memory_publication(
+    dir: &Path,
+    manifest: &SnapshotManifest,
+    saved_state_bytes: &[u8],
+    memory_file: &std::fs::File,
+    scratch_file: Option<&std::fs::File>,
+    memory_publication: MemoryPublication,
+) -> Result<(), SnapshotWriteError> {
+    let mut staging = stage_snapshot(
+        dir,
+        manifest,
+        saved_state_bytes,
+        memory_file,
+        scratch_file,
+        memory_publication,
+    )?;
+    if let Err(error) =
+        ensure_path_absent(dir, "snapshot destination").and_then(|()| staging.publish(dir))
+    {
+        return Err(staging.rollback(error));
+    }
 
     let parent = snapshot_parent(dir);
     sync_directory(parent).map_err(|error| SnapshotWriteError::Committed {
@@ -1086,76 +1167,97 @@ fn stage_snapshot(
     saved_state_bytes: &[u8],
     memory_file: &std::fs::File,
     scratch_file: Option<&std::fs::File>,
-) -> anyhow::Result<StagingDirectory> {
+    memory_publication: MemoryPublication,
+) -> Result<StagingDirectory, SnapshotWriteError> {
     validate_manifest_header(manifest)?;
     validate_manifest_version(manifest)?;
     if let Some(contract) = &manifest.machine_contract {
         validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
     }
-    anyhow::ensure!(
-        manifest.version == MANIFEST_VERSION,
-        "snapshot manifest version {} is not supported for writing (expected {})",
-        manifest.version,
-        MANIFEST_VERSION,
-    );
-    anyhow::ensure!(
-        u64::try_from(saved_state_bytes.len()).unwrap_or(u64::MAX) <= MAX_SAVED_STATE_SIZE_BYTES,
-        "saved state exceeds the maximum size of {MAX_SAVED_STATE_SIZE_BYTES} bytes",
-    );
+    if manifest.version != MANIFEST_VERSION {
+        return Err(anyhow::anyhow!(
+            "snapshot manifest version {} is not supported for writing (expected {})",
+            manifest.version,
+            MANIFEST_VERSION,
+        )
+        .into());
+    }
+    if u64::try_from(saved_state_bytes.len()).unwrap_or(u64::MAX) > MAX_SAVED_STATE_SIZE_BYTES {
+        return Err(anyhow::anyhow!(
+            "saved state exceeds the maximum size of {MAX_SAVED_STATE_SIZE_BYTES} bytes"
+        )
+        .into());
+    }
 
     let parent = snapshot_parent(dir);
     validate_directory(parent, "snapshot parent directory")?;
     ensure_path_absent(dir, "snapshot destination")?;
 
-    let staging = StagingDirectory::create(parent, dir)?;
+    let mut staging = StagingDirectory::create(parent, dir)?;
     let state_path = staging.path().join(STATE_FILE_NAME);
     let memory_path = staging.path().join(MEMORY_FILE_NAME);
     let manifest_path = staging.path().join(MANIFEST_FILE_NAME);
 
-    write_bytes(&state_path, saved_state_bytes, "saved state")?;
-    copy_exact(
-        memory_file,
-        &memory_path,
-        manifest.memory_size_bytes,
-        "memory backing file",
-        "snapshot memory",
-    )?;
-    match (paired_scratch_block(manifest), scratch_file) {
-        (Some(scratch), Some(scratch_file)) => {
-            let scratch_path = staging.path().join(SCRATCH_FILE_NAME);
+    let result = (|| -> anyhow::Result<()> {
+        write_bytes(&state_path, saved_state_bytes, "saved state")?;
+        if memory_publication == MemoryPublication::IndependentCopy {
             copy_exact(
-                scratch_file,
-                &scratch_path,
-                scratch.length,
-                "scratch backing file",
-                "snapshot scratch",
-            )?;
-            verify_file_digest(
-                &open_file_with_length(&scratch_path, scratch.length, SCRATCH_FILE_NAME)?,
-                scratch.length,
-                &scratch.identity,
-                "scratch.img",
+                memory_file,
+                &memory_path,
+                manifest.memory_size_bytes,
+                "memory backing file",
+                "snapshot memory",
             )?;
         }
-        (Some(_), None) => anyhow::bail!("snapshot contract requires a paired scratch image"),
-        (None, Some(_)) => anyhow::bail!("snapshot contract does not declare a scratch image"),
-        (None, None) => {}
+        match (paired_scratch_block(manifest), scratch_file) {
+            (Some(scratch), Some(scratch_file)) => {
+                let scratch_path = staging.path().join(SCRATCH_FILE_NAME);
+                copy_exact(
+                    scratch_file,
+                    &scratch_path,
+                    scratch.length,
+                    "scratch backing file",
+                    "snapshot scratch",
+                )?;
+                verify_file_digest(
+                    &open_file_with_length(&scratch_path, scratch.length, SCRATCH_FILE_NAME)?,
+                    scratch.length,
+                    &scratch.identity,
+                    "scratch.img",
+                )?;
+            }
+            (Some(_), None) => anyhow::bail!("snapshot contract requires a paired scratch image"),
+            (None, Some(_)) => {
+                anyhow::bail!("snapshot contract does not declare a scratch image")
+            }
+            (None, None) => {}
+        }
+
+        let mut published_manifest = manifest.clone();
+        published_manifest.state_size_bytes = saved_state_bytes.len() as u64;
+        // Current local snapshots use strict structure, length, generation,
+        // and machine-contract checks without RAM-sized in-band hashing.
+        published_manifest.state_sha256.clear();
+        published_manifest.memory_sha256.clear();
+
+        let manifest_bytes = mesh::payload::encode(published_manifest);
+        anyhow::ensure!(
+            manifest_bytes.len() as u64 <= MAX_MANIFEST_SIZE_BYTES,
+            "snapshot manifest exceeds the maximum size of {MAX_MANIFEST_SIZE_BYTES} bytes",
+        );
+        write_bytes(&manifest_path, &manifest_bytes, "snapshot manifest")?;
+
+        if memory_publication == MemoryPublication::OwnedExactFile {
+            publish_owned_memory_file(&mut staging, memory_file, manifest.memory_size_bytes)?;
+        }
+
+        sync_directory(staging.path())?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(staging),
+        Err(error) => Err(staging.rollback(error)),
     }
-
-    let mut published_manifest = manifest.clone();
-    published_manifest.state_size_bytes = saved_state_bytes.len() as u64;
-    published_manifest.state_sha256.clear();
-    published_manifest.memory_sha256.clear();
-
-    let manifest_bytes = mesh::payload::encode(published_manifest);
-    anyhow::ensure!(
-        manifest_bytes.len() as u64 <= MAX_MANIFEST_SIZE_BYTES,
-        "snapshot manifest exceeds the maximum size of {MAX_MANIFEST_SIZE_BYTES} bytes",
-    );
-    write_bytes(&manifest_path, &manifest_bytes, "snapshot manifest")?;
-
-    sync_directory(staging.path())?;
-    Ok(staging)
 }
 
 impl OpenedSnapshot {
@@ -1527,6 +1629,9 @@ fn validate_directory(path: &Path, description: &str) -> anyhow::Result<()> {
 
 struct StagingDirectory {
     path: Option<PathBuf>,
+    source_memory_alias: bool,
+    #[cfg(test)]
+    inject_cleanup_failure: bool,
 }
 
 impl StagingDirectory {
@@ -1543,7 +1648,14 @@ impl StagingDirectory {
                 std::process::id()
             ));
             match create_private_directory(&path) {
-                Ok(()) => return Ok(Self { path: Some(path) }),
+                Ok(()) => {
+                    return Ok(Self {
+                        path: Some(path),
+                        source_memory_alias: false,
+                        #[cfg(test)]
+                        inject_cleanup_failure: false,
+                    });
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -1573,6 +1685,62 @@ impl StagingDirectory {
             )
         })?;
         self.path = None;
+        Ok(())
+    }
+
+    fn mark_source_memory_alias(&mut self) {
+        self.source_memory_alias = true;
+    }
+
+    fn rollback(mut self, error: anyhow::Error) -> SnapshotWriteError {
+        if self.source_memory_alias
+            && let Err(cleanup_error) = self.remove_staging_directory()
+        {
+            return SnapshotWriteError::CleanupUncertain {
+                path: self
+                    .path
+                    .clone()
+                    .expect("unpublished staging path is present"),
+                error,
+                cleanup_error,
+            };
+        }
+
+        if let Err(cleanup_error) = self.remove_staging_directory() {
+            tracing::warn!(
+                error = cleanup_error.as_ref() as &dyn std::error::Error,
+                "failed to remove independent snapshot staging artifacts"
+            );
+        }
+        SnapshotWriteError::BeforeCommit(error)
+    }
+
+    fn remove_staging_directory(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.inject_cleanup_failure {
+            anyhow::bail!("injected snapshot staging cleanup failure");
+        }
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        let parent = snapshot_parent(path).to_owned();
+        match fs_err::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove staging directory {}", path.display())
+                });
+            }
+        }
+        anyhow::ensure!(
+            !path_exists(path)?,
+            "snapshot staging directory still exists after removal: {}",
+            path.display()
+        );
+        sync_directory(&parent).context("failed to flush snapshot staging cleanup")?;
+        self.path = None;
+        self.source_memory_alias = false;
         Ok(())
     }
 }
@@ -1634,7 +1802,14 @@ fn rename_no_replace(source: &Path, destination: &Path) -> anyhow::Result<()> {
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
-            let _ = fs_err::remove_dir_all(path);
+            if let Err(error) = fs_err::remove_dir_all(path) {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    source_memory_alias = self.source_memory_alias,
+                    path = %path.display(),
+                    "failed to remove dropped snapshot staging directory"
+                );
+            }
         }
     }
 }
@@ -1669,6 +1844,231 @@ fn write_bytes(path: &Path, bytes: &[u8], description: &str) -> anyhow::Result<(
         .with_context(|| format!("failed to write {description}"))?;
     file.sync_all()
         .with_context(|| format!("failed to flush {description}"))?;
+    Ok(())
+}
+
+fn publish_owned_memory_file(
+    staging: &mut StagingDirectory,
+    source: &std::fs::File,
+    expected_length: u64,
+) -> anyhow::Result<()> {
+    let source_metadata = source
+        .metadata()
+        .context("failed to inspect automatic snapshot RAM handle")?;
+    anyhow::ensure!(
+        source_metadata.file_type().is_file(),
+        "automatic snapshot RAM handle is not a regular file"
+    );
+    anyhow::ensure!(
+        source_metadata.len() == expected_length,
+        "automatic snapshot RAM size ({} bytes) doesn't match manifest ({expected_length} bytes)",
+        source_metadata.len()
+    );
+
+    // The VM worker has stopped all writers before this call. Flush through
+    // the exact handle immediately before linking the same file generation.
+    source
+        .sync_all()
+        .context("failed to flush automatic snapshot RAM handle")?;
+
+    let memory_path = staging.path().join(MEMORY_FILE_NAME);
+    let directory = OpenedSnapshotDirectory::open_for_publication(staging.path())?;
+    // From this point, any failure is treated as though the link may have been
+    // installed until the complete staging directory is proven absent.
+    staging.mark_source_memory_alias();
+    let method = match create_hard_link_from_handle(source, &directory.file, MEMORY_FILE_NAME) {
+        Ok(method) => method,
+        Err(error) if hard_link_is_unsupported(&error) => {
+            tracing::info!(
+                error = &error as &dyn std::error::Error,
+                "exact-file snapshot RAM publication is unavailable; using independent copy"
+            );
+            drop(directory);
+            return copy_exact(
+                source,
+                &memory_path,
+                expected_length,
+                "automatic snapshot RAM handle",
+                "snapshot memory",
+            );
+        }
+        Err(error) => {
+            return Err(error).context("failed to create automatic RAM staging hard link");
+        }
+    };
+    let linked =
+        directory.open_regular_file_for_identity(MEMORY_FILE_NAME, "linked snapshot memory")?;
+    verify_hard_link_identity(source, &linked, expected_length)?;
+    tracing::info!(
+        method,
+        logical_bytes = expected_length,
+        "published exact snapshot memory artifact"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_hard_link_from_handle(
+    source: &std::fs::File,
+    directory: &std::fs::File,
+    name: &str,
+) -> std::io::Result<&'static str> {
+    use nix::fcntl::AT_FDCWD;
+    use nix::fcntl::AtFlags;
+    use std::os::fd::AsRawFd;
+
+    match nix::unistd::linkat(
+        source,
+        Path::new(""),
+        directory,
+        name,
+        AtFlags::AT_EMPTY_PATH,
+    ) {
+        Ok(()) => return Ok("linkat-empty-path"),
+        Err(error)
+            if matches!(
+                error,
+                nix::errno::Errno::EPERM | nix::errno::Errno::EINVAL | nix::errno::Errno::ENOENT
+            ) =>
+        {
+            tracing::debug!(
+                error = &nix_error(error) as &dyn std::error::Error,
+                "AT_EMPTY_PATH hard link is unavailable"
+            );
+        }
+        Err(error) => return Err(nix_error(error)),
+    }
+
+    let source_path = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
+    // Following is required to link the descriptor's target rather than the
+    // procfs symlink itself. The descriptor remains live, and the caller proves
+    // the resulting device/inode against `source` before publication.
+    nix::unistd::linkat(
+        AT_FDCWD,
+        &source_path,
+        directory,
+        name,
+        AtFlags::AT_SYMLINK_FOLLOW,
+    )
+    .map(|()| "linkat-proc-fd")
+    .map_err(nix_error)
+}
+
+#[cfg(windows)]
+fn create_hard_link_from_handle(
+    source: &std::fs::File,
+    directory: &std::fs::File,
+    name: &str,
+) -> std::io::Result<&'static str> {
+    pal::windows::fs::hard_link_relative(source, directory, std::ffi::OsStr::new(name))?;
+    Ok("file-link-information")
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn create_hard_link_from_handle(
+    _source: &std::fs::File,
+    _directory: &std::fs::File,
+    _name: &str,
+) -> std::io::Result<&'static str> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "exact-file hard links are unsupported on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn hard_link_is_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EACCES
+                | libc::EMLINK
+                | libc::EINVAL
+                | libc::ELOOP
+                | libc::ENOENT
+                | libc::ENOSYS
+                | libc::EOPNOTSUPP
+                | libc::EPERM
+                | libc::EXDEV
+        )
+    )
+}
+
+#[cfg(windows)]
+fn hard_link_is_unsupported(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::Foundation::ERROR_FILE_SYSTEM_LIMITATION;
+    use windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION;
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE;
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
+    use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
+    use windows_sys::Win32::Foundation::ERROR_TOO_MANY_LINKS;
+
+    matches!(
+        error.raw_os_error(),
+        Some(raw) if matches!(
+            raw as u32,
+            ERROR_ACCESS_DENIED
+                | ERROR_FILE_SYSTEM_LIMITATION
+                | ERROR_INVALID_FUNCTION
+                | ERROR_INVALID_PARAMETER
+                | ERROR_NOT_SAME_DEVICE
+                | ERROR_NOT_SUPPORTED
+                | ERROR_PRIVILEGE_NOT_HELD
+                | ERROR_TOO_MANY_LINKS
+        )
+    )
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn hard_link_is_unsupported(_error: &std::io::Error) -> bool {
+    true
+}
+
+fn verify_hard_link_identity(
+    source: &std::fs::File,
+    linked: &std::fs::File,
+    expected_length: u64,
+) -> anyhow::Result<()> {
+    let source_metadata = source
+        .metadata()
+        .context("failed to re-inspect automatic snapshot RAM handle")?;
+    let linked_metadata = linked
+        .metadata()
+        .context("failed to inspect linked snapshot memory")?;
+    anyhow::ensure!(
+        source_metadata.file_type().is_file() && linked_metadata.file_type().is_file(),
+        "automatic snapshot RAM hard link does not resolve to regular files"
+    );
+    anyhow::ensure!(
+        source_metadata.len() == expected_length && linked_metadata.len() == expected_length,
+        "automatic snapshot RAM hard-link EOF does not match manifest ({expected_length} bytes)"
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            source_metadata.dev() == linked_metadata.dev()
+                && source_metadata.ino() == linked_metadata.ino(),
+            "automatic snapshot RAM hard link has the wrong device or inode"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let source_identity = pal::windows::fs::file_identity(source)
+            .context("failed to query automatic snapshot RAM identity")?;
+        let linked_identity = pal::windows::fs::file_identity(linked)
+            .context("failed to query linked snapshot RAM identity")?;
+        anyhow::ensure!(
+            source_identity == linked_identity && source_identity.end_of_file == expected_length,
+            "automatic snapshot RAM hard link has the wrong file identity or EOF"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    anyhow::bail!("exact-file hard-link identity checks are unsupported on this platform");
+
     Ok(())
 }
 
@@ -2058,6 +2458,14 @@ struct OpenedSnapshotDirectory {
 
 impl OpenedSnapshotDirectory {
     fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_impl(path, false)
+    }
+
+    fn open_for_publication(path: &Path) -> anyhow::Result<Self> {
+        Self::open_impl(path, true)
+    }
+
+    fn open_impl(path: &Path, allow_changes: bool) -> anyhow::Result<Self> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -2070,12 +2478,20 @@ impl OpenedSnapshotDirectory {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
             use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
             use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 
             options
-                .share_mode(FILE_SHARE_READ)
+                .share_mode(if allow_changes {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                } else {
+                    FILE_SHARE_READ
+                })
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         }
+        #[cfg(not(windows))]
+        let _ = allow_changes;
         let file = options
             .open(path)
             .with_context(|| format!("failed to open snapshot directory {}", path.display()))?;
@@ -2126,6 +2542,27 @@ impl OpenedSnapshotDirectory {
                 })?;
         #[cfg(not(any(target_os = "linux", windows)))]
         let file = open_regular_file_impl(&self.path.join(name), description)?;
+
+        validate_opened_regular_file(&file, description, &self.display_path(name))?;
+        Ok(file)
+    }
+
+    fn open_regular_file_for_identity(
+        &self,
+        name: &str,
+        description: &str,
+    ) -> anyhow::Result<std::fs::File> {
+        #[cfg(windows)]
+        let file =
+            pal::windows::fs::open_relative_for_identity(&self.file, std::ffi::OsStr::new(name))
+                .with_context(|| {
+                    format!(
+                        "failed to open {description} at {}",
+                        self.display_path(name).display()
+                    )
+                })?;
+        #[cfg(not(windows))]
+        let file = self.open_regular_file(name, description)?;
 
         validate_opened_regular_file(&file, description, &self.display_path(name))?;
         Ok(file)
@@ -2212,7 +2649,7 @@ impl OpenedSnapshotDirectory {
         }
         #[cfg(windows)]
         {
-            return pal::windows::fs::create_relative_new(&self.file, std::ffi::OsStr::new(name));
+            pal::windows::fs::create_relative_new(&self.file, std::ffi::OsStr::new(name))
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -4321,6 +4758,112 @@ mod tests {
             std::fs::read(snap_dir.join(MEMORY_FILE_NAME)).unwrap(),
             b"SAMEFILE"
         );
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn owned_memory_snapshot_publishes_exact_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("automatic-memory.bin");
+        std::fs::write(&memory_path, vec![0x5a_u8; 1024]).unwrap();
+        let memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&memory_path)
+            .unwrap();
+
+        write_snapshot_from_owned_memory_and_scratch_files(
+            &snap_dir,
+            &test_manifest(),
+            b"state",
+            &memory_file,
+            None,
+        )
+        .unwrap();
+
+        let published = std::fs::File::open(snap_dir.join(MEMORY_FILE_NAME)).unwrap();
+        verify_hard_link_identity(&memory_file, &published, 1024).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn owned_memory_link_uses_exact_handle_after_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("automatic-memory.bin");
+        let moved_path = dir.path().join("mapped-memory.bin");
+        std::fs::write(&memory_path, vec![0x5a_u8; 1024]).unwrap();
+        let memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&memory_path)
+            .unwrap();
+        std::fs::rename(&memory_path, &moved_path).unwrap();
+        std::fs::write(&memory_path, vec![0xa5_u8; 1024]).unwrap();
+
+        write_snapshot_from_owned_memory_and_scratch_files(
+            &snap_dir,
+            &test_manifest(),
+            b"state",
+            &memory_file,
+            None,
+        )
+        .unwrap();
+
+        let published = std::fs::File::open(snap_dir.join(MEMORY_FILE_NAME)).unwrap();
+        verify_hard_link_identity(&memory_file, &published, 1024).unwrap();
+        assert_eq!(
+            std::fs::read(snap_dir.join(MEMORY_FILE_NAME)).unwrap(),
+            vec![0x5a_u8; 1024]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn injected_failure_removes_live_memory_staging_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("automatic-memory.bin");
+        std::fs::write(&memory_path, vec![0x5a_u8; 1024]).unwrap();
+        let memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&memory_path)
+            .unwrap();
+        let staging = stage_snapshot(
+            &snap_dir,
+            &test_manifest(),
+            b"state",
+            &memory_file,
+            None,
+            MemoryPublication::OwnedExactFile,
+        )
+        .unwrap();
+        assert!(staging.source_memory_alias);
+        let staging_path = staging.path().to_owned();
+
+        let error = staging.rollback(anyhow::anyhow!("injected failure after memory link"));
+
+        assert!(error.is_rollback_safe());
+        assert!(!staging_path.exists());
+        assert!(!snap_dir.exists());
+        std::fs::write(&memory_path, vec![0xa5_u8; 1024]).unwrap();
+    }
+
+    #[test]
+    fn uncertain_live_alias_cleanup_is_not_rollback_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let mut staging = StagingDirectory::create(dir.path(), &snap_dir).unwrap();
+        staging.mark_source_memory_alias();
+        staging.inject_cleanup_failure = true;
+
+        let error = staging.rollback(anyhow::anyhow!("injected publication failure"));
+
+        assert!(!error.is_committed());
+        assert!(!error.is_rollback_safe());
+        assert!(matches!(error, SnapshotWriteError::CleanupUncertain { .. }));
     }
 
     #[cfg(target_os = "linux")]

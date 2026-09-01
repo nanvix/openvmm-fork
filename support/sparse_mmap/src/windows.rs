@@ -7,6 +7,7 @@
 
 use Memory::CreateFileMappingNumaW;
 use Memory::CreateFileMappingW;
+use Memory::FlushViewOfFile;
 use Memory::GetLargePageMinimum;
 use Memory::MEM_COMMIT;
 use Memory::MEM_DECOMMIT;
@@ -500,6 +501,23 @@ impl SparseMapping {
     /// Returns the length of the mapping, in bytes.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Flushes modified shared file pages in a populated local view.
+    pub fn flush(&self, offset: usize, len: usize) -> Result<(), Error> {
+        let _ = self.validate_offset_len(offset, len)?;
+        if self.process.is_some() {
+            return Err(Error::new(
+                io::ErrorKind::Unsupported,
+                "flushing a remote mapped view is unsupported",
+            ));
+        }
+        // SAFETY: `validate_offset_len` proves the range is within this
+        // reservation. Callers use this only for populated shared views.
+        if unsafe { FlushViewOfFile(self.address.add(offset), len) } == 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Returns the process associated with the mapping

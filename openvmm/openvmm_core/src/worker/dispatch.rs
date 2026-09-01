@@ -4097,6 +4097,15 @@ impl LoadedVm {
                                     RemoteError::new(error),
                                 )
                             })?;
+                            self.inner
+                                .memory_manager
+                                .flush_shared_file_backing()
+                                .context("failed to flush mapped guest RAM")
+                                .map_err(|error| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                })?;
                             let tsc_frequency_hz = self
                                 .inner
                                 .partition

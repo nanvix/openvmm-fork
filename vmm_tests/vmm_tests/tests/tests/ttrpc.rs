@@ -952,9 +952,12 @@ fn test_ttrpc_microvm_snapshot_restore(
                 == 0,
             "captured source executed past the snapshot boundary"
         );
+        // Automatic RAM publication hard-links memory.bin to the source backing
+        // file. Wait for OpenVMM to release its writable handle before opening
+        // the snapshot as immutable, especially on Windows.
+        anyhow::ensure!(child.wait().await?.success(), "capture server failed");
         openvmm_helpers::snapshot::read_snapshot(&snapshot_path, MEMORY_BYTES)
             .context("TTRPC capture produced an invalid snapshot")?;
-        anyhow::ensure!(child.wait().await?.success(), "capture server failed");
         anyhow::ensure!(
             !pidfile_path.exists(),
             "capture source PID remained alive after snapshot commit"

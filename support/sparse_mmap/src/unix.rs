@@ -186,6 +186,17 @@ impl SparseMapping {
         self.len
     }
 
+    /// Flushes modified shared file pages in a populated range.
+    pub fn flush(&self, offset: usize, len: usize) -> Result<(), Error> {
+        let _ = self.validate_offset_len(offset, len)?;
+        // SAFETY: `validate_offset_len` proves the range is within this
+        // reservation. Callers use this only for populated shared mappings.
+        if unsafe { libc::msync(self.address.add(offset), len, libc::MS_SYNC) } < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn validate_offset_len(&self, offset: usize, len: usize) -> io::Result<usize> {
         let end = offset.checked_add(len).ok_or(io::ErrorKind::InvalidInput)?;
         let page_size = page_size();

@@ -12,7 +12,7 @@ an ABI-v2 mounted-scratch capture, one paired scratch image:
 snapshot-dir/
 ├── manifest.bin   # Protobuf-encoded SnapshotManifest
 ├── state.bin      # Protobuf-encoded device saved state
-├── memory.bin     # Sparse independent clone of the guest-memory handle
+├── memory.bin     # Exact automatic RAM file or independent supplied-RAM clone
 └── scratch.img    # Optional paired ABI-v2 writable scratch image
 ```
 
@@ -54,13 +54,25 @@ default values, forward/backward compatibility) apply.
 
 ## Memory (`memory.bin`)
 
-`memory.bin` is an exact-length sparse-aware clone of the opened file handle
-that backs guest RAM. Capture uses that handle rather than reopening its
-pathname, so replacing the source path cannot substitute different bytes
-during publication. Clone support is used when available, with allocated-range
-or zero-scan copying as a fallback. The independently owned clone is flushed in
-the private staging directory before publication, and later source writes
-cannot change it.
+For automatically allocated microVM RAM, `memory.bin` is a hard link to the
+exact OpenVMM-owned backing handle. State and manifest are written and flushed
+first; OpenVMM then flushes the stopped guest's shared RAM mappings and exact
+backing handle, creates the link last, and verifies the linked handle's file
+identity and EOF before the staging directory is renamed into place. Linux
+prefers `linkat(AT_EMPTY_PATH)` and can use a `/proc/self/fd` link with a
+device/inode proof. Windows uses handle-relative `FileLinkInformation` and
+verifies `FILE_ID_INFO`. Filesystems that cannot create the link fall back to
+an independent sparse-aware copy.
+
+User-supplied RAM always uses the independent-copy path, never a hard link.
+Clone support is used when available, with allocated-range or zero-scan copying
+as a fallback on Linux; Windows uses a dense copy. Both paths use an
+already-open handle rather than reopening its pathname, so replacing the source
+path cannot substitute different bytes.
+Successful guest-requested capture is terminal for the source. If publication
+fails after the automatic link exists, OpenVMM removes and durably flushes the
+private staging directory before allowing rollback; uncertain cleanup makes
+the source terminate instead of resume.
 
 Restore likewise opens the snapshot directory once and resolves its artifacts
 relative to that handle. Windows uses read-only handles with `FILE_SHARE_READ`

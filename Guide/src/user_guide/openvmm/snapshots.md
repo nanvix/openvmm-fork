@@ -35,9 +35,11 @@ workload-start snapshots are reusable clones; instance checkpoints are
 single-use resumes.
 
 ```admonish warning
-The memory backing file and snapshot destination must be on the **same
-filesystem**. OpenVMM copies memory into a uniquely named sibling staging
-directory and atomically renames the completed directory into place.
+Automatically allocated microVM RAM and the snapshot destination are on the
+same filesystem so OpenVMM can promote the exact RAM file by hard link. A
+filesystem without hard-link support falls back to copying. Explicit
+user-supplied memory is always copied into a uniquely named sibling staging
+directory. OpenVMM atomically renames the completed directory into place.
 ```
 
 ## Saving a snapshot
@@ -59,13 +61,18 @@ specifying the output directory:
 save-snapshot path/to/snapshot-dir
 ```
 
-OpenVMM writes and flushes `manifest.bin`, `state.bin`, and an independent
-`memory.bin` in a sibling staging directory. The destination must not already
+OpenVMM writes and flushes `manifest.bin`, `state.bin`, and `memory.bin` in a
+sibling staging directory. Host-driven saves and user-supplied microVM backing
+use an independent memory copy. Automatic microVM backing uses its exact RAM
+file when the filesystem supports hard links. The destination must not already
 exist. Publishing the completed directory is the commit point.
 
 ```admonish warning
 After a host-driven save, the VM remains **paused**. Guest-requested microVM
 capture instead terminates the source process after publication commits.
+If automatic-RAM publication fails after creating its staging link, OpenVMM
+removes the complete staging directory before resuming; if cleanup cannot be
+proved, it terminates the source instead.
 ```
 
 ## Restoring a snapshot

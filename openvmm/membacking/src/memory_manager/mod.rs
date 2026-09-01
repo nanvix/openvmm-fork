@@ -784,6 +784,11 @@ impl GuestMemoryManager {
         }
     }
 
+    /// Flushes guest writes from the primary shared file mappings.
+    pub fn flush_shared_file_backing(&self) -> io::Result<()> {
+        self.va_mapper.flush_shared_file_mappings()
+    }
+
     /// Returns a resolver that prepares guest-memory backing on demand in
     /// response to partition memory-access faults (soft large pages, lazy
     /// commit).
