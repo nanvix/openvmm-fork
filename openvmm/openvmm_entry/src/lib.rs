@@ -4346,6 +4346,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         Vec<openvmm_helpers::snapshot::SnapshotMicrovmSandboxBlock>,
     )>,
 ) -> anyhow::Result<PreparedSnapshotRestore> {
+    let artifact_prepare = openvmm_defs::profile::ProfileSpan::start();
     let manifest = snapshot.manifest();
     // Validate manifest against current VM config.
     openvmm_helpers::snapshot::validate_manifest(
@@ -4444,12 +4445,30 @@ pub(crate) fn prepare_snapshot_restore_for_config(
 
     snapshot.claim_for_restore()?;
 
+    artifact_prepare.complete(
+        "restore",
+        "artifact_prepare",
+        openvmm_defs::profile::ProfileCounters {
+            logical_bytes: Some(expected_memory_size),
+            ..Default::default()
+        },
+    );
+
     // Create the private mapping from a duplicate of the exact opened handle.
     // The original file and directory handles move to the worker and keep this
     // generation pinned until VM teardown.
+    let cow_section_create = openvmm_defs::profile::ProfileSpan::start();
     let memory_file = snapshot.duplicate_memory_file_for_mapping(expected_memory_size)?;
     let shared_memory =
         openvmm_helpers::shared_memory::file_to_copy_on_write_memory_fd(memory_file)?;
+    cow_section_create.complete(
+        "restore",
+        "cow_section_create",
+        openvmm_defs::profile::ProfileCounters {
+            logical_bytes: Some(expected_memory_size),
+            ..Default::default()
+        },
+    );
     snapshot.validate_memory_generation(expected_memory_size)?;
     let (_, _, guards) = snapshot.into_parts();
 
@@ -4462,6 +4481,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
 }
 
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
+    openvmm_defs::profile::initialize();
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
 
@@ -4566,11 +4586,30 @@ async fn run_control_inner(
     let mesh = mesh_slot.as_ref().unwrap();
     let mut private_scratch_dir = None;
     let mut restore_gate_required = false;
+    let artifact_open = openvmm_defs::profile::ProfileSpan::start();
     let mut restore_snapshot = opt
         .restore_snapshot
         .as_deref()
         .map(openvmm_helpers::snapshot::OpenedSnapshot::open)
         .transpose()?;
+    if opt.restore_snapshot.is_some() {
+        let counters = if openvmm_defs::profile::enabled() {
+            restore_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.artifact_size_counters().ok())
+                .map(|(logical_bytes, allocated_bytes)| {
+                    openvmm_defs::profile::ProfileCounters {
+                        logical_bytes: Some(logical_bytes),
+                        allocated_bytes: Some(allocated_bytes),
+                        ..Default::default()
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        artifact_open.complete("restore", "artifact_open", counters);
+    }
     if let Some(contract) = restore_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.manifest().machine_contract.as_ref())
@@ -5006,10 +5045,13 @@ async fn run_control_inner(
             rpc: rpc_recv,
             notify: notify_send,
         };
-        vm_host
+        let worker_launch = openvmm_defs::profile::ProfileSpan::start();
+        let worker = vm_host
             .launch_worker(VM_WORKER, params)
             .await
-            .context("failed to launch vm worker")?
+            .context("failed to launch vm worker")?;
+        worker_launch.complete_milestone("startup", "worker_launch", Default::default());
+        worker
     };
 
     if opt.restore_snapshot.is_some() {

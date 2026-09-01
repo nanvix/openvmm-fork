@@ -269,6 +269,15 @@ fn median(samples: &[f64]) -> f64 {
     }
 }
 
+fn nearest_rank_percentile(samples: &[f64], percentile: usize) -> f64 {
+    assert!(!samples.is_empty());
+    assert!((1..=100).contains(&percentile));
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = (percentile * sorted.len()).div_ceil(100) - 1;
+    sorted[index]
+}
+
 fn metric_json(name: &str, samples: &[f64]) -> String {
     let values = samples
         .iter()
@@ -277,8 +286,9 @@ fn metric_json(name: &str, samples: &[f64]) -> String {
         .join(",");
     format!(
         "\"{name}\":{{\"samples_ms\":[{values}],\"p50_ms\":{:.6},\
-         \"min_ms\":{:.6},\"max_ms\":{:.6}}}",
+         \"p95_ms\":{:.6},\"min_ms\":{:.6},\"max_ms\":{:.6}}}",
         median(samples),
+        nearest_rank_percentile(samples, 95),
         samples.iter().copied().fold(f64::INFINITY, f64::min),
         samples.iter().copied().fold(f64::NEG_INFINITY, f64::max),
     )
