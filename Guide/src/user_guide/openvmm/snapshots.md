@@ -97,23 +97,43 @@ do not modify the snapshot artifact.
 MicroVM orchestrators can add `--restore-ready-path <PATH>`. OpenVMM connects
 to an existing Unix domain socket on Linux or named pipe on Windows and writes
 `OPENVMM_RESTORE_READY_V1\n` after restore validation, attachment resolution,
-and state-unit startup, while restored vCPUs are still held. The event is
-single-use and is not serialized. Failure to write and flush it stops the
-started units and fails restore without releasing a vCPU. The peer must accept
-and read while resume is in progress; on Windows, flush completion waits until
-the named-pipe peer consumes the complete frame.
+and state-unit startup. Ungated restores publish it before releasing a restored
+vCPU. Gated ABI-v2 restores publish it after the guest acknowledges repair and
+host input is re-enabled, while the restored vCPU remains stopped. The event
+is single-use and is not serialized.
+Failure to write and flush it stops the started units and fails restore without
+releasing gated input. The peer must accept and read while resume is in
+progress; on Windows, flush completion waits until the named-pipe peer consumes
+the complete frame.
 
 For a tiered ABI-v2 restore, OpenVMM starts device workers with network and
 control input gated. The guest performs post-restore repair and writes the
 existing snapshot port (`0x605`) to acknowledge completion. OpenVMM stops at
 that exact post-write boundary, completes the deferred write while the vCPU is
 stopped, and then releases device input before resuming the vCPU. The acknowledgement is bounded by
-`--restore-gate-timeout-ms` (30000 milliseconds by default). Platform manifests
+`--restore-gate-timeout-ms` (60000 milliseconds by default). Platform manifests
 leave read-only layer identities unbound, while later tiers require exact image
 identities. An instance-checkpoint restore attempt atomically creates
 `resume.claim`; subsequent restores are rejected. The claim is committed after
 artifact and configuration validation but before worker construction, so the
 restore attempt remains consumed if later worker startup fails.
+
+An ABI-v2 template may opt into restore-time vCPU activation by booting with an
+explicit canonical `maxcpus=1`, `2`, `4`, or `8` value below or equal to its
+configured VP capacity. The snapshot records that boot-online count while its
+topology, APIC IDs, and saved VP inventory remain fixed at capacity.
+`--restore-processors <COUNT>` requests the contiguous online prefix
+`0..COUNT-1` and must satisfy `boot-online <= COUNT <= capacity`. The guest
+onlines and verifies that prefix before acknowledging the restore gate.
+On MSHV, an explicit target instantiates and binds only that VP prefix; saving
+such a reduced-prefix runtime is unsupported. MSHV restores without an explicit
+target, and all KVM and WHP restores, instantiate the full VP capacity.
+Versioned MSHV CPU contracts do not expose `IA32_TSC_ADJUST` because snapshot
+state cannot preserve that register independently of `IA32_TSC`; this prevents
+host-side TSC correction from appearing as per-VP firmware adjustment skew.
+Snapshots without the explicit capture-time `maxcpus` opt-in, including legacy
+snapshots, reject a restore target. This is not a post-readiness hotplug API and
+cannot add VPs absent from the saved topology.
 
 ```admonish warning
 Versions 3 through 5 do not contain or validate embedded checksums for

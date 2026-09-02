@@ -139,6 +139,8 @@ enum PartitionRequest {
 pub struct PartitionUnitParams<'a> {
     pub vtl_guest_memory: [Option<&'a GuestMemory>; 3],
     pub processor_topology: &'a ProcessorTopology,
+    /// VP prefix to instantiate. The full topology remains guest-visible.
+    pub active_vp_count: Option<u32>,
     /// Tracks the halt state of VPs.
     pub halt_vps: Arc<Halt>,
     /// The receiver returned from `Halt::new()`.
@@ -166,6 +168,8 @@ pub enum Error {
     NameInUse(NameInUse),
     #[error("missing guest memory required for gdb support")]
     MissingGuestMemory,
+    #[error("active VP count {active} is outside topology capacity 1..={capacity}")]
+    InvalidActiveVpCount { active: u32, capacity: u32 },
 }
 
 /// Error returned by [`PartitionUnit::set_initial_regs()`].
@@ -200,10 +204,23 @@ impl PartitionUnit {
             return Err(Error::DebuggingNotSupported);
         }
 
-        let mut vp_set = VpSet::new(params.vtl_guest_memory.map(|m| m.cloned()), params.halt_vps);
+        let vp_capacity = params.processor_topology.vp_count();
+        let active_vp_count = params.active_vp_count.unwrap_or(vp_capacity);
+        if !(1..=vp_capacity).contains(&active_vp_count) {
+            return Err(Error::InvalidActiveVpCount {
+                active: active_vp_count,
+                capacity: vp_capacity,
+            });
+        }
+        let mut vp_set = VpSet::new(
+            params.vtl_guest_memory.map(|m| m.cloned()),
+            params.halt_vps,
+            vp_capacity as usize,
+        );
         let vps = params
             .processor_topology
             .vps_arch()
+            .take(active_vp_count as usize)
             .map(|vp| vp_set.add(vp))
             .collect();
 

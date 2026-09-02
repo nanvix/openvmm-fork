@@ -2929,11 +2929,7 @@ async fn vm_config_from_command_line(
 
     if let Some(io) = microvm_portb_cfg {
         let restore_entropy = if opt.restore_entropy {
-            let mut entropy = [0_u8; 64];
-            getrandom::fill(&mut entropy).context("failed to generate restore entropy")?;
-            let mut packet = b"OPENVMM_ENTROPY_V1\0".to_vec();
-            packet.extend(entropy);
-            packet
+            fresh_microvm_restore_packet(opt.restore_processors)?
         } else {
             Vec::new()
         };
@@ -4463,6 +4459,48 @@ fn calculate_snapshot_downtime(
     Ok(downtime)
 }
 
+fn microvm_restore_packet(
+    entropy: &[u8; 64],
+    restore_online_vp_count: Option<u32>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut packet = if let Some(count) = restore_online_vp_count {
+        let count = u8::try_from(count).context("restore-online VP count does not fit in u8")?;
+        let mut packet = b"OPENVMM_ENTROPY_V2\0".to_vec();
+        packet.push(count);
+        packet
+    } else {
+        b"OPENVMM_ENTROPY_V1\0".to_vec()
+    };
+    packet.extend(entropy);
+    Ok(packet)
+}
+
+pub(crate) fn fresh_microvm_restore_packet(
+    restore_online_vp_count: Option<u32>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut entropy = [0_u8; 64];
+    getrandom::fill(&mut entropy).context("failed to generate restore entropy")?;
+    microvm_restore_packet(&entropy, restore_online_vp_count)
+}
+
+#[cfg(test)]
+mod restore_packet_tests {
+    use super::microvm_restore_packet;
+
+    #[test]
+    fn restore_packet_versions_preserve_entropy_and_online_target() {
+        let entropy = [0x5a; 64];
+        let v1 = microvm_restore_packet(&entropy, None).unwrap();
+        assert_eq!(&v1[..19], b"OPENVMM_ENTROPY_V1\0");
+        assert_eq!(&v1[19..], &entropy);
+
+        let v2 = microvm_restore_packet(&entropy, Some(8)).unwrap();
+        assert_eq!(&v2[..19], b"OPENVMM_ENTROPY_V2\0");
+        assert_eq!(v2[19], 8);
+        assert_eq!(&v2[20..], &entropy);
+    }
+}
+
 fn align_legacy_network_policy_contract(
     saved: &openvmm_helpers::snapshot::SnapshotMachineContract,
     expected: &mut openvmm_helpers::snapshot::SnapshotMachineContract,
@@ -4816,6 +4854,13 @@ async fn run_control_inner(
                 && contract.microvm_abi_version == expected_abi_version,
             "snapshot microVM ABI version does not match the requested machine"
         );
+        if let Some(restore_processors) = opt.restore_processors {
+            openvmm_helpers::snapshot::validate_restore_online_vp_count(
+                manifest,
+                restore_processors,
+            )?;
+            restore_gate_required = true;
+        }
         anyhow::ensure!(
             opt.cmdline.is_empty(),
             "restore-time command-line overrides are not allowed"
@@ -4899,7 +4944,7 @@ async fn run_control_inner(
     } else {
         None
     };
-    if restore_gate_required {
+    if restore_gate_required || opt.restore_processors.is_some() {
         opt.restore_entropy = true;
     }
     if restore_machine_contract.is_some() && !opt.restore_entropy {
@@ -5215,6 +5260,7 @@ async fn run_control_inner(
             restore_ready_sink,
             restore_gate_timeout: restore_gate_required
                 .then_some(Duration::from_millis(opt.restore_gate_timeout_ms)),
+            restore_vp_count: opt.restore_processors,
             rpc: rpc_recv,
             notify: notify_send,
         };

@@ -591,6 +591,11 @@ message MicrovmSnapshotConfig {
     // Unix socket (Linux) or named pipe (Windows) that receives exactly one
     // OPENVMM_RESTORE_READY_V1 event before restored guest execution begins.
     string restore_ready_path = 5;
+    // Bring this contiguous prefix of capacity VPs online before restore readiness.
+    // Zero preserves legacy restore behavior.
+    uint32 restore_processor_count = 6;
+    // Maximum time allowed for gated guest repair. Zero selects 60 seconds.
+    uint64 restore_gate_timeout_ms = 7;
 }
 
 message CreateVMRequest {

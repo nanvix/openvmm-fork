@@ -74,32 +74,16 @@ pub mod profile {
         }
 
         /// Emits one exclusive phase interval.
-        pub fn complete(
-            self,
-            operation: &'static str,
-            phase: &'static str,
-            counters: ProfileCounters,
-        ) {
+        pub fn complete(self, operation: &str, phase: &str, counters: ProfileCounters) {
             self.emit(operation, phase, true, counters);
         }
 
         /// Emits one cumulative milestone that may contain nested phase intervals.
-        pub fn complete_milestone(
-            self,
-            operation: &'static str,
-            phase: &'static str,
-            counters: ProfileCounters,
-        ) {
+        pub fn complete_milestone(self, operation: &str, phase: &str, counters: ProfileCounters) {
             self.emit(operation, phase, false, counters);
         }
 
-        fn emit(
-            self,
-            operation: &'static str,
-            phase: &'static str,
-            exclusive: bool,
-            counters: ProfileCounters,
-        ) {
+        fn emit(self, operation: &str, phase: &str, exclusive: bool, counters: ProfileCounters) {
             let Some(started) = self.started else {
                 return;
             };

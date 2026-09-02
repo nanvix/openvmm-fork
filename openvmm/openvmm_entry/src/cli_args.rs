@@ -360,8 +360,12 @@ Examples:
     #[clap(long, requires = "restore_snapshot")]
     pub restore_entropy: bool,
 
+    /// Bring this contiguous prefix of capacity VPs online before restore readiness.
+    #[clap(long, value_name = "COUNT", requires = "restore_snapshot")]
+    pub restore_processors: Option<u32>,
+
     /// Maximum time allowed for an ABI-v2 guest to complete post-restore repair.
-    #[clap(long, value_name = "MILLISECONDS", default_value_t = 30000)]
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 60000)]
     pub restore_gate_timeout_ms: u64,
 
     /// Capture a microVM snapshot to this directory when the guest writes PMIO 0x605.
@@ -1559,8 +1563,9 @@ impl Options {
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
                     && self.microvm_mount.is_none()
-                    && self.microvm_sandbox_block.is_empty(),
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, and microVM egress policy require a microVM machine"
+                    && self.microvm_sandbox_block.is_empty()
+                    && self.restore_processors.is_none(),
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --restore-processors, and microVM egress policy require a microVM machine"
             );
             return Ok(());
         }
@@ -1621,6 +1626,19 @@ impl Options {
                 self.restore_gate_timeout_ms != 0,
                 "microVM post-restore gate timeout must be nonzero"
             );
+            if let Some(restore_processors) = self.restore_processors {
+                anyhow::ensure!(
+                    abi_version == MICROVM_ABI_VERSION_2,
+                    "--restore-processors requires microVM ABI version 2"
+                );
+                anyhow::ensure!(
+                    openvmm_defs::config::microvm_processor_count_supported(
+                        abi_version,
+                        restore_processors,
+                    ),
+                    "microVM ABI version {abi_version} does not support a restore-online count of {restore_processors}"
+                );
+            }
         }
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
@@ -5567,6 +5585,42 @@ mod tests {
                 .unwrap();
         assert!(abi_v1.validate_microvm_options().is_err());
 
+        for restore_processors in [1, 2, 4, 8] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm-v2",
+                "--restore-snapshot",
+                "snapshot",
+                "--restore-processors",
+                &restore_processors.to_string(),
+            ])
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+        }
+        let noncanonical_restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm-v2",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-processors",
+            "3",
+        ])
+        .unwrap();
+        assert!(noncanonical_restore.validate_microvm_options().is_err());
+        let abi_v1_restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-processors",
+            "1",
+        ])
+        .unwrap();
+        assert!(abi_v1_restore.validate_microvm_options().is_err());
+
         for args in [
             vec![
                 "openvmm",
@@ -5674,7 +5728,7 @@ mod tests {
                 "scratch:mem:1M",
             ])
             .unwrap();
-            assert_eq!(options.restore_gate_timeout_ms, 30_000);
+            assert_eq!(options.restore_gate_timeout_ms, 60_000);
             options.validate_microvm_options().unwrap();
         }
 

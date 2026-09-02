@@ -870,6 +870,7 @@ pub struct VpSet {
     inner: Arc<Inner>,
     #[inspect(rename = "vp", iter_by_index, safe)]
     vps: Vec<Vp>,
+    vp_capacity: usize,
     #[inspect(skip)]
     started: bool,
 }
@@ -909,6 +910,36 @@ fn validate_restore_vp_indices(
     Ok(())
 }
 
+fn select_instantiated_vp_states<T>(
+    vp_capacity: usize,
+    instantiated_vp_count: usize,
+    states: Vec<(VpIndex, T)>,
+) -> Result<Vec<(VpIndex, T)>, RestoreError> {
+    validate_restore_vp_indices(vp_capacity, states.iter().map(|(vp_index, _)| *vp_index))?;
+    Ok(states
+        .into_iter()
+        .filter(|(vp_index, _)| vp_index.index() < instantiated_vp_count as u32)
+        .collect())
+}
+
+fn validate_save_vp_count(
+    instantiated_vp_count: usize,
+    vp_capacity: usize,
+) -> Result<(), SaveError> {
+    if instantiated_vp_count != vp_capacity {
+        return Err(SaveError::NotSupported);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "dump", feature = "gdb"))]
+fn instantiated_vp_index(vp_count: usize, vp: VpIndex) -> anyhow::Result<usize> {
+    let index = vp.index() as usize;
+    (index < vp_count)
+        .then_some(index)
+        .with_context(|| format!("vp{} is not instantiated", vp.index()))
+}
+
 #[cfg(test)]
 mod restore_vp_index_tests {
     use super::*;
@@ -933,10 +964,57 @@ mod restore_vp_index_tests {
         let unknown = validate_restore_vp_indices(4, [0, 1, 2, 4].map(VpIndex::new)).unwrap_err();
         assert!(unknown.to_string().contains("unknown entry id: vp4"));
     }
+
+    #[test]
+    fn validates_full_inventory_before_selecting_instantiated_prefix() {
+        let states = (0..4).map(|index| (VpIndex::new(index), index)).collect();
+        let selected = select_instantiated_vp_states(4, 2, states).unwrap();
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|(vp_index, state)| (vp_index.index(), state))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 1)]
+        );
+
+        let missing_dormant_vp = [0, 1, 2]
+            .map(|index| (VpIndex::new(index), index))
+            .into_iter()
+            .collect();
+        let error = select_instantiated_vp_states(4, 2, missing_dormant_vp).unwrap_err();
+        let RestoreError::InvalidSavedState(error) = error else {
+            panic!("expected invalid saved state");
+        };
+        assert!(error.to_string().contains("missing state for vp3"));
+    }
+
+    #[test]
+    fn rejects_saving_an_instantiated_prefix() {
+        assert!(validate_save_vp_count(4, 4).is_ok());
+        assert!(matches!(
+            validate_save_vp_count(2, 4),
+            Err(SaveError::NotSupported)
+        ));
+    }
+
+    #[test]
+    fn rejects_access_to_an_uninstantiated_vp() {
+        assert_eq!(instantiated_vp_index(2, VpIndex::new(1)).unwrap(), 1);
+        assert!(
+            instantiated_vp_index(2, VpIndex::new(2))
+                .unwrap_err()
+                .to_string()
+                .contains("vp2 is not instantiated")
+        );
+    }
 }
 
 impl VpSet {
-    pub fn new(vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS], halt: Arc<Halt>) -> Self {
+    pub fn new(
+        vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS],
+        halt: Arc<Halt>,
+        vp_capacity: usize,
+    ) -> Self {
         let inner = Inner {
             vtl_guest_memory,
             halt,
@@ -944,6 +1022,7 @@ impl VpSet {
         Self {
             inner: Arc::new(inner),
             vps: Vec::new(),
+            vp_capacity,
             started: false,
         }
     }
@@ -1082,6 +1161,7 @@ impl VpSet {
 
     pub async fn save(&mut self) -> Result<Vec<(VpIndex, SavedStateBlob)>, SaveError> {
         assert!(!self.started);
+        validate_save_vp_count(self.vps.len(), self.vp_capacity)?;
         self.vps
             .iter()
             .enumerate()
@@ -1104,8 +1184,11 @@ impl VpSet {
         states: impl IntoIterator<Item = (VpIndex, SavedStateBlob)>,
     ) -> Result<(), RestoreError> {
         assert!(!self.started);
-        let states = states.into_iter().collect::<Vec<_>>();
-        validate_restore_vp_indices(self.vps.len(), states.iter().map(|(vp_index, _)| *vp_index))?;
+        let states = select_instantiated_vp_states(
+            self.vp_capacity,
+            self.vps.len(),
+            states.into_iter().collect(),
+        )?;
         states
             .into_iter()
             .map(|(vp_index, data)| {
@@ -1195,6 +1278,11 @@ impl VpSet {
 
         Ok(())
     }
+
+    #[cfg(any(feature = "dump", feature = "gdb"))]
+    fn instantiated_vp(&self, vp: VpIndex) -> anyhow::Result<&Vp> {
+        Ok(&self.vps[instantiated_vp_index(self.vps.len(), vp)?])
+    }
 }
 
 /// Error returned when registers could not be set on a VP.
@@ -1216,7 +1304,7 @@ impl VpSet {
         vp: VpIndex,
         vtl: Vtl,
     ) -> anyhow::Result<hyperv_dump::VpState> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(|x| VpEvent::State(StateEvent::GetDumpVpState(x)), vtl)
             .await
@@ -1232,7 +1320,7 @@ impl VpSet {
         vp: VpIndex,
         state: virt::x86::DebugState,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::SetDebugState(x))),
@@ -1261,7 +1349,7 @@ impl VpSet {
         vp: VpIndex,
         state: Box<DebuggerVpState>,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::SetVpState(x))),
@@ -1272,7 +1360,7 @@ impl VpSet {
     }
 
     pub async fn get_vp_state(&self, vp: VpIndex) -> anyhow::Result<Box<DebuggerVpState>> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::GetVpState(x))),
@@ -1288,7 +1376,7 @@ impl VpSet {
         gva: u64,
         len: usize,
     ) -> anyhow::Result<Vec<u8>> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::ReadVirtualMemory(x))),
@@ -1304,7 +1392,7 @@ impl VpSet {
         gva: u64,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::WriteVirtualMemory(x))),

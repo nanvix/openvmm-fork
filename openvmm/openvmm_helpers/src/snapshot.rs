@@ -482,6 +482,9 @@ pub struct SnapshotMachineContract {
     /// Version of the reserved restore-attachable microVM virtio-fs slot.
     #[mesh(22)]
     pub microvm_filesystem_slot_version: u32,
+    /// Virtual processors online at boot, or zero when restore activation is disabled.
+    #[mesh(23)]
+    pub boot_online_vp_count: u32,
 }
 
 impl SnapshotMachineContract {
@@ -609,6 +612,77 @@ fn microvm_pvh_layout_version(abi_version: u32) -> anyhow::Result<u32> {
     }
 }
 
+fn microvm_boot_online_vp_count(
+    abi_version: u32,
+    vp_capacity: u32,
+    effective_command_line: &str,
+) -> anyhow::Result<u32> {
+    if abi_version != openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+        return Ok(0);
+    }
+
+    let mut boot_online_vp_count = None;
+    for token in effective_command_line.split_ascii_whitespace() {
+        let Some(value) = token.strip_prefix("maxcpus=") else {
+            continue;
+        };
+        anyhow::ensure!(
+            boot_online_vp_count.is_none(),
+            "microVM command line contains multiple maxcpus values"
+        );
+        let count = value
+            .parse::<u32>()
+            .context("microVM maxcpus value is invalid")?;
+        anyhow::ensure!(
+            openvmm_defs::config::microvm_processor_count_supported(abi_version, count),
+            "microVM ABI version {abi_version} does not support a boot-online count of {count}"
+        );
+        anyhow::ensure!(
+            count <= vp_capacity,
+            "microVM boot-online count {count} exceeds VP capacity {vp_capacity}"
+        );
+        boot_online_vp_count = Some(count);
+    }
+    Ok(boot_online_vp_count.unwrap_or(0))
+}
+
+/// Validates a restore-time online VP target against an opt-in snapshot contract.
+pub fn validate_restore_online_vp_count(
+    manifest: &SnapshotManifest,
+    restore_online_vp_count: u32,
+) -> anyhow::Result<()> {
+    let contract = manifest
+        .machine_contract
+        .as_ref()
+        .context("snapshot is missing the authoritative machine contract")?;
+    anyhow::ensure!(
+        contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2,
+        "restore-time VP activation requires microVM ABI version 2"
+    );
+    anyhow::ensure!(
+        contract.boot_online_vp_count != 0,
+        "snapshot does not declare restore-time VP activation support"
+    );
+    anyhow::ensure!(
+        openvmm_defs::config::microvm_processor_count_supported(
+            contract.microvm_abi_version,
+            restore_online_vp_count,
+        ),
+        "restore-online VP count {restore_online_vp_count} is not supported"
+    );
+    anyhow::ensure!(
+        restore_online_vp_count >= contract.boot_online_vp_count,
+        "restore-online VP count {restore_online_vp_count} is below boot-online count {}",
+        contract.boot_online_vp_count
+    );
+    anyhow::ensure!(
+        restore_online_vp_count <= manifest.vp_count,
+        "restore-online VP count {restore_online_vp_count} exceeds VP capacity {}",
+        manifest.vp_count
+    );
+    Ok(())
+}
+
 fn microvm_machine_contract(
     abi_version: u32,
     source_hypervisor: &str,
@@ -642,6 +716,8 @@ fn microvm_machine_contract(
     const HIGH_RAM_START: u64 = 4 * 1024 * 1024 * 1024;
     let topology = microvm_snapshot_topology(abi_version, processor_count)?;
     let pvh_layout_version = microvm_pvh_layout_version(abi_version)?;
+    let boot_online_vp_count =
+        microvm_boot_online_vp_count(abi_version, processor_count, &effective_command_line)?;
 
     let low_length = memory_size.min(LOW_RAM_END);
     let mut memory_ranges = vec![SnapshotMemoryRange {
@@ -1011,6 +1087,7 @@ fn microvm_machine_contract(
         } else {
             0
         },
+        boot_online_vp_count,
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
@@ -3202,6 +3279,11 @@ pub fn validate_microvm_machine_contract(
         "snapshot processor topology doesn't match the requested machine"
     );
     anyhow::ensure!(
+        contract.boot_online_vp_count == 0
+            || contract.boot_online_vp_count == expected.boot_online_vp_count,
+        "snapshot boot-online VP count doesn't match the requested machine"
+    );
+    anyhow::ensure!(
         contract.devices == expected.devices,
         "snapshot device inventory, order, or configuration doesn't match the requested machine"
     );
@@ -3366,6 +3448,21 @@ fn validate_machine_contract_shape(
             *topology == microvm_snapshot_topology(contract.microvm_abi_version, vp_count)?,
             "snapshot processor topology is not canonical for microVM ABI version {}",
             contract.microvm_abi_version
+        );
+    }
+    if contract.boot_online_vp_count != 0 {
+        anyhow::ensure!(
+            contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2,
+            "snapshot boot-online VP count requires microVM ABI version 2"
+        );
+        anyhow::ensure!(
+            contract.boot_online_vp_count
+                == microvm_boot_online_vp_count(
+                    contract.microvm_abi_version,
+                    vp_count,
+                    &contract.effective_command_line,
+                )?,
+            "snapshot boot-online VP count does not match the effective command line"
         );
     }
 
@@ -3962,6 +4059,7 @@ mod tests {
             apic_frequency_hz: Some(1_000_000_000),
             microvm_sandbox_blocks: Vec::new(),
             microvm_filesystem_slot_version: 0,
+            boot_online_vp_count: 0,
         };
         contract.set_effective_command_line("console=hvc0".to_owned());
         contract.set_cpu_compatibility_contract(vec![1, 2, 3]);
@@ -4058,6 +4156,63 @@ mod tests {
             .unwrap()
             .set_effective_command_line("console=hvc0 nvx_snapshot_tier=platform".to_owned());
         validate_manifest_version(&manifest).unwrap();
+    }
+
+    #[test]
+    fn abi_v2_restore_online_vp_count_is_bounded_by_template() {
+        assert_eq!(
+            microvm_boot_online_vp_count(
+                openvmm_defs::config::MICROVM_ABI_VERSION_2,
+                8,
+                "console=hvc0 maxcpus=1",
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            microvm_boot_online_vp_count(
+                openvmm_defs::config::MICROVM_ABI_VERSION_2,
+                8,
+                "console=hvc0",
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            microvm_boot_online_vp_count(
+                openvmm_defs::config::MICROVM_ABI_VERSION_2,
+                8,
+                "maxcpus=3",
+            )
+            .is_err()
+        );
+
+        let mut manifest = test_manifest();
+        manifest.vp_count = 8;
+        let mut contract = test_machine_contract();
+        contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_2;
+        contract.boot_online_vp_count = 2;
+        manifest.machine_contract = Some(contract);
+
+        for target in [2, 4, 8] {
+            validate_restore_online_vp_count(&manifest, target).unwrap();
+        }
+        for target in [1, 3, 16] {
+            assert!(validate_restore_online_vp_count(&manifest, target).is_err());
+        }
+
+        manifest.vp_count = 4;
+        let error = validate_restore_online_vp_count(&manifest, 8).unwrap_err();
+        assert!(error.to_string().contains("exceeds VP capacity 4"));
+        manifest.vp_count = 8;
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .boot_online_vp_count = 0;
+        let error = validate_restore_online_vp_count(&manifest, 8).unwrap_err();
+        assert!(error.to_string().contains("does not declare"));
     }
 
     #[test]
