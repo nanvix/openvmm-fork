@@ -751,7 +751,16 @@ impl VmService {
             restore_entropy,
             quiesce_timeout_ms,
             restore_ready_path,
+            restore_processor_count,
+            restore_gate_timeout_ms,
         } = microvm_snapshot.unwrap_or_default();
+        let restore_online_vp_count =
+            (restore_processor_count != 0).then_some(restore_processor_count);
+        let restore_gate_timeout = Duration::from_millis(if restore_gate_timeout_ms == 0 {
+            60_000
+        } else {
+            restore_gate_timeout_ms
+        });
         let resolve_path = |value: String| -> anyhow::Result<Option<PathBuf>> {
             if value.is_empty() {
                 return Ok(None);
@@ -776,6 +785,14 @@ impl VmService {
         anyhow::ensure!(
             !restore_entropy || restore_path.is_some(),
             "restore_entropy requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_online_vp_count.is_none() || restore_path.is_some(),
+            "restore_processor_count requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_gate_timeout_ms == 0 || restore_path.is_some(),
+            "restore_gate_timeout_ms requires restore_path"
         );
         anyhow::ensure!(
             restore_ready_path.is_empty() || restore_path.is_some(),
@@ -819,6 +836,12 @@ impl VmService {
             );
             let memory_size = manifest.memory_size_bytes;
             let vp_count = manifest.vp_count;
+            if let Some(restore_online_vp_count) = restore_online_vp_count {
+                openvmm_helpers::snapshot::validate_restore_online_vp_count(
+                    manifest,
+                    restore_online_vp_count,
+                )?;
+            }
             let machine_contract = machine_contract.clone();
             Some(AuthoritativeMicrovmRestore {
                 path,
@@ -1033,7 +1056,7 @@ impl VmService {
             let restore_time = prepared
                 .restore_time
                 .context("microVM snapshot is missing its restore-time contract")?;
-            if !restore_entropy {
+            if !restore_entropy && restore_online_vp_count.is_none() {
                 tracing::warn!(
                     "restoring cloned guest RNG state without fresh entropy injection; cryptographic workloads are unsafe"
                 );
@@ -1365,12 +1388,8 @@ impl VmService {
             .build()
             .context("failed to build vm configuration")?;
         if let Some(io) = microvm_portb {
-            let restore_entropy = if restore_entropy {
-                let mut entropy = [0_u8; 64];
-                getrandom::fill(&mut entropy).context("failed to generate restore entropy")?;
-                let mut packet = b"OPENVMM_ENTROPY_V1\0".to_vec();
-                packet.extend(entropy);
-                packet
+            let restore_entropy = if restore_entropy || restore_online_vp_count.is_some() {
+                crate::fresh_microvm_restore_packet(restore_online_vp_count)?
             } else {
                 Vec::new()
             };
@@ -2080,7 +2099,8 @@ impl VmService {
                         .and_then(|(_, _, frequency, _)| *frequency),
                     restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
                     restore_ready_sink,
-                    restore_gate_timeout: None,
+                    restore_gate_timeout: restore_online_vp_count.map(|_| restore_gate_timeout),
+                    restore_vp_count: restore_online_vp_count,
                     rpc: recv,
                     notify: notify_send,
                 },

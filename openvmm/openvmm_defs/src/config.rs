@@ -910,7 +910,7 @@ pub fn build_microvm_command_line(
             .any(|reserved| token.starts_with(reserved))
         }) {
             anyhow::bail!(
-                "microVM kernel command line cannot override console, virtio discovery, or static network configuration"
+                "microVM kernel command line cannot override profile-owned configuration"
             );
         }
     }

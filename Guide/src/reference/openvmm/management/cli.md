@@ -202,18 +202,31 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--restore-ready-path <PATH>`: Connect to an existing Unix domain socket on
   Linux or a `//./pipe/...` named pipe on Windows and write exactly
   `OPENVMM_RESTORE_READY_V1\n` once all restored state, required attachments,
-  and execution-owned workers are ready. The event is flushed before the
-  restored vCPU is released. It is valid only with `--restore-snapshot` and is
-  process-local; it is not saved in the snapshot. A connection, write, or
-  flush failure aborts startup and stops the VM. The peer must accept and read
-  the event while startup is in progress; Windows flush completion waits for
-  the named-pipe peer to consume the complete frame.
+  and execution-owned workers are ready. Ungated restores flush the event
+  before releasing the restored vCPU. Gated ABI-v2 restores flush it after the
+  guest acknowledges post-restore repair and external input is re-enabled,
+  while the restored vCPU remains stopped.
+  It is valid only with `--restore-snapshot` and is process-local; it is not
+  saved in the snapshot. A connection, write, or flush failure aborts startup
+  and stops the VM. The peer must accept and read the event while startup is
+  in progress; Windows flush completion waits for the named-pipe peer to
+  consume the complete frame.
 * `--restore-entropy`: Make a fresh `OPENVMM_ENTROPY_V1` packet available on
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
+* `--restore-processors <COUNT>`: For an opt-in ABI-v2 snapshot, bring the
+  contiguous VP prefix `0..COUNT-1` online before restore readiness. The
+  snapshot's manifest VP count remains immutable capacity and must still match
+  `--processors`. The target must be 1, 2, 4, or 8 and satisfy
+  `boot-online <= target <= capacity`. This option implies a version-2 private
+  restore packet and the post-restore gate. Legacy snapshots reject it. An
+  explicit MSHV restore instantiates and binds only the requested prefix while
+  validating the full saved VP inventory; that reduced-prefix process cannot
+  be saved again. MSHV restores without this option, and KVM and WHP restores,
+  instantiate the full VP capacity.
 * `--restore-gate-timeout-ms <MILLISECONDS>`: Bound ABI-v2 guest repair and
-  gate acknowledgement after restore. The default is 30000 milliseconds.
+  gate acknowledgement after restore. The default is 60000 milliseconds.
 * `--snapshot-tier <TIER>`: Required with ABI-v2 snapshot capture. Choose
   `platform`, `workload-start`, or `instance-checkpoint`. The first two are
   reusable clone policies; instance checkpoints use single-use resume policy.

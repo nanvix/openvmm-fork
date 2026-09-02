@@ -61,13 +61,21 @@ restore flow over both transports:
   client requires the matching path configuration.
 * `restore_entropy` requests fresh entropy and is valid only with
 	`restore_path`.
+* `restore_processor_count` requests restore-time activation of the contiguous
+  VP prefix `0..count-1`. Zero preserves legacy behavior. A nonzero value is
+  valid only for an opt-in ABI-v2 snapshot, implies fresh entropy and the
+  post-restore gate, and must satisfy the snapshot's boot-online and immutable
+  capacity bounds. `ProcessorConfig.processor_count`, when present, remains an
+  exact capacity assertion.
+* `restore_gate_timeout_ms` bounds gated guest repair. Zero selects the
+  60-second default; a nonzero value is valid only with `restore_path`.
 * `restore_ready_path` names an existing Unix domain socket on Linux or a
   `//./pipe/...` named pipe on Windows. `ResumeVM` writes and flushes exactly
-  `OPENVMM_RESTORE_READY_V1\n` after all fatal restore startup work completes
-  and before the restored vCPU is released. Signaling failure makes
-  `ResumeVM` fail and tears down the managed VM. The peer must accept and read
-  concurrently with `ResumeVM`; Windows flush completion waits until the
-  complete frame has been consumed.
+  `OPENVMM_RESTORE_READY_V1\n` after all fatal restore startup work completes.
+  For a gated restore, this occurs after guest repair succeeds and host input
+  is re-enabled, while the restored vCPU remains stopped. Signaling failure makes `ResumeVM` fail and tears down the
+  managed VM. The peer must accept and read concurrently with `ResumeVM`;
+  Windows flush completion waits until the complete frame has been consumed.
 
 On cold boot, `DevicesConfig.virtio_console` may configure one microVM Unix
 socket or named-pipe endpoint. Listener mode recreates the path on restore.

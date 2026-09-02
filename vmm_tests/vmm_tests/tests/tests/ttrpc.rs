@@ -100,6 +100,28 @@ petri::multitest!(vec![
         },
     ))
     .into(),
+    petri::SimpleTest::new(
+        "test_ttrpc_microvm_v2_restore_processor_activation",
+        |resolver| {
+            Some([
+                resolver.require(artifacts::OPENVMM_NATIVE).erase(),
+                resolver
+                    .require(artifacts::loadable::MICROVM_PVH_TEST_KERNEL_X64)
+                    .erase(),
+                resolver
+                    .require(artifacts::loadable::MICROVM_PVH_TEST_INITRD_X64)
+                    .erase(),
+            ])
+        },
+        test_ttrpc_microvm_v2_restore_processor_activation,
+    )
+    .requirements(petri::requirements::TestCaseRequirements::new(
+        petri::requirements::TestRequirement::RequiresCapability {
+            name: petri_artifacts_common::capabilities::MICROVM_PVH,
+            vmm: petri::requirements::VmmType::OpenVmm,
+        },
+    ))
+    .into(),
 ]);
 
 fn microvm_portb_config(path: &Path) -> vmservice::SerialConfig {
@@ -769,6 +791,244 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 .into_iter()
                 .collect::<anyhow::Result<Vec<_>>>()?;
             anyhow::ensure!(before == after, "v2 restore modified snapshot artifacts");
+        }
+        Ok(())
+    })
+}
+
+fn test_ttrpc_microvm_v2_restore_processor_activation(
+    params: petri::PetriTestParams<'_>,
+    [openvmm, kernel, initrd]: [ResolvedArtifact; 3],
+) -> anyhow::Result<()> {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    const CAPACITY: u32 = 8;
+    const MEMORY_MB: u64 = 128;
+    const BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
+
+    let tempdir = if cfg!(target_os = "linux") {
+        tempfile::Builder::new()
+            .prefix("openvmm-ttrpc-vcpu-activation-")
+            .tempdir_in("/tmp")
+    } else {
+        tempfile::tempdir()
+    }?;
+    let snapshot_path = tempdir.path().join("snapshot");
+    let fingerprint = |path: &Path| -> anyhow::Result<u64> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::fs::read(path)?.hash(&mut hasher);
+        Ok(hasher.finish())
+    };
+
+    DefaultPool::run_with(async |driver| {
+        let rpc_path = tempdir.path().join("capture-rpc.sock");
+        let pidfile_path = tempdir.path().join("capture.pid");
+        let portb_path = tempdir.path().join("capture-portb.sock");
+        let (mut child, client, _stderr_task) =
+            launch_openvmm(&driver, &params, &openvmm, &rpc_path, &pidfile_path).await?;
+        client
+            .call()
+            .start(
+                vmservice::Vm::CreateVm,
+                vmservice::CreateVmRequest {
+                    config: Some(vmservice::VmConfig {
+                        memory_config: Some(vmservice::MemoryConfig {
+                            memory_mb: MEMORY_MB,
+                            ..Default::default()
+                        }),
+                        processor_config: Some(vmservice::ProcessorConfig {
+                            processor_count: CAPACITY,
+                            ..Default::default()
+                        }),
+                        serial_config: Some(microvm_portb_config(&portb_path)),
+                        boot_config: Some(vmservice::vm_config::BootConfig::PvhBoot(
+                            vmservice::PvhBoot {
+                                kernel_path: kernel.get().to_string_lossy().into_owned(),
+                                initrd_path: initrd.get().to_string_lossy().into_owned(),
+                                kernel_cmdline: "maxcpus=1".to_owned(),
+                            },
+                        )),
+                        machine_profile: vmservice::vm_config::MachineProfile::MicrovmV2 as i32,
+                        ..Default::default()
+                    }),
+                    log_id: String::new(),
+                    microvm_snapshot: Some(vmservice::MicrovmSnapshotConfig {
+                        destination_path: snapshot_path.to_string_lossy().into_owned(),
+                        quiesce_timeout_ms: 5_000,
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .map_err(|status| {
+                anyhow::anyhow!("activation capture CreateVM failed: {}", status.message)
+            })?;
+        let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
+        let (mut portb_read, mut portb_write) = portb.split();
+        client
+            .call()
+            .start(vmservice::Vm::ResumeVm, ())
+            .await
+            .map_err(|status| {
+                anyhow::anyhow!("activation capture ResumeVM failed: {}", status.message)
+            })?;
+        let mut output = Vec::new();
+        wait_for_bytes(&mut portb_read, &mut output, BOOT_MARKER).await?;
+        portb_write
+            .write_all(
+                br#"set -eu
+[ "$(cat /sys/devices/system/cpu/possible)" = "0-7" ]
+[ "$(cat /sys/devices/system/cpu/online)" = "0" ]
+echo TTRPC-VCPU-TEMPLATE-OK
+nvx-snapshot
+echo TTRPC-VCPU-CAPTURE-CROSSED
+"#,
+            )
+            .await?;
+        portb_write.flush().await?;
+        wait_for_bytes(&mut portb_read, &mut output, b"TTRPC-VCPU-TEMPLATE-OK").await?;
+        drain_until_closed(&mut portb_read, &mut output).await?;
+        anyhow::ensure!(
+            output
+                .split(|byte| *byte == b'\n')
+                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                .filter(|line| *line == b"TTRPC-VCPU-CAPTURE-CROSSED")
+                .count()
+                == 0,
+            "activation capture crossed its terminal snapshot boundary"
+        );
+        anyhow::ensure!(child.wait().await?.success(), "activation capture failed");
+
+        let (manifest, _) =
+            openvmm_helpers::snapshot::read_snapshot(&snapshot_path, MEMORY_MB * 1024 * 1024)?;
+        anyhow::ensure!(manifest.vp_count == CAPACITY, "snapshot capacity changed");
+        anyhow::ensure!(
+            manifest
+                .machine_contract
+                .as_ref()
+                .is_some_and(|contract| contract.boot_online_vp_count == 1),
+            "snapshot did not record a boot-online count of one"
+        );
+        let before = ["manifest.bin", "state.bin", "memory.bin"]
+            .map(|name| fingerprint(&snapshot_path.join(name)))
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let request = |portb_path: &Path, ready_path: &Path, target: u32| {
+            let mut request =
+                microvm_v2_restore_request(&snapshot_path, portb_path, ready_path, CAPACITY);
+            request
+                .microvm_snapshot
+                .as_mut()
+                .unwrap()
+                .restore_processor_count = target;
+            request
+                .microvm_snapshot
+                .as_mut()
+                .unwrap()
+                .restore_gate_timeout_ms = 5_000;
+            request
+        };
+
+        let rpc_path = tempdir.path().join("invalid-rpc.sock");
+        let pidfile_path = tempdir.path().join("invalid.pid");
+        let invalid_portb_path = tempdir.path().join("invalid-portb.sock");
+        let (mut invalid_child, invalid_client, _stderr_task) =
+            launch_openvmm(&driver, &params, &openvmm, &rpc_path, &pidfile_path).await?;
+        for target in [3, 16] {
+            let ready = RestoreReadyListener::bind(
+                &driver,
+                tempdir.path().join(format!("invalid-{target}-ready.sock")),
+            )?;
+            expect_create_vm_error(
+                &invalid_client,
+                request(&invalid_portb_path, ready.path(), target),
+                "restore-online VP count",
+            )
+            .await?;
+            ready.expect_no_connection(&driver).await?;
+        }
+        let _ = invalid_client.call().start(vmservice::Vm::Quit, ()).await;
+        anyhow::ensure!(
+            invalid_child.wait().await?.success(),
+            "invalid target server failed"
+        );
+
+        for target in [1, 2, 4, 8] {
+            let rpc_path = tempdir.path().join(format!("restore-{target}-rpc.sock"));
+            let pidfile_path = tempdir.path().join(format!("restore-{target}.pid"));
+            let portb_path = tempdir.path().join(format!("restore-{target}-portb.sock"));
+            let (mut child, client, _stderr_task) =
+                launch_openvmm(&driver, &params, &openvmm, &rpc_path, &pidfile_path).await?;
+            let restore_ready = RestoreReadyListener::bind(
+                &driver,
+                tempdir.path().join(format!("restore-{target}-ready.sock")),
+            )?;
+            client
+                .call()
+                .start(
+                    vmservice::Vm::CreateVm,
+                    request(&portb_path, restore_ready.path(), target),
+                )
+                .await
+                .map_err(|status| {
+                    anyhow::anyhow!("target {target} CreateVM failed: {}", status.message)
+                })?;
+            let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
+            let (mut portb_read, mut portb_write) = portb.split();
+            let (resume, readiness) = futures::join!(
+                client.call().start(vmservice::Vm::ResumeVm, ()),
+                restore_ready.read_all(&driver)
+            );
+            resume.map_err(|status| {
+                anyhow::anyhow!("target {target} ResumeVM failed: {}", status.message)
+            })?;
+            anyhow::ensure!(
+                readiness? == openvmm_defs::worker::RESTORE_READY_EVENT_V1,
+                "target {target} did not publish restore readiness"
+            );
+
+            let cpu_marker = format!("NVX-CPU-ONLINE-OK: count={target}");
+            let mut output = Vec::new();
+            wait_for_bytes(&mut portb_read, &mut output, cpu_marker.as_bytes()).await?;
+            let expected_online = if target == 1 {
+                "0".to_owned()
+            } else {
+                format!("0-{}", target - 1)
+            };
+            let probe = format!(
+                r#"set -eu
+[ "$(cat /sys/devices/system/cpu/possible)" = "0-7" ]
+[ "$(cat /sys/devices/system/cpu/online)" = "{expected_online}" ]
+cpu=0
+while [ "$cpu" -lt {target} ]; do
+    actual=$(taskset -c "$cpu" awk '{{ print $39 }}' /proc/self/stat)
+    [ "$actual" -eq "$cpu" ]
+    echo "TTRPC-VCPU-WORK-OK target={target} cpu=$cpu"
+    cpu=$((cpu + 1))
+done
+echo "TTRPC-VCPU-ACTIVATION-OK target={target}"
+nvx-exit 0
+"#
+            );
+            portb_write.write_all(probe.as_bytes()).await?;
+            portb_write.flush().await?;
+            let marker = format!("TTRPC-VCPU-ACTIVATION-OK target={target}");
+            wait_for_bytes(&mut portb_read, &mut output, marker.as_bytes()).await?;
+            drain_until_closed(&mut portb_read, &mut output).await?;
+            anyhow::ensure!(
+                child.wait().await?.success(),
+                "target {target} restore failed"
+            );
+            let after = ["manifest.bin", "state.bin", "memory.bin"]
+                .map(|name| fingerprint(&snapshot_path.join(name)))
+                .into_iter()
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                before == after,
+                "target {target} modified snapshot artifacts"
+            );
         }
         Ok(())
     })

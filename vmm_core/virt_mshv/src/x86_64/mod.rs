@@ -107,7 +107,7 @@ impl virt::Hypervisor for LinuxMshv {
             pt_num_cpu_fbanks: mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16,
             pt_cpu_fbanks: [
                 !u64::from(supported_processor_features()),
-                !u64::from(supported_processor_features1()),
+                !u64::from(supported_processor_features1(config.versioned_cpu_contract)),
             ],
             pt_disabled_xsave: !u64::from(supported_xsave_features()),
             ..Default::default()
@@ -1219,7 +1219,9 @@ fn supported_processor_features() -> hvdef::HvX64PartitionProcessorFeatures {
 }
 
 /// Processor features (bank 1) that we support exposing to guests.
-fn supported_processor_features1() -> hvdef::HvX64PartitionProcessorFeatures1 {
+fn supported_processor_features1(
+    versioned_cpu_contract: bool,
+) -> hvdef::HvX64PartitionProcessorFeatures1 {
     hvdef::HvX64PartitionProcessorFeatures1::new()
         .with_a_count_m_count_support(true)
         .with_tsc_invariant_support(true)
@@ -1237,7 +1239,7 @@ fn supported_processor_features1() -> hvdef::HvX64PartitionProcessorFeatures1 {
         .with_movdir64b_support(true)
         .with_cldemote_support(true)
         .with_serialize_support(true)
-        .with_tsc_adjust_support(true)
+        .with_tsc_adjust_support(!versioned_cpu_contract)
         .with_fz_l_rep_movsb(true)
         .with_fs_rep_stosb(true)
         .with_fs_rep_cmpsb(true)
@@ -1261,6 +1263,17 @@ fn supported_processor_features1() -> hvdef::HvX64PartitionProcessorFeatures1 {
         .with_rfds_clear_support(true)
         .with_sm3_support(true)
         .with_sm4_support(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_cpu_contract_does_not_expose_tsc_adjust() {
+        assert!(!supported_processor_features1(true).tsc_adjust_support());
+        assert!(supported_processor_features1(false).tsc_adjust_support());
+    }
 }
 
 /// XSAVE features that we support exposing to guests.
