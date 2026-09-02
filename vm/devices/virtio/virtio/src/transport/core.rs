@@ -318,9 +318,13 @@ impl VirtioTransportCore {
 
         if val == 0 {
             if self.device_status.as_u32() == 0 {
+                self.device_sender
+                    .send(DeviceCommand::Reset(Rpc::detached(())));
                 return;
             }
             if !self.device_status.driver_ok() {
+                self.device_sender
+                    .send(DeviceCommand::Reset(Rpc::detached(())));
                 self.reset_status(ops);
             } else {
                 self.doorbells.clear();
@@ -354,7 +358,7 @@ impl VirtioTransportCore {
             let features = self.driver_feature;
             let queues: Vec<_> = self
                 .queues
-                .iter()
+                .iter_mut()
                 .enumerate()
                 .filter(|(_, qd)| qd.params.enable)
                 .map(|(i, qd)| {
@@ -367,6 +371,7 @@ impl VirtioTransportCore {
                             event: qd.event.clone(),
                             guest_memory: self.guest_memory.clone(),
                         },
+                        qd.saved_state,
                     )
                 })
                 .collect();
@@ -420,7 +425,8 @@ impl VirtioTransportCore {
             &mut self.restored_device_state,
             DeviceRestoreState::NotRestored,
         );
-        let should_start = self.device_status.driver_ok() || device_state.is_restored();
+        let active = self.device_status.driver_ok();
+        let should_start = active || device_state.is_restored();
         if !should_start {
             return None;
         }
@@ -431,7 +437,7 @@ impl VirtioTransportCore {
                 if !qd.params.enable {
                     continue;
                 }
-                let initial_state = qd.saved_state.take();
+                let initial_state = qd.saved_state;
                 queues.push((
                     i,
                     qd.params,
@@ -462,6 +468,7 @@ impl VirtioTransportCore {
             queues,
             features,
             device_state,
+            active,
         })
     }
 
@@ -481,8 +488,10 @@ impl VirtioTransportCore {
             .call(DeviceCommand::Stop, ())
             .await
             .expect("device task is gone");
-        for (i, state) in queues.into_iter().enumerate() {
-            self.queues[i].saved_state = state;
+        for (i, (was_started, state)) in queues.into_iter().enumerate() {
+            if was_started {
+                self.queues[i].saved_state = state;
+            }
         }
         self.captured_device_state = Some(device_state);
     }
@@ -513,7 +522,10 @@ impl VirtioTransportCore {
     /// Signal a queue notification by index.
     pub fn notify_queue(&self, queue_index: u32) {
         if let Some(qd) = self.queues.get(queue_index as usize) {
-            qd.event.signal();
+            self.device_sender.send(DeviceCommand::Kick {
+                idx: queue_index as u16,
+                event: qd.event.clone(),
+            });
         }
     }
 

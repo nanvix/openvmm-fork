@@ -776,9 +776,15 @@ mod tests {
     use crate::profile::MICROVM_ATTACHMENT_ID;
     use crate::profile::MicroVmVirtioFsProfile;
     use crate::profile::microvm_root_identity;
+    use chipset_device::io::IoResult;
+    use chipset_device::mmio::MmioIntercept;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use test_with_tracing::test;
+    use virtio::transport::VirtioMmioDevice;
+    use vmcore::device_state::ChangeDeviceState;
+    use vmcore::line_interrupt::LineInterrupt;
+    use vmcore::save_restore::SaveRestore;
     use vmcore::vm_task::SingleDriverBackend;
 
     fn make_device(
@@ -938,6 +944,117 @@ mod tests {
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
 
         assert!(VirtioFsDevice::new_microvm(&driver_source, profile, fs, None).is_err());
+    }
+
+    #[async_test]
+    async fn inactive_transport_restore_defers_microvm_hostfs_state(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+        let source_device = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        let mut source = VirtioMmioDevice::new(
+            Box::new(source_device),
+            &driver,
+            GuestMemory::empty(),
+            LineInterrupt::detached(),
+            None,
+            0,
+            0x1000,
+        )
+        .unwrap();
+        source.quiesce_input().await.unwrap();
+        source.stop().await;
+        let saved = source.save().unwrap();
+        assert!(
+            saved
+                .device_state
+                .as_ref()
+                .unwrap()
+                .parse::<SavedState>()
+                .unwrap()
+                .dormant
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let destination_device = VirtioFsDevice::new_microvm_hostfs(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            microvm_root_identity(root.path()).unwrap(),
+            false,
+            root.path(),
+            None,
+        )
+        .unwrap();
+        let mut destination = VirtioMmioDevice::new(
+            Box::new(destination_device),
+            &driver,
+            GuestMemory::empty(),
+            LineInterrupt::detached(),
+            None,
+            0,
+            0x1000,
+        )
+        .unwrap();
+        destination.restore(saved).unwrap();
+        destination.start_fallible().await.unwrap();
+        destination.quiesce_input().await.unwrap();
+        destination.stop().await;
+        let mut staged = destination.save().unwrap();
+        assert!(
+            staged
+                .device_state
+                .as_ref()
+                .unwrap()
+                .parse::<SavedState>()
+                .unwrap()
+                .dormant
+        );
+
+        destination.start_fallible().await.unwrap();
+        let mut config = [0; 4];
+        match destination.mmio_read(0x100, &mut config) {
+            IoResult::Defer(token) => token.read_future(&mut config).await.unwrap(),
+            other => panic!("expected deferred config read, got {other:?}"),
+        }
+        destination.stop().await;
+        let activated = destination.save().unwrap();
+        assert!(
+            !activated
+                .device_state
+                .unwrap()
+                .parse::<SavedState>()
+                .unwrap()
+                .dormant
+        );
+
+        let mut invalid_private = staged
+            .device_state
+            .as_ref()
+            .unwrap()
+            .parse::<SavedState>()
+            .unwrap();
+        invalid_private.attachment_id = "wrong-attachment".to_owned();
+        staged.device_state = Some(SavedStateBlob::new(invalid_private));
+        let invalid_device = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        let mut invalid_destination = VirtioMmioDevice::new(
+            Box::new(invalid_device),
+            &driver,
+            GuestMemory::empty(),
+            LineInterrupt::detached(),
+            None,
+            0,
+            0x1000,
+        )
+        .unwrap();
+        assert!(invalid_destination.restore(staged).is_err());
     }
 
     #[test]
