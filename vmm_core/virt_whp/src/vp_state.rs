@@ -16,11 +16,22 @@ use zerocopy::FromZeros;
 pub struct WhpVpStateAccess<'a, 'b> {
     run: &'a mut WhpProcessor<'b>,
     vtl: Vtl,
+    #[cfg(guest_arch = "x86_64")]
+    tsc_deadline_before_apic: Option<virt::x86::vp::TscDeadline>,
+    #[cfg(guest_arch = "x86_64")]
+    tsc_deadline_read: bool,
 }
 
 impl<'a> WhpProcessor<'a> {
     pub(crate) fn access_state(&mut self, vtl: Vtl) -> WhpVpStateAccess<'_, 'a> {
-        WhpVpStateAccess { run: self, vtl }
+        WhpVpStateAccess {
+            run: self,
+            vtl,
+            #[cfg(guest_arch = "x86_64")]
+            tsc_deadline_before_apic: None,
+            #[cfg(guest_arch = "x86_64")]
+            tsc_deadline_read: false,
+        }
     }
 }
 
@@ -124,6 +135,11 @@ mod x86 {
         }
 
         fn apic(&mut self) -> Result<vp::Apic, Self::Error> {
+            // State serialization reads APIC before IA32_TSC_DEADLINE. Read the
+            // deadline first so an expiry cannot fall between those snapshots.
+            if self.caps().tsc_deadline && !self.tsc_deadline_read {
+                self.tsc_deadline_before_apic = Some(self.run.vp.get_register_state(self.vtl)?);
+            }
             self.run.save_apic(self.vtl)
         }
 
@@ -188,7 +204,12 @@ mod x86 {
         }
 
         fn tsc_deadline(&mut self) -> Result<vp::TscDeadline, Self::Error> {
-            self.run.vp.get_register_state(self.vtl)
+            self.tsc_deadline_read = true;
+            if let Some(value) = self.tsc_deadline_before_apic.take() {
+                Ok(value)
+            } else {
+                self.run.vp.get_register_state(self.vtl)
+            }
         }
 
         fn set_tsc_deadline(&mut self, value: &vp::TscDeadline) -> Result<(), Self::Error> {
