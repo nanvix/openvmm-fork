@@ -160,7 +160,7 @@ pub enum MachineProfileCli {
     Standard,
     /// The microVM ABI version 1 machine.
     Microvm,
-    /// The microVM ABI version 2 sandbox-block and deterministic SMP machine.
+    /// The microVM ABI version 2 fixed-topology shared-status machine.
     MicrovmV2,
 }
 
@@ -5549,7 +5549,6 @@ mod tests {
         );
 
         assert!(Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).is_err());
-
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
     }

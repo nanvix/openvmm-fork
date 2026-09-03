@@ -76,7 +76,7 @@ pub struct Config {
 
 /// The initial microVM guest ABI version.
 pub const MICROVM_ABI_VERSION_1: u32 = 1;
-/// The microVM ABI version with fixed sandbox block-device roles and deterministic SMP topology.
+/// The microVM ABI version with fixed device roles, deterministic SMP, and shared interrupts.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
 
 /// Returns whether a processor count is valid for the selected microVM ABI.
@@ -143,6 +143,39 @@ pub const MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES: [u64; 4] = [
     0xd000_5000,
     0xd000_6000,
 ];
+/// Guest-physical base of the ABI-v2 shared virtio interrupt-status page.
+pub const MICROVM_SHARED_STATUS_PAGE_GPA: u64 = 0x3_0000;
+/// Size of the ABI-v2 shared virtio interrupt-status page.
+pub const MICROVM_SHARED_STATUS_PAGE_SIZE: u64 = 0x1000;
+/// ABI-v2 shared-status offset for virtio-net.
+pub const MICROVM_VIRTIO_NET_STATUS_OFFSET: u64 = 0x00;
+/// ABI-v2 shared-status offset for virtio-fs.
+pub const MICROVM_VIRTIO_FS_STATUS_OFFSET: u64 = 0x04;
+/// ABI-v2 shared-status offset for virtio-console.
+pub const MICROVM_VIRTIO_CONSOLE_STATUS_OFFSET: u64 = 0x08;
+/// ABI-v2 shared-status offset for the distro virtio-blk slot.
+pub const MICROVM_VIRTIO_DISTRO_BLK_STATUS_OFFSET: u64 = 0x0c;
+/// ABI-v2 shared-status offset for the runtime virtio-blk slot.
+pub const MICROVM_VIRTIO_RUNTIME_BLK_STATUS_OFFSET: u64 = 0x10;
+/// ABI-v2 shared-status offset for the custom virtio-blk slot.
+pub const MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET: u64 = 0x14;
+/// ABI-v2 shared-status offset for the scratch virtio-blk slot.
+pub const MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET: u64 = 0x18;
+
+/// Returns the ABI-v2 shared interrupt-status word for a fixed virtio-mmio slot.
+pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
+    let offset = match mmio_base {
+        MICROVM_VIRTIO_NET_MMIO_BASE => MICROVM_VIRTIO_NET_STATUS_OFFSET,
+        MICROVM_VIRTIO_FS_MMIO_BASE => MICROVM_VIRTIO_FS_STATUS_OFFSET,
+        MICROVM_VIRTIO_CONSOLE_MMIO_BASE => MICROVM_VIRTIO_CONSOLE_STATUS_OFFSET,
+        MICROVM_VIRTIO_BLK_MMIO_BASE => MICROVM_VIRTIO_DISTRO_BLK_STATUS_OFFSET,
+        0xd000_4000 => MICROVM_VIRTIO_RUNTIME_BLK_STATUS_OFFSET,
+        0xd000_5000 => MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET,
+        0xd000_6000 => MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET,
+        _ => return None,
+    };
+    Some(MICROVM_SHARED_STATUS_PAGE_GPA + offset)
+}
 /// Level-triggered ISA IRQs published in the ABI-v1 MADT.
 pub const MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS: [u32; 5] = [
     MICROVM_VIRTIO_BLK_IRQ,
@@ -151,17 +184,8 @@ pub const MICROVM_VIRTIO_V1_LEVEL_TRIGGERED_IRQS: [u32; 5] = [
     MICROVM_VIRTIO_CONSOLE_IRQ,
     MICROVM_VIRTIO_NET_KVM_IRQ,
 ];
-/// Level-triggered ISA IRQs published in the ABI-v2 MADT.
-pub const MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS: [u32; 8] = [
-    MICROVM_VIRTIO_BLK_IRQ,
-    MICROVM_VIRTIO_NET_WHP_IRQ,
-    MICROVM_VIRTIO_FS_IRQ,
-    MICROVM_VIRTIO_CONSOLE_IRQ,
-    MICROVM_VIRTIO_CUSTOM_BLK_IRQ,
-    MICROVM_VIRTIO_NET_KVM_IRQ,
-    MICROVM_VIRTIO_SCRATCH_BLK_IRQ,
-    MICROVM_VIRTIO_RUNTIME_BLK_IRQ,
-];
+/// ABI-v2 publishes no level-triggered virtio IRQs in the MADT or PVH MP table.
+pub const MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS: [u32; 0] = [];
 
 /// The stable role of a microVM ABI-v2 sandbox block device.
 #[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -519,6 +543,26 @@ fn validate_microvm_virtio_reservations(abi_version: u32) -> anyhow::Result<()> 
         );
         if let Some(next) = bases.get(index + 1) {
             anyhow::ensure!(end <= *next, "microVM virtio MMIO reservations overlap");
+        }
+    }
+    if abi_version == MICROVM_ABI_VERSION_2 {
+        let mut previous_status_gpa = None;
+        for base in bases {
+            let status_gpa = microvm_virtio_status_gpa(*base).ok_or_else(|| {
+                anyhow::anyhow!("microVM virtio MMIO slot {base:#x} has no shared-status word")
+            })?;
+            anyhow::ensure!(
+                status_gpa.is_multiple_of(size_of::<u32>() as u64)
+                    && status_gpa >= MICROVM_SHARED_STATUS_PAGE_GPA
+                    && status_gpa + size_of::<u32>() as u64
+                        <= MICROVM_SHARED_STATUS_PAGE_GPA + MICROVM_SHARED_STATUS_PAGE_SIZE,
+                "microVM shared-status word for slot {base:#x} is outside the reserved page"
+            );
+            anyhow::ensure!(
+                previous_status_gpa.is_none_or(|previous| previous < status_gpa),
+                "microVM shared-status words are duplicated or out of order"
+            );
+            previous_status_gpa = Some(status_gpa);
         }
     }
     Ok(())
@@ -1577,26 +1621,13 @@ mod tests {
     }
 
     #[test]
-    fn microvm_v2_block_irqs_avoid_rtc_and_are_level_triggered() {
+    fn microvm_v2_block_irqs_avoid_rtc_and_are_edge_triggered() {
         assert_eq!(MICROVM_VIRTIO_RUNTIME_BLK_IRQ, 12);
         assert!(
-            !microvm_level_triggered_irqs(MICROVM_ABI_VERSION_2)
+            microvm_level_triggered_irqs(MICROVM_ABI_VERSION_2)
                 .unwrap()
-                .contains(&8)
+                .is_empty()
         );
-        for role in [
-            MicrovmSandboxBlockRole::Distro,
-            MicrovmSandboxBlockRole::Runtime,
-            MicrovmSandboxBlockRole::Custom,
-            MicrovmSandboxBlockRole::Scratch,
-        ] {
-            assert!(
-                microvm_level_triggered_irqs(MICROVM_ABI_VERSION_2)
-                    .unwrap()
-                    .contains(&role.irq()),
-                "{role:?} IRQ must be level-triggered"
-            );
-        }
         assert_eq!(
             microvm_level_triggered_irqs(MICROVM_ABI_VERSION_1).unwrap(),
             &[
@@ -1612,6 +1643,28 @@ mod tests {
             &MICROVM_VIRTIO_V2_LEVEL_TRIGGERED_IRQS
         );
         assert!(microvm_pvh_level_triggered_irqs(3).is_err());
+        assert!(microvm_pvh_level_triggered_irqs(4).is_err());
+    }
+
+    #[test]
+    fn microvm_v2_shared_status_slots_are_stable() {
+        let slots = [
+            (MICROVM_VIRTIO_NET_MMIO_BASE, 0x3_0000),
+            (MICROVM_VIRTIO_FS_MMIO_BASE, 0x3_0004),
+            (MICROVM_VIRTIO_CONSOLE_MMIO_BASE, 0x3_0008),
+            (MICROVM_VIRTIO_BLK_MMIO_BASE, 0x3_000c),
+            (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[1], 0x3_0010),
+            (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[2], 0x3_0014),
+            (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[3], 0x3_0018),
+        ];
+        for (mmio_base, expected_gpa) in slots {
+            assert_eq!(microvm_virtio_status_gpa(mmio_base), Some(expected_gpa));
+            assert_eq!(expected_gpa % size_of::<u32>() as u64, 0);
+            assert!(
+                expected_gpa < MICROVM_SHARED_STATUS_PAGE_GPA + MICROVM_SHARED_STATUS_PAGE_SIZE
+            );
+        }
+        assert_eq!(microvm_virtio_status_gpa(0xd000_7000), None);
     }
 
     #[test]

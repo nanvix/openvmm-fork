@@ -505,7 +505,7 @@ message VMConfig {
         MICROVM = 1;
         // Deterministic SMP-capable microVM ABI.
         MICROVM_V2 = 2;
-        reserved 3;
+        reserved 3, 4;
     }
 
     // Action for the VMM to take when the guest triggers a power event.

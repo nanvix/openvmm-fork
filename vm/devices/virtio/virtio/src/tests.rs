@@ -20,6 +20,7 @@ use crate::spec::pci::*;
 use crate::spec::queue::*;
 use crate::spec::*;
 use crate::transport::VirtioMmioDevice;
+use crate::transport::VirtioMmioInterruptMode;
 use crate::transport::VirtioPciDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
@@ -325,6 +326,25 @@ unsafe impl GuestMemoryAccess for VirtioTestMemoryAccess {
             _ => panic!("Unexpected write request at address {:x}", address),
         };
         Ok(())
+    }
+
+    fn compare_exchange_fallback(
+        &self,
+        address: u64,
+        current: &mut [u8],
+        new: &[u8],
+    ) -> Result<bool, GuestMemoryBackingError> {
+        let mut map = self.memory_map.lock();
+        let Some((true, value)) = map.get(address, current.len()) else {
+            panic!("Unexpected compare exchange request at address {address:x}");
+        };
+        if value == current {
+            value.copy_from_slice(new);
+            Ok(true)
+        } else {
+            current.copy_from_slice(value);
+            Ok(false)
+        }
     }
 }
 
@@ -5256,6 +5276,95 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
 
     // Stop and clean up.
     dev2.stop().await;
+}
+
+#[async_test]
+async fn mmio_shared_status_save_restore_and_reset(driver: DefaultDriver) {
+    use vmcore::save_restore::SaveRestore;
+
+    const STATUS_GPA: u64 = 0xfeed_0000;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    test_mem.modify_memory_map(STATUS_GPA, &0u32.to_ne_bytes(), true);
+    let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
+    let mem = GuestMemory::new("test", test_mem.clone());
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+    let device = || {
+        Box::new(TestDevice::new(
+            &driver_source,
+            DeviceTraits {
+                device_id: VirtioDeviceType::CONSOLE,
+                device_features: VirtioDeviceFeatures::new()
+                    .with_bank(0, 2 | VIRTIO_F_RING_INDIRECT_DESC | VIRTIO_F_RING_EVENT_IDX),
+                max_queues: 1,
+                device_register_length: 0,
+                ..Default::default()
+            },
+            None,
+        ))
+    };
+
+    let source_target = TestLineInterruptTarget::new_arc();
+    let mut source = VirtioMmioDevice::new_with_disabled_features_and_interrupt_mode(
+        device(),
+        &driver_source.simple(),
+        mem.clone(),
+        LineInterrupt::new_with_target("shared-status-source", source_target.clone(), 0),
+        Some(doorbell_registration.clone()),
+        0,
+        0x1000,
+        0,
+        VirtioMmioInterruptMode::SharedStatus {
+            status_gpa: STATUS_GPA,
+        },
+    )
+    .unwrap();
+    guest
+        .setup_chipset_device(&mut source, guest.queue_features())
+        .await;
+    assert_eq!(
+        test_mem.memory_map_get_u32(STATUS_GPA),
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE
+    );
+    assert!(!source_target.is_high(0));
+    source.stop().await;
+    let saved = source.save().unwrap();
+    assert_eq!(
+        saved.interrupt_status,
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE
+    );
+    drop(source);
+
+    let destination_target = TestLineInterruptTarget::new_arc();
+    let mut destination = VirtioMmioDevice::new_with_disabled_features_and_interrupt_mode(
+        device(),
+        &driver_source.simple(),
+        mem,
+        LineInterrupt::new_with_target(
+            "shared-status-destination",
+            destination_target.clone(),
+            0,
+        ),
+        Some(doorbell_registration),
+        0,
+        0x1000,
+        0,
+        VirtioMmioInterruptMode::SharedStatus {
+            status_gpa: STATUS_GPA,
+        },
+    )
+    .unwrap();
+    destination.restore(saved).unwrap();
+    assert_eq!(
+        test_mem.memory_map_get_u32(STATUS_GPA),
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE
+    );
+    assert!(!destination_target.is_high(0));
+
+    destination.reset().await;
+    assert_eq!(test_mem.memory_map_get_u32(STATUS_GPA), 0);
+    assert!(!destination_target.is_high(0));
 }
 
 #[async_test]

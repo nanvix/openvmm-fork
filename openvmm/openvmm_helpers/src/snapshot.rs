@@ -35,8 +35,10 @@ pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
 pub const MICROVM_FILESYSTEM_SLOT_VERSION: u32 = 1;
 /// Xen PVH memory/boot layout version used by microVM ABI version 1.
 pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 1;
-/// SMP-safe Xen PVH memory/boot layout version used by microVM ABI version 2.
+/// SMP-safe Xen PVH layout with shared interrupt status used by microVM ABI version 2.
 pub const MICROVM_SMP_PVH_LAYOUT_VERSION: u32 = 2;
+/// Snapshot contract name for ABI-v2 shared-status edge interrupts.
+pub const MICROVM_SHARED_STATUS_INTERRUPT_MODE: &str = "edge-shared-status";
 /// Clock policy applied when a snapshot is restored.
 pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
 /// Fleet-wide snapshot captured before image and sandbox configuration is consumed.
@@ -485,6 +487,15 @@ pub struct SnapshotMachineContract {
     /// Virtual processors online at boot, or zero when restore activation is disabled.
     #[mesh(23)]
     pub boot_online_vp_count: u32,
+    /// Virtio interrupt-delivery mode, empty for ABI versions before version 3.
+    #[mesh(24)]
+    pub virtio_interrupt_mode: String,
+    /// Guest-physical base of the shared interrupt-status page, or zero when absent.
+    #[mesh(25)]
+    pub virtio_shared_status_page_gpa: u64,
+    /// Size of the shared interrupt-status page, or zero when absent.
+    #[mesh(26)]
+    pub virtio_shared_status_page_size: u64,
 }
 
 impl SnapshotMachineContract {
@@ -718,6 +729,16 @@ fn microvm_machine_contract(
     let pvh_layout_version = microvm_pvh_layout_version(abi_version)?;
     let boot_online_vp_count =
         microvm_boot_online_vp_count(abi_version, processor_count, &effective_command_line)?;
+    let (virtio_interrupt_mode, virtio_shared_status_page_gpa, virtio_shared_status_page_size) =
+        if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+            (
+                MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned(),
+                openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
+                openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+            )
+        } else {
+            (String::new(), 0, 0)
+        };
 
     let low_length = memory_size.min(LOW_RAM_END);
     let mut memory_ranges = vec![SnapshotMemoryRange {
@@ -1088,6 +1109,9 @@ fn microvm_machine_contract(
             0
         },
         boot_online_vp_count,
+        virtio_interrupt_mode,
+        virtio_shared_status_page_gpa,
+        virtio_shared_status_page_size,
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
@@ -1758,7 +1782,10 @@ fn claim_snapshot_for_restore_in_directory(
 pub fn requires_post_restore_gate(manifest: &SnapshotManifest) -> bool {
     manifest.version == MANIFEST_VERSION
         && manifest.machine_contract.as_ref().is_some_and(|contract| {
-            contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2
+            matches!(
+                contract.microvm_abi_version,
+                openvmm_defs::config::MICROVM_ABI_VERSION_2
+            )
         })
         && !manifest.snapshot_tier.is_empty()
 }
@@ -3263,6 +3290,12 @@ pub fn validate_microvm_machine_contract(
         "snapshot PVH layout version doesn't match the requested machine"
     );
     anyhow::ensure!(
+        contract.virtio_interrupt_mode == expected.virtio_interrupt_mode
+            && contract.virtio_shared_status_page_gpa == expected.virtio_shared_status_page_gpa
+            && contract.virtio_shared_status_page_size == expected.virtio_shared_status_page_size,
+        "snapshot virtio interrupt contract doesn't match the requested machine"
+    );
+    anyhow::ensure!(
         contract.clock_policy == expected.clock_policy,
         "snapshot clock policy doesn't match the requested machine"
     );
@@ -3345,6 +3378,24 @@ fn validate_machine_contract_shape(
         "snapshot PVH layout version {} is unsupported",
         contract.pvh_layout_version
     );
+    if contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+        anyhow::ensure!(
+            contract.virtio_interrupt_mode == MICROVM_SHARED_STATUS_INTERRUPT_MODE
+                && contract.virtio_shared_status_page_gpa
+                    == openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                && contract.virtio_shared_status_page_size
+                    == openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+            "snapshot microVM ABI version 2 shared-status interrupt contract is invalid"
+        );
+    } else {
+        anyhow::ensure!(
+            contract.virtio_interrupt_mode.is_empty()
+                && contract.virtio_shared_status_page_gpa == 0
+                && contract.virtio_shared_status_page_size == 0,
+            "snapshot microVM ABI version {} cannot contain shared-status interrupt state",
+            contract.microvm_abi_version
+        );
+    }
     anyhow::ensure!(
         contract.clock_policy == ADVANCE_BY_HOST_DOWNTIME,
         "snapshot clock policy '{}' is unsupported",
@@ -4060,17 +4111,30 @@ mod tests {
             microvm_sandbox_blocks: Vec::new(),
             microvm_filesystem_slot_version: 0,
             boot_online_vp_count: 0,
+            virtio_interrupt_mode: String::new(),
+            virtio_shared_status_page_gpa: 0,
+            virtio_shared_status_page_size: 0,
         };
         contract.set_effective_command_line("console=hvc0".to_owned());
         contract.set_cpu_compatibility_contract(vec![1, 2, 3]);
         contract
     }
 
-    fn paired_scratch_manifest(scratch: &[u8]) -> SnapshotManifest {
-        let mut manifest = test_manifest();
+    fn test_machine_contract_v2() -> SnapshotMachineContract {
         let mut contract = test_machine_contract();
         contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_2;
         contract.pvh_layout_version = MICROVM_SMP_PVH_LAYOUT_VERSION;
+        contract.virtio_interrupt_mode = MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned();
+        contract.virtio_shared_status_page_gpa =
+            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA;
+        contract.virtio_shared_status_page_size =
+            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE;
+        contract
+    }
+
+    fn paired_scratch_manifest(scratch: &[u8]) -> SnapshotManifest {
+        let mut manifest = test_manifest();
+        let mut contract = test_machine_contract_v2();
         contract.microvm_sandbox_blocks = vec![
             SnapshotMicrovmSandboxBlock {
                 role: "distro".to_owned(),
@@ -4893,11 +4957,30 @@ mod tests {
     }
 
     #[test]
+    fn microvm_v2_snapshot_identifies_shared_status_page() {
+        let contract = test_machine_contract_v2();
+        let mut manifest = test_manifest();
+        manifest.machine_contract = Some(contract.clone());
+
+        validate_microvm_machine_contract(&manifest, &contract).unwrap();
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .virtio_shared_status_page_gpa += 0x1000;
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shared-status interrupt contract")
+        );
+    }
+
+    #[test]
     fn validate_microvm_v2_snapshot_rejects_noncanonical_apic_ids() {
         let mut manifest = test_manifest();
-        let mut contract = test_machine_contract();
-        contract.microvm_abi_version = openvmm_defs::config::MICROVM_ABI_VERSION_2;
-        contract.pvh_layout_version = MICROVM_SMP_PVH_LAYOUT_VERSION;
+        let mut contract = test_machine_contract_v2();
         contract.topology.apic_ids = vec![0, 2];
         manifest.machine_contract = Some(contract.clone());
 
