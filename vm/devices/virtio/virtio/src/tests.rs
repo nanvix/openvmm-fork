@@ -146,6 +146,7 @@ struct VirtioTestMemoryAccess {
     /// Behind an `Arc` so each handed-out registration can remove its own entry
     /// when it is dropped.
     live_doorbells: Arc<Mutex<Vec<DoorbellSpec>>>,
+    doorbell_events: Arc<Mutex<Vec<(DoorbellSpec, Event)>>>,
 }
 
 /// A doorbell registration as the transport asked for it.
@@ -226,6 +227,20 @@ impl VirtioTestMemoryAccess {
         let mut specs = self.live_doorbells.lock().clone();
         specs.sort_unstable();
         specs
+    }
+
+    fn signal_doorbell(&self, spec: DoorbellSpec) -> bool {
+        let event = self
+            .doorbell_events
+            .lock()
+            .iter()
+            .find_map(|(registered, event)| (*registered == spec).then(|| event.clone()));
+        if let Some(event) = event {
+            event.signal();
+            true
+        } else {
+            false
+        }
     }
 
     fn modify_memory_map(&self, address: u64, data: &[u8], writeable: bool) {
@@ -317,6 +332,7 @@ unsafe impl GuestMemoryAccess for VirtioTestMemoryAccess {
 /// UNINSTALLS the doorbell, so it de-registers itself from `live_doorbells`.
 struct DoorbellEntry {
     live: Arc<Mutex<Vec<DoorbellSpec>>>,
+    events: Arc<Mutex<Vec<(DoorbellSpec, Event)>>>,
     spec: DoorbellSpec,
 }
 
@@ -325,6 +341,10 @@ impl Drop for DoorbellEntry {
         let mut live = self.live.lock();
         if let Some(i) = live.iter().position(|s| *s == self.spec) {
             live.remove(i);
+        }
+        let mut events = self.events.lock();
+        if let Some(i) = events.iter().position(|(spec, _)| *spec == self.spec) {
+            events.remove(i);
         }
     }
 }
@@ -335,7 +355,7 @@ impl DoorbellRegistration for VirtioTestMemoryAccess {
         address: u64,
         value: Option<u64>,
         length: Option<u32>,
-        _: &Event,
+        event: &Event,
     ) -> io::Result<Box<dyn Send + Sync>> {
         self.doorbell_count.fetch_add(1, Ordering::Relaxed);
         let spec = DoorbellSpec {
@@ -344,8 +364,10 @@ impl DoorbellRegistration for VirtioTestMemoryAccess {
             length,
         };
         self.live_doorbells.lock().push(spec);
+        self.doorbell_events.lock().push((spec, event.clone()));
         Ok(Box::new(DoorbellEntry {
             live: self.live_doorbells.clone(),
+            events: self.doorbell_events.clone(),
             spec,
         }))
     }
@@ -3396,6 +3418,165 @@ async fn verify_device_packed_queue_simple(driver: DefaultDriver) {
     verify_device_queue_simple_inner(test_mem, guest, features).await;
 }
 
+#[async_test]
+async fn mmio_used_buffer_ack_doorbell_deasserts_interrupt(driver: DefaultDriver) {
+    const MMIO_BASE: u64 = 0x1000;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    let mut guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true);
+    let target = TestLineInterruptTarget::new_arc();
+    let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
+    let base_addr = guest.get_queue_descriptor_backing_memory_address(0);
+    let queue_work = Arc::new(
+        move |_: u16, queue: &mut VirtioQueue, work: VirtioQueueCallbackWork| {
+            assert_eq!(work.payload[0].address, base_addr);
+            queue.complete(work, 123);
+        },
+    );
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(
+            &driver_source,
+            DeviceTraits {
+                device_id: VirtioDeviceType::CONSOLE,
+                device_features: VirtioDeviceFeatures::new()
+                    .with_bank(0, VIRTIO_F_RING_EVENT_IDX | 2)
+                    .with_bank(1, VIRTIO_F_VERSION_1),
+                max_queues: 1,
+                device_register_length: 0,
+                ..Default::default()
+            },
+            Some(queue_work),
+        )),
+        &driver,
+        guest.mem(),
+        interrupt,
+        Some(test_mem.clone()),
+        MMIO_BASE,
+        0x1000,
+    )
+    .unwrap();
+
+    guest
+        .setup_chipset_device(&mut dev, guest.queue_features())
+        .await;
+    expect_mmio_interrupt(
+        &mut dev,
+        &target,
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE,
+        false,
+    )
+    .await;
+    guest.add_to_avail_queue(0);
+    dev.write_u32(80, 0);
+    poll_fn(|cx| target.poll_high(cx, 0)).await;
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+    );
+
+    let ack = DoorbellSpec {
+        address: MMIO_BASE + 100,
+        value: Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+        length: Some(4),
+    };
+    assert!(test_mem.signal_doorbell(ack));
+    let mut timer = PolledTimer::new(&driver);
+    for _ in 0..10 {
+        yield_and_poll_device(&mut dev).await;
+        if !target.is_high(0) {
+            break;
+        }
+        timer.sleep(Duration::from_millis(1)).await;
+    }
+    assert!(!target.is_high(0));
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        0
+    );
+    dev.stop().await;
+}
+
+#[async_test]
+async fn mmio_ack_before_completion_keeps_new_interrupt_asserted(driver: DefaultDriver) {
+    const MMIO_BASE: u64 = 0x2000;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    let mut guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+    let target = TestLineInterruptTarget::new_arc();
+    let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(
+            &driver_source,
+            DeviceTraits {
+                device_id: VirtioDeviceType::CONSOLE,
+                device_features: VirtioDeviceFeatures::new()
+                    .with_bank(0, VIRTIO_F_RING_EVENT_IDX | 2)
+                    .with_bank(1, VIRTIO_F_VERSION_1),
+                max_queues: 1,
+                device_register_length: 0,
+                ..Default::default()
+            },
+            Some(Arc::new(
+                |_: u16, queue: &mut VirtioQueue, work: VirtioQueueCallbackWork| {
+                    queue.complete(work, 123);
+                },
+            )),
+        )),
+        &driver,
+        guest.mem(),
+        interrupt,
+        Some(test_mem.clone()),
+        MMIO_BASE,
+        0x1000,
+    )
+    .unwrap();
+
+    guest
+        .setup_chipset_device(&mut dev, guest.queue_features())
+        .await;
+    expect_mmio_interrupt(
+        &mut dev,
+        &target,
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE,
+        false,
+    )
+    .await;
+    guest.add_to_avail_queue(0);
+    dev.write_u32(80, 0);
+    poll_fn(|cx| target.poll_high(cx, 0)).await;
+    assert_eq!(guest.get_next_completed(0), Some((0, 123)));
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+    );
+    guest.add_to_avail_queue(0);
+    dev.write_u32(80, 0);
+    let mut timer = PolledTimer::new(&driver);
+    let second_completion = loop {
+        yield_and_poll_device(&mut dev).await;
+        if let Some(completion) = guest.get_next_completed(0) {
+            break completion;
+        }
+        timer.sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(second_completion, (0, 123));
+    assert!(test_mem.signal_doorbell(DoorbellSpec {
+        address: MMIO_BASE + 100,
+        value: Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+        length: Some(4),
+    }));
+    timer.sleep(Duration::from_millis(1)).await;
+
+    assert!(target.is_high(0));
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+    );
+    dev.stop().await;
+}
+
 async fn verify_device_multi_queue_inner(
     test_mem: Arc<VirtioTestMemoryAccess>,
     mut guest: VirtioTestGuest,
@@ -4982,6 +5163,7 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
     let mut saved = dev.save().expect("save should succeed");
     assert_eq!(saved.queues.len(), 1);
     assert!(saved.queues[0].common.enable);
+    saved.interrupt_status = VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER;
 
     let features = guest.queue_features();
     let queue = &mut saved.queues[0].common;
@@ -5027,6 +5209,7 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
             .is_err()
     );
     queue.queue_state = original_progress;
+    drop(dev);
 
     // Create a new device and restore into it.
     let interrupt2 = LineInterrupt::detached();
@@ -5056,6 +5239,18 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
     // Verify device is active after restore — read STATUS register.
     assert_ne!(
         dev2.read_u32(VirtioMmioRegister::STATUS.0 as u64) & VIRTIO_DRIVER_OK,
+        0
+    );
+    assert!(test_mem.signal_doorbell(DoorbellSpec {
+        address: VirtioMmioRegister::INTERRUPT_ACK.0 as u64,
+        value: Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+        length: Some(4),
+    }));
+    let mut timer = PolledTimer::new(&driver);
+    timer.sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        dev2.read_u32(VirtioMmioRegister::INTERRUPT_STATUS.0 as u64)
+            & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
         0
     );
 

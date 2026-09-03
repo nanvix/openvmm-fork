@@ -25,11 +25,33 @@ use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
 use inspect::Inspect;
 use inspect::InspectMut;
-use pal_async::task::Spawn;
+#[cfg(target_os = "linux")]
+use pal_async::driver::PollImpl;
+#[cfg(target_os = "linux")]
+use pal_async::driver::SpawnDriver as MmioDriver;
+#[cfg(target_os = "linux")]
+use pal_async::fd::PollFdReady;
+#[cfg(target_os = "linux")]
+use pal_async::interest::InterestSlot;
+#[cfg(target_os = "linux")]
+use pal_async::interest::PollEvents;
+#[cfg(not(target_os = "linux"))]
+use pal_async::task::Spawn as MmioDriver;
+#[cfg(target_os = "linux")]
+use pal_async::task::Task;
+#[cfg(target_os = "linux")]
+use pal_event::Event;
 use parking_lot::Mutex;
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::future::poll_fn;
 use std::ops::RangeInclusive;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::task::Context;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
 use vmcore::line_interrupt::LineInterrupt;
@@ -44,22 +66,104 @@ struct MmioTransport {
     #[inspect(hex)]
     vendor_id: u32,
     interrupt_state: Arc<Mutex<InterruptState>>,
+    #[cfg(target_os = "linux")]
+    #[inspect(skip)]
+    _interrupt_ack_task: Option<Task<()>>,
+    #[cfg(target_os = "linux")]
+    #[inspect(skip)]
+    _interrupt_ack_doorbell: Option<Box<dyn Send + Sync>>,
+    #[cfg(target_os = "linux")]
+    #[inspect(skip)]
+    interrupt_ack_event: Option<Event>,
+}
+
+#[cfg(target_os = "linux")]
+struct InterruptAckWait {
+    ready: PollImpl<dyn PollFdReady>,
+    event: Event,
+    interrupt_state: Arc<Mutex<InterruptState>>,
+}
+
+#[cfg(target_os = "linux")]
+impl InterruptAckWait {
+    async fn run(mut self) {
+        loop {
+            poll_fn(|cx| {
+                self.ready
+                    .poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN)
+            })
+            .await;
+            self.ready.clear_fd_ready(InterestSlot::Read);
+            let mut state = self.interrupt_state.lock();
+            if self.event.try_wait() {
+                state.acknowledge_used_buffer();
+            }
+        }
+    }
 }
 
 #[derive(Inspect)]
 struct InterruptState {
     interrupt: LineInterrupt,
     status: u32,
+    used_buffer_generation: u64,
+    observed_used_buffer_generation: Option<u64>,
 }
 
 impl InterruptState {
     fn update(&mut self, is_set: bool, bits: u32) {
         if is_set {
+            if bits & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0 {
+                self.used_buffer_generation = self.used_buffer_generation.wrapping_add(1);
+            }
             self.status |= bits;
         } else {
+            if bits & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0 {
+                self.observed_used_buffer_generation = None;
+            }
             self.status &= !bits;
         }
         self.interrupt.set_level(self.status != 0);
+    }
+
+    fn read_status(&mut self) -> u32 {
+        if self.status & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0 {
+            self.observed_used_buffer_generation = Some(self.used_buffer_generation);
+        }
+        self.status
+    }
+
+    fn acknowledge_used_buffer(&mut self) {
+        if self.observed_used_buffer_generation == Some(self.used_buffer_generation) {
+            self.update(false, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+        } else {
+            self.observed_used_buffer_generation = None;
+        }
+    }
+}
+
+impl MmioTransport {
+    fn lock_interrupt_state(&self) -> parking_lot::MutexGuard<'_, InterruptState> {
+        let mut state = self.interrupt_state.lock();
+        #[cfg(target_os = "linux")]
+        if let Some(event) = &self.interrupt_ack_event {
+            if event.try_wait() {
+                state.acknowledge_used_buffer();
+            }
+        }
+        state
+    }
+
+    fn read_interrupt_status(&self) -> u32 {
+        self.lock_interrupt_state().read_status()
+    }
+
+    fn reset_interrupt_state(&self) {
+        let mut state = self.lock_interrupt_state();
+        state.status = 0;
+        state.used_buffer_generation = 0;
+        state.observed_used_buffer_generation = None;
+        state.interrupt.set_level(false);
     }
 }
 
@@ -80,7 +184,7 @@ impl TransportOps for MmioTransport {
     }
 
     fn reset_interrupts(&mut self) {
-        self.interrupt_state.lock().update(false, !0);
+        self.reset_interrupt_state();
     }
 
     fn doorbell_region(&mut self) -> Option<(u64, u32)> {
@@ -108,7 +212,7 @@ impl fmt::Debug for VirtioMmioDevice {
 impl VirtioMmioDevice {
     pub fn new(
         device: Box<dyn DynVirtioDevice>,
-        driver: &impl Spawn,
+        driver: &impl MmioDriver,
         guest_memory: GuestMemory,
         interrupt: LineInterrupt,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
@@ -130,7 +234,7 @@ impl VirtioMmioDevice {
     /// Creates an MMIO transport after masking guest-visible device features.
     pub fn new_with_disabled_features(
         device: Box<dyn DynVirtioDevice>,
-        driver: &impl Spawn,
+        driver: &impl MmioDriver,
         guest_memory: GuestMemory,
         interrupt: LineInterrupt,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
@@ -139,10 +243,45 @@ impl VirtioMmioDevice {
         disabled_features: u64,
     ) -> std::io::Result<Self> {
         let traits = device.traits();
+        #[cfg(target_os = "linux")]
+        let supports_accelerated_doorbells = device.supports_accelerated_doorbells();
         let interrupt_state = Arc::new(Mutex::new(InterruptState {
             interrupt,
             status: 0,
+            used_buffer_generation: 0,
+            observed_used_buffer_generation: None,
         }));
+        #[cfg(target_os = "linux")]
+        let (interrupt_ack_event, interrupt_ack_task, interrupt_ack_doorbell) =
+            if supports_accelerated_doorbells && let Some(registration) = &doorbell_registration {
+                let event = Event::new();
+                match registration.register_doorbell(
+                    mmio_gpa + VirtioMmioRegister::INTERRUPT_ACK.0 as u64,
+                    Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+                    Some(4),
+                    &event,
+                ) {
+                    Ok(doorbell) => match driver.new_dyn_fd_ready(event.as_fd().as_raw_fd()) {
+                        Ok(ready) => {
+                            let interrupt_ack_event = event.clone();
+                            let task = driver.spawn(
+                                "virtio-mmio-interrupt-ack",
+                                InterruptAckWait {
+                                    ready,
+                                    event,
+                                    interrupt_state: interrupt_state.clone(),
+                                }
+                                .run(),
+                            );
+                            (Some(interrupt_ack_event), Some(task), Some(doorbell))
+                        }
+                        Err(_) => (None, None, None),
+                    },
+                    Err(_) => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            };
 
         let core = VirtioTransportCore::new_with_disabled_features(
             device,
@@ -159,6 +298,12 @@ impl VirtioMmioDevice {
                 device_id: traits.device_id.0 as u32,
                 vendor_id: 0x1af4,
                 interrupt_state,
+                #[cfg(target_os = "linux")]
+                _interrupt_ack_task: interrupt_ack_task,
+                #[cfg(target_os = "linux")]
+                _interrupt_ack_doorbell: interrupt_ack_doorbell,
+                #[cfg(target_os = "linux")]
+                interrupt_ack_event,
             },
         })
     }
@@ -212,7 +357,7 @@ impl VirtioMmioDevice {
                     .is_some_and(|qd| qd.params.enable) as u32
             }
             VirtioMmioRegister::QUEUE_NOTIFY => 0,
-            VirtioMmioRegister::INTERRUPT_STATUS => self.mmio.interrupt_state.lock().status,
+            VirtioMmioRegister::INTERRUPT_STATUS => self.mmio.read_interrupt_status(),
             VirtioMmioRegister::INTERRUPT_ACK => 0,
             VirtioMmioRegister::STATUS => self.core.device_status.as_u32(),
             VirtioMmioRegister::QUEUE_DESC_LOW => self
@@ -410,7 +555,7 @@ impl ChangeDeviceState for VirtioMmioDevice {
 }
 
 impl PollDevice for VirtioMmioDevice {
-    fn poll_device(&mut self, cx: &mut std::task::Context<'_>) {
+    fn poll_device(&mut self, cx: &mut Context<'_>) {
         self.core.poll_device(&mut self.mmio, cx);
         if !self.core.stalled_io.is_empty() && !self.core.state.is_busy() {
             self.replay_stalled_io();
@@ -474,7 +619,7 @@ mod saved_state {
             Ok(state::SavedState {
                 common,
                 queues,
-                interrupt_status: self.mmio.interrupt_state.lock().status,
+                interrupt_status: self.mmio.lock_interrupt_state().status,
                 device_state,
             })
         }
@@ -483,6 +628,7 @@ mod saved_state {
             &mut self,
             state: Self::SavedState,
         ) -> Result<(), vmcore::save_restore::RestoreError> {
+            self.mmio.reset_interrupt_state();
             let saved_queue_count = state.queues.len();
             self.core.restore_common(
                 &mut self.mmio,
@@ -496,6 +642,9 @@ mod saved_state {
             {
                 let mut is = self.mmio.interrupt_state.lock();
                 is.status = state.interrupt_status;
+                is.used_buffer_generation = 0;
+                is.observed_used_buffer_generation =
+                    (is.status & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0).then_some(0);
                 is.interrupt.set_level(is.status != 0);
             }
 
