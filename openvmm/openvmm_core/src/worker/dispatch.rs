@@ -3886,33 +3886,37 @@ impl LoadedVm {
             return true;
         };
 
-        if !self.restore_input_gated
-            && let Err(error) = self
+        if !self.restore_input_gated {
+            let input_gate = openvmm_defs::profile::ProfileSpan::start();
+            if let Err(error) = self
                 .state_units
                 .quiesce_input_for_save(request.input_gate_timeout)
                 .await
-        {
-            tracelimit::error_ratelimited!(
-                error = error.as_ref() as &dyn std::error::Error,
-                "failed to gate host input before snapshot boundary"
-            );
-            if let Err(resume_error) = self
-                .state_units
-                .resume_input_after_save(request.input_gate_timeout)
-                .await
             {
                 tracelimit::error_ratelimited!(
-                    error = resume_error.as_ref() as &dyn std::error::Error,
-                    "host-input gate rollback is uncertain; terminating VM worker"
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "failed to gate host input before snapshot boundary"
                 );
+                if let Err(resume_error) = self
+                    .state_units
+                    .resume_input_after_save(request.input_gate_timeout)
+                    .await
+                {
+                    tracelimit::error_ratelimited!(
+                        error = resume_error.as_ref() as &dyn std::error::Error,
+                        "host-input gate rollback is uncertain; terminating VM worker"
+                    );
+                    request.transaction_complete.complete(());
+                    return false;
+                }
+                request.release_write.send(());
                 request.transaction_complete.complete(());
-                return false;
+                return true;
             }
-            request.release_write.send(());
-            request.transaction_complete.complete(());
-            return true;
+            input_gate.complete("capture", "input_gate", Default::default());
         }
 
+        let vp_stop_at_io_boundary = openvmm_defs::profile::ProfileSpan::start();
         match self
             .inner
             .partition_unit
@@ -3920,6 +3924,11 @@ impl LoadedVm {
             .await
         {
             Ok(stop_guard) => {
+                vp_stop_at_io_boundary.complete(
+                    "capture",
+                    "vp_stop_at_io_boundary",
+                    Default::default(),
+                );
                 self.snapshot_stop_guard = Some(stop_guard);
                 self.snapshot_transaction_complete = Some(request.transaction_complete);
                 self.snapshot_capture_wall_clock = Some(std::time::SystemTime::now().into());
