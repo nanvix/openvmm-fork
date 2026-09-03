@@ -13,6 +13,7 @@ use crate::importer::StartupMemoryType;
 use crate::importer::TableRegister;
 use crate::importer::X86Register;
 use hvdef::HV_PAGE_SIZE;
+use memory_range::MemoryRange;
 use object::LittleEndian;
 use object::ReadCache;
 use object::ReadRef;
@@ -45,6 +46,7 @@ const CMDLINE_MAX_SIZE: usize = 64 * 1024;
 const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18;
 const XEN_HVM_START_MAGIC_VALUE: u32 = 0x336e_c578;
 const XEN_HVM_MEMMAP_TYPE_RAM: u32 = 1;
+const XEN_HVM_MEMMAP_TYPE_RESERVED: u32 = 2;
 const MAX_NOTE_SIZE: u64 = 1024 * 1024;
 
 const SEG_ATTR_CODE: u16 = 0xc09b;
@@ -128,6 +130,8 @@ pub struct BootConfig<'a> {
     pub apic_ids: &'a [u32],
     /// ISA IRQs described as active-high, level-triggered.
     pub level_triggered_irqs: &'a [u32],
+    /// Page-aligned RAM ranges published as reserved in the PVH memory map.
+    pub reserved_memory_ranges: &'a [MemoryRange],
 }
 
 /// Guest placement selected by the loader.
@@ -183,6 +187,8 @@ pub enum Error {
     CommandLineTooLong,
     #[error("PVH memory map does not fit in its reserved page")]
     MemoryMapTooLarge,
+    #[error("invalid PVH reserved memory range {start:#x}..{end:#x}")]
+    InvalidReservedMemoryRange { start: u64, end: u64 },
     #[error("PVH ACPI data does not fit in its reserved boot metadata region")]
     AcpiTablesTooLarge,
     #[error("PVH processor topology must contain at least one processor")]
@@ -272,6 +278,7 @@ where
             layout: PvhBootLayout::Legacy,
             apic_ids: LEGACY_APIC_IDS,
             level_triggered_irqs: LEGACY_LEVEL_TRIGGERED_IRQS,
+            reserved_memory_ranges: &[],
         },
     )
 }
@@ -586,7 +593,7 @@ fn import_boot_structures(
     }
     import_pages(importer, 0, 1, "pvh-boot-tables", &boot_page)?;
 
-    let memory_ranges = memory_layout.ram();
+    let memory_ranges = pvh_memory_map(memory_layout, boot_config.reserved_memory_ranges)?;
     let memmap_size = memory_ranges
         .len()
         .checked_mul(size_of::<HvmMemmapTableEntry>())
@@ -597,13 +604,7 @@ fn import_boot_structures(
     let memmap_entries =
         u32::try_from(memory_ranges.len()).map_err(|_| Error::MemoryMapTooLarge)?;
     let mut memmap_page = [0u8; HV_PAGE_SIZE as usize];
-    for (index, range) in memory_ranges.iter().enumerate() {
-        let entry = HvmMemmapTableEntry {
-            addr: range.range.start(),
-            size: range.range.len(),
-            entry_type: XEN_HVM_MEMMAP_TYPE_RAM,
-            reserved: 0,
-        };
+    for (index, entry) in memory_ranges.iter().enumerate() {
         let offset = index * size_of::<HvmMemmapTableEntry>();
         memmap_page[offset..offset + size_of::<HvmMemmapTableEntry>()]
             .copy_from_slice(entry.as_bytes());
@@ -697,6 +698,63 @@ fn import_boot_structures(
     )?;
 
     Ok(())
+}
+
+fn pvh_memory_map(
+    memory_layout: &MemoryLayout,
+    reserved_ranges: &[MemoryRange],
+) -> Result<Vec<HvmMemmapTableEntry>, Error> {
+    let mut previous_end = 0;
+    for range in reserved_ranges {
+        let valid = !range.is_empty()
+            && range.start().is_multiple_of(HV_PAGE_SIZE)
+            && range.end().is_multiple_of(HV_PAGE_SIZE)
+            && range.start() >= previous_end
+            && memory_layout.ram().iter().any(|ram| {
+                range.start() >= ram.range.start() && range.end() <= ram.range.end()
+            });
+        if !valid {
+            return Err(Error::InvalidReservedMemoryRange {
+                start: range.start(),
+                end: range.end(),
+            });
+        }
+        previous_end = range.end();
+    }
+
+    let mut entries = Vec::with_capacity(memory_layout.ram().len() + reserved_ranges.len() * 2);
+    for ram in memory_layout.ram() {
+        let mut next = ram.range.start();
+        for reserved in reserved_ranges {
+            if reserved.start() < ram.range.start() || reserved.end() > ram.range.end() {
+                continue;
+            }
+            if next < reserved.start() {
+                entries.push(HvmMemmapTableEntry {
+                    addr: next,
+                    size: reserved.start() - next,
+                    entry_type: XEN_HVM_MEMMAP_TYPE_RAM,
+                    reserved: 0,
+                });
+            }
+            entries.push(HvmMemmapTableEntry {
+                addr: reserved.start(),
+                size: reserved.len(),
+                entry_type: XEN_HVM_MEMMAP_TYPE_RESERVED,
+                reserved: 0,
+            });
+            next = reserved.end();
+        }
+        if next < ram.range.end() {
+            entries.push(HvmMemmapTableEntry {
+                addr: next,
+                size: ram.range.end() - next,
+                entry_type: XEN_HVM_MEMMAP_TYPE_RAM,
+                reserved: 0,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 fn write_mp_tables(
@@ -1109,6 +1167,36 @@ mod tests {
     }
 
     #[test]
+    fn reserves_configured_memory_ranges() {
+        let shared_status = MemoryRange::new(0x3_0000..0x3_1000);
+        let entries = pvh_memory_map(&make_layout(), &[shared_status]).unwrap();
+        let entries = entries
+            .iter()
+            .map(|entry| (entry.addr, entry.size, entry.entry_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [
+                (0, 0x3_0000, XEN_HVM_MEMMAP_TYPE_RAM),
+                (0x3_0000, 0x1000, XEN_HVM_MEMMAP_TYPE_RESERVED),
+                (
+                    0x3_1000,
+                    64 * 1024 * 1024 - 0x3_1000,
+                    XEN_HVM_MEMMAP_TYPE_RAM
+                ),
+            ]
+        );
+
+        assert!(matches!(
+            pvh_memory_map(
+                &make_layout(),
+                &[MemoryRange::new(64 * 1024 * 1024..64 * 1024 * 1024 + 0x1000)]
+            ),
+            Err(Error::InvalidReservedMemoryRange { .. })
+        ));
+    }
+
+    #[test]
     fn loads_segments_zeroes_bss_and_sets_entry_state() {
         let mut kernel = Cursor::new(test_elf());
         let mut initrd = Cursor::new(vec![0x5a; 17]);
@@ -1245,6 +1333,7 @@ mod tests {
                 layout: PvhBootLayout::Smp,
                 apic_ids: &apic_ids,
                 level_triggered_irqs: LEVEL_TRIGGERED_IRQS,
+                reserved_memory_ranges: &[],
             };
             let mut boot_page = [0; HV_PAGE_SIZE as usize];
             write_mp_tables(&mut boot_page, &boot_config).unwrap();
@@ -1292,6 +1381,7 @@ mod tests {
                     layout: PvhBootLayout::Smp,
                     apic_ids: &[],
                     level_triggered_irqs: &[],
+                    reserved_memory_ranges: &[],
                 }
             ),
             Err(Error::NoProcessors)
@@ -1303,6 +1393,7 @@ mod tests {
                     layout: PvhBootLayout::Smp,
                     apic_ids: &[0, 2],
                     level_triggered_irqs: &[],
+                    reserved_memory_ranges: &[],
                 }
             ),
             Err(Error::InvalidApicId { .. })
@@ -1314,6 +1405,7 @@ mod tests {
                     layout: PvhBootLayout::Legacy,
                     apic_ids: &[0, 1, 2, 3],
                     level_triggered_irqs: &[],
+                    reserved_memory_ranges: &[],
                 }
             ),
             Err(Error::MpTableOverlap { .. })

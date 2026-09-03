@@ -116,6 +116,7 @@ use virt::ProtoPartition;
 use virt::VpIndex;
 use virtio::PciInterruptModel;
 use virtio::VirtioMmioDevice;
+use virtio::VirtioMmioInterruptMode;
 use virtio::VirtioPciDevice;
 use virtio::resolve::VirtioResolveInput;
 use vm_loader::InitialLoad;
@@ -305,25 +306,6 @@ pub struct RestartState {
 // Do not use during program execution
 static LOADED_VM: DebugPtr<LoadedVm> = DebugPtr::new();
 
-fn restore_vp_prefix(hypervisor_id: &str, requested_vp_count: Option<u32>) -> Option<u32> {
-    (hypervisor_id == "mshv")
-        .then_some(requested_vp_count)
-        .flatten()
-}
-
-#[cfg(test)]
-mod restore_vp_prefix_tests {
-    use super::restore_vp_prefix;
-
-    #[test]
-    fn limits_only_explicit_mshv_restores() {
-        assert_eq!(restore_vp_prefix("mshv", Some(2)), Some(2));
-        assert_eq!(restore_vp_prefix("mshv", None), None);
-        assert_eq!(restore_vp_prefix("kvm", Some(2)), None);
-        assert_eq!(restore_vp_prefix("whp", Some(2)), None);
-    }
-}
-
 /// The VM worker, used to create and run a VM partition.
 pub struct VmWorker {
     vm: LoadedVm,
@@ -344,8 +326,6 @@ impl Worker for VmWorker {
         let snapshot_restore_guards = parameters.snapshot_restore_guards;
         let restore_ready_sink = parameters.restore_ready_sink;
         let restore_gate_timeout = parameters.restore_gate_timeout;
-        let restore_vp_count =
-            restore_vp_prefix(parameters.hypervisor.id(), parameters.restore_vp_count);
         let restore_time = match (
             parameters.restore_downtime,
             parameters.restore_tsc_frequency_hz,
@@ -413,14 +393,7 @@ impl Worker for VmWorker {
             .transpose()
             .context("failed to decode saved state")?;
 
-        let mut vm = block_with_io(|_| {
-            vm.load(
-                saved_state,
-                parameters.notify,
-                restore_time,
-                restore_vp_count,
-            )
-        })?;
+        let mut vm = block_with_io(|_| vm.load(saved_state, parameters.notify, restore_time))?;
         vm.snapshot_boundary_requests = snapshot_boundary_requests;
         vm.snapshot_ready = snapshot_ready;
         vm.restore_ready_sink = restore_ready_sink;
@@ -460,7 +433,7 @@ impl Worker for VmWorker {
             shared_memory,
         ))?;
         pal_async::local::block_on(async {
-            let mut vm = vm.load(Some(saved_state), notify, None, None).await?;
+            let mut vm = vm.load(Some(saved_state), notify, None).await?;
 
             LOADED_VM.store(&vm);
 
@@ -1522,7 +1495,6 @@ impl InitializedVm {
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
         restore_time: Option<(Duration, u64, Option<u64>)>,
-        restore_vp_count: Option<u32>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
 
@@ -1530,7 +1502,7 @@ impl InitializedVm {
 
         let Self {
             partition,
-            mut vps,
+            vps,
             vmtime_keeper,
             vmtime_source,
             memory_manager,
@@ -1546,19 +1518,6 @@ impl InitializedVm {
             igvm_file,
             driver_source,
         } = self;
-
-        let vp_capacity = processor_topology.vp_count();
-        anyhow::ensure!(
-            vps.len() == vp_capacity as usize,
-            "backend returned {} VP binders for topology capacity {vp_capacity}",
-            vps.len()
-        );
-        let instantiated_vp_count = restore_vp_count.unwrap_or(vp_capacity);
-        anyhow::ensure!(
-            (1..=vp_capacity).contains(&instantiated_vp_count),
-            "restore VP count {instantiated_vp_count} is outside capacity 1..={vp_capacity}"
-        );
-        vps.truncate(instantiated_vp_count as usize);
 
         let mut resolver = ResourceResolver::new();
 
@@ -3008,7 +2967,7 @@ impl InitializedVm {
                 .await?;
             match bus {
                 VirtioBus::Mmio => {
-                    let (mmio_start, mmio_len, irq, disabled_features) = if matches!(
+                    let (mmio_start, mmio_len, irq, disabled_features, interrupt_mode) = if matches!(
                         cfg.machine_profile,
                         MachineProfile::Microvm { .. }
                     ) {
@@ -3076,16 +3035,37 @@ impl InitializedVm {
                             }
                             _ => 1 << 34,
                         };
-                        (start, len, irq, disabled_features)
+                        let interrupt_mode = if matches!(
+                            cfg.machine_profile,
+                            MachineProfile::Microvm {
+                                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
+                            }
+                        ) {
+                            VirtioMmioInterruptMode::SharedStatus {
+                                status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(start)
+                                    .context(
+                                        "microVM ABI version 2 slot has no shared-status word",
+                                    )?,
+                            }
+                        } else {
+                            VirtioMmioInterruptMode::Legacy
+                        };
+                        (start, len, irq, disabled_features, interrupt_mode)
                     } else {
                         let start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
                         virtio_mmio_index += 1;
-                        (start, 0x1000, virtio_mmio_irq, 0)
+                        (
+                            start,
+                            0x1000,
+                            virtio_mmio_irq,
+                            0,
+                            VirtioMmioInterruptMode::Legacy,
+                        )
                     };
                     let id = format!("{id}-{mmio_start}");
                     let gm = gm.clone();
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
-                        VirtioMmioDevice::new_with_disabled_features(
+                        VirtioMmioDevice::new_with_disabled_features_and_interrupt_mode(
                             device.0,
                             &driver_source.simple(),
                             gm,
@@ -3094,6 +3074,7 @@ impl InitializedVm {
                             mmio_start,
                             mmio_len,
                             disabled_features,
+                            interrupt_mode,
                         )
                     })?;
                 }
@@ -3143,7 +3124,6 @@ impl InitializedVm {
         // create a new channel to intercept guest resets
         let (halt_send, halt_recv) = mesh::channel();
 
-        let partition_unit_create = openvmm_defs::profile::ProfileSpan::start();
         let (partition_unit, vp_runners) = PartitionUnit::new(
             driver_source.simple(),
             state_units
@@ -3153,7 +3133,7 @@ impl InitializedVm {
             partition.clone().into_vm_partition(),
             PartitionUnitParams {
                 processor_topology: &processor_topology,
-                active_vp_count: Some(instantiated_vp_count),
+                active_vp_count: None,
                 halt_vps,
                 halt_request_recv,
                 client_notify_send: halt_send,
@@ -3166,10 +3146,8 @@ impl InitializedVm {
             },
         )
         .context("failed to create partition unit")?;
-        partition_unit_create.complete("startup", "partition_unit_create", Default::default());
 
         // Start the VP backing threads.
-        let vp_thread_bind = openvmm_defs::profile::ProfileSpan::start();
         try_join_all(vps.into_iter().zip(vp_runners).enumerate().map(
             |(vp_index, (mut vp, runner))| {
                 let partition = partition.clone();
@@ -3177,31 +3155,17 @@ impl InitializedVm {
                 let (send, recv) = mesh::oneshot();
                 thread::Builder::new()
                     .name(format!("vp-{}", vp_index))
-                    .spawn(move || {
-                        let vp_bind = openvmm_defs::profile::ProfileSpan::start();
-                        let bind_result = vp.bind();
-                        if vp_index == 0 {
-                            vp_bind.complete_milestone(
-                                "startup",
-                                "vp_bind_bsp",
-                                Default::default(),
-                            );
-                        } else if openvmm_defs::profile::enabled() {
-                            let phase = format!("vp_bind_ap_{vp_index}");
-                            vp_bind.complete_milestone("startup", &phase, Default::default());
+                    .spawn(move || match vp.bind() {
+                        Ok(mut vp) => {
+                            send.send(Ok(()));
+                            block_on_vp(
+                                partition,
+                                VpIndex::new(vp_index as u32),
+                                vp.run(runner, &chipset),
+                            )
                         }
-                        match bind_result {
-                            Ok(mut vp) => {
-                                send.send(Ok(()));
-                                block_on_vp(
-                                    partition,
-                                    VpIndex::new(vp_index as u32),
-                                    vp.run(runner, &chipset),
-                                )
-                            }
-                            Err(err) => {
-                                send.send(Err(err));
-                            }
+                        Err(err) => {
+                            send.send(Err(err));
                         }
                     })
                     .unwrap();
@@ -3214,7 +3178,6 @@ impl InitializedVm {
             },
         ))
         .await?;
-        vp_thread_bind.complete("startup", "vp_thread_bind", Default::default());
 
         let mut this = LoadedVm {
             state_units,
@@ -3316,12 +3279,10 @@ impl InitializedVm {
                 .context("loadedvm restore failed")?;
             saved_state_restore.complete("restore", "saved_state_restore", Default::default());
             if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
-                let state_time_advance = openvmm_defs::profile::ProfileSpan::start();
                 this.state_units
                     .advance_time(downtime)
                     .await
                     .context("failed to advance restored VM time")?;
-                state_time_advance.complete("restore", "state_time_advance", Default::default());
                 #[cfg(guest_arch = "x86_64")]
                 {
                     let apic_frequency = match saved_apic_frequency {
@@ -3330,28 +3291,18 @@ impl InitializedVm {
                             "destination backend does not expose a local APIC frequency",
                         )?,
                     };
-                    let vp_tsc_advance = openvmm_defs::profile::ProfileSpan::start();
                     this.inner
                         .partition_unit
                         .advance_tsc(downtime, frequency, Some(apic_frequency))
                         .await
                         .context("failed to advance restored vCPU TSC")?;
-                    vp_tsc_advance.complete("restore", "vp_tsc_advance", Default::default());
                 }
-                let backend_time_advance = openvmm_defs::profile::ProfileSpan::start();
                 this.inner
                     .partition
                     .advance_snapshot_time(downtime)
                     .context("failed to advance backend snapshot clock")?;
-                backend_time_advance.complete(
-                    "restore",
-                    "backend_time_advance",
-                    Default::default(),
-                );
             }
-            let restore_vp_stop = openvmm_defs::profile::ProfileSpan::start();
             this.restore_start_guard = Some(this.inner.partition_unit.temporarily_stop_vps().await);
-            restore_vp_stop.complete("restore", "restore_vp_stop", Default::default());
         } else {
             // Assign PCI bus numbers/BARs before building firmware so that the
             // ACPI tables (specifically the SRAT generic-initiator entries) can
@@ -3499,6 +3450,16 @@ impl LoadedVmInner {
                     openvmm_defs::config::MICROVM_ABI_VERSION_2 => loader::pvh::PvhBootLayout::Smp,
                     _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
                 };
+                let pvh_reserved_memory_ranges =
+                    if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
+                        vec![MemoryRange::new(
+                            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                                ..openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                                    + openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+                        )]
+                    } else {
+                        Vec::new()
+                    };
                 let apic_ids = self
                     .processor_topology
                     .vps_arch()
@@ -3532,6 +3493,7 @@ impl LoadedVmInner {
                             apic_ids: &apic_ids,
                             level_triggered_irqs:
                                 openvmm_defs::config::microvm_pvh_level_triggered_irqs(abi_version)?,
+                            reserved_memory_ranges: &pvh_reserved_memory_ranges,
                         },
                     },
                     &self.gm,
@@ -3801,34 +3763,16 @@ impl LoadedVmInner {
 }
 
 impl LoadedVm {
-    fn publish_restore_ready(&mut self) -> anyhow::Result<()> {
-        if let Some(mut sink) = self.restore_ready_sink.take() {
-            sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
-                #[cfg(windows)]
-                {
-                    sink.sync_all()
-                }
-                #[cfg(not(windows))]
-                {
-                    sink.flush()
-                }
-            })?;
-        }
-        Ok(())
-    }
-
     async fn resume(&mut self) -> anyhow::Result<bool> {
         if self.running {
             return Ok(false);
         }
         if let Some(timeout) = self.restore_gate_timeout {
-            let input_gate = openvmm_defs::profile::ProfileSpan::start();
             self.state_units
                 .quiesce_input_for_save(timeout)
                 .await
                 .context("failed to establish post-restore input gate")?;
             self.restore_input_gated = true;
-            input_gate.complete("restore", "input_gate", Default::default());
         }
         let device_start = openvmm_defs::profile::ProfileSpan::start();
         self.state_units
@@ -3847,8 +3791,18 @@ impl LoadedVm {
                 },
             );
         }
-        if self.restore_gate_timeout.is_none() {
-            if let Err(error) = self.publish_restore_ready() {
+        if let Some(mut sink) = self.restore_ready_sink.take() {
+            let signal_result = sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
+                #[cfg(windows)]
+                {
+                    sink.sync_all()
+                }
+                #[cfg(not(windows))]
+                {
+                    sink.flush()
+                }
+            });
+            if let Err(error) = signal_result {
                 self.state_units.stop().await;
                 return Err(error).context("failed to publish restore readiness event");
             }
@@ -3973,10 +3927,6 @@ impl LoadedVm {
         self.state_units
             .resume_input_after_save(input_gate_timeout)
             .await?;
-        if self.restore_input_gated {
-            self.publish_restore_ready()
-                .context("failed to publish restore readiness event")?;
-        }
         let transaction_complete = self
             .snapshot_transaction_complete
             .take()

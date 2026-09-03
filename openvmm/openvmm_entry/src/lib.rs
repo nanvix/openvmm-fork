@@ -1712,7 +1712,7 @@ async fn vm_config_from_command_line(
         opt.machine,
         MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
     );
-    let is_microvm_v2 = opt.machine == MachineProfileCli::MicrovmV2;
+    let is_microvm_smp = opt.machine == MachineProfileCli::MicrovmV2;
     opt.validate_microvm_options()?;
     let effective_microvm_network = if is_microvm {
         effective_microvm_network(opt, restore_machine_contract)?
@@ -3377,8 +3377,12 @@ async fn vm_config_from_command_line(
     #[cfg(guest_arch = "x86_64")]
     let topology_arch =
         openvmm_defs::config::ArchTopologyConfig::X86(openvmm_defs::config::X86TopologyConfig {
-            apic_id_offset: if is_microvm_v2 { 0 } else { opt.apic_id_offset },
-            x2apic: if is_microvm_v2 {
+            apic_id_offset: if is_microvm_smp {
+                0
+            } else {
+                opt.apic_id_offset
+            },
+            x2apic: if is_microvm_smp {
                 openvmm_defs::config::X2ApicConfig::Unsupported
             } else {
                 opt.x2apic
@@ -3821,12 +3825,12 @@ async fn vm_config_from_command_line(
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: opt.processors,
-            vps_per_socket: if is_microvm_v2 {
+            vps_per_socket: if is_microvm_smp {
                 Some(opt.processors)
             } else {
                 opt.vps_per_socket
             },
-            enable_smt: if is_microvm_v2 {
+            enable_smt: if is_microvm_smp {
                 Some(false)
             } else {
                 match opt.smt {

@@ -591,7 +591,7 @@ impl VmController {
             anyhow::ensure!(
                 matches!(
                     self.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1..=2 }
+                    MachineProfile::Microvm { abi_version: 1 | 2 }
                 ),
                 "guest-requested snapshot capture requires microVM ABI version 1 or 2"
             );
