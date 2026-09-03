@@ -12,6 +12,7 @@ use crate::DynVirtioDevice;
 use crate::QueueResources;
 use crate::queue::QueueState;
 use crate::spec::VirtioDeviceFeatures;
+use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
 use chipset_device::io::deferred::DeferredRead;
 use chipset_device::io::deferred::DeferredWrite;
@@ -61,6 +62,8 @@ pub enum DeviceCommand {
         data: [u8; 8],
         deferred: DeferredWrite,
     },
+    /// Queue notification, serialized with private-state activation.
+    Kick { idx: u16, event: pal_event::Event },
     /// Inspect the device state.
     Inspect(inspect::Deferred),
 }
@@ -80,7 +83,7 @@ pub enum ConfigReadCompletion {
 
 /// Parameters for the Enable command.
 pub struct EnableParams {
-    pub queues: Vec<(u16, QueueResources)>,
+    pub queues: Vec<(u16, QueueResources, Option<QueueState>)>,
     pub features: VirtioDeviceFeatures,
 }
 
@@ -89,9 +92,11 @@ pub struct StartParams {
     pub queues: Vec<(u16, QueueResources, Option<QueueState>)>,
     pub features: VirtioDeviceFeatures,
     pub device_state: DeviceRestoreState,
+    pub active: bool,
 }
 
 /// Whether this start follows restore, and its optional private payload.
+#[derive(Clone)]
 pub enum DeviceRestoreState {
     NotRestored,
     Restored(Option<SavedStateBlob>),
@@ -105,7 +110,7 @@ impl DeviceRestoreState {
 
 /// Queue and device-private state captured after a device has stopped.
 pub struct StopResult {
-    pub queues: Vec<Option<QueueState>>,
+    pub queues: Vec<(bool, Option<QueueState>)>,
     pub device_state: Result<Option<SavedStateBlob>, SaveError>,
 }
 
@@ -154,7 +159,7 @@ impl TransportState {
     pub fn start_enable(
         &mut self,
         sender: &mesh::Sender<DeviceCommand>,
-        queues: Vec<(u16, QueueResources)>,
+        queues: Vec<(u16, QueueResources, Option<QueueState>)>,
         features: VirtioDeviceFeatures,
     ) {
         assert!(!self.is_busy());
@@ -210,56 +215,154 @@ impl TransportState {
 /// Owns the virtio device and processes commands from the transport.
 struct DeviceTask {
     device: Box<dyn DynVirtioDevice>,
+    device_type: u16,
     max_queues: u16,
+    pending_restore: DeviceRestoreState,
+    queue_events: Vec<Option<pal_event::Event>>,
+    pending_kicks: Vec<bool>,
+    started_queues: Vec<bool>,
 }
 
 impl DeviceTask {
+    fn stage_restore(&mut self, state: DeviceRestoreState, active: bool) {
+        if state.is_restored() {
+            tracing::debug!(
+                target: "virtio_restore",
+                event = "restore_staged",
+                device_type = self.device_type,
+                trigger = if active { "active-start" } else { "inactive-start" },
+                queue_index = -1,
+                restored_progress = false,
+                success = true,
+                "virtio restore lifecycle"
+            );
+            self.pending_restore = state;
+        }
+    }
+
+    fn apply_pending_restore(
+        &mut self,
+        trigger: &'static str,
+        queue_index: Option<u16>,
+    ) -> Result<(), vmcore::save_restore::RestoreError> {
+        let DeviceRestoreState::Restored(state) = &self.pending_restore else {
+            return Ok(());
+        };
+        let result = self.device.restore_device(state.clone());
+        tracing::debug!(
+            target: "virtio_restore",
+            event = "private_state_apply",
+            device_type = self.device_type,
+            trigger,
+            queue_index = queue_index.map(i32::from).unwrap_or(-1),
+            restored_progress = false,
+            success = result.is_ok(),
+            "virtio restore lifecycle"
+        );
+        if result.is_ok() {
+            self.pending_restore = DeviceRestoreState::NotRestored;
+        }
+        result
+    }
+
     async fn enable(&mut self, params: EnableParams) -> bool {
-        for (idx, resources) in params.queues {
-            if let Err(err) = self
+        if let Err(error) = self.apply_pending_restore("driver-ok", None) {
+            tracelimit::error_ratelimited!(
+                error = &error as &dyn std::error::Error,
+                "virtio device restore failed during enable"
+            );
+            self.stop_all_queues().await;
+            self.clear_queue_events();
+            self.device.reset().await;
+            self.pending_restore = DeviceRestoreState::NotRestored;
+            return false;
+        }
+        let mut started_events = Vec::with_capacity(params.queues.len());
+        for (idx, resources, initial_state) in params.queues {
+            let event = resources.event.clone();
+            let restored_progress = initial_state.is_some();
+            let result = self
                 .device
-                .start_queue(idx, resources, &params.features, None)
-                .await
-            {
+                .start_queue(idx, resources, &params.features, initial_state)
+                .await;
+            tracing::debug!(
+                target: "virtio_restore",
+                event = "queue_start",
+                device_type = self.device_type,
+                trigger = "driver-ok",
+                queue_index = i32::from(idx),
+                restored_progress,
+                success = result.is_ok(),
+                "virtio restore lifecycle"
+            );
+            if let Err(err) = result {
                 tracelimit::error_ratelimited!(
                     error = &*err as &dyn std::error::Error,
                     idx,
                     "virtio device start_queue failed"
                 );
                 self.stop_all_queues().await;
+                self.clear_queue_events();
                 self.device.reset().await;
+                self.pending_restore = DeviceRestoreState::NotRestored;
                 return false;
             }
+            self.started_queues[idx as usize] = true;
+            started_events.push((idx, event));
+        }
+        for (idx, event) in started_events {
+            self.dispatch_pending_kick(idx, &event);
         }
         true
     }
 
     async fn disable(&mut self) {
         self.stop_all_queues().await;
+        self.clear_queue_events();
         self.device.reset().await;
+        self.pending_restore = DeviceRestoreState::NotRestored;
     }
 
     async fn stop(&mut self) -> StopResult {
-        let mut states = vec![None; self.max_queues as usize];
+        let mut states = Vec::with_capacity(self.max_queues as usize);
         for idx in 0..self.max_queues {
-            states[idx as usize] = self.device.stop_queue(idx).await;
+            let was_started = std::mem::take(&mut self.started_queues[idx as usize]);
+            states.push((was_started, self.device.stop_queue(idx).await));
         }
         StopResult {
             queues: states,
-            device_state: self.device.save_device(),
+            device_state: match &self.pending_restore {
+                DeviceRestoreState::NotRestored => self.device.save_device(),
+                DeviceRestoreState::Restored(state) => Ok(state.clone()),
+            },
         }
     }
 
     async fn start(&mut self, params: StartParams) -> anyhow::Result<()> {
-        if let DeviceRestoreState::Restored(state) = params.device_state {
-            self.device.restore_device(state)?;
+        self.stage_restore(params.device_state, params.active);
+        if !params.active {
+            return Ok(());
         }
+        self.apply_pending_restore("active-start", None)?;
+        let mut started_events = Vec::with_capacity(params.queues.len());
         for (idx, resources, initial_state) in params.queues {
-            if let Err(error) = self
+            let event = resources.event.clone();
+            let restored_progress = initial_state.is_some();
+            let result = self
                 .device
                 .start_queue(idx, resources, &params.features, initial_state)
-                .await
-            {
+                .await;
+            tracing::debug!(
+                target: "virtio_restore",
+                event = "queue_start",
+                device_type = self.device_type,
+                trigger = "active-start",
+                queue_index = i32::from(idx),
+                restored_progress,
+                success = result.is_ok(),
+                "virtio restore lifecycle"
+            );
+            if let Err(error) = result {
                 tracelimit::error_ratelimited!(
                     error = &*error as &dyn std::error::Error,
                     idx,
@@ -268,13 +371,20 @@ impl DeviceTask {
                 self.stop_all_queues().await;
                 return Err(error);
             }
+            self.started_queues[idx as usize] = true;
+            started_events.push((idx, event));
+        }
+        for (idx, event) in started_events {
+            self.dispatch_pending_kick(idx, &event);
         }
         Ok(())
     }
 
     async fn reset(&mut self) {
         self.stop_all_queues().await;
+        self.clear_queue_events();
         self.device.reset().await;
+        self.pending_restore = DeviceRestoreState::NotRestored;
     }
 
     async fn quiesce_input(&mut self) -> anyhow::Result<()> {
@@ -288,7 +398,32 @@ impl DeviceTask {
     async fn stop_all_queues(&mut self) {
         for idx in 0..self.max_queues {
             self.device.stop_queue(idx).await;
+            self.started_queues[idx as usize] = false;
         }
+    }
+
+    fn clear_queue_events(&mut self) {
+        for event in self.queue_events.iter().flatten() {
+            while event.try_wait() {}
+        }
+        self.pending_kicks.fill(false);
+    }
+
+    fn dispatch_pending_kick(&mut self, idx: u16, event: &pal_event::Event) {
+        if !std::mem::take(&mut self.pending_kicks[idx as usize]) {
+            return;
+        }
+        event.signal();
+        tracing::debug!(
+            target: "virtio_restore",
+            event = "kick_dispatch",
+            device_type = self.device_type,
+            trigger = "driver-ok",
+            queue_index = i32::from(idx),
+            restored_progress = false,
+            success = true,
+            "virtio restore lifecycle"
+        );
     }
 }
 
@@ -297,9 +432,16 @@ pub async fn run_device_task(
     device: Box<dyn DynVirtioDevice>,
     mut recv: mesh::Receiver<DeviceCommand>,
 ) {
+    let traits = device.traits();
+    let max_queues = traits.max_queues;
     let mut task = DeviceTask {
-        max_queues: device.traits().max_queues,
+        device_type: traits.device_id.0,
+        max_queues,
         device,
+        pending_restore: DeviceRestoreState::NotRestored,
+        queue_events: vec![None; max_queues as usize],
+        pending_kicks: vec![false; max_queues as usize],
+        started_queues: vec![false; max_queues as usize],
     };
 
     while let Some(cmd) = recv.next().await {
@@ -339,6 +481,14 @@ pub async fn run_device_task(
                 completion,
                 deferred,
             } => {
+                if let Err(error) = task.apply_pending_restore("config-read", None) {
+                    tracelimit::error_ratelimited!(
+                        error = &error as &dyn std::error::Error,
+                        "virtio device restore failed before config read"
+                    );
+                    deferred.complete_error(IoError::NoResponse);
+                    continue;
+                }
                 let start_word = offset & !3;
                 let end = offset as usize + len as usize;
                 let mut buf = [0u8; 12];
@@ -364,6 +514,14 @@ pub async fn run_device_task(
                 data,
                 deferred,
             } => {
+                if let Err(error) = task.apply_pending_restore("config-write", None) {
+                    tracelimit::error_ratelimited!(
+                        error = &error as &dyn std::error::Error,
+                        "virtio device restore failed before config write"
+                    );
+                    deferred.complete_error(IoError::NoResponse);
+                    continue;
+                }
                 if len == 4 && offset & 3 == 0 {
                     task.device
                         .write_registers_u32(
@@ -389,6 +547,47 @@ pub async fn run_device_task(
                     }
                 }
                 deferred.complete();
+            }
+            DeviceCommand::Kick { idx, event } => {
+                if let Some(slot) = task.queue_events.get_mut(idx as usize) {
+                    *slot = Some(event.clone());
+                }
+                if let Err(error) = task.apply_pending_restore("kick", Some(idx)) {
+                    tracelimit::error_ratelimited!(
+                        error = &error as &dyn std::error::Error,
+                        idx,
+                        "virtio device restore failed before queue kick"
+                    );
+                    continue;
+                }
+                if task.started_queues.get(idx as usize) == Some(&true) {
+                    event.signal();
+                    tracing::debug!(
+                        target: "virtio_restore",
+                        event = "kick_dispatch",
+                        device_type = task.device_type,
+                        trigger = "kick",
+                        queue_index = i32::from(idx),
+                        restored_progress = false,
+                        success = true,
+                        "virtio restore lifecycle"
+                    );
+                } else if let Some(pending) = task.pending_kicks.get_mut(idx as usize) {
+                    let newly_staged = !*pending;
+                    *pending = true;
+                    if newly_staged {
+                        tracing::debug!(
+                            target: "virtio_restore",
+                            event = "kick_staged",
+                            device_type = task.device_type,
+                            trigger = "kick",
+                            queue_index = i32::from(idx),
+                            restored_progress = false,
+                            success = true,
+                            "virtio restore lifecycle"
+                        );
+                    }
+                }
             }
             DeviceCommand::Inspect(deferred) => {
                 deferred.inspect(&mut *task.device);

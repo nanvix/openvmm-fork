@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
+use chipset_device::io::IoResult;
+use chipset_device::mmio::MmioIntercept;
 use guestmem::GuestMemory;
 use inspect::InspectMut;
 use net_backend::Endpoint;
@@ -47,7 +49,11 @@ use virtio::test_helpers::make_available;
 use virtio::test_helpers::read_used;
 use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
+use virtio::transport::VirtioMmioDevice;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
+use vmcore::line_interrupt::LineInterrupt;
+use vmcore::save_restore::SaveRestore;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -1080,6 +1086,77 @@ async fn save_restore_preserves_partial_queue_lifecycle(driver: DefaultDriver) {
         &half_open.mem,
     )
     .unwrap();
+}
+
+#[async_test]
+async fn inactive_transport_restore_defers_net_private_state(driver: DefaultDriver) {
+    let source_harness = TestHarness::new_save_restore(&driver);
+    let mut source = VirtioMmioDevice::new(
+        Box::new(source_harness.device),
+        &driver,
+        source_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    source.stop().await;
+    let saved = source.save().unwrap();
+    assert_eq!(
+        saved
+            .device_state
+            .as_ref()
+            .unwrap()
+            .parse::<crate::saved_state::SavedState>()
+            .unwrap()
+            .endpoint_generation,
+        0
+    );
+
+    let destination_harness = TestHarness::new_save_restore(&driver);
+    let mut destination = VirtioMmioDevice::new(
+        Box::new(destination_harness.device),
+        &driver,
+        destination_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    destination.restore(saved).unwrap();
+    destination.start_fallible().await.unwrap();
+    destination.stop().await;
+    let staged = destination.save().unwrap();
+    assert_eq!(
+        staged
+            .device_state
+            .as_ref()
+            .unwrap()
+            .parse::<crate::saved_state::SavedState>()
+            .unwrap()
+            .endpoint_generation,
+        0
+    );
+
+    destination.start_fallible().await.unwrap();
+    let mut config = [0; 4];
+    match destination.mmio_read(0x100, &mut config) {
+        IoResult::Defer(token) => token.read_future(&mut config).await.unwrap(),
+        other => panic!("expected deferred config read, got {other:?}"),
+    }
+    destination.stop().await;
+    let activated = destination.save().unwrap();
+    assert_eq!(
+        activated
+            .device_state
+            .unwrap()
+            .parse::<crate::saved_state::SavedState>()
+            .unwrap()
+            .endpoint_generation,
+        1
+    );
 }
 
 #[async_test]

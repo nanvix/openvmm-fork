@@ -9793,6 +9793,7 @@ dependencies = [
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
+ "tracing",
  "virtio_resources",
  "virtio_spec",
  "vm_resource",
@@ -9834,6 +9835,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chipset_device",
  "futures",
  "futures-concurrency",
  "guestmem",
@@ -9860,6 +9862,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitfield-struct 0.11.0",
+ "chipset_device",
  "futures",
  "guestmem",
  "inspect",
@@ -10003,6 +10006,7 @@ name = "virtiofs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chipset_device",
  "fuse",
  "futures",
  "guestmem",

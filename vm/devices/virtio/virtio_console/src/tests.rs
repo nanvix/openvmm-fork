@@ -8,6 +8,8 @@
 //! descriptor rings just as a guest driver would.
 
 use crate::VirtioConsoleDevice;
+use chipset_device::io::IoResult;
+use chipset_device::mmio::MmioIntercept;
 use futures::AsyncRead;
 use futures::AsyncWrite;
 use guestmem::GuestMemory;
@@ -37,8 +39,12 @@ use virtio::test_helpers::init_used_ring;
 use virtio::test_helpers::make_available;
 use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
+use virtio::transport::VirtioMmioDevice;
 use virtio_resources::console::VirtioConsoleDisconnectPolicy;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
+use vmcore::line_interrupt::LineInterrupt;
+use vmcore::save_restore::SaveRestore;
 use vmcore::save_restore::SavedStateBlob;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
@@ -1115,4 +1121,86 @@ async fn saved_state_validator_rejects_tx_offset_past_descriptor(driver: Default
         },
     ];
     assert!(validator(Some(&state), &VirtioDeviceFeatures::new(), &queues, &mem,).is_err());
+}
+
+#[async_test]
+async fn inactive_transport_restore_defers_console_private_state(driver: DefaultDriver) {
+    let source_harness = TestHarness::new(&driver);
+    let mut source = VirtioMmioDevice::new(
+        Box::new(source_harness.device),
+        &driver,
+        source_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    source.stop().await;
+    let mut saved = source.save().unwrap();
+    let staged_rx = b"deferred console input".to_vec();
+    saved.device_state = Some(SavedStateBlob::new(crate::saved_state::SavedState {
+        schema_version: super::SAVED_STATE_VERSION,
+        columns: 123,
+        rows: 45,
+        partial_transmit: 0,
+        staged_rx: staged_rx.clone(),
+        disconnect_policy_id: 0,
+    }));
+
+    let destination_harness = TestHarness::new(&driver);
+    let mut destination = VirtioMmioDevice::new(
+        Box::new(destination_harness.device),
+        &driver,
+        destination_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    destination.restore(saved).unwrap();
+    destination.start_fallible().await.unwrap();
+    destination.stop().await;
+    let staged = destination.save().unwrap();
+    let staged_private = staged
+        .device_state
+        .as_ref()
+        .unwrap()
+        .parse::<crate::saved_state::SavedState>()
+        .unwrap();
+    assert_eq!(staged_private.columns, 123);
+    assert_eq!(staged_private.rows, 45);
+    assert_eq!(staged_private.staged_rx, staged_rx);
+
+    destination.start_fallible().await.unwrap();
+    let mut config = [0; 4];
+    match destination.mmio_read(0x100, &mut config) {
+        IoResult::Defer(token) => token.read_future(&mut config).await.unwrap(),
+        other => panic!("expected deferred config read, got {other:?}"),
+    }
+    assert_eq!(u16::from_ne_bytes(config[..2].try_into().unwrap()), 123);
+    assert_eq!(u16::from_ne_bytes(config[2..].try_into().unwrap()), 45);
+
+    let mut invalid = staged;
+    invalid.device_state = Some(SavedStateBlob::new(crate::saved_state::SavedState {
+        schema_version: super::SAVED_STATE_VERSION,
+        columns: 80,
+        rows: 25,
+        partial_transmit: 0,
+        staged_rx: vec![0; super::MAX_STAGED_RX_BYTES + 1],
+        disconnect_policy_id: 0,
+    }));
+    let invalid_harness = TestHarness::new(&driver);
+    let mut invalid_destination = VirtioMmioDevice::new(
+        Box::new(invalid_harness.device),
+        &driver,
+        invalid_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    assert!(invalid_destination.restore(invalid).is_err());
 }
