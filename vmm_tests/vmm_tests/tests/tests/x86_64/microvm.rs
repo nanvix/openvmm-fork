@@ -137,6 +137,14 @@ impl OpenvmmTestProcess {
         stdin.flush().context("failed to flush guest command")
     }
 
+    fn send_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let stdin = self.stdin.as_mut().context("OpenVMM stdin is closed")?;
+        stdin
+            .write_all(bytes)
+            .context("failed to write guest input")?;
+        stdin.flush().context("failed to flush guest input")
+    }
+
     fn drain_output(&mut self) {
         while let Ok(chunk) = self.output_recv.try_recv() {
             self.output.extend_from_slice(&chunk);
@@ -947,7 +955,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
     artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
 ) -> anyhow::Result<()> {
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
-    const SNAPSHOT_MARKER: &[u8] = b"PHASE3-SNAPSHOT-NOW";
+    const RX_READY_MARKER: &[u8] = b"PHASE3-RX-READY";
     const RX_MARKER: &[u8] = b"PHASE3-RX-RESTORED";
     const DONE_MARKER: &[u8] = b"PHASE3-TX-DONE";
     const BINARY_MARKER: &[u8] = b"\0\r\n\x7f\xffPHASE3-BINARY";
@@ -984,7 +992,7 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
         "--virtio-console".into(),
         format!("listen=tcp:{address}").into(),
     ]);
-    let source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
+    let mut source = OpenvmmTestProcess::launch(openvmm.get(), &capture_args)?;
     let mut source_console = TcpConsole::connect(address)?;
     source_console.wait_for(MICROVM_BOOT_MARKER)?;
     source_console.wait_for(MICROVM_SHELL_PROMPT)?;
@@ -1022,18 +1030,25 @@ async fn phase_3_console_snapshot_restore<OpenvmmArtifact>(
          mkfifo /tmp/phase3-resume; \
          (i=0; while [ $i -lt {tx_count} ]; do printf 'PHASE3-TX-%05d\\n' \"$i\"; i=$((i+1)); if [ $i -eq 100 ]; then touch /tmp/phase3-tx-started; IFS= read -r phase3_resume < /tmp/phase3-resume; [ \"$phase3_resume\" = resume ]; fi; done) & tx_pid=$!; \
          while [ ! -e /tmp/phase3-tx-started ]; do sleep 0.01; done; \
-         echo PHASE3-SNAPSHOT-NOW; sleep 1; nvx-snapshot; \
+         echo PHASE3-RX-READY; \
+            phase3_snapshot_now=$(dd if=/dev/port bs=1 skip=233 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
+            [ \"$phase3_snapshot_now\" = 1 ] || {{ nvx-exit 54; exit; }}; \
+            sleep 1; \
+         nvx-snapshot; \
             {receive} \
-             printf 'resume\\n' > /tmp/phase3-resume; \
+            printf 'resume\n' > /tmp/phase3-resume; \
             {restored_marker} \
-         {completion}"
+            {completion}"
     ))?;
-    source_console.wait_for(SNAPSHOT_MARKER)?;
+    source_console.wait_for(RX_READY_MARKER)?;
     if hypervisor == "mshv" {
         source_console.send_bytes(b"PHASE3-RX\n")?;
     } else {
         source_console.send_bytes(&[0, 1, 2, 127, 255])?;
     }
+    // Port B is independent of the virtio console, so it can signal that the
+    // host write completed without consuming the queued console payload.
+    source.send_bytes(&[1])?;
     let (status, source_process_output) = source.wait()?;
     anyhow::ensure!(
         status.success(),
