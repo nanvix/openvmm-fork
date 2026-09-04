@@ -100,7 +100,7 @@ pub struct MicroVmVirtioFsProfile {
 impl MicroVmVirtioFsProfile {
     /// Builds the constrained microVM profile from the resource attachment
     /// fields. `stable_id`, `root_identity`, and `read_only` correspond
-    /// exactly to `VirtioFsProfile::MicrovmV1`.
+    /// exactly to `VirtioFsProfile::Microvm`.
     pub fn from_attachment(
         stable_id: String,
         root_identity: Vec<u8>,
@@ -244,7 +244,7 @@ impl MicroVmVirtioFsProfile {
 }
 
 /// Computes the portable root identity expected in
-/// `VirtioFsProfile::MicrovmV1::root_identity`.
+/// `VirtioFsProfile::Microvm::root_identity`.
 pub fn microvm_root_identity(root_path: impl AsRef<Path>) -> anyhow::Result<Vec<u8>> {
     #[expect(
         clippy::disallowed_methods,

@@ -565,12 +565,7 @@ fn build_x86_topology(
         Some(ArchTopologyConfig::X86(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
-    let mut builder = if matches!(
-        machine_profile,
-        MachineProfile::Microvm {
-            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
-        }
-    ) {
+    let mut builder = if machine_profile == MachineProfile::Microvm {
         TopologyBuilder::new_x86()
     } else {
         TopologyBuilder::from_host_topology()?
@@ -1151,10 +1146,7 @@ impl InitializedVm {
                     .map(|typ| typ.into())
                     .unwrap_or(virt::IsolationType::None),
                 nested_virt: cfg.hypervisor.nested_virt,
-                versioned_cpu_contract: matches!(
-                    cfg.machine_profile,
-                    MachineProfile::Microvm { .. }
-                ),
+                versioned_cpu_contract: cfg.machine_profile == MachineProfile::Microvm,
             })
             .context("failed to create the prototype partition")?;
         partition_prototype.complete("startup", "partition_prototype", Default::default());
@@ -1192,7 +1184,7 @@ impl InitializedVm {
             None
         };
 
-        let virtio_mmio_count = if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+        let virtio_mmio_count = if cfg.machine_profile == MachineProfile::Microvm {
             0
         } else {
             cfg.virtio_devices
@@ -1875,14 +1867,7 @@ impl InitializedVm {
                 .into_resource(),
                 century_reg_idx: 0x32, // TODO: automatically sync with FADT
                 initial_cmos: initial_rtc_cmos,
-                mode: if matches!(
-                    cfg.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1 }
-                ) {
-                    dev::GenericCmosRtcMode::MicrovmV1
-                } else {
-                    dev::GenericCmosRtcMode::Standard
-                },
+                mode: dev::GenericCmosRtcMode::Standard,
             }
         });
 
@@ -2967,10 +2952,10 @@ impl InitializedVm {
                 .await?;
             match bus {
                 VirtioBus::Mmio => {
-                    let (mmio_start, mmio_len, irq, disabled_features, interrupt_mode) = if matches!(
-                        cfg.machine_profile,
-                        MachineProfile::Microvm { .. }
-                    ) {
+                    let (mmio_start, mmio_len, irq, disabled_features, interrupt_mode) = if cfg
+                        .machine_profile
+                        == MachineProfile::Microvm
+                    {
                         let (start, irq) = match id.as_str() {
                             "virtio-net" => (
                                 openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
@@ -2984,25 +2969,12 @@ impl InitializedVm {
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
                             ),
-                            "virtio-blk" => match cfg.machine_profile {
-                                MachineProfile::Microvm {
-                                    abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
-                                } => (
-                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
-                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
-                                ),
-                                MachineProfile::Microvm {
-                                    abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
-                                } => {
-                                    let block = microvm_sandbox_blocks.next().context(
-                                        "microVM ABI version 2 virtio-blk device has no sandbox role",
-                                    )?;
-                                    (block.role.mmio_base(), block.role.irq())
-                                }
-                                _ => anyhow::bail!(
-                                    "unsupported microVM ABI reached worker construction"
-                                ),
-                            },
+                            "virtio-blk" => {
+                                let block = microvm_sandbox_blocks
+                                    .next()
+                                    .context("microVM virtio-blk device has no sandbox role")?;
+                                (block.role.mmio_base(), block.role.irq())
+                            }
                             _ => anyhow::bail!(
                                 "unsupported microVM virtio device '{id}' reached worker construction"
                             ),
@@ -3018,37 +2990,19 @@ impl InitializedVm {
                         let disabled_features = match id.as_str() {
                             "virtio-net" => !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES,
                             "virtiofs" => !openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES,
-                            "virtio-blk"
-                                if matches!(
-                                    cfg.machine_profile,
-                                    MachineProfile::Microvm {
-                                        abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
-                                    }
-                                ) =>
-                            {
+                            "virtio-blk" => {
                                 let block = cfg
                                     .microvm_sandbox_blocks
                                     .iter()
                                     .find(|block| block.role.mmio_base() == start)
-                                    .context("microVM ABI version 2 block slot has no role")?;
+                                    .context("microVM block slot has no role")?;
                                 !openvmm_defs::config::microvm_sandbox_block_features(block.role)
                             }
                             _ => 1 << 34,
                         };
-                        let interrupt_mode = if matches!(
-                            cfg.machine_profile,
-                            MachineProfile::Microvm {
-                                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2
-                            }
-                        ) {
-                            VirtioMmioInterruptMode::SharedStatus {
-                                status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(start)
-                                    .context(
-                                        "microVM ABI version 2 slot has no shared-status word",
-                                    )?,
-                            }
-                        } else {
-                            VirtioMmioInterruptMode::Legacy
+                        let interrupt_mode = VirtioMmioInterruptMode::SharedStatus {
+                            status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(start)
+                                .context("microVM slot has no shared-status word")?,
                         };
                         (start, len, irq, disabled_features, interrupt_mode)
                     } else {
@@ -3361,10 +3315,8 @@ impl LoadedVmInner {
                 }
             })
             .collect();
-        let microvm_level_triggered_irqs = match self.machine_profile {
-            MachineProfile::Microvm { abi_version } => {
-                openvmm_defs::config::microvm_level_triggered_irqs(abi_version)?
-            }
+        let microvm_level_triggered_irqs: &[u32] = match self.machine_profile {
+            MachineProfile::Microvm => &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
             MachineProfile::Standard => &[],
         };
         let acpi_builder = AcpiTablesBuilder {
@@ -3437,29 +3389,15 @@ impl LoadedVmInner {
                 initrd,
                 cmdline,
             } => {
-                let abi_version = match self.machine_profile {
-                    MachineProfile::Microvm { abi_version } => abi_version,
-                    MachineProfile::Standard => {
-                        anyhow::bail!("PVH load mode requires the microVM profile")
-                    }
-                };
-                let pvh_layout = match abi_version {
-                    openvmm_defs::config::MICROVM_ABI_VERSION_1 => {
-                        loader::pvh::PvhBootLayout::Legacy
-                    }
-                    openvmm_defs::config::MICROVM_ABI_VERSION_2 => loader::pvh::PvhBootLayout::Smp,
-                    _ => anyhow::bail!("unsupported microVM ABI version {abi_version}"),
-                };
-                let pvh_reserved_memory_ranges =
-                    if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
-                        vec![MemoryRange::new(
-                            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
-                                ..openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
-                                    + openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
-                        )]
-                    } else {
-                        Vec::new()
-                    };
+                anyhow::ensure!(
+                    self.machine_profile == MachineProfile::Microvm,
+                    "PVH load mode requires the microVM profile"
+                );
+                let pvh_reserved_memory_ranges = vec![MemoryRange::new(
+                    openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                        ..openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                            + openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+                )];
                 let apic_ids = self
                     .processor_topology
                     .vps_arch()
@@ -3489,10 +3427,9 @@ impl LoadedVmInner {
                             tables: tables.tables,
                         },
                         boot_config: loader::pvh::BootConfig {
-                            layout: pvh_layout,
                             apic_ids: &apic_ids,
                             level_triggered_irqs:
-                                openvmm_defs::config::microvm_pvh_level_triggered_irqs(abi_version)?,
+                                &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
                             reserved_memory_ranges: &pvh_reserved_memory_ranges,
                         },
                     },
@@ -4076,9 +4013,9 @@ impl LoadedVm {
                 Event::WorkerRpc(Ok(message)) => match message {
                     WorkerRpc::Stop => break,
                     WorkerRpc::Restart(rpc) => {
-                        if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                        if self.inner.machine_profile == MachineProfile::Microvm {
                             rpc.complete(Err(RemoteError::new(anyhow::anyhow!(
-                                "worker restart is unavailable for microVM ABI version 1"
+                                "worker restart is unavailable for microVM"
                             ))));
                             continue;
                         }
@@ -4142,9 +4079,9 @@ impl LoadedVm {
                     }
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
                     VmRpc::Save(rpc) => {
-                        if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                        if self.inner.machine_profile == MachineProfile::Microvm {
                             rpc.handle_failable_sync(|()| {
-                                anyhow::bail!("save is unavailable for microVM ABI version 1")
+                                anyhow::bail!("save is unavailable for microVM")
                             });
                         } else {
                             rpc.handle_failable(async |()| {
@@ -4155,10 +4092,7 @@ impl LoadedVm {
                     }
                     VmRpc::QuiesceForSnapshot(rpc) => {
                         rpc.handle(async |timeout| {
-                            if !matches!(
-                                self.inner.machine_profile,
-                                MachineProfile::Microvm { .. }
-                            ) {
+                            if self.inner.machine_profile != MachineProfile::Microvm {
                                 return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
                                     RemoteError::new(anyhow::anyhow!(
                                         "guest-requested snapshot quiesce requires the microVM profile"
@@ -4340,7 +4274,7 @@ impl LoadedVm {
                     }
                     VmRpc::PulseSaveRestore(rpc) => {
                         rpc.handle(async |()| {
-                            if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                            if self.inner.machine_profile == MachineProfile::Microvm {
                                 return Err(PulseSaveRestoreError::UnsupportedMachineProfile);
                             }
                             if !self.inner.partition.supports_reset() {

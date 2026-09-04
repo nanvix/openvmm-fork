@@ -468,8 +468,8 @@ impl VmController {
     }
 
     async fn handle_restart(&mut self) -> anyhow::Result<()> {
-        if matches!(self.machine_profile, MachineProfile::Microvm { .. }) {
-            anyhow::bail!("worker restart is unavailable for microVM ABI version 1");
+        if self.machine_profile == MachineProfile::Microvm {
+            anyhow::bail!("worker restart is unavailable for microVM");
         }
         let vm_host = self
             .mesh
@@ -513,8 +513,8 @@ impl VmController {
     }
 
     async fn handle_save_snapshot(&self, dir: &Path) -> anyhow::Result<()> {
-        if matches!(self.machine_profile, MachineProfile::Microvm { .. }) {
-            anyhow::bail!("disk snapshots are unavailable for microVM ABI version 1");
+        if self.machine_profile == MachineProfile::Microvm {
+            anyhow::bail!("disk snapshots are unavailable for microVM");
         }
         let memory_file_path = self
             .memory_backing_file
@@ -589,58 +589,46 @@ impl VmController {
 
         let preflight = (|| -> anyhow::Result<String> {
             anyhow::ensure!(
-                matches!(
-                    self.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1 | 2 }
-                ),
-                "guest-requested snapshot capture requires microVM ABI version 1 or 2"
+                self.machine_profile == MachineProfile::Microvm,
+                "guest-requested snapshot capture requires the microVM profile"
             );
             anyhow::ensure!(
                 matches!(self.source_hypervisor.as_str(), "kvm" | "mshv" | "whp"),
                 "microVM snapshot source backend must be KVM, MSHV, or WHP"
             );
-            match self.machine_profile {
-                MachineProfile::Microvm { abi_version: 1 } => anyhow::ensure!(
-                    self.microvm_sandbox_block_sources.is_empty(),
-                    "microVM ABI version 1 snapshot cannot contain sandbox blocks"
-                ),
-                MachineProfile::Microvm { abi_version: 2 } => anyhow::ensure!(
-                    self.microvm_sandbox_block_sources.is_empty()
-                        || (self.microvm_sandbox_block_sources.len() >= 2
-                            && self
-                                .microvm_sandbox_block_sources
-                                .last()
-                                .is_some_and(|source| {
-                                    source.role
-                                        == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
-                                })),
-                    "microVM ABI version 2 snapshot requires either no blocks or at least one lower layer and scratch"
-                ),
-                _ => unreachable!(),
-            }
-            if let MachineProfile::Microvm { abi_version: 2 } = self.machine_profile {
-                if self.microvm_sandbox_block_sources.is_empty() {
-                    anyhow::ensure!(
-                        self.snapshot_tier.is_none(),
-                        "blockless microVM ABI-v2 snapshot capture does not use a tier"
-                    );
-                } else {
-                    let tier = self
-                        .snapshot_tier
-                        .context("microVM ABI-v2 sandbox snapshot capture requires a tier")?;
-                    let paired_scratch = scratch_policy
-                        == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
-                    anyhow::ensure!(
-                        paired_scratch == tier.requires_paired_scratch(),
-                        "snapshot tier '{}' requires {} scratch capture",
-                        tier.manifest_name(),
-                        if tier.requires_paired_scratch() {
-                            "paired"
-                        } else {
-                            "fresh"
-                        }
-                    );
-                }
+            anyhow::ensure!(
+                self.microvm_sandbox_block_sources.is_empty()
+                    || (self.microvm_sandbox_block_sources.len() >= 2
+                        && self
+                            .microvm_sandbox_block_sources
+                            .last()
+                            .is_some_and(|source| {
+                                source.role
+                                    == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                            })),
+                "microVM snapshot requires either no blocks or at least one lower layer and scratch"
+            );
+            if self.microvm_sandbox_block_sources.is_empty() {
+                anyhow::ensure!(
+                    self.snapshot_tier.is_none(),
+                    "blockless microVM snapshot capture does not use a tier"
+                );
+            } else {
+                let tier = self
+                    .snapshot_tier
+                    .context("microVM sandbox snapshot capture requires a tier")?;
+                let paired_scratch = scratch_policy
+                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
+                anyhow::ensure!(
+                    paired_scratch == tier.requires_paired_scratch(),
+                    "snapshot tier '{}' requires {} scratch capture",
+                    tier.manifest_name(),
+                    if tier.requires_paired_scratch() {
+                        "paired"
+                    } else {
+                        "fresh"
+                    }
+                );
             }
             anyhow::ensure!(
                 fs_err::symlink_metadata(&destination)
@@ -732,53 +720,32 @@ impl VmController {
                 .zip(self.microvm_filesystem_root_path.as_deref())
                 .zip(self.microvm_filesystem_attachment.clone())
                 .map(|((filesystem, root_path), attachment)| (filesystem, root_path, attachment));
-            let machine_contract = match self.machine_profile {
-                MachineProfile::Microvm { abi_version: 1 } => {
-                    openvmm_helpers::snapshot::microvm_v1_machine_contract(
-                        &self.source_hypervisor,
-                        command_line,
-                        network,
-                        self.microvm_filesystem_slot,
-                        filesystem,
-                        self.microvm_console_attachment.clone(),
-                        self.memory,
-                        response.state_unit_names,
-                        response.capture_wall_clock,
-                        response.tsc_frequency_hz,
-                        Some(response.apic_frequency_hz),
-                        response.cpu_contract,
-                    )?
+            let mut blocks = crate::storage_builder::snapshot_block_contract(
+                &self.microvm_sandbox_block_sources,
+                scratch_policy,
+            )?;
+            if self.snapshot_tier == Some(crate::cli_args::SnapshotTierCli::Platform) {
+                for block in blocks.iter_mut().filter(|block| block.read_only) {
+                    block.identity_kind = "unbound".to_owned();
+                    block.identity.clear();
                 }
-                MachineProfile::Microvm { abi_version: 2 } => {
-                    let mut blocks = crate::storage_builder::snapshot_block_contract(
-                        &self.microvm_sandbox_block_sources,
-                        scratch_policy,
-                    )?;
-                    if self.snapshot_tier == Some(crate::cli_args::SnapshotTierCli::Platform) {
-                        for block in blocks.iter_mut().filter(|block| block.read_only) {
-                            block.identity_kind = "unbound".to_owned();
-                            block.identity.clear();
-                        }
-                    }
-                    openvmm_helpers::snapshot::microvm_v2_machine_contract(
-                        &self.source_hypervisor,
-                        command_line,
-                        network,
-                        self.microvm_filesystem_slot,
-                        filesystem,
-                        self.microvm_console_attachment.clone(),
-                        blocks,
-                        self.processors,
-                        self.memory,
-                        response.state_unit_names,
-                        response.capture_wall_clock,
-                        response.tsc_frequency_hz,
-                        Some(response.apic_frequency_hz),
-                        response.cpu_contract,
-                    )?
-                }
-                _ => unreachable!(),
-            };
+            }
+            let machine_contract = openvmm_helpers::snapshot::microvm_machine_contract(
+                &self.source_hypervisor,
+                command_line,
+                network,
+                self.microvm_filesystem_slot,
+                filesystem,
+                self.microvm_console_attachment.clone(),
+                blocks,
+                self.processors,
+                self.memory,
+                response.state_unit_names,
+                response.capture_wall_clock,
+                response.tsc_frequency_hz,
+                Some(response.apic_frequency_hz),
+                response.cpu_contract,
+            )?;
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
                 version: openvmm_helpers::snapshot::MANIFEST_VERSION,
                 created_at: std::time::SystemTime::now().into(),
@@ -836,10 +803,7 @@ impl VmController {
                     ..Default::default()
                 },
             );
-            let scratch_file = (matches!(
-                self.machine_profile,
-                MachineProfile::Microvm { abi_version: 2 }
-            ) && !self.microvm_sandbox_block_sources.is_empty()
+            let scratch_file = (!self.microvm_sandbox_block_sources.is_empty()
                 && scratch_policy
                     == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
                 .then(|| {

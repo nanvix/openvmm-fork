@@ -10,8 +10,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--version`, `-V`: Print the OpenVMM build identity and exit. `-V` prints the concise identity. `--version` also prints the upstream product version, build kind, full Git revision when available, and build target. An ordinary checkout reports `MAJOR.MINOR.PATCH+g<SHORT_REVISION>`. This includes an exact checkout of an `openvmm-vMAJOR.MINOR.PATCH` release tag. A checkout detected with tracked changes appends `.dirty`; staged changes refresh this reliably, while an unstaged-only transition may remain cached until another build-script input changes. A Git-free source tree reports `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
 * `--machine <PROFILE>`: Select the guest-visible machine contract. The
-  default is `standard`. `microvm` selects microVM ABI version 1, an x86-64
-  Xen PVH machine that runs on KVM, MSHV, or WHP with exactly one vCPU. On
+  default is `standard`. `microvm` selects the x86-64 Xen PVH microVM, which
+  runs on KVM, MSHV, or WHP with exactly 1, 2, 4, or 8 vCPUs. On
   Linux, auto-detection prefers MSHV when `/dev/mshv` is available and falls
   back to KVM:
 
@@ -22,7 +22,7 @@ as well as the generated CLI help (via `cargo run -- --help`).
     --kernel vmlinux --initrd initramfs.cpio.gz
   openvmm --machine microvm --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz
-  openvmm --machine microvm-v2 --processors 8 --hypervisor whp \
+  openvmm --machine microvm --processors 8 --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz
   ```
 
@@ -30,7 +30,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `XEN_ELFNOTE_PHYS32_ENTRY`. The profile owns the base command line
   (`earlycon=xe9 console=hvc0 reboot=t panic=-1`) and switches the primary
   console to `hvc1` when `--virtio-console` is present. It reserves a 1-GiB
-  MMIO gap from 3 to 4 GiB and exposes only PIC/IOAPIC, PIT, binary UTC RTC,
+  MMIO gap from 3 to 4 GiB and exposes only PIC/IOAPIC, PIT, a CMOS RTC
+  anchored to UTC,
   the microVM portb console, lifecycle ports, and the optional fixed virtio
   devices described below. User arguments cannot override `earlycon=`,
   `console=`, `virtio_mmio.device=`, `virtnet_*=`, or `virtfs_*=`.
@@ -38,18 +39,25 @@ as well as the generated CLI help (via `cargo run -- --help`).
   One virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and remains
   dormant when `--mount` is omitted; an optional `--mount` binds HostFs to it;
   one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
-  IRQ 7; and one optional `--virtio-blk <DISK>` is exposed at MMIO
-  `0xd0003000`, IRQ 4. All use split rings. Firmware, ACPI, SMBIOS, PCI,
+  IRQ 7; and `--microvm-sandbox-block` exposes fixed distro, runtime, custom,
+  and scratch slots starting at MMIO `0xd0003000`. Ordinary `--virtio-blk`
+  is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
   VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
   are rejected. Host-driven save/restore, pulse-save/restore, and worker
   restart remain unavailable.
 
-  `microvm-v2` accepts exactly 1, 2, 4, or 8 vCPUs in one socket and one die,
+  `microvm` uses one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
-  the no-block ABI-v1/v2 machines and fixed-block ABI-v2 machine on
-  Linux/KVM, Linux/MSHV, and Windows/WHP. ABI-v1 capture with its optional
-  unroled virtio-blk device remains unsupported.
+  blockless and fixed-block machines on Linux/KVM, Linux/MSHV, and Windows/WHP.
+
+  ```admonish warning title="microVM migration"
+  The canonical `microvm` spelling now selects the contract formerly exposed
+  as `microvm-v2`; the `microvm-v2` selector and the former ABI-v1 behavior are
+  removed. Snapshot ABI and PVH layout fields remain numeric value 2. ABI or
+  layout value 1 snapshots are rejected and must be run with OpenVMM commit
+  `1b70365613517a10718e00284a62bdffbd80e41c` or an earlier compatible build.
+  ```
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
   at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
   `/1` through `/30` are accepted. The first usable subnet address becomes
@@ -137,9 +145,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
 
   `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
   timeout and defaults to 5000. A request with no configured destination is
-  ignored and the guest continues. Capture requires microVM ABI v1 or v2, one
-  vCPU for v1 or 1/2/4/8 vCPUs for v2, KVM, MSHV, or WHP, and shared
-  file-backed RAM. ABI-v2 block media must
+  ignored and the guest continues. Capture requires 1, 2, 4, or 8 vCPUs,
+  KVM, MSHV, or WHP, and shared file-backed RAM. Sandbox block media must
   be cached regular raw files with nonzero 512-byte-aligned geometry. An
   attached virtio console saves accepted but undelivered input and the offset
   of a partially forwarded guest transmit descriptor. An attached microVM
@@ -164,11 +171,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   The manifest supplies the authoritative RAM size, topology, ABI,
   fixed device inventory, effective kernel command line, source backend, CPU
   contract, and TSC frequency. Kernel, initrd, command-line, memory, processor,
-  device, and topology overrides are not accepted. For ABI v2, repeat the
+  device, and topology overrides are not accepted. Repeat the
   snapshot's exact `--processors` count; a mismatch is rejected before any VP
-  starts. Restore requires the same
-  backend kind as capture. ABI-v1 WHP microVMs use a 1 GHz virtual TSC that is
-  configured before partition setup and reproduced on restore.
+  starts. Restore requires the same backend kind as capture.
 
   When the snapshot contains a virtio console, its attachment policy comes
   from the manifest. OpenVMM recreates listeners, reconnects required clients,
@@ -188,7 +193,7 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `--network-profile portable`; the snapshot's profile and canonical egress
   policy must match the supplied portable configuration.
 
-  For ABI v2, restore repeats each read-only
+  For sandbox-block snapshots, restore repeats each read-only
   `--microvm-sandbox-block` argument. Its role, access, geometry, and SHA-256
   must match the manifest. A paired snapshot supplies scratch internally from
   a verified process-private copy of `scratch.img`; passing another scratch is
@@ -203,7 +208,7 @@ as well as the generated CLI help (via `cargo run -- --help`).
   Linux or a `//./pipe/...` named pipe on Windows and write exactly
   `OPENVMM_RESTORE_READY_V1\n` once all restored state, required attachments,
   and execution-owned workers are ready. Ungated restores flush the event
-  before releasing the restored vCPU. Gated ABI-v2 restores flush it after the
+  before releasing the restored vCPU. Gated microVM restores flush it after the
   guest acknowledges post-restore repair and external input is re-enabled,
   while the restored vCPU remains stopped.
   It is valid only with `--restore-snapshot` and is process-local; it is not
@@ -215,19 +220,20 @@ as well as the generated CLI help (via `cargo run -- --help`).
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
-* `--restore-processors <COUNT>`: For an opt-in ABI-v2 snapshot, bring the
+* `--restore-processors <COUNT>`: For an opt-in microVM snapshot, bring the
   contiguous VP prefix `0..COUNT-1` online before restore readiness. The
   snapshot's manifest VP count remains immutable capacity and must still match
   `--processors`. The target must be 1, 2, 4, or 8 and satisfy
   `boot-online <= target <= capacity`. This option implies a version-2 private
-  restore packet and the post-restore gate. Legacy snapshots reject it. An
+  restore packet and the post-restore gate. Snapshots without activation
+  metadata reject it. An
   explicit MSHV restore instantiates and binds only the requested prefix while
   validating the full saved VP inventory; that reduced-prefix process cannot
   be saved again. MSHV restores without this option, and KVM and WHP restores,
   instantiate the full VP capacity.
-* `--restore-gate-timeout-ms <MILLISECONDS>`: Bound ABI-v2 guest repair and
+* `--restore-gate-timeout-ms <MILLISECONDS>`: Bound microVM guest repair and
   gate acknowledgement after restore. The default is 60000 milliseconds.
-* `--snapshot-tier <TIER>`: Required with ABI-v2 snapshot capture. Choose
+* `--snapshot-tier <TIER>`: Required for snapshot capture with sandbox blocks. Choose
   `platform`, `workload-start`, or `instance-checkpoint`. The first two are
   reusable clone policies; instance checkpoints use single-use resume policy.
 
@@ -457,7 +463,7 @@ Serial devices can be configured to appear as different devices inside the guest
     `//./pipe/openvmm-microvm-<NAME>` namespace. TCP ports must be nonzero.
     TCP addresses must be loopback addresses.
   * `connect=PATH` or `connect=tcp:IP:PORT`: require a client connection before
-    vCPUs start. Cold boot and restore use the ABI-v1 five-second timeout. The
+    vCPUs start. Cold boot and restore use a five-second timeout. The
     restore command must explicitly resupply the matching client attachment.
   * `console`: require the restore caller to supply the same inherited terminal
     attachment. Portb recovery output moves to stderr while the terminal is

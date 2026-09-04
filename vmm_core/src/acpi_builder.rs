@@ -1544,9 +1544,9 @@ mod test {
                 .collect::<Vec<_>>();
 
             let mp_table = loader::pvh::build_mp_config_table(&loader::pvh::BootConfig {
-                layout: loader::pvh::PvhBootLayout::Smp,
                 apic_ids: &apic_ids,
                 level_triggered_irqs: &[],
+                reserved_memory_ranges: &[],
             })
             .unwrap();
             let mp_ids = mp_table[44..44 + apic_ids.len() * 20]

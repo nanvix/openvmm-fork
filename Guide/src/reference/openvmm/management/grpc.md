@@ -47,8 +47,8 @@ In other words: This API is _very_ WIP, and user discretion is advised.
 `CreateVMRequest.microvm_snapshot` exposes the microVM capture and
 restore flow over both transports:
 
-* `destination_path` configures guest-requested capture. Supply an ABI-v1 or
-  ABI-v2 microVM configuration, including PVH boot files, memory, and the
+* `destination_path` configures guest-requested capture. Supply a microVM
+  configuration, including PVH boot files, memory, and the
   processor count. The path
 	must not exist. `quiesce_timeout_ms` defaults to five seconds when zero.
 * `restore_path` selects manifest-authoritative restore. `config` may be
@@ -63,7 +63,7 @@ restore flow over both transports:
 	`restore_path`.
 * `restore_processor_count` requests restore-time activation of the contiguous
   VP prefix `0..count-1`. Zero preserves legacy behavior. A nonzero value is
-  valid only for an opt-in ABI-v2 snapshot, implies fresh entropy and the
+  valid only for a snapshot that advertises processor activation, implies fresh entropy and the
   post-restore gate, and must satisfy the snapshot's boot-online and immutable
   capacity bounds. `ProcessorConfig.processor_count`, when present, remains an
   exact capacity assertion.
@@ -79,7 +79,7 @@ restore flow over both transports:
 
 On cold boot, `DevicesConfig.virtio_console` may configure one microVM Unix
 socket or named-pipe endpoint. Listener mode recreates the path on restore.
-Client mode is required and uses the ABI-v1 five-second connection timeout
+Client mode is required and uses a five-second connection timeout
 before vCPUs start. The device uses MMIO `0xd0002000`, IRQ 7, and selects
 `hvc1`; its canonical path and policy become the stable restore attachment.
 
@@ -101,9 +101,13 @@ The readiness endpoint is a process-local orchestration attachment and is not
 part of saved state. Each successful restore publishes one event; validation,
 attachment, or worker-start failure publishes none.
 
-`VMConfig.MICROVM` remains ABI v1. `VMConfig.MICROVM_V2` selects ABI v2 and
-accepts exactly 1, 2, 4, or 8 processors. TTRPC ABI-v2 construction is
-currently no-block; role-bearing sandbox blocks remain CLI-only.
+`VMConfig.MICROVM` is numeric value 2 and accepts exactly 1, 2, 4, or 8
+processors. Numeric value 1 is reserved and rejected before host resources are
+opened. Existing clients that already send value 2 remain wire-compatible;
+clients that used the former `MICROVM_V2` source name must regenerate or update
+their bindings. RPC construction is currently blockless; role-bearing sandbox
+blocks remain CLI-only. Snapshot ABI and PVH layout values remain 2, while
+value 1 snapshots are unsupported.
 
 The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,
 and security restrictions documented under [`--snapshot-destination`].

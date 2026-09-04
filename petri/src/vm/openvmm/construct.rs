@@ -136,7 +136,7 @@ impl PetriVmConfigOpenVmm {
             physical_nvme_devices,
         } = petri_vm_config;
 
-        let is_microvm = matches!(machine_profile, MachineProfile::Microvm { .. });
+        let is_microvm = machine_profile == MachineProfile::Microvm;
         if is_microvm {
             anyhow::ensure!(
                 matches!(arch, MachineArch::X86_64),

@@ -30,7 +30,7 @@ impl Worker {
         let (vm_rpc, rpc_recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
-        let hypervisor = if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+        let hypervisor = if cfg.machine_profile == MachineProfile::Microvm {
             openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
         } else {
             openvmm_helpers::hypervisor::choose_hypervisor()?

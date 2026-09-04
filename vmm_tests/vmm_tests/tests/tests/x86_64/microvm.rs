@@ -453,7 +453,7 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     const CONTINUED_MARKER: &str = "PETRI-MICROVM-SNAPSHOT-CONTINUED";
     const RAW_MARKER: &[u8] = b"\0\r\n\x7f\xffPETRI-MICROVM-SNAPSHOT-CONTINUED";
 
-    let mut vm = config.with_microvm_machine().run_without_agent().await?;
+    let mut vm = config.with_microvm_machine(1).run_without_agent().await?;
 
     CancelContext::new()
         .with_timeout(TIMEOUT)
@@ -467,7 +467,7 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
         .await
         .expect_err("microVM host save unexpectedly succeeded");
     assert!(
-        format!("{save_error:#}").contains("save is unavailable for microVM ABI version 1"),
+        format!("{save_error:#}").contains("save is unavailable for microVM"),
         "unexpected microVM host-save error: {save_error:#}"
     );
     let pulse_error = vm
@@ -486,7 +486,7 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
             format!(
                 "printf '\\013' | dd of=/dev/port bs=1 seek=112 count=1 conv=notrunc 2>/dev/null; \
                  rtc=$(dd if=/dev/port bs=1 skip=113 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
-                 [ \"$rtc\" = 6 ] || {{ nvx-exit 40; exit; }}; \
+                 [ \"$rtc\" = 2 ] || {{ nvx-exit 40; exit; }}; \
                  [ \"$(date +%s)\" -ge 1500000000 ] || {{ nvx-exit 41; exit; }}; \
                  irq0=$(awk '/^[[:space:]]*0:/ {{ print $2; exit }}' /proc/interrupts); \
                  [ \"${{irq0:-0}}\" -gt 0 ] || {{ nvx-exit 42; exit; }}; \
@@ -523,7 +523,7 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     vm.teardown().await
 }
 
-async fn microvm_v2_smp(
+async fn microvm_smp(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     processor_count: u32,
 ) -> anyhow::Result<()> {
@@ -581,16 +581,16 @@ nvx-exit 37
 "#
     );
     let modified_initrd =
-        config.prepare_initrd_with_file("microvm-v2-smp-test.sh", workload.as_bytes(), 0o100755)?;
+        config.prepare_initrd_with_file("microvm-smp-test.sh", workload.as_bytes(), 0o100755)?;
     let mut vm = config
         .with_prebuilt_initrd(modified_initrd.to_path_buf())
-        .with_microvm_v2_machine(processor_count)
+        .with_microvm_machine(processor_count)
         .modify_backend(|backend| {
             backend.with_custom_config(|config| {
                 let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
-                    panic!("microVM v2 SMP test did not produce PVH load mode");
+                    panic!("microVM SMP test did not produce PVH load mode");
                 };
-                cmdline.push_str(" nvx_exec=/microvm-v2-smp-test.sh");
+                cmdline.push_str(" nvx_exec=/microvm-smp-test.sh");
             })
         })
         .run_without_agent()
@@ -603,39 +603,39 @@ nvx-exit 37
                 .wait_for_microvm_portb_output("NVX-SMP-PROBE-OK"),
         )
         .await
-        .context("timed out waiting for microVM v2 SMP probe marker")??;
+        .context("timed out waiting for microVM SMP probe marker")??;
     let halt = CancelContext::new()
         .with_timeout(TIMEOUT)
         .until_cancelled(vm.wait_for_halt())
         .await
-        .context("timed out waiting for microVM v2 SMP shutdown")??;
+        .context("timed out waiting for microVM SMP shutdown")??;
     assert_eq!(halt.reason, PetriHaltReason::PowerOff);
     assert!(
         halt.detail.contains("code: 37"),
-        "microVM v2 SMP workload failed: {}",
+        "microVM SMP workload failed: {}",
         halt.detail
     );
     vm.teardown().await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v2_smp_1(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v2_smp(config, 1).await
+async fn microvm_smp_1(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_smp(config, 1).await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v2_smp_2(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v2_smp(config, 2).await
+async fn microvm_smp_2(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_smp(config, 2).await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v2_smp_4(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v2_smp(config, 4).await
+async fn microvm_smp_4(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_smp(config, 4).await
 }
 
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v2_smp_8(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    microvm_v2_smp(config, 8).await
+async fn microvm_smp_8(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    microvm_smp(config, 8).await
 }
 
 #[vmm_test_with(
@@ -1791,29 +1791,29 @@ async fn phase_5_filesystem_snapshot_restore<OpenvmmArtifact>(
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
 )]
-async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
+async fn microvm_paired_scratch_snapshot_restore<OpenvmmArtifact>(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
 ) -> anyhow::Result<()> {
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
     const LAYER_BYTES: usize = 1024 * 1024;
     const SCRATCH_BYTES: usize = 8 * 1024 * 1024;
-    const POST_OUT_MARKER: &[u8] = b"MICROVM-V2-SCRATCH-POST-OUT";
-    const RESTORED_MARKER: &[u8] = b"MICROVM-V2-SCRATCH-RESTORED";
+    const POST_OUT_MARKER: &[u8] = b"MICROVM-SCRATCH-POST-OUT";
+    const RESTORED_MARKER: &[u8] = b"MICROVM-SCRATCH-RESTORED";
 
     let (openvmm,) = artifacts;
     let (kernel, initrd) = config
         .linux_direct_boot_files()
-        .context("ABI-v2 snapshot test requires direct-boot Linux artifacts")?;
+        .context("microVM snapshot test requires direct-boot Linux artifacts")?;
     let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
-            .prefix("openvmm-microvm-v2-snapshot-")
+            .prefix("openvmm-microvm-snapshot-")
             .tempdir_in("/tmp")
     } else {
         tempfile::tempdir()
     }
-    .context("failed to create ABI-v2 snapshot test directory")?;
+    .context("failed to create microVM snapshot test directory")?;
     let snapshot_dir = temp_dir.path().join("snapshot");
     let layer_path = temp_dir.path().join("distro.erofs");
     let wrong_layer_path = temp_dir.path().join("wrong-distro.erofs");
@@ -1833,7 +1833,7 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
     let mut capture_args = [
         "--single-process",
         "--machine",
-        "microvm-v2",
+        "microvm",
         "--hypervisor",
         hypervisor,
     ]
@@ -1869,39 +1869,39 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
          tries=0; while [ $tries -lt 2000 ]; do set -- $(cat /sys/block/vdb/inflight); [ $(($1+$2)) -gt 0 ] && break; kill -0 $writer 2>/dev/null || break; tries=$((tries+1)); done; \
          [ $tries -lt 2000 ] && kill -0 $writer 2>/dev/null || { nvx-exit 62; exit; }; \
          printf '\\001' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
-         printf '\002' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
-         echo MICROVM-V2-SCRATCH-POST-OUT; \
+         printf '\\002' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
+         echo MICROVM-SCRATCH-POST-OUT; \
          wait $writer; \
          first_byte=$(dd if=/dev/vdb bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
          [ \"$first_byte\" = 0 ] || { nvx-exit 63; exit; }; \
-         echo MICROVM-V2-SCRATCH-RESTORED; \
+         echo MICROVM-SCRATCH-RESTORED; \
          printf PRIVATE-RESTORE-MUTATION | dd of=/dev/vdb bs=512 count=1 conv=sync,notrunc 2>/dev/null; \
          sync; nvx-exit 37",
     )?;
     let (status, output) = source.wait()?;
     anyhow::ensure!(
         status.success(),
-        "ABI-v2 snapshot source exited with {status}; output: {}",
+        "microVM snapshot source exited with {status}; output: {}",
         output_tail(&output)
     );
     anyhow::ensure!(
         count_output_lines(&output, POST_OUT_MARKER) == 0
             && count_output_lines(&output, RESTORED_MARKER) == 0,
-        "ABI-v2 source continued past its snapshot boundary"
+        "microVM source continued past its snapshot boundary"
     );
 
     let (manifest, _) = openvmm_helpers::snapshot::read_snapshot(&snapshot_dir, MEMORY_BYTES)?;
     let contract = manifest
         .machine_contract
         .as_ref()
-        .context("ABI-v2 snapshot is missing its machine contract")?;
+        .context("microVM snapshot is missing its machine contract")?;
     anyhow::ensure!(
         contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2
             && contract.microvm_sandbox_blocks.last().is_some_and(|block| {
                 block.role == "scratch"
                     && block.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME
             }),
-        "ABI-v2 snapshot did not publish a paired scratch contract"
+        "microVM snapshot did not publish a paired scratch contract"
     );
     let snapshot_fingerprint = snapshot_payload_fingerprint(&snapshot_dir)?;
 
@@ -1909,7 +1909,7 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
         let mut args = [
             "--single-process",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--hypervisor",
             hypervisor,
         ]
@@ -1930,17 +1930,17 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
         let (status, output) = restore.wait()?;
         anyhow::ensure!(
             status.code() == Some(37),
-            "ABI-v2 restore {restore_index} exited with {status}; output: {}",
+            "microVM restore {restore_index} exited with {status}; output: {}",
             output_tail(&output)
         );
         anyhow::ensure!(
             count_output_lines(&output, POST_OUT_MARKER) == 1
                 && count_output_lines(&output, RESTORED_MARKER) == 1,
-            "ABI-v2 restore {restore_index} did not observe one coherent scratch outcome"
+            "microVM restore {restore_index} did not observe one coherent scratch outcome"
         );
         anyhow::ensure!(
             snapshot_payload_fingerprint(&snapshot_dir)? == snapshot_fingerprint,
-            "ABI-v2 restore {restore_index} modified snapshot artifacts"
+            "microVM restore {restore_index} modified snapshot artifacts"
         );
     }
 
@@ -1988,22 +1988,22 @@ async fn microvm_v2_paired_scratch_snapshot_restore<OpenvmmArtifact>(
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
 )]
-async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
+async fn microvm_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
 ) -> anyhow::Result<()> {
     const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
     const DISK_BYTES: usize = 1024 * 1024;
-    const POST_OUT_MARKER: &[u8] = b"MICROVM-V2-FRESH-POST-OUT";
+    const POST_OUT_MARKER: &[u8] = b"MICROVM-FRESH-POST-OUT";
 
     let (openvmm,) = artifacts;
     let (kernel, initrd) = config
         .linux_direct_boot_files()
-        .context("ABI-v2 fresh-scratch test requires direct-boot Linux artifacts")?;
+        .context("microVM fresh-scratch test requires direct-boot Linux artifacts")?;
     let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
-            .prefix("openvmm-microvm-v2-fresh-")
+            .prefix("openvmm-microvm-fresh-")
             .tempdir_in("/tmp")
     } else {
         tempfile::tempdir()
@@ -2027,7 +2027,7 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
         [
             "--single-process",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--hypervisor",
             hypervisor,
         ]
@@ -2060,17 +2060,17 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
         "set -eu; \
          tries=0; while [ ! -b /dev/vdb ] && [ $tries -lt 600 ]; do sleep 0.05; tries=$((tries+1)); done; \
          printf '\\000' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
-         printf '\002' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
-         echo MICROVM-V2-FRESH-POST-OUT; \
+         printf '\\002' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null; \
+         echo MICROVM-FRESH-POST-OUT; \
          blockdev --flushbufs /dev/vdb; \
          value=$(dd if=/dev/vdb bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d '[:space:]'); \
-         echo MICROVM-V2-FRESH-SCRATCH-$value; nvx-exit 37",
+         echo MICROVM-FRESH-SCRATCH-$value; nvx-exit 37",
     )?;
     let (status, output) = source.wait()?;
     anyhow::ensure!(
         status.success()
             && count_output_lines(&output, POST_OUT_MARKER) == 0
-            && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
+            && count_output_lines(&output, b"MICROVM-FRESH-SCRATCH-165") == 0,
         "fresh-scratch source crossed its capture boundary: {}",
         output_tail(&output)
     );
@@ -2118,7 +2118,7 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
         let restore =
             OpenvmmTestProcess::launch(openvmm.get(), &restore_args(Some(&scratch_path)))?;
         let (status, output) = restore.wait()?;
-        let marker = format!("MICROVM-V2-FRESH-SCRATCH-{value}");
+        let marker = format!("MICROVM-FRESH-SCRATCH-{value}");
         anyhow::ensure!(
             status.code() == Some(37)
                 && count_output_lines(&output, POST_OUT_MARKER) == 1
@@ -2137,7 +2137,7 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
     anyhow::ensure!(
         !status.success()
             && count_output_lines(&output, POST_OUT_MARKER) == 0
-            && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
+            && count_output_lines(&output, b"MICROVM-FRESH-SCRATCH-165") == 0,
         "fresh-scratch restore without scratch entered the guest"
     );
 
@@ -2148,7 +2148,7 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
     anyhow::ensure!(
         !status.success()
             && count_output_lines(&output, POST_OUT_MARKER) == 0
-            && count_output_lines(&output, b"MICROVM-V2-FRESH-SCRATCH-165") == 0,
+            && count_output_lines(&output, b"MICROVM-FRESH-SCRATCH-165") == 0,
         "fresh-scratch restore with wrong geometry entered the guest"
     );
 
@@ -2162,7 +2162,7 @@ async fn microvm_v2_fresh_scratch_snapshot_restore<OpenvmmArtifact>(
         petri_artifacts_vmm_test::artifacts::OPENVMM_NATIVE
     ])
 )]
-async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
+async fn microvm_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     artifacts: (petri::ResolvedArtifact<OpenvmmArtifact>,),
 ) -> anyhow::Result<()> {
@@ -2176,7 +2176,7 @@ async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
     let hypervisor = microvm_hypervisor()?;
     let temp_dir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
-            .prefix("openvmm-microvm-v2-tiers-")
+            .prefix("openvmm-microvm-tiers-")
             .tempdir_in("/tmp")
     } else {
         tempfile::tempdir()
@@ -2199,7 +2199,7 @@ async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
         [
             "--single-process",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--hypervisor",
             hypervisor,
         ]
@@ -2455,7 +2455,7 @@ async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
                 !status.success()
                     && contains_bytes(
                         &output,
-                        b"microVM snapshot restore requires --machine microvm or microvm-v2"
+                        b"microVM snapshot restore requires --machine microvm"
                     )
                     && !snapshot_dir.join("resume.claim").exists(),
                 "wrong-profile restore consumed or entered an instance checkpoint: {}",
@@ -2544,95 +2544,16 @@ async fn microvm_v2_snapshot_tiers_and_restore_gate<OpenvmmArtifact>(
     Ok(())
 }
 
-#[openvmm_test_no_agent(ignore(
-    reason = "requires a published microVM PVH kernel and initramfs",
-    microvm_pvh_x64
-))]
-async fn phase_1_block(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    use disk_backend_resources::LayeredDiskHandle;
-    use disk_backend_resources::layer::RamDiskLayerHandle;
-    use openvmm_defs::config::LoadMode;
-    use openvmm_defs::config::VirtioBus;
-    use openvmm_defs::config::append_microvm_virtio_discovery;
-    use virtio_resources::blk::VirtioBlkHandle;
-
-    const TIMEOUT: Duration = Duration::from_secs(30);
-    const DISK_SIZE: u64 = 8 * 1024 * 1024;
-    const WORKLOAD: &[u8] = br#"#!/bin/sh
-set -eu
-tries=0
-while [ ! -b /dev/vda ] && [ "$tries" -lt 200 ]; do
-    sleep 0.05
-    tries=$((tries + 1))
-done
-device=$(readlink -f /sys/block/vda/device) || exit 20
-grep -q 'virtio_mmio.device=0x1000@0xd0003000:4' /proc/cmdline || exit 21
-[ "$(cat /sys/block/vda/size)" = 16384 ] || exit 23
-printf MICROVM-BLOCK-RW-OK | dd of=/dev/vda bs=512 count=1 conv=sync,notrunc 2>/dev/null
-readback=$(dd if=/dev/vda bs=512 count=1 2>/dev/null | head -c 15)
-[ "$readback" = MICROVM-BLOCK-RW-OK ] || exit 24
-exit 37
-"#;
-
-    let modified_initrd =
-        config.prepare_initrd_with_file("microvm-block-test.sh", WORKLOAD, 0o100755)?;
-    let disk = LayeredDiskHandle::single_layer(RamDiskLayerHandle {
-        len: Some(DISK_SIZE),
-        sector_size: None,
-    })
-    .into_resource();
-
-    let mut vm = config
-        .with_prebuilt_initrd(modified_initrd.to_path_buf())
-        .with_microvm_machine()
-        .modify_backend(move |backend| {
-            backend.with_custom_config(|config| {
-                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
-                    panic!("microVM test did not produce PVH load mode");
-                };
-                cmdline.push_str(" nvx_exec=/microvm-block-test.sh");
-                append_microvm_virtio_discovery(cmdline, None, false, None, false, true).unwrap();
-                config.virtio_devices.push((
-                    VirtioBus::Mmio,
-                    VirtioBlkHandle {
-                        disk,
-                        read_only: false,
-                    }
-                    .into_resource(),
-                ));
-            })
-        })
-        .run_without_agent()
-        .await?;
-
-    let halt = CancelContext::new()
-        .with_timeout(TIMEOUT)
-        .until_cancelled(vm.wait_for_halt())
-        .await
-        .context("timed out waiting for microVM block workload")??;
-    assert_eq!(halt.reason, PetriHaltReason::PowerOff);
-    assert!(
-        halt.detail.contains("code: 37"),
-        "microVM block workload failed: {}",
-        halt.detail
-    );
-
-    vm.teardown().await
-}
-
 #[openvmm_test_no_agent(microvm_pvh_x64)]
-async fn microvm_v2_sandbox_blocks(
-    config: PetriVmBuilder<OpenVmmPetriBackend>,
-) -> anyhow::Result<()> {
+async fn microvm_sandbox_blocks(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     use disk_backend_resources::LayeredDiskHandle;
     use disk_backend_resources::layer::RamDiskLayerHandle;
     use openvmm_defs::config::LoadMode;
-    use openvmm_defs::config::MICROVM_ABI_VERSION_2;
     use openvmm_defs::config::MachineProfile;
     use openvmm_defs::config::MicrovmSandboxBlockConfig;
     use openvmm_defs::config::MicrovmSandboxBlockRole;
     use openvmm_defs::config::VirtioBus;
-    use openvmm_defs::config::append_microvm_v2_virtio_discovery;
+    use openvmm_defs::config::append_microvm_virtio_discovery;
     use virtio_resources::blk::VirtioBlkHandle;
 
     const TIMEOUT: Duration = Duration::from_secs(30);
@@ -2655,14 +2576,14 @@ grep -q 'virtio_mmio.device=0x1000@0xd0006000:11' /proc/cmdline || exit 24
 [ "$(cat /sys/block/vdb/ro)" = 1 ] || exit 26
 [ "$(cat /sys/block/vdc/ro)" = 1 ] || exit 27
 [ "$(cat /sys/block/vdd/ro)" = 0 ] || exit 28
-printf MICROVM-V2-SCRATCH-OK | dd of=/dev/vdd bs=512 count=1 conv=sync,notrunc 2>/dev/null
-[ "$(dd if=/dev/vdd bs=512 count=1 2>/dev/null | head -c 22)" = MICROVM-V2-SCRATCH-OK ] || exit 29
+printf MICROVM-SCRATCH-OK | dd of=/dev/vdd bs=512 count=1 conv=sync,notrunc 2>/dev/null
+[ "$(dd if=/dev/vdd bs=512 count=1 2>/dev/null | head -c 18)" = MICROVM-SCRATCH-OK ] || exit 29
 /sbin/nvx-exit 37
 while :; do sleep 3600; done
 "#;
 
     let modified_initrd =
-        config.prepare_initrd_with_file("microvm-v2-sandbox-blocks.sh", WORKLOAD, 0o100755)?;
+        config.prepare_initrd_with_file("microvm-sandbox-blocks.sh", WORKLOAD, 0o100755)?;
     let roles = [
         MicrovmSandboxBlockConfig {
             role: MicrovmSandboxBlockRole::Distro,
@@ -2691,18 +2612,15 @@ while :; do sleep 3600; done
 
     let mut vm = config
         .with_prebuilt_initrd(modified_initrd.to_path_buf())
-        .with_microvm_v2_machine(1)
+        .with_microvm_machine(1)
         .modify_backend(move |backend| {
             backend.with_custom_config(|config| {
-                config.machine_profile = MachineProfile::Microvm {
-                    abi_version: MICROVM_ABI_VERSION_2,
-                };
+                config.machine_profile = MachineProfile::Microvm;
                 let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
                     panic!("microVM test did not produce PVH load mode");
                 };
-                cmdline.push_str(" nvx_exec=/microvm-v2-sandbox-blocks.sh");
-                append_microvm_v2_virtio_discovery(cmdline, None, false, None, false, &roles)
-                    .unwrap();
+                cmdline.push_str(" nvx_exec=/microvm-sandbox-blocks.sh");
+                append_microvm_virtio_discovery(cmdline, None, false, None, false, &roles).unwrap();
                 config.microvm_sandbox_blocks = roles.to_vec();
                 config
                     .virtio_devices
@@ -2725,7 +2643,7 @@ while :; do sleep 3600; done
         .with_timeout(TIMEOUT)
         .until_cancelled(vm.wait_for_halt())
         .await
-        .context("timed out waiting for microVM v2 sandbox-block workload")??;
+        .context("timed out waiting for microVM sandbox-block workload")??;
     assert_eq!(halt.reason, PetriHaltReason::PowerOff);
     assert!(
         halt.detail.contains("code: 37"),
@@ -2817,7 +2735,7 @@ nvx-exit 37
     let irq = microvm_virtio_net_irq(None)?;
 
     let mut vm = config
-        .with_microvm_machine()
+        .with_microvm_machine(1)
         .modify_backend(move |backend| {
             backend.with_custom_config(|config| {
                 let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
@@ -2829,7 +2747,7 @@ nvx-exit 37
                     false,
                     None,
                     false,
-                    false,
+                    &[],
                 )
                 .unwrap();
                 config.microvm_network = Some(network.clone());

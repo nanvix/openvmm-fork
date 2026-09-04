@@ -37,11 +37,9 @@ To run these examples using a pre-compiled copy of OpenVMM, swap `cargo run
 --` with `/path/to/openvmm`.
 ```
 
-### microVM ABI v2 sandbox block devices
+### microVM sandbox block devices
 
-`--machine microvm` remains the ABI-v1 profile and supports its original,
-single optional `--virtio-blk` device. `--machine microvm-v2` is a separate,
-incompatible guest ABI for single-sandbox workloads. It assigns up to three
+`--machine microvm` is the only microVM profile. It assigns up to three
 read-only lower layers and one writable scratch device to fixed virtio-mmio
 locations:
 
@@ -54,44 +52,45 @@ locations:
 
 Use `--microvm-sandbox-block ROLE:DISK`, in the order shown. Lower-layer
 roles require the normal disk `,ro` option and a non-empty topology must end
-with `scratch`; ordinary `--virtio-blk` is intentionally rejected for v2.
+with `scratch`; ordinary `--virtio-blk` is intentionally rejected.
 For example:
 
 ```shell
-openvmm --machine microvm-v2 --kernel vmlinux --initrd initramfs.cpio.gz \
+openvmm --machine microvm --kernel vmlinux --initrd initramfs.cpio.gz \
   --microvm-sandbox-block distro:file:distro.erofs,ro \
   --microvm-sandbox-block runtime:file:runtime.erofs,ro \
   --microvm-sandbox-block custom:file:custom.erofs,ro \
   --microvm-sandbox-block scratch:file:scratch.img
 ```
 
-ABI-v2 capture and restore support cached regular raw files. Capture records
+Capture and restore support cached regular raw files. Capture records
 the role, access mode, exact geometry, and SHA-256 of every read-only layer. A
 normal snapshot request pairs the writable scratch as `scratch.img`; restore
 accepts the read-only layer arguments again and creates a private scratch copy
 from that artifact. A pre-mount request may select fresh-scratch policy instead,
 in which case restore requires a new writable scratch file of matching size.
 
-### microVM ABI v2 deterministic SMP
+### microVM deterministic SMP
 
-`--machine microvm-v2 --processors N` selects the SMP-capable microVM ABI.
+`--machine microvm --processors N` selects the microVM machine.
 `N` must be exactly `1`, `2`, `4`, or `8`. The guest topology is independent
 of the host: one socket, one die, `N` cores, one thread per core, no SMT or
 NUMA, xAPIC mode, and contiguous APIC IDs `0..N-1`; APIC ID 0 is the BSP.
 Custom socket, SMT, APIC, x2APIC, and NUMA options are rejected.
 
-ABI v2 uses fixed virtio device slots and sandbox block roles. Its Xen PVH
-layout version is 2: the MP table still begins at `0x400`, while
+The microVM uses fixed virtio device slots and sandbox block roles. Its
+persisted ABI and Xen PVH layout values remain 2: the MP table still begins at
+`0x400`, while
 the boot GDT moves to `0x800` so the eight-processor table cannot overlap it.
 The MP table and ACPI MADT are generated from the same canonical topology.
-ABI v1 retains its original one-vCPU PVH layout version 1.
+ABI and layout value 1 snapshots are rejected.
 
 Snapshots record the ABI version, processor count, full topology, APIC IDs,
 and PVH layout version. Restore requires an exact match before any VP starts.
 For example:
 
 ```shell
-openvmm --machine microvm-v2 --processors 8 \
+openvmm --machine microvm --processors 8 \
   --kernel vmlinux --initrd initramfs.cpio.gz
 ```
 

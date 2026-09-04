@@ -20,7 +20,7 @@ mount -t virtiofs myfs /mnt/share
 Standard-machine virtio-fs may use the normal PCI, VPCI, or MMIO placement
 rules. It does not support snapshot and restore.
 
-## microVM ABI version 1
+## microVM
 
 The microVM profile reserves one fixed virtio-fs slot. Without `--mount`, the
 slot is guest-discoverable but dormant and has no HostFs backend or filesystem
@@ -55,7 +55,7 @@ The fixed transport is always discoverable. Active attachment policy and the
 canonical absolute host path become snapshot-authoritative.
 
 `SectionFs`, aggregate roots, alternate tags, PCI transport, DAX, and extra
-queues are not part of microVM ABI version 1.
+queues are not part of the microVM profile.
 
 ## Snapshot attachments
 

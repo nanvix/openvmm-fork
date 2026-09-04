@@ -138,8 +138,8 @@ message DevicesConfig {
     repeated WindowsPCIDevice windows_device = 4;
     repeated VirtioFSConfig virtiofs_config = 5;
     VirtioConsoleConfig virtio_console = 6;
-    // microVM ABI-v1 optional fixed-slot virtio-blk device.
-    VirtioBlk virtio_blk = 7;
+    reserved 7;
+    reserved "virtio_blk";
 }
 
 // An endpoint PCIe device function. Attached behind a port in the topology
@@ -501,11 +501,9 @@ message VMConfig {
     // Guest-visible machine contract.
     enum MachineProfile {
         STANDARD = 0;
-        // Original one-vCPU microVM ABI. This value is retained for compatibility.
-        MICROVM = 1;
         // Deterministic SMP-capable microVM ABI.
-        MICROVM_V2 = 2;
-        reserved 3, 4;
+        MICROVM = 2;
+        reserved 1, 3, 4;
     }
 
     // Action for the VMM to take when the guest triggers a power event.
@@ -757,7 +755,7 @@ message WindowsPCIDevice {
 message VirtioFSConfig {
     string tag = 1;
     string root_path = 2;
-    // Absolute guest target for the microVM ABI-v1 fixed HostFs device.
+    // Absolute guest target for the microVM fixed HostFs device.
     // Must be empty for a standard-machine virtio-fs device.
     string guest_mount_target = 3;
     // Enable the microVM common read-write contract. False selects read-only.

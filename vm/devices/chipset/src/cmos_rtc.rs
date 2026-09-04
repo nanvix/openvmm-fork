@@ -206,8 +206,6 @@ struct RtcState {
 pub enum RtcMode {
     /// Standard programmable MC146818-compatible behavior.
     Standard,
-    /// microVM ABI version 1 binary, 24-hour, read-only clock behavior.
-    MicrovmV1,
 }
 
 /// A fallible UTC clock source for the RTC.
@@ -239,7 +237,7 @@ impl UtcClockSource for LocalClockUtcSource {
 }
 
 impl RtcState {
-    fn new(initial_cmos: Option<[u8; 256]>, mode: RtcMode) -> Self {
+    fn new(initial_cmos: Option<[u8; 256]>, _mode: RtcMode) -> Self {
         let mut cmos = initial_cmos.map(CmosData).unwrap_or_else(CmosData::empty);
 
         cmos[CmosReg::STATUS_A] = {
@@ -250,7 +248,7 @@ impl RtcState {
         };
         cmos[CmosReg::STATUS_B] = {
             StatusRegB::new()
-                .with_disable_bcd(mode == RtcMode::MicrovmV1)
+                .with_disable_bcd(false)
                 .with_h24_mode(true)
                 .into()
         };
@@ -262,7 +260,7 @@ impl RtcState {
             // default Hyper-V used, so we'll stick with it
             addr: 0x80,
             cmos,
-            time_valid: mode == RtcMode::Standard,
+            time_valid: true,
             transaction_read_mask: None,
         }
     }
@@ -675,10 +673,6 @@ impl Rtc {
 
         tracing::trace!(?addr, ?data, "set_cmos_byte");
 
-        if self.mode == RtcMode::MicrovmV1 {
-            return;
-        }
-
         if (CmosReg::STATUS_A..=CmosReg::STATUS_D).contains(&addr) {
             self.set_status_byte(addr, data);
         } else {
@@ -716,15 +710,11 @@ impl Rtc {
 
         let data = if (CmosReg::STATUS_A..=CmosReg::STATUS_D).contains(&addr) {
             self.get_status_byte(addr)
+        } else if addr.depends_on_rtc(self.century_reg) {
+            self.sync_clock_to_cmos();
+            self.state.cmos[addr]
         } else {
-            if self.mode == RtcMode::MicrovmV1 && addr.depends_on_rtc(self.century_reg) {
-                self.read_microvm_calendar_byte(addr)
-            } else if addr.depends_on_rtc(self.century_reg) {
-                self.sync_clock_to_cmos();
-                self.state.cmos[addr]
-            } else {
-                self.state.cmos[addr]
-            }
+            self.state.cmos[addr]
         };
 
         tracing::trace!(?addr, ?data, "get_cmos_byte");
@@ -775,24 +765,6 @@ impl Rtc {
     }
 
     fn get_status_byte(&mut self, addr: CmosReg) -> u8 {
-        if self.mode == RtcMode::MicrovmV1 {
-            return match addr {
-                CmosReg::STATUS_A => {
-                    self.begin_microvm_transaction();
-                    if self.state.time_valid { 0x26 } else { 0xa6 }
-                }
-                CmosReg::STATUS_B => 0x06,
-                CmosReg::STATUS_C => 0x00,
-                CmosReg::STATUS_D => {
-                    if self.state.transaction_read_mask.is_none() {
-                        self.begin_microvm_transaction();
-                        self.state.transaction_read_mask = None;
-                    }
-                    if self.state.time_valid { 0x80 } else { 0x00 }
-                }
-                _ => unreachable!("passed invalid status reg"),
-            };
-        }
         match addr {
             CmosReg::STATUS_A => {
                 let mut data = StatusRegA::from(self.state.cmos[CmosReg::STATUS_A]);
@@ -1015,45 +987,6 @@ impl Rtc {
         self.state.time_valid = false;
     }
 
-    fn calendar_register_bit(&self, addr: CmosReg) -> u16 {
-        match addr {
-            CmosReg::SECOND => 1 << 0,
-            CmosReg::MINUTE => 1 << 1,
-            CmosReg::HOUR => 1 << 2,
-            CmosReg::DAY_OF_WEEK => 1 << 3,
-            CmosReg::DAY_OF_MONTH => 1 << 4,
-            CmosReg::MONTH => 1 << 5,
-            CmosReg::YEAR => 1 << 6,
-            _ if addr == self.century_reg => 1 << 7,
-            _ => unreachable!("passed non-calendar register"),
-        }
-    }
-
-    /// A microVM transaction starts at a status-A read or the first direct
-    /// calendar read. Each calendar register may be read once from the latch;
-    /// rereading a field starts the next transaction from fresh host UTC.
-    fn begin_microvm_transaction(&mut self) {
-        self.state.transaction_read_mask = Some(0);
-        self.sync_clock_to_cmos();
-    }
-
-    fn read_microvm_calendar_byte(&mut self, addr: CmosReg) -> u8 {
-        let bit = self.calendar_register_bit(addr);
-        if self
-            .state
-            .transaction_read_mask
-            .is_none_or(|read_mask| read_mask & bit != 0)
-        {
-            self.begin_microvm_transaction();
-        }
-
-        let Some(read_mask) = &mut self.state.transaction_read_mask else {
-            return 0;
-        };
-        *read_mask |= bit;
-        self.state.cmos[addr]
-    }
-
     /// Write-back the current contents of the CMOS RTC registers into the
     /// backing `real_time_source`
     fn sync_cmos_to_clock(&mut self) {
@@ -1192,10 +1125,7 @@ mod save_restore {
             } = state;
             let time_valid = time_valid.unwrap_or(true);
 
-            const CALENDAR_REGISTER_MASK: u16 = 0xff;
-            if transaction_read_mask.is_some_and(|mask| {
-                self.mode != RtcMode::MicrovmV1 || mask & !CALENDAR_REGISTER_MASK != 0
-            }) {
+            if transaction_read_mask.is_some() {
                 return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
                     "invalid RTC coherent transaction state"
                 )));
@@ -1207,44 +1137,6 @@ mod save_restore {
                 time_valid,
                 transaction_read_mask,
             };
-            if self.mode == RtcMode::MicrovmV1 {
-                let status_a = StatusRegA::from(restored_state.cmos[CmosReg::STATUS_A]);
-                let status_b = StatusRegB::from(restored_state.cmos[CmosReg::STATUS_B]);
-                if status_a.oscillator_control() != ENABLE_OSCILLATOR_CONTROL
-                    || !status_b.disable_bcd()
-                    || !status_b.h24_mode()
-                {
-                    return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
-                        "invalid microVM RTC control register state"
-                    )));
-                }
-            }
-            if transaction_read_mask.is_some() {
-                let status_b = StatusRegB::from(restored_state.cmos[CmosReg::STATUS_B]);
-                let calendar_is_zero = [
-                    CmosReg::SECOND,
-                    CmosReg::MINUTE,
-                    CmosReg::HOUR,
-                    CmosReg::DAY_OF_WEEK,
-                    CmosReg::DAY_OF_MONTH,
-                    CmosReg::MONTH,
-                    CmosReg::YEAR,
-                    self.century_reg,
-                ]
-                .into_iter()
-                .all(|reg| restored_state.cmos[reg] == 0);
-                let calendar_is_valid = self.read_cmos_date_time_from(&restored_state.cmos).is_ok()
-                    && (1..=7).contains(&restored_state.cmos[CmosReg::DAY_OF_WEEK]);
-                if !status_b.disable_bcd()
-                    || !status_b.h24_mode()
-                    || (time_valid && !calendar_is_valid)
-                    || (!time_valid && !calendar_is_zero)
-                {
-                    return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
-                        "invalid RTC coherent calendar sample"
-                    )));
-                }
-            }
 
             self.state = restored_state;
             self.real_time_source
@@ -1265,8 +1157,6 @@ mod tests {
     use super::*;
     use local_clock::MockLocalClock;
     use local_clock::MockLocalClockAccessor;
-    use parking_lot::Mutex;
-    use std::sync::Arc;
     use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
@@ -1309,74 +1199,6 @@ mod tests {
         Rtc,
     ) {
         new_test_rtc_with_mode(RtcMode::Standard)
-    }
-
-    fn set_utc(rtc: &mut Rtc, utc: &str) {
-        let timestamp: jiff::Timestamp = utc.parse().unwrap();
-        rtc.real_time_source.set_time(timestamp.into());
-    }
-
-    fn microvm_calendar_tuple(rtc: &mut Rtc) -> [u8; 8] {
-        let century_reg = rtc.century_reg;
-        [
-            get_cmos_data(rtc, CmosReg::SECOND),
-            get_cmos_data(rtc, CmosReg::MINUTE),
-            get_cmos_data(rtc, CmosReg::HOUR),
-            get_cmos_data(rtc, CmosReg::DAY_OF_WEEK),
-            get_cmos_data(rtc, CmosReg::DAY_OF_MONTH),
-            get_cmos_data(rtc, CmosReg::MONTH),
-            get_cmos_data(rtc, CmosReg::YEAR),
-            get_cmos_data(rtc, century_reg),
-        ]
-    }
-
-    #[derive(Inspect)]
-    struct FallibleTestClock {
-        #[inspect(skip)]
-        state: Arc<Mutex<(LocalClockTime, usize)>>,
-    }
-
-    #[derive(Clone)]
-    struct FallibleTestClockAccessor {
-        state: Arc<Mutex<(LocalClockTime, usize)>>,
-    }
-
-    impl FallibleTestClock {
-        fn new(time: LocalClockTime) -> (Self, FallibleTestClockAccessor) {
-            let state = Arc::new(Mutex::new((time, 0)));
-            (
-                Self {
-                    state: state.clone(),
-                },
-                FallibleTestClockAccessor { state },
-            )
-        }
-    }
-
-    impl UtcClockSource for FallibleTestClock {
-        fn get_time(&mut self) -> Result<LocalClockTime, UtcClockSourceError> {
-            let mut state = self.state.lock();
-            if state.1 != 0 {
-                state.1 -= 1;
-                Err(UtcClockSourceError)
-            } else {
-                Ok(state.0)
-            }
-        }
-
-        fn set_time(&mut self, new_time: LocalClockTime) {
-            self.state.lock().0 = new_time;
-        }
-    }
-
-    impl FallibleTestClockAccessor {
-        fn fail(&self) {
-            self.state.lock().1 = usize::MAX;
-        }
-
-        fn fail_once(&self) {
-            self.state.lock().1 = 1;
-        }
     }
 
     fn get_cmos_data(rtc: &mut Rtc, addr: CmosReg) -> u8 {
@@ -1544,234 +1366,10 @@ mod tests {
     }
 
     #[test]
-    fn microvm_v1_is_binary_24_hour_and_read_only() {
-        let (_, _, _, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
-
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0x26);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_B), 0x06);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0x00);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
-        set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0xff);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_B), 0x06);
-        set_cmos_data(&mut rtc, CmosReg(0x20), 0xff);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg(0x20)), 0x00);
-    }
-
-    #[test]
-    fn microvm_v1_latches_coherent_utc_across_calendar_boundaries() {
-        let boundaries = [
-            (
-                "2024-02-29T12:34:59Z",
-                Duration::from_secs(2),
-                [59, 34, 12, 5, 29, 2, 24, 20],
-                [1, 35, 12, 5, 29, 2, 24, 20],
-            ),
-            (
-                "2024-02-29T23:59:59Z",
-                Duration::from_secs(2),
-                [59, 59, 23, 5, 29, 2, 24, 20],
-                [1, 0, 0, 6, 1, 3, 24, 20],
-            ),
-            (
-                "2024-04-30T23:59:59Z",
-                Duration::from_secs(2),
-                [59, 59, 23, 3, 30, 4, 24, 20],
-                [1, 0, 0, 4, 1, 5, 24, 20],
-            ),
-            (
-                "2024-02-28T23:59:59Z",
-                Duration::from_secs(2),
-                [59, 59, 23, 4, 28, 2, 24, 20],
-                [1, 0, 0, 5, 29, 2, 24, 20],
-            ),
-            (
-                "2024-12-31T23:59:59Z",
-                Duration::from_secs(2),
-                [59, 59, 23, 3, 31, 12, 24, 20],
-                [1, 0, 0, 4, 1, 1, 25, 20],
-            ),
-        ];
-
-        for (start, advance, before, after) in boundaries {
-            let (_, _, clock, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
-            set_utc(&mut rtc, start);
-
-            assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0x26);
-            assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), before[0]);
-            clock.tick(advance);
-            assert_eq!(
-                [
-                    get_cmos_data(&mut rtc, CmosReg::MINUTE),
-                    get_cmos_data(&mut rtc, CmosReg::HOUR),
-                    get_cmos_data(&mut rtc, CmosReg::DAY_OF_WEEK),
-                    get_cmos_data(&mut rtc, CmosReg::DAY_OF_MONTH),
-                    get_cmos_data(&mut rtc, CmosReg::MONTH),
-                    get_cmos_data(&mut rtc, CmosReg::YEAR),
-                    get_cmos_data(&mut rtc, CmosReg(0x32)),
-                ],
-                before[1..]
-            );
-
-            assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), after[0]);
-            assert_eq!(microvm_calendar_tuple(&mut rtc), after);
-        }
-    }
-
-    #[test]
-    fn microvm_v1_reports_clock_failure_without_stale_calendar_data() {
-        let mut pool = pal_async::DefaultPool::new();
-        let driver = pool.driver();
-        let vm_time_keeper =
-            vmcore::vmtime::VmTimeKeeper::new(&pool.driver(), VmTime::from_100ns(0));
-        let vm_time_source = pool
-            .run_until(vm_time_keeper.builder().build(&driver))
-            .unwrap();
-        let timestamp: jiff::Timestamp = "2024-02-29T23:59:59Z".parse().unwrap();
-        let (clock, clock_control) = FallibleTestClock::new(timestamp.into());
-        let mut rtc = Rtc::new_with_mode_and_utc_clock(
-            Box::new(clock),
-            LineInterrupt::detached(),
-            &vm_time_source,
-            0x32,
-            None,
-            false,
-            RtcMode::MicrovmV1,
-        );
-
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0x26);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_B), 0x06);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 59);
-
-        clock_control.fail();
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0xa6);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x00);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 0);
-    }
-
-    #[test]
-    fn microvm_v1_holds_a_transient_failure_for_the_whole_transaction() {
-        let mut pool = pal_async::DefaultPool::new();
-        let driver = pool.driver();
-        let vm_time_keeper =
-            vmcore::vmtime::VmTimeKeeper::new(&pool.driver(), VmTime::from_100ns(0));
-        let vm_time_source = pool
-            .run_until(vm_time_keeper.builder().build(&driver))
-            .unwrap();
-        let timestamp: jiff::Timestamp = "2024-02-29T23:59:59Z".parse().unwrap();
-        let (clock, clock_control) = FallibleTestClock::new(timestamp.into());
-        let mut rtc = Rtc::new_with_mode_and_utc_clock(
-            Box::new(clock),
-            LineInterrupt::detached(),
-            &vm_time_source,
-            0x32,
-            None,
-            false,
-            RtcMode::MicrovmV1,
-        );
-
-        clock_control.fail_once();
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 0);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::MINUTE), 0);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x00);
-
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 59);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
-    }
-
-    #[test]
-    fn microvm_v1_restore_preserves_failed_transaction() {
-        let mut pool = pal_async::DefaultPool::new();
-        let driver = pool.driver();
-        let vm_time_keeper =
-            vmcore::vmtime::VmTimeKeeper::new(&pool.driver(), VmTime::from_100ns(0));
-        let vm_time_source = pool
-            .run_until(vm_time_keeper.builder().build(&driver))
-            .unwrap();
-        let timestamp: jiff::Timestamp = "2024-02-29T23:59:59Z".parse().unwrap();
-        let (clock, clock_control) = FallibleTestClock::new(timestamp.into());
-        let mut rtc = Rtc::new_with_mode_and_utc_clock(
-            Box::new(clock),
-            LineInterrupt::detached(),
-            &vm_time_source,
-            0x32,
-            None,
-            false,
-            RtcMode::MicrovmV1,
-        );
-
-        clock_control.fail_once();
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 0);
-        let saved = rtc.save().unwrap();
-        rtc.restore(saved).unwrap();
-
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::MINUTE), 0);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x00);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 59);
-    }
-
-    #[test]
-    fn microvm_v1_status_d_does_not_open_a_calendar_transaction() {
-        let (_, _, clock, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
-        set_utc(&mut rtc, "2024-12-31T23:59:59Z");
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
-
-        clock.tick(Duration::from_secs(2));
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 1);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::YEAR), 25);
-    }
-
-    #[test]
-    fn microvm_v1_restore_preserves_active_transaction_then_refreshes() {
-        let (_, _, clock, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
-        set_utc(&mut rtc, "2024-12-31T23:59:59Z");
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0x26);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 59);
-        let saved = rtc.save().unwrap();
-
-        clock.tick(Duration::from_secs(2));
-        rtc.restore(saved).unwrap();
-        set_utc(&mut rtc, "2025-01-01T00:00:01Z");
-
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::YEAR), 24);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::MONTH), 12);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::DAY_OF_MONTH), 31);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::SECOND), 1);
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::YEAR), 25);
-    }
-
-    #[test]
-    fn microvm_v1_rejects_invalid_saved_transaction() {
-        let (_, _, _, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
+    fn rtc_rejects_retired_coherent_transaction_state() {
+        let (_, _, _, mut rtc) = new_test_rtc();
         let mut saved = rtc.save().unwrap();
         saved.transaction_read_mask = Some(1 << 15);
-        saved.time_valid = Some(true);
-
-        assert!(matches!(
-            rtc.restore(saved),
-            Err(vmcore::save_restore::RestoreError::InvalidSavedState(_))
-        ));
-    }
-
-    #[test]
-    fn microvm_v1_rejects_invalid_saved_calendar_sample() {
-        let (_, _, _, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
-        set_utc(&mut rtc, "2024-02-29T23:59:59Z");
-        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0x26);
-        let mut saved = rtc.save().unwrap();
-        saved.cmos[CmosReg::MONTH.0 as usize] = 13;
-
-        assert!(matches!(
-            rtc.restore(saved),
-            Err(vmcore::save_restore::RestoreError::InvalidSavedState(_))
-        ));
-    }
-
-    #[test]
-    fn microvm_v1_rejects_disabled_oscillator_on_restore() {
-        let (_, _, _, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
-        let mut saved = rtc.save().unwrap();
-        saved.cmos[CmosReg::STATUS_A.0 as usize] = 0x66;
 
         assert!(matches!(
             rtc.restore(saved),

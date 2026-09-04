@@ -6,14 +6,14 @@ for developers working on the save/restore subsystem.
 ## Directory layout
 
 A snapshot is stored as a directory containing three required files and, for
-an ABI-v2 mounted-scratch capture, one paired scratch image:
+a mounted microVM scratch capture, one paired scratch image:
 
 ```text
 snapshot-dir/
 ├── manifest.bin   # Protobuf-encoded SnapshotManifest
 ├── state.bin      # Protobuf-encoded device saved state
 ├── memory.bin     # Exact automatic RAM file or independent supplied-RAM clone
-└── scratch.img    # Optional paired ABI-v2 writable scratch image
+└── scratch.img    # Optional paired microVM writable scratch image
 ```
 
 ## Manifest format
@@ -26,7 +26,7 @@ crate's protobuf encoding.
 New snapshots use manifest version 5. The legacy `state_sha256` and
 `memory_sha256` protobuf tags remain reserved so version 2 manifests can be
 decoded; versions 3 through 5 require both fields to be absent. Restore accepts
-versions 2 through 4 for compatibility. Tiered ABI-v2 snapshots require version
+versions 2 through 4 for compatibility. Tiered microVM snapshots require version
 5, which records capture tier, clone/resume policy, and consumed configuration
 sections.
 
@@ -87,7 +87,7 @@ stronger mode such as a lease, fs-verity, or a verified artifact broker.
 
 ## Scratch (`scratch.img`)
 
-The ABI-v2 block contract records every fixed role, access mode, geometry, and
+The microVM block contract records every fixed role, access mode, geometry, and
 immutable read-only layer digest. A paired capture copies the exact opened
 writable scratch handle into the same staging directory after device queues
 drain, verifies its SHA-256, and publishes it atomically with VM state. Restore
@@ -163,12 +163,12 @@ Key unsupported categories:
   `supports_save_restore()` to `false`. `virtio-blk`, `virtio-console`,
   `virtio-pmem`, and `virtio-rng` override it to `true`. `virtio-net` enables
   it only for resources with an explicit static identity and feature contract,
-  such as the microVM ABI-v1 NIC; ordinary virtio-net resources remain
+  such as the microVM NIC; ordinary virtio-net resources remain
   disabled.
   The transport stores an opaque typed device-private payload in addition to
   common queue state. Devices with unsupported host-side session state, such
   as `virtio-9p`, leave save/restore disabled. `virtiofs` enables typed
-  device-private state only for the constrained microVM ABI-v1 HostFs profile;
+  device-private state only for the constrained microVM HostFs profile;
   ordinary, aggregate, and SectionFs resources remain disabled.
 - **Some VMBus devices** — `GuestCrashDevice`, `GuestEmulationDevice`,
   `VmbusSerialHost`, `Vmbfs` return `None` from

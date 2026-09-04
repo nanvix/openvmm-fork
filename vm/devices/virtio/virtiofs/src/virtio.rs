@@ -279,7 +279,7 @@ impl VirtioFsDevice {
     }
 
     /// Creates the fixed no-DAX microVM HostFs device directly from the
-    /// `MicrovmV1` resource fields and its process-local host root.
+    /// `Microvm` resource fields and its process-local host root.
     pub fn new_microvm_hostfs(
         driver_source: &VmTaskDriverSource,
         stable_id: String,
