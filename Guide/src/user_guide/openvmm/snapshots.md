@@ -12,7 +12,7 @@ microVM scratch:
 - **Device state** — the saved state of all emulated devices
 - **Manifest** — metadata describing the snapshot (architecture, memory size,
   VP count, page size, etc.)
-- **Scratch** — the exact ABI-v2 writable image when capture occurs after mount
+- **Scratch** — the exact microVM writable image when capture occurs after mount
 
 These are stored as three required files and one optional paired file:
 
@@ -21,15 +21,15 @@ These are stored as three required files and one optional paired file:
 | `manifest.bin`  | Protobuf-encoded snapshot metadata          |
 | `state.bin`     | Serialized device state                     |
 | `memory.bin`    | Memory backing file                         |
-| `scratch.img`   | Paired ABI-v2 scratch, when declared        |
+| `scratch.img`   | Paired microVM scratch, when declared       |
 
 ## Prerequisites
 
 Host-driven snapshots require **file-backed guest memory**. Pass `file=<PATH>`
 in the `--memory` option when launching a standard VM. A microVM launched with
 `--snapshot-destination` automatically creates temporary file-backed RAM in
-the destination's parent directory when no backing file was supplied. ABI-v2
-capture additionally requires
+the destination's parent directory when no backing file was supplied. Capture
+with sandbox blocks additionally requires
 `--snapshot-tier platform|workload-start|instance-checkpoint`. Platform and
 workload-start snapshots are reusable clones; instance checkpoints are
 single-use resumes.
@@ -98,7 +98,7 @@ MicroVM orchestrators can add `--restore-ready-path <PATH>`. OpenVMM connects
 to an existing Unix domain socket on Linux or named pipe on Windows and writes
 `OPENVMM_RESTORE_READY_V1\n` after restore validation, attachment resolution,
 and state-unit startup. Ungated restores publish it before releasing a restored
-vCPU. Gated ABI-v2 restores publish it after the guest acknowledges repair and
+vCPU. Gated microVM restores publish it after the guest acknowledges repair and
 host input is re-enabled, while the restored vCPU remains stopped. The event
 is single-use and is not serialized.
 Failure to write and flush it stops the started units and fails restore without
@@ -106,7 +106,7 @@ releasing gated input. The peer must accept and read while resume is in
 progress; on Windows, flush completion waits until the named-pipe peer consumes
 the complete frame.
 
-For a tiered ABI-v2 restore, OpenVMM starts device workers with network and
+For a tiered microVM restore, OpenVMM starts device workers with network and
 control input gated. The guest performs post-restore repair and writes the
 existing snapshot port (`0x605`) to acknowledge completion. OpenVMM stops at
 that exact post-write boundary, completes the deferred write while the vCPU is
@@ -118,7 +118,7 @@ identities. An instance-checkpoint restore attempt atomically creates
 artifact and configuration validation but before worker construction, so the
 restore attempt remains consumed if later worker startup fails.
 
-An ABI-v2 template may opt into restore-time vCPU activation by booting with an
+A microVM template may opt into restore-time vCPU activation by booting with an
 explicit canonical `maxcpus=1`, `2`, `4`, or `8` value below or equal to its
 configured VP capacity. The snapshot records that boot-online count while its
 topology, APIC IDs, and saved VP inventory remain fixed at capacity.
@@ -155,16 +155,15 @@ validation error and refuse to start.
 ## Device configuration on restore
 
 For standard-machine snapshots, device flags must still be supplied on restore
-and must reproduce the saved machine. For microVM ABI-v1 and ABI-v2 snapshots, the
-manifest is authoritative for RAM, topology, ABI, fixed devices, placement,
+and must reproduce the saved machine. For microVM snapshots, the manifest is
+authoritative for RAM, topology, ABI, fixed devices, placement,
 features, interrupts, and the effective PVH command line. Restore-time
 guest-visible overrides are rejected.
 
-The ABI-v1 CPU contract records the effective CPUID/XSTATE surface and TSC
-frequency. WHP microVMs use a reproducible 1 GHz virtual TSC configured before
-partition setup; restore recreates and validates that rate before any vCPU
-runs. KVM snapshots likewise require the destination to reproduce their saved
-backend CPU and clock contract.
+The CPU contract records the effective CPUID/XSTATE surface and TSC frequency.
+Restore recreates and validates that rate before any vCPU runs. KVM snapshots
+likewise require the destination to reproduce their saved backend CPU and
+clock contract.
 
 Every snapshot records a complete state-unit inventory. Each emulated device
 saves state under a unique name (for example `"pit"`, `"vmbus"`, or `"ide"`),
@@ -256,7 +255,7 @@ OpenVMM snapshots:
 | VMBus Keyboard / Mouse / Video | VMBus | Yes |
 | Guest Emulation Log | VMBus | Yes |
 | virtio-blk | Virtio (PCI/MMIO) | Yes |
-| virtio-net | Virtio (PCI/MMIO) | microVM ABI-v1 only |
+| virtio-net | Virtio (PCI/MMIO) | microVM only |
 | virtio-pmem | Virtio (PCI/MMIO) | Yes |
 | virtio-rng | Virtio (PCI/MMIO) | Yes |
 | virtio-console | Virtio (PCI/MMIO) | Yes |
@@ -267,7 +266,7 @@ OpenVMM snapshots:
 | Assigned PCI (pass-through) | PCI | **No** |
 | Relayed vPCI | PCI | **No** |
 | PCAT BIOS firmware | Chipset (ISA) | **No** (see limitations) |
-| virtio-fs | Virtio (MMIO) | microVM ABI-v1 HostFs only |
+| virtio-fs | Virtio (MMIO) | microVM HostFs only |
 | virtio-9p | Virtio (PCI/MMIO) | **No** |
 | Guest Crash Device | VMBus | **No** |
 | Guest Emulation Device (GED) | VMBus | **No** |
@@ -291,5 +290,6 @@ immediately with a clear error if any active device does not support it.
 - OpenHCL-based VMs do not currently support this snapshot mechanism
 - VMs using PCAT firmware do not support save/restore
 - Standard-machine restore still requires matching `--memory` and
-  `--processors`. MicroVM ABI-v1 restore reads them authoritatively from the
-  manifest and rejects overrides.
+  `--processors`. MicroVM restore reads them authoritatively from the manifest
+  and rejects overrides. Only persisted microVM ABI and PVH layout value 2 are
+  supported; value 1 snapshots require an earlier compatible OpenVMM build.

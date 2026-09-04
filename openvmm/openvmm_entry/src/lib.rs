@@ -709,7 +709,7 @@ fn effective_microvm_network(
             EndpointConfigCli::Microvm(config) => Some(config.clone()),
             _ => anyhow::bail!("microVM --net was not validated as a static IPv4 identity"),
         },
-        _ => anyhow::bail!("microVM ABI version 1 permits at most one virtio-net device"),
+        _ => anyhow::bail!("microVM permits at most one virtio-net device"),
     };
     let Some(restore) = restore else {
         return requested
@@ -1285,16 +1285,18 @@ mod microvm_console_attachment_tests {
             false,
             None,
             false,
-            false,
+            &[],
         )
         .unwrap();
-        openvmm_helpers::snapshot::microvm_v1_machine_contract(
+        openvmm_helpers::snapshot::microvm_machine_contract(
             source_hypervisor,
             command_line,
             Some((&network, &policy, microvm_network_attachment())),
             false,
             None,
             None,
+            Vec::new(),
+            1,
             1024,
             [
                 "partition",
@@ -1423,16 +1425,18 @@ mod microvm_console_attachment_tests {
             true,
             Some(&filesystem),
             false,
-            false,
+            &[],
         )
         .unwrap();
-        openvmm_helpers::snapshot::microvm_v1_machine_contract(
+        openvmm_helpers::snapshot::microvm_machine_contract(
             if cfg!(windows) { "whp" } else { "kvm" },
             command_line,
             None,
             true,
             Some((&filesystem, Path::new(&root_path), attachment)),
             None,
+            Vec::new(),
+            1,
             1024,
             [
                 "partition",
@@ -1464,16 +1468,18 @@ mod microvm_console_attachment_tests {
             true,
             None,
             false,
-            false,
+            &[],
         )
         .unwrap();
-        openvmm_helpers::snapshot::microvm_v1_machine_contract(
+        openvmm_helpers::snapshot::microvm_machine_contract(
             if cfg!(windows) { "whp" } else { "kvm" },
             command_line,
             None,
             true,
             None,
             None,
+            Vec::new(),
+            1,
             1024,
             [
                 "partition",
@@ -1708,11 +1714,10 @@ async fn vm_config_from_command_line(
     opt: &Options,
     restore_machine_contract: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
 ) -> anyhow::Result<(Config, VmResources)> {
-    let is_microvm = matches!(
-        opt.machine,
-        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
-    );
-    let is_microvm_smp = opt.machine == MachineProfileCli::MicrovmV2;
+    let is_microvm = opt.machine == MachineProfileCli::Microvm;
+    if let Some(contract) = restore_machine_contract {
+        openvmm_helpers::snapshot::validate_supported_microvm_contract(contract)?;
+    }
     opt.validate_microvm_options()?;
     let effective_microvm_network = if is_microvm {
         effective_microvm_network(opt, restore_machine_contract)?
@@ -1876,7 +1881,7 @@ async fn vm_config_from_command_line(
             || opt.vmbus_com2_serial.is_some()
             || opt.debugcon.is_some())
     {
-        bail!("microVM ABI version 1 does not expose UART, debugcon, or VMBus serial");
+        bail!("microVM does not expose UART, debugcon, or VMBus serial");
     }
 
     let microvm_console = if is_microvm {
@@ -3120,7 +3125,7 @@ async fn vm_config_from_command_line(
 
     let mut vmgs = if is_microvm {
         if opt.vmgs.is_some() {
-            bail!("microVM ABI version 1 does not support VMGS");
+            bail!("microVM does not support VMGS");
         }
         None
     } else {
@@ -3377,12 +3382,8 @@ async fn vm_config_from_command_line(
     #[cfg(guest_arch = "x86_64")]
     let topology_arch =
         openvmm_defs::config::ArchTopologyConfig::X86(openvmm_defs::config::X86TopologyConfig {
-            apic_id_offset: if is_microvm_smp {
-                0
-            } else {
-                opt.apic_id_offset
-            },
-            x2apic: if is_microvm_smp {
+            apic_id_offset: if is_microvm { 0 } else { opt.apic_id_offset },
+            x2apic: if is_microvm {
                 openvmm_defs::config::X2ApicConfig::Unsupported
             } else {
                 opt.x2apic
@@ -3490,7 +3491,7 @@ async fn vm_config_from_command_line(
                     root_path: filesystem.root_path.clone(),
                     mount_options: String::new(),
                 },
-                virtio_resources::fs::VirtioFsProfile::MicrovmV1 {
+                virtio_resources::fs::VirtioFsProfile::Microvm {
                     stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
                     root_identity: filesystem.attachment.identity.clone(),
                     read_only: filesystem.config.access.is_read_only(),
@@ -3499,7 +3500,7 @@ async fn vm_config_from_command_line(
         } else {
             (
                 virtio_resources::fs::VirtioFsBackend::Dormant,
-                virtio_resources::fs::VirtioFsProfile::MicrovmV1Dormant {
+                virtio_resources::fs::VirtioFsProfile::MicrovmDormant {
                     stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
                 },
             )
@@ -3825,12 +3826,12 @@ async fn vm_config_from_command_line(
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: opt.processors,
-            vps_per_socket: if is_microvm_smp {
+            vps_per_socket: if is_microvm {
                 Some(opt.processors)
             } else {
                 opt.vps_per_socket
             },
-            enable_smt: if is_microvm_smp {
+            enable_smt: if is_microvm {
                 Some(false)
             } else {
                 match opt.smt {
@@ -3902,9 +3903,7 @@ async fn vm_config_from_command_line(
         .hypervisor
         .as_deref()
         .and_then(|spec| spec.split(':').next());
-    if matches!(cfg.machine_profile, MachineProfile::Microvm { .. })
-        && restore_machine_contract.is_none()
-    {
+    if cfg.machine_profile == MachineProfile::Microvm && restore_machine_contract.is_none() {
         let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode else {
             unreachable!("microVM configuration was constructed with PVH load mode");
         };
@@ -3935,31 +3934,14 @@ async fn vm_config_from_command_line(
             cmdline.push_str("nvx_snapshot_tier=");
             cmdline.push_str(snapshot_tier.manifest_name());
         }
-        match cfg.machine_profile {
-            MachineProfile::Microvm {
-                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
-            } => openvmm_defs::config::append_microvm_virtio_discovery(
-                cmdline,
-                network,
-                microvm_filesystem_slot,
-                cfg.microvm_filesystem.as_ref(),
-                has_console,
-                cfg.virtio_devices
-                    .iter()
-                    .any(|(_, device)| device.id() == "virtio-blk"),
-            )?,
-            MachineProfile::Microvm {
-                abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
-            } => openvmm_defs::config::append_microvm_v2_virtio_discovery(
-                cmdline,
-                network,
-                microvm_filesystem_slot,
-                cfg.microvm_filesystem.as_ref(),
-                has_console,
-                &cfg.microvm_sandbox_blocks,
-            )?,
-            _ => unreachable!("microVM profile has an unsupported ABI version"),
-        }
+        openvmm_defs::config::append_microvm_virtio_discovery(
+            cmdline,
+            network,
+            microvm_filesystem_slot,
+            cfg.microvm_filesystem.as_ref(),
+            has_console,
+            &cfg.microvm_sandbox_blocks,
+        )?;
     }
     openvmm_defs::config::validate_machine_config(&cfg, requested_hypervisor)?;
     resources.serial_driver = Some(serial_driver);
@@ -4398,34 +4380,19 @@ fn prepare_snapshot_restore(
     sandbox_block_sources: &[storage_builder::MicrovmSandboxBlockSource],
 ) -> anyhow::Result<PreparedSnapshotRestore> {
     let manifest = snapshot.manifest();
-    let expected_microvm_contract = if matches!(
-        opt.machine,
-        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
-    ) {
-        let abi_version = match opt.machine {
-            MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
-            MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
-            MachineProfileCli::Standard => unreachable!(),
-        };
-        let sandbox_blocks = if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2 {
-            let scratch_policy = if manifest
-                .machine_contract
-                .as_ref()
-                .and_then(|contract| contract.microvm_sandbox_blocks.last())
-                .is_some_and(|block| block.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME)
-            {
-                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
-            } else {
-                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Fresh
-            };
-            storage_builder::snapshot_block_contract(sandbox_block_sources, scratch_policy)?
+    let expected_microvm_contract = if opt.machine == MachineProfileCli::Microvm {
+        let scratch_policy = if manifest
+            .machine_contract
+            .as_ref()
+            .and_then(|contract| contract.microvm_sandbox_blocks.last())
+            .is_some_and(|block| block.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME)
+        {
+            chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
         } else {
-            anyhow::ensure!(
-                sandbox_block_sources.is_empty() && opt.virtio_blk.is_empty(),
-                "microVM ABI version 1 snapshot restore cannot attach block media"
-            );
-            Vec::new()
+            chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Fresh
         };
+        let sandbox_blocks =
+            storage_builder::snapshot_block_contract(sandbox_block_sources, scratch_policy)?;
         Some((
             expected_hypervisor,
             effective_command_line
@@ -4433,7 +4400,6 @@ fn prepare_snapshot_restore(
             network,
             filesystem,
             console_attachment,
-            abi_version,
             sandbox_blocks,
         ))
     } else {
@@ -4541,7 +4507,6 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             &openvmm_helpers::snapshot::SnapshotAttachment,
         )>,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
-        u32,
         Vec<openvmm_helpers::snapshot::SnapshotMicrovmSandboxBlock>,
     )>,
 ) -> anyhow::Result<PreparedSnapshotRestore> {
@@ -4561,7 +4526,6 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         network,
         filesystem,
         console_attachment,
-        abi_version,
         sandbox_blocks,
     )) = expected_microvm_contract
     {
@@ -4577,43 +4541,22 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             .as_ref()
             .and(filesystem)
             .map(|(config, root_path, attachment)| (config, root_path, attachment.clone()));
-        let mut expected_contract = match abi_version {
-            openvmm_defs::config::MICROVM_ABI_VERSION_1 => {
-                openvmm_helpers::snapshot::microvm_v1_machine_contract(
-                    expected_hypervisor,
-                    effective_command_line.to_owned(),
-                    network,
-                    filesystem_slot,
-                    filesystem,
-                    console_attachment.cloned(),
-                    expected_memory_size,
-                    saved_contract.state_unit_names.clone(),
-                    saved_contract.capture_wall_clock,
-                    saved_contract.tsc_frequency_hz,
-                    saved_contract.apic_frequency_hz,
-                    saved_contract.cpu_contract.clone(),
-                )?
-            }
-            openvmm_defs::config::MICROVM_ABI_VERSION_2 => {
-                openvmm_helpers::snapshot::microvm_v2_machine_contract(
-                    expected_hypervisor,
-                    effective_command_line.to_owned(),
-                    network,
-                    filesystem_slot,
-                    filesystem,
-                    console_attachment.cloned(),
-                    sandbox_blocks,
-                    expected_vp_count,
-                    expected_memory_size,
-                    saved_contract.state_unit_names.clone(),
-                    saved_contract.capture_wall_clock,
-                    saved_contract.tsc_frequency_hz,
-                    saved_contract.apic_frequency_hz,
-                    saved_contract.cpu_contract.clone(),
-                )?
-            }
-            version => anyhow::bail!("microVM ABI version {version} is unsupported"),
-        };
+        let mut expected_contract = openvmm_helpers::snapshot::microvm_machine_contract(
+            expected_hypervisor,
+            effective_command_line.to_owned(),
+            network,
+            filesystem_slot,
+            filesystem,
+            console_attachment.cloned(),
+            sandbox_blocks,
+            expected_vp_count,
+            expected_memory_size,
+            saved_contract.state_unit_names.clone(),
+            saved_contract.capture_wall_clock,
+            saved_contract.tsc_frequency_hz,
+            saved_contract.apic_frequency_hz,
+            saved_contract.cpu_contract.clone(),
+        )?;
         align_legacy_network_policy_contract(saved_contract, &mut expected_contract);
         openvmm_helpers::snapshot::validate_microvm_machine_contract(manifest, &expected_contract)?;
         let capture_time: std::time::SystemTime = saved_contract
@@ -4821,22 +4764,14 @@ async fn run_control_inner(
         .and_then(|snapshot| snapshot.manifest().machine_contract.as_ref())
         && contract.machine_profile == "microvm"
     {
-        let requested_abi_version = match opt.machine {
-            MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
-            MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
-            MachineProfileCli::Standard => {
-                anyhow::bail!("microVM snapshot restore requires --machine microvm or microvm-v2")
-            }
-        };
         anyhow::ensure!(
-            contract.microvm_abi_version == requested_abi_version,
-            "snapshot microVM ABI version does not match the requested machine"
+            opt.machine == MachineProfileCli::Microvm,
+            "microVM snapshot restore requires --machine microvm"
         );
+        openvmm_helpers::snapshot::validate_supported_microvm_contract(contract)?;
     }
-    let restore_machine_contract = if matches!(
-        opt.machine,
-        MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
-    ) && let Some(snapshot) = restore_snapshot.as_ref()
+    let restore_machine_contract = if opt.machine == MachineProfileCli::Microvm
+        && let Some(snapshot) = restore_snapshot.as_ref()
     {
         let manifest = snapshot.manifest();
         let snapshot_dir = opt
@@ -4848,16 +4783,11 @@ async fn run_control_inner(
             .machine_contract
             .as_ref()
             .context("microVM snapshot is missing its authoritative machine contract")?;
-        let expected_abi_version = match opt.machine {
-            MachineProfileCli::Microvm => openvmm_defs::config::MICROVM_ABI_VERSION_1,
-            MachineProfileCli::MicrovmV2 => openvmm_defs::config::MICROVM_ABI_VERSION_2,
-            MachineProfileCli::Standard => unreachable!(),
-        };
         anyhow::ensure!(
-            contract.machine_profile == "microvm"
-                && contract.microvm_abi_version == expected_abi_version,
-            "snapshot microVM ABI version does not match the requested machine"
+            contract.machine_profile == "microvm",
+            "snapshot machine profile does not match the requested microVM machine"
         );
+        openvmm_helpers::snapshot::validate_supported_microvm_contract(contract)?;
         if let Some(restore_processors) = opt.restore_processors {
             openvmm_helpers::snapshot::validate_restore_online_vp_count(
                 manifest,
@@ -4878,14 +4808,12 @@ async fn run_control_inner(
             "restore-time memory overrides are not allowed"
         );
         opt.memory.size = Some(vmm_cli::MemorySize(manifest.memory_size_bytes));
-        if expected_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2
-            && !contract.microvm_sandbox_blocks.is_empty()
-        {
+        if !contract.microvm_sandbox_blocks.is_empty() {
             let scratch = contract
                 .microvm_sandbox_blocks
                 .last()
                 .filter(|block| block.role == "scratch")
-                .context("microVM ABI-v2 snapshot is missing its scratch contract")?;
+                .context("microVM snapshot is missing its scratch contract")?;
             if scratch.artifact == openvmm_helpers::snapshot::SCRATCH_FILE_NAME {
                 anyhow::ensure!(
                     !opt.microvm_sandbox_block.iter().any(|block| {
@@ -5172,11 +5100,7 @@ async fn run_control_inner(
     };
     let hypervisor = match &opt.hypervisor {
         Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
-        None if matches!(
-            opt.machine,
-            MachineProfileCli::Microvm | MachineProfileCli::MicrovmV2
-        ) =>
-        {
+        None if opt.machine == MachineProfileCli::Microvm => {
             openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
         }
         None => openvmm_helpers::hypervisor::choose_hypervisor()?,

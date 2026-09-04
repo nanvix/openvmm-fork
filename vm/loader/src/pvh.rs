@@ -33,8 +33,7 @@ const HIMEM_START: u64 = 0x10_0000;
 const MP_FLOATING_POINTER_ADDR: usize = 0;
 const MP_CONFIG_TABLE_ADDR: usize = 0x400;
 const MP_IRQ_FLAGS_LEVEL_HIGH: u16 = 0x000d;
-const LEGACY_BOOT_GDT_ADDR: u64 = 0x500;
-const SMP_BOOT_GDT_ADDR: u64 = 0x800;
+const BOOT_GDT_ADDR: u64 = 0x800;
 const START_INFO_ADDR: u64 = 0x6000;
 const MODLIST_ADDR: u64 = 0x6040;
 const MEMMAP_ADDR: u64 = 0x7000;
@@ -103,29 +102,9 @@ pub struct AcpiTables {
     pub tables: Vec<u8>,
 }
 
-/// Versioned placement of Xen PVH boot metadata in the first guest page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PvhBootLayout {
-    /// Original one-vCPU layout used by microVM ABI version 1.
-    Legacy,
-    /// SMP-safe layout used by microVM ABI version 2.
-    Smp,
-}
-
-impl PvhBootLayout {
-    const fn gdt_addr(self) -> u64 {
-        match self {
-            Self::Legacy => LEGACY_BOOT_GDT_ADDR,
-            Self::Smp => SMP_BOOT_GDT_ADDR,
-        }
-    }
-}
-
 /// Guest-visible processor and interrupt data for Xen PVH boot tables.
 #[derive(Debug, Clone, Copy)]
 pub struct BootConfig<'a> {
-    /// Versioned placement for the GDT and IDT.
-    pub layout: PvhBootLayout,
     /// APIC IDs in virtual-processor order. The first entry is the BSP.
     pub apic_ids: &'a [u32],
     /// ISA IRQs described as active-high, level-triggered.
@@ -252,37 +231,6 @@ struct ParsedKernel {
     entrypoint: u64,
 }
 
-/// Loads an x86-64 Xen PVH ELF image and imports its boot state.
-pub fn load<F, R>(
-    importer: &mut dyn ImageLoad<X86Register>,
-    kernel: &mut F,
-    initrd: Option<InitrdConfig<'_, R>>,
-    cmdline: &str,
-    memory_layout: &MemoryLayout,
-    acpi_tables: Option<&AcpiTables>,
-) -> Result<LoadInfo, Error>
-where
-    F: Read + Seek,
-    R: Read + Seek,
-{
-    const LEGACY_APIC_IDS: &[u32] = &[0];
-    const LEGACY_LEVEL_TRIGGERED_IRQS: &[u32] = &[4, 5, 6, 7, 10];
-    load_with_boot_config(
-        importer,
-        kernel,
-        initrd,
-        cmdline,
-        memory_layout,
-        acpi_tables,
-        &BootConfig {
-            layout: PvhBootLayout::Legacy,
-            apic_ids: LEGACY_APIC_IDS,
-            level_triggered_irqs: LEGACY_LEVEL_TRIGGERED_IRQS,
-            reserved_memory_ranges: &[],
-        },
-    )
-}
-
 /// Loads an x86-64 Xen PVH ELF image with explicit boot-table configuration.
 pub fn load_with_boot_config<F, R>(
     importer: &mut dyn ImageLoad<X86Register>,
@@ -366,7 +314,7 @@ where
         acpi_tables,
         boot_config,
     )?;
-    import_registers(importer, entrypoint, boot_config.layout)?;
+    import_registers(importer, entrypoint)?;
 
     Ok(LoadInfo { entrypoint, initrd })
 }
@@ -580,7 +528,7 @@ fn import_boot_structures(
 ) -> Result<(), Error> {
     let mut boot_page = [0u8; HV_PAGE_SIZE as usize];
     write_mp_tables(&mut boot_page, boot_config)?;
-    let boot_gdt_addr = boot_config.layout.gdt_addr();
+    let boot_gdt_addr = BOOT_GDT_ADDR;
     let gdt = [
         0,
         gdt_entry(SEG_ATTR_CODE, 0, 0x000f_ffff),
@@ -710,9 +658,10 @@ fn pvh_memory_map(
             && range.start().is_multiple_of(HV_PAGE_SIZE)
             && range.end().is_multiple_of(HV_PAGE_SIZE)
             && range.start() >= previous_end
-            && memory_layout.ram().iter().any(|ram| {
-                range.start() >= ram.range.start() && range.end() <= ram.range.end()
-            });
+            && memory_layout
+                .ram()
+                .iter()
+                .any(|ram| range.start() >= ram.range.start() && range.end() <= ram.range.end());
         if !valid {
             return Err(Error::InvalidReservedMemoryRange {
                 start: range.start(),
@@ -763,7 +712,7 @@ fn write_mp_tables(
 ) -> Result<(), Error> {
     let table = build_mp_config_table(boot_config)?;
     let table_end = MP_CONFIG_TABLE_ADDR + table.len();
-    let gdt_addr = boot_config.layout.gdt_addr();
+    let gdt_addr = BOOT_GDT_ADDR;
     if table_end > gdt_addr as usize {
         return Err(Error::MpTableOverlap {
             table_end,
@@ -877,9 +826,8 @@ fn checksum(bytes: &[u8]) -> u8 {
 fn import_registers(
     importer: &mut dyn ImageLoad<X86Register>,
     entrypoint: u64,
-    boot_layout: PvhBootLayout,
 ) -> Result<(), Error> {
-    let boot_gdt_addr = boot_layout.gdt_addr();
+    let boot_gdt_addr = BOOT_GDT_ADDR;
     let data_segment = SegmentRegister {
         base: 0,
         limit: u32::MAX,
@@ -999,6 +947,33 @@ mod tests {
     use crate::importer::ParameterAreaIndex;
     use memory_range::MemoryRange;
     use std::io::Cursor;
+
+    fn load<F, R>(
+        importer: &mut dyn ImageLoad<X86Register>,
+        kernel: &mut F,
+        initrd: Option<InitrdConfig<'_, R>>,
+        cmdline: &str,
+        memory_layout: &MemoryLayout,
+        acpi_tables: Option<&AcpiTables>,
+    ) -> Result<LoadInfo, Error>
+    where
+        F: Read + Seek,
+        R: Read + Seek,
+    {
+        load_with_boot_config(
+            importer,
+            kernel,
+            initrd,
+            cmdline,
+            memory_layout,
+            acpi_tables,
+            &BootConfig {
+                apic_ids: &[0],
+                level_triggered_irqs: &[],
+                reserved_memory_ranges: &[MemoryRange::new(0x3_0000..0x3_1000)],
+            },
+        )
+    }
 
     #[derive(Default)]
     struct RecordingImporter {
@@ -1190,7 +1165,9 @@ mod tests {
         assert!(matches!(
             pvh_memory_map(
                 &make_layout(),
-                &[MemoryRange::new(64 * 1024 * 1024..64 * 1024 * 1024 + 0x1000)]
+                &[MemoryRange::new(
+                    64 * 1024 * 1024..64 * 1024 * 1024 + 0x1000
+                )]
             ),
             Err(Error::InvalidReservedMemoryRange { .. })
         ));
@@ -1311,15 +1288,12 @@ mod tests {
                 .fold(0u8, |sum, byte| sum.wrapping_add(byte)),
             0
         );
-        for irq in [4, 5, 6, 7, 10] {
+        for irq in (0..16).filter(|irq| *irq != 2) {
             let entry = mp_table[80..]
                 .chunks_exact(8)
                 .find(|entry| entry[0] == 3 && entry[5] == irq)
                 .unwrap();
-            assert_eq!(
-                u16::from_le_bytes(entry[2..4].try_into().unwrap()),
-                MP_IRQ_FLAGS_LEVEL_HIGH
-            );
+            assert_eq!(u16::from_le_bytes(entry[2..4].try_into().unwrap()), 0);
         }
     }
 
@@ -1330,7 +1304,6 @@ mod tests {
         for processor_count in [1usize, 2, 4, 8] {
             let apic_ids = (0..processor_count as u32).collect::<Vec<_>>();
             let boot_config = BootConfig {
-                layout: PvhBootLayout::Smp,
                 apic_ids: &apic_ids,
                 level_triggered_irqs: LEVEL_TRIGGERED_IRQS,
                 reserved_memory_ranges: &[],
@@ -1344,7 +1317,7 @@ mod tests {
                     .unwrap(),
             ) as usize;
             assert_eq!(table_length, 180 + 20 * processor_count);
-            assert!(MP_CONFIG_TABLE_ADDR + table_length <= SMP_BOOT_GDT_ADDR as usize);
+            assert!(MP_CONFIG_TABLE_ADDR + table_length <= BOOT_GDT_ADDR as usize);
 
             let table = &boot_page[MP_CONFIG_TABLE_ADDR..MP_CONFIG_TABLE_ADDR + table_length];
             assert_eq!(
@@ -1372,13 +1345,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_smp_mp_topology_and_legacy_overlap() {
+    fn rejects_invalid_mp_topology_and_gdt_overlap() {
         let mut boot_page = [0; HV_PAGE_SIZE as usize];
         assert!(matches!(
             write_mp_tables(
                 &mut boot_page,
                 &BootConfig {
-                    layout: PvhBootLayout::Smp,
                     apic_ids: &[],
                     level_triggered_irqs: &[],
                     reserved_memory_ranges: &[],
@@ -1390,7 +1362,6 @@ mod tests {
             write_mp_tables(
                 &mut boot_page,
                 &BootConfig {
-                    layout: PvhBootLayout::Smp,
                     apic_ids: &[0, 2],
                     level_triggered_irqs: &[],
                     reserved_memory_ranges: &[],
@@ -1402,8 +1373,7 @@ mod tests {
             write_mp_tables(
                 &mut boot_page,
                 &BootConfig {
-                    layout: PvhBootLayout::Legacy,
-                    apic_ids: &[0, 1, 2, 3],
+                    apic_ids: &(0..100).collect::<Vec<_>>(),
                     level_triggered_irqs: &[],
                     reserved_memory_ranges: &[],
                 }

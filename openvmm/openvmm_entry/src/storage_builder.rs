@@ -282,7 +282,7 @@ impl StorageBuilder {
             })
     }
 
-    /// Adds a fixed-role microVM ABI-v2 sandbox block device.
+    /// Adds a fixed-role microVM sandbox block device.
     pub async fn add_microvm_sandbox_block(
         &mut self,
         role: MicrovmSandboxBlockRole,
@@ -1081,24 +1081,14 @@ impl StorageBuilder {
         }
 
         let mut vtl0_virtio_blk_disks = std::mem::take(&mut self.vtl0_virtio_blk_disks);
-        if let MachineProfile::Microvm { abi_version } = config.machine_profile {
-            if abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_1 {
-                anyhow::ensure!(
-                    vtl0_virtio_blk_disks.len() <= 1
-                        && vtl0_virtio_blk_disks
-                            .iter()
-                            .all(|disk| disk.microvm_sandbox_role.is_none()),
-                    "microVM ABI version 1 permits at most one unroled virtio-blk device"
-                );
-            } else {
-                anyhow::ensure!(
-                    vtl0_virtio_blk_disks
-                        .iter()
-                        .all(|disk| disk.microvm_sandbox_role.is_some()),
-                    "microVM ABI version {abi_version} requires roles for every virtio-blk device"
-                );
-                vtl0_virtio_blk_disks.sort_by_key(|disk| disk.microvm_sandbox_role);
-            }
+        if config.machine_profile == MachineProfile::Microvm {
+            anyhow::ensure!(
+                vtl0_virtio_blk_disks
+                    .iter()
+                    .all(|disk| disk.microvm_sandbox_role.is_some()),
+                "microVM requires roles for every virtio-blk device"
+            );
+            vtl0_virtio_blk_disks.sort_by_key(|disk| disk.microvm_sandbox_role);
             for mut vblk in vtl0_virtio_blk_disks {
                 if let Some(role) = vblk.microvm_sandbox_role {
                     config

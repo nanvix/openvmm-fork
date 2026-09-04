@@ -388,39 +388,39 @@ impl VirtioMmioDevice {
             shared_status,
         }));
         #[cfg(target_os = "linux")]
-        let (interrupt_ack_event, interrupt_ack_task, interrupt_ack_doorbell) =
-            if interrupt_mode == VirtioMmioInterruptMode::Legacy
-                && supports_accelerated_doorbells
-                && let Some(registration) = &doorbell_registration
-            {
-                let event = Event::new();
-                match registration.register_doorbell(
-                    mmio_gpa + VirtioMmioRegister::INTERRUPT_ACK.0 as u64,
-                    Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
-                    Some(4),
-                    &event,
-                ) {
-                    Ok(doorbell) => match driver.new_dyn_fd_ready(event.as_fd().as_raw_fd()) {
-                        Ok(ready) => {
-                            let interrupt_ack_event = event.clone();
-                            let task = driver.spawn(
-                                "virtio-mmio-interrupt-ack",
-                                InterruptAckWait {
-                                    ready,
-                                    event,
-                                    interrupt_state: interrupt_state.clone(),
-                                }
-                                .run(),
-                            );
-                            (Some(interrupt_ack_event), Some(task), Some(doorbell))
-                        }
-                        Err(_) => (None, None, None),
-                    },
+        let (interrupt_ack_event, interrupt_ack_task, interrupt_ack_doorbell) = if interrupt_mode
+            == VirtioMmioInterruptMode::Legacy
+            && supports_accelerated_doorbells
+            && let Some(registration) = &doorbell_registration
+        {
+            let event = Event::new();
+            match registration.register_doorbell(
+                mmio_gpa + VirtioMmioRegister::INTERRUPT_ACK.0 as u64,
+                Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+                Some(4),
+                &event,
+            ) {
+                Ok(doorbell) => match driver.new_dyn_fd_ready(event.as_fd().as_raw_fd()) {
+                    Ok(ready) => {
+                        let interrupt_ack_event = event.clone();
+                        let task = driver.spawn(
+                            "virtio-mmio-interrupt-ack",
+                            InterruptAckWait {
+                                ready,
+                                event,
+                                interrupt_state: interrupt_state.clone(),
+                            }
+                            .run(),
+                        );
+                        (Some(interrupt_ack_event), Some(task), Some(doorbell))
+                    }
                     Err(_) => (None, None, None),
-                }
-            } else {
-                (None, None, None)
-            };
+                },
+                Err(_) => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
 
         let core = VirtioTransportCore::new_with_disabled_features(
             device,
@@ -781,9 +781,11 @@ mod saved_state {
             {
                 let mut is = self.mmio.interrupt_state.lock();
                 if let Some(shared_status) = &is.shared_status {
-                    shared_status.store(state.interrupt_status).map_err(|error| {
-                        vmcore::save_restore::RestoreError::InvalidSavedState(error.into())
-                    })?;
+                    shared_status
+                        .store(state.interrupt_status)
+                        .map_err(|error| {
+                            vmcore::save_restore::RestoreError::InvalidSavedState(error.into())
+                        })?;
                     is.interrupt.set_level(false);
                 } else {
                     is.status = state.interrupt_status;

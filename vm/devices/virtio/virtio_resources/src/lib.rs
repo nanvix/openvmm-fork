@@ -55,12 +55,12 @@ pub mod fs {
     #[derive(MeshPayload)]
     pub enum VirtioFsProfile {
         Standard,
-        MicrovmV1 {
+        Microvm {
             stable_id: String,
             root_identity: Vec<u8>,
             read_only: bool,
         },
-        MicrovmV1Dormant {
+        MicrovmDormant {
             stable_id: String,
         },
     }

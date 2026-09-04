@@ -81,7 +81,7 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
                     VirtioFsDevice::new(input.driver_source, &resource.tag, fs, 0, None)
                 }
             },
-            VirtioFsProfile::MicrovmV1Dormant { stable_id } => {
+            VirtioFsProfile::MicrovmDormant { stable_id } => {
                 anyhow::ensure!(
                     resource.tag == crate::profile::MICROVM_MOUNT_TAG,
                     "microVM virtio-fs tag must be '{}'",
@@ -93,7 +93,7 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
                 );
                 VirtioFsDevice::new_microvm_dormant(input.driver_source, stable_id, None)?
             }
-            VirtioFsProfile::MicrovmV1 {
+            VirtioFsProfile::Microvm {
                 stable_id,
                 root_identity,
                 read_only,
@@ -158,7 +158,7 @@ mod tests {
             VirtioFsHandle {
                 tag: tag.to_owned(),
                 fs,
-                profile: VirtioFsProfile::MicrovmV1 {
+                profile: VirtioFsProfile::Microvm {
                     stable_id: MICROVM_ATTACHMENT_ID.to_owned(),
                     root_identity,
                     read_only: true,

@@ -455,7 +455,6 @@ impl<'a> BaseChipsetBuilder<'a> {
                     false,
                     match mode {
                         options::dev::GenericCmosRtcMode::Standard => cmos_rtc::RtcMode::Standard,
-                        options::dev::GenericCmosRtcMode::MicrovmV1 => cmos_rtc::RtcMode::MicrovmV1,
                     },
                 )
             })?;
@@ -1178,8 +1177,6 @@ pub mod options {
         pub enum GenericCmosRtcMode {
             /// Standard programmable MC146818-compatible behavior.
             Standard,
-            /// microVM ABI version 1 binary, 24-hour clock behavior.
-            MicrovmV1,
         }
 
         /// Generic MC146818A compatible RTC + CMOS device

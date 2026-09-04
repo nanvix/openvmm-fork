@@ -83,7 +83,7 @@ pub struct VmWorkerParameters {
     pub restore_cpu_contract: Option<Vec<u8>>,
     /// Single-use process-local sink for the restore readiness event.
     pub restore_ready_sink: Option<std::fs::File>,
-    /// Timeout for the ABI-v2 post-restore input gate, when required.
+    /// Timeout for the microVM post-restore input gate, when required.
     pub restore_gate_timeout: Option<std::time::Duration>,
     /// MSHV VP prefix instantiated for an explicit restore-time activation target.
     pub restore_vp_count: Option<u32>,

@@ -5341,11 +5341,7 @@ async fn mmio_shared_status_save_restore_and_reset(driver: DefaultDriver) {
         device(),
         &driver_source.simple(),
         mem,
-        LineInterrupt::new_with_target(
-            "shared-status-destination",
-            destination_target.clone(),
-            0,
-        ),
+        LineInterrupt::new_with_target("shared-status-destination", destination_target.clone(), 0),
         Some(doorbell_registration),
         0,
         0x1000,

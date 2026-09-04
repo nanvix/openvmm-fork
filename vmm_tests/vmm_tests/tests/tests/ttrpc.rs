@@ -57,7 +57,7 @@ petri::test!(test_ttrpc_interface, |resolver| {
 
 petri::multitest!(vec![
     petri::SimpleTest::new(
-        "test_ttrpc_microvm_snapshot_restore",
+        "test_ttrpc_microvm_snapshot_robustness",
         |resolver| {
             Some([
                 resolver.require(artifacts::OPENVMM_NATIVE).erase(),
@@ -69,7 +69,7 @@ petri::multitest!(vec![
                     .erase(),
             ])
         },
-        test_ttrpc_microvm_snapshot_restore,
+        test_ttrpc_microvm_snapshot_robustness,
     )
     .requirements(petri::requirements::TestCaseRequirements::new(
         petri::requirements::TestRequirement::RequiresCapability {
@@ -79,7 +79,7 @@ petri::multitest!(vec![
     ))
     .into(),
     petri::SimpleTest::new(
-        "test_ttrpc_microvm_v2_smp_snapshot_restore",
+        "test_ttrpc_microvm_smp_snapshot_restore",
         |resolver| {
             Some([
                 resolver.require(artifacts::OPENVMM_NATIVE).erase(),
@@ -91,7 +91,7 @@ petri::multitest!(vec![
                     .erase(),
             ])
         },
-        test_ttrpc_microvm_v2_smp_snapshot_restore,
+        test_ttrpc_microvm_smp_snapshot_restore,
     )
     .requirements(petri::requirements::TestCaseRequirements::new(
         petri::requirements::TestRequirement::RequiresCapability {
@@ -101,7 +101,7 @@ petri::multitest!(vec![
     ))
     .into(),
     petri::SimpleTest::new(
-        "test_ttrpc_microvm_v2_restore_processor_activation",
+        "test_ttrpc_microvm_restore_processor_activation",
         |resolver| {
             Some([
                 resolver.require(artifacts::OPENVMM_NATIVE).erase(),
@@ -113,7 +113,7 @@ petri::multitest!(vec![
                     .erase(),
             ])
         },
-        test_ttrpc_microvm_v2_restore_processor_activation,
+        test_ttrpc_microvm_restore_processor_activation,
     )
     .requirements(petri::requirements::TestCaseRequirements::new(
         petri::requirements::TestRequirement::RequiresCapability {
@@ -330,7 +330,7 @@ fn attachment_free_restore_request(snapshot_path: &Path) -> vmservice::CreateVmR
     }
 }
 
-fn microvm_v2_restore_request(
+fn microvm_smp_restore_request(
     snapshot_path: &Path,
     portb_path: &Path,
     restore_ready_path: &Path,
@@ -343,7 +343,7 @@ fn microvm_v2_restore_request(
                 ..Default::default()
             }),
             serial_config: Some(microvm_portb_config(portb_path)),
-            machine_profile: vmservice::vm_config::MachineProfile::MicrovmV2 as i32,
+            machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
             ..Default::default()
         }),
         log_id: String::new(),
@@ -435,7 +435,7 @@ rm -rf "$worker_dir"
 echo TTRPC-SMP-PROBE-OK
 "#;
 
-fn test_ttrpc_microvm_v2_smp_snapshot_restore(
+fn test_ttrpc_microvm_smp_snapshot_restore(
     params: petri::PetriTestParams<'_>,
     [openvmm, kernel, initrd]: [ResolvedArtifact; 3],
 ) -> anyhow::Result<()> {
@@ -444,11 +444,11 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
 
     const MEMORY_MB: u64 = 128;
     const BOOT_MARKER: &[u8] = b"ALPINE-MICROVM-BOOT-OK";
-    const RESTORE_MARKER: &[u8] = b"TTRPC-V2-RESTORED";
+    const RESTORE_MARKER: &[u8] = b"TTRPC-MICROVM-RESTORED";
 
     let tempdir = if cfg!(target_os = "linux") {
         tempfile::Builder::new()
-            .prefix("openvmm-ttrpc-v2-")
+            .prefix("openvmm-ttrpc-microvm-")
             .tempdir_in("/tmp")
     } else {
         tempfile::tempdir()
@@ -492,7 +492,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                             crash: vmservice::vm_config::GuestPowerAction::Restart as i32,
                             ..Default::default()
                         }),
-                        machine_profile: vmservice::vm_config::MachineProfile::MicrovmV2 as i32,
+                        machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
                         ..Default::default()
                     }),
                     log_id: String::new(),
@@ -504,14 +504,14 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 },
             )
             .await
-            .map_err(|status| anyhow::anyhow!("v2 CreateVM failed: {}", status.message))?;
+            .map_err(|status| anyhow::anyhow!("microVM CreateVM failed: {}", status.message))?;
         let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
         let (mut portb_read, mut portb_write) = portb.split();
         client
             .call()
             .start(vmservice::Vm::ResumeVm, ())
             .await
-            .map_err(|status| anyhow::anyhow!("v2 ResumeVM failed: {}", status.message))?;
+            .map_err(|status| anyhow::anyhow!("microVM ResumeVM failed: {}", status.message))?;
         let mut output = Vec::new();
         wait_for_bytes(&mut portb_read, &mut output, BOOT_MARKER).await?;
         portb_write.write_all(TTRPC_SMP_PROBE).await?;
@@ -543,8 +543,11 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
             .with_timeout(Duration::from_secs(15))
             .until_cancelled(drain_until_closed(&mut portb_read, &mut output))
             .await
-            .context("timed out draining v2 capture source")??;
-        anyhow::ensure!(child.wait().await?.success(), "v2 capture server failed");
+            .context("timed out draining microVM capture source")??;
+        anyhow::ensure!(
+            child.wait().await?.success(),
+            "microVM capture server failed"
+        );
 
         let before = ["manifest.bin", "state.bin", "memory.bin"]
             .map(|name| fingerprint(&snapshot_path.join(name)))
@@ -578,7 +581,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                     crash: vmservice::vm_config::GuestPowerAction::Restart as i32,
                     ..Default::default()
                 }),
-                machine_profile: vmservice::vm_config::MachineProfile::MicrovmV2 as i32,
+                machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
                 ..Default::default()
             }),
             log_id: String::new(),
@@ -608,10 +611,14 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
         )
         .await?;
 
-        let mut old_abi_smp = create_request.clone();
-        old_abi_smp.config.as_mut().unwrap().machine_profile =
-            vmservice::vm_config::MachineProfile::Microvm as i32;
-        expect_create_vm_error(&negative_client, old_abi_smp, "does not support 2 vCPUs").await?;
+        let mut retired_profile = create_request.clone();
+        retired_profile.config.as_mut().unwrap().machine_profile = 1;
+        expect_create_vm_error(
+            &negative_client,
+            retired_profile,
+            "unknown machine profile 1",
+        )
+        .await?;
 
         let cancel_portb_path = tempdir.path().join("cancel-portb.sock");
         let cancel_ready =
@@ -620,7 +627,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
             .call()
             .start(
                 vmservice::Vm::CreateVm,
-                microvm_v2_restore_request(
+                microvm_smp_restore_request(
                     &snapshot_path,
                     &cancel_portb_path,
                     cancel_ready.path(),
@@ -638,13 +645,13 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
             .map_err(|status| anyhow::anyhow!("cancel TeardownVM failed: {}", status.message))?;
         anyhow::ensure!(
             cancel_ready.read_all(&driver).await?.is_empty(),
-            "cancelled v2 restore published a readiness event"
+            "cancelled microVM restore published a readiness event"
         );
         let mut cancel_output = Vec::new();
         drain_until_closed(&mut cancel_read, &mut cancel_output).await?;
         anyhow::ensure!(
             cancel_output.is_empty(),
-            "cancelled v2 restore entered the guest"
+            "cancelled microVM restore entered the guest"
         );
         let _ = negative_client.call().start(vmservice::Vm::Quit, ()).await;
         anyhow::ensure!(
@@ -670,7 +677,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 )?;
                 expect_create_vm_error(
                     &client,
-                    microvm_v2_restore_request(&snapshot_path, &portb_path, wrong_ready.path(), 1),
+                    microvm_smp_restore_request(&snapshot_path, &portb_path, wrong_ready.path(), 1),
                     "processor count does not match",
                 )
                 .await?;
@@ -678,14 +685,14 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
 
                 let failed_ready = RestoreReadyListener::bind(
                     &driver,
-                    tempdir.path().join("v2-failed-ready.sock"),
+                    tempdir.path().join("microvm-failed-ready.sock"),
                 )?;
-                let failed_portb_path = tempdir.path().join("v2-failed-portb.sock");
+                let failed_portb_path = tempdir.path().join("microvm-failed-portb.sock");
                 client
                     .call()
                     .start(
                         vmservice::Vm::CreateVm,
-                        microvm_v2_restore_request(
+                        microvm_smp_restore_request(
                             &snapshot_path,
                             &failed_portb_path,
                             failed_ready.path(),
@@ -694,7 +701,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                     )
                     .await
                     .map_err(|status| {
-                        anyhow::anyhow!("v2 failed-ready CreateVM failed: {}", status.message)
+                        anyhow::anyhow!("microVM failed-ready CreateVM failed: {}", status.message)
                     })?;
                 let failed_portb =
                     PolledSocket::new(&driver, UnixStream::connect(&failed_portb_path)?)?;
@@ -704,19 +711,19 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                     .call()
                     .start(vmservice::Vm::ResumeVm, ())
                     .await
-                    .expect_err("v2 restore resumed after readiness transport failure");
+                    .expect_err("microVM restore resumed after readiness transport failure");
                 anyhow::ensure!(
                     error
                         .message
                         .contains("failed to publish restore readiness event"),
-                    "unexpected v2 readiness error: {}",
+                    "unexpected microVM readiness error: {}",
                     error.message
                 );
                 let mut failed_output = Vec::new();
                 drain_until_closed(&mut failed_read, &mut failed_output).await?;
                 anyhow::ensure!(
                     failed_output.is_empty(),
-                    "v2 restore emitted guest output before readiness"
+                    "microVM restore emitted guest output before readiness"
                 );
                 let properties = client
                     .call()
@@ -726,11 +733,11 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                     )
                     .await
                     .map_err(|status| {
-                        anyhow::anyhow!("v2 PropertiesVM failed: {}", status.message)
+                        anyhow::anyhow!("microVM PropertiesVM failed: {}", status.message)
                     })?;
                 anyhow::ensure!(
                     properties.state == vmservice::VmState::Uninitialized as i32,
-                    "v2 readiness failure did not clean up the VM"
+                    "microVM readiness failure did not clean up the VM"
                 );
             }
 
@@ -744,7 +751,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 .call()
                 .start(
                     vmservice::Vm::CreateVm,
-                    microvm_v2_restore_request(
+                    microvm_smp_restore_request(
                         &snapshot_path,
                         &portb_path,
                         restore_ready.path(),
@@ -753,7 +760,7 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 )
                 .await
                 .map_err(|status| {
-                    anyhow::anyhow!("v2 restore CreateVM failed: {}", status.message)
+                    anyhow::anyhow!("microVM restore CreateVM failed: {}", status.message)
                 })?;
             let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
             let (mut portb_read, mut portb_write) = portb.split();
@@ -762,11 +769,11 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 restore_ready.read_all(&driver)
             );
             resume.map_err(|status| {
-                anyhow::anyhow!("v2 restore ResumeVM failed: {}", status.message)
+                anyhow::anyhow!("microVM restore ResumeVM failed: {}", status.message)
             })?;
             anyhow::ensure!(
                 readiness? == openvmm_defs::worker::RESTORE_READY_EVENT_V1,
-                "v2 restore did not publish its readiness event"
+                "microVM restore did not publish its readiness event"
             );
             portb_write.write_all(TTRPC_SMP_PROBE).await?;
             let mut output = Vec::new();
@@ -780,23 +787,29 @@ fn test_ttrpc_microvm_v2_smp_snapshot_restore(
                 })?;
             output.clear();
             portb_write
-                .write_all(b"echo TTRPC-V2-RESTORED; nvx-exit 37\n")
+                .write_all(b"echo TTRPC-MICROVM-RESTORED; nvx-exit 37\n")
                 .await?;
             portb_write.flush().await?;
             wait_for_bytes(&mut portb_read, &mut output, RESTORE_MARKER).await?;
             drain_until_closed(&mut portb_read, &mut output).await?;
-            anyhow::ensure!(child.wait().await?.success(), "v2 restore server failed");
+            anyhow::ensure!(
+                child.wait().await?.success(),
+                "microVM restore server failed"
+            );
             let after = ["manifest.bin", "state.bin", "memory.bin"]
                 .map(|name| fingerprint(&snapshot_path.join(name)))
                 .into_iter()
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            anyhow::ensure!(before == after, "v2 restore modified snapshot artifacts");
+            anyhow::ensure!(
+                before == after,
+                "microVM restore modified snapshot artifacts"
+            );
         }
         Ok(())
     })
 }
 
-fn test_ttrpc_microvm_v2_restore_processor_activation(
+fn test_ttrpc_microvm_restore_processor_activation(
     params: petri::PetriTestParams<'_>,
     [openvmm, kernel, initrd]: [ResolvedArtifact; 3],
 ) -> anyhow::Result<()> {
@@ -849,7 +862,7 @@ fn test_ttrpc_microvm_v2_restore_processor_activation(
                                 kernel_cmdline: "maxcpus=1".to_owned(),
                             },
                         )),
-                        machine_profile: vmservice::vm_config::MachineProfile::MicrovmV2 as i32,
+                        machine_profile: vmservice::vm_config::MachineProfile::Microvm as i32,
                         ..Default::default()
                     }),
                     log_id: String::new(),
@@ -917,7 +930,7 @@ echo TTRPC-VCPU-CAPTURE-CROSSED
 
         let request = |portb_path: &Path, ready_path: &Path, target: u32| {
             let mut request =
-                microvm_v2_restore_request(&snapshot_path, portb_path, ready_path, CAPACITY);
+                microvm_smp_restore_request(&snapshot_path, portb_path, ready_path, CAPACITY);
             request
                 .microvm_snapshot
                 .as_mut()
@@ -1034,7 +1047,7 @@ nvx-exit 0
     })
 }
 
-fn test_ttrpc_microvm_snapshot_restore(
+fn test_ttrpc_microvm_snapshot_robustness(
     params: petri::PetriTestParams<'_>,
     [openvmm, kernel, initrd]: [ResolvedArtifact; 3],
 ) -> anyhow::Result<()> {
@@ -1266,6 +1279,36 @@ fn test_ttrpc_microvm_snapshot_restore(
                 let manifest_path = snapshot_path.join("manifest.bin");
                 let manifest_bytes = std::fs::read(&manifest_path)?;
                 let manifest = openvmm_helpers::snapshot::read_snapshot_manifest(&snapshot_path)?;
+
+                let mut retired_abi = manifest.clone();
+                retired_abi
+                    .machine_contract
+                    .as_mut()
+                    .context("snapshot is missing its machine contract")?
+                    .microvm_abi_version = 1;
+                std::fs::write(&manifest_path, mesh::payload::encode(retired_abi))?;
+                expect_create_vm_error(
+                    &client,
+                    attachment_free_restore_request(&snapshot_path),
+                    "ABI version 1 is unsupported",
+                )
+                .await?;
+                std::fs::write(&manifest_path, &manifest_bytes)?;
+
+                let mut retired_layout = manifest.clone();
+                retired_layout
+                    .machine_contract
+                    .as_mut()
+                    .context("snapshot is missing its machine contract")?
+                    .pvh_layout_version = 1;
+                std::fs::write(&manifest_path, mesh::payload::encode(retired_layout))?;
+                expect_create_vm_error(
+                    &client,
+                    attachment_free_restore_request(&snapshot_path),
+                    "PVH layout version 1 is unsupported",
+                )
+                .await?;
+                std::fs::write(&manifest_path, &manifest_bytes)?;
 
                 let mut wrong_backend = manifest.clone();
                 wrong_backend
