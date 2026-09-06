@@ -1066,7 +1066,9 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Returns the kernel and initrd paths for a direct-boot Linux VM.
     pub fn linux_direct_boot_files(&self) -> Option<(&Path, &Path)> {
         match &self.config.firmware {
-            Firmware::LinuxDirect { kernel, initrd } => Some((kernel.get(), initrd.get())),
+            Firmware::LinuxDirect { kernel, initrd } => {
+                Some((kernel.get(), initrd.as_ref()?.get()))
+            }
             _ => None,
         }
     }
@@ -2664,8 +2666,8 @@ pub enum Firmware {
     LinuxDirect {
         /// The kernel to boot.
         kernel: ResolvedArtifact,
-        /// The initrd to use.
-        initrd: ResolvedArtifact,
+        /// The optional initrd to use.
+        initrd: Option<ResolvedArtifact>,
     },
     /// Boot Linux directly, without any firmware, with OpenHCL in VTL2.
     OpenhclLinuxDirect {
@@ -2795,12 +2797,12 @@ impl BootDeviceType {
 }
 
 impl Firmware {
-    /// Constructs a microVM Xen PVH kernel/initramfs pair.
-    pub fn microvm_pvh(resolver: &ArtifactResolver<'_>) -> Self {
+    /// Constructs the source-built, kernel-only Xen PVH test guest.
+    pub fn microvm_test_pvh(resolver: &ArtifactResolver<'_>) -> Self {
         use petri_artifacts_vmm_test::artifacts::loadable::*;
         Firmware::LinuxDirect {
-            kernel: resolver.require(MICROVM_PVH_TEST_KERNEL_X64).erase(),
-            initrd: resolver.require(MICROVM_PVH_TEST_INITRD_X64).erase(),
+            kernel: resolver.require(GUEST_TEST_PVH_X64).erase(),
+            initrd: None,
         }
     }
 
@@ -2810,11 +2812,11 @@ impl Firmware {
         match arch {
             MachineArch::X86_64 => Firmware::LinuxDirect {
                 kernel: resolver.require(LINUX_DIRECT_TEST_KERNEL_X64).erase(),
-                initrd: resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase(),
+                initrd: Some(resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase()),
             },
             MachineArch::Aarch64 => Firmware::LinuxDirect {
                 kernel: resolver.require(LINUX_DIRECT_TEST_KERNEL_AARCH64).erase(),
-                initrd: resolver.require(LINUX_DIRECT_TEST_INITRD_AARCH64).erase(),
+                initrd: Some(resolver.require(LINUX_DIRECT_TEST_INITRD_AARCH64).erase()),
             },
         }
     }
@@ -2827,7 +2829,7 @@ impl Firmware {
         use petri_artifacts_vmm_test::artifacts::loadable::*;
         Firmware::LinuxDirect {
             kernel: resolver.require(LINUX_DIRECT_TEST_BZIMAGE_X64).erase(),
-            initrd: resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase(),
+            initrd: Some(resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase()),
         }
     }
 
@@ -2940,7 +2942,7 @@ impl Firmware {
     /// Get the initrd path for Linux direct boot firmware.
     pub fn linux_direct_initrd(&self) -> Option<&Path> {
         match self {
-            Firmware::LinuxDirect { initrd, .. } => Some(initrd.get()),
+            Firmware::LinuxDirect { initrd, .. } => initrd.as_ref().map(|initrd| initrd.get()),
             _ => None,
         }
     }
