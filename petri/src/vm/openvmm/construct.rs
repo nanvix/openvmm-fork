@@ -1000,9 +1000,14 @@ impl PetriVmConfigSetupCore<'_> {
                 let kernel = File::open(kernel.clone())
                     .context("Failed to open kernel")?
                     .into();
-                let initrd = File::open(initrd.clone())
-                    .context("Failed to open initrd")?
-                    .into();
+                let initrd = initrd
+                    .as_ref()
+                    .map(|initrd| {
+                        File::open(initrd.clone())
+                            .context("Failed to open initrd")
+                            .map(Into::into)
+                    })
+                    .transpose()?;
 
                 let init = if self.uses_pipette_as_init {
                     "/pipette"
@@ -1020,7 +1025,7 @@ impl PetriVmConfigSetupCore<'_> {
 
                 LoadMode::Linux {
                     kernel,
-                    initrd: Some(initrd),
+                    initrd,
                     cmdline,
                     enable_serial: self.enable_serial,
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,

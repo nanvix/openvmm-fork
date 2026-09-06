@@ -64,7 +64,7 @@ enum HostVendor {
 enum Firmware {
     LinuxDirect,
     LinuxDirectBzImage,
-    MicrovmPvh,
+    MicrovmTestPvh,
     Pcat(PcatGuest),
     Uefi(UefiGuest),
     OpenhclLinuxDirect,
@@ -145,7 +145,7 @@ impl ResolvedConfig {
         let firmware_prefix = match &self.firmware {
             Firmware::LinuxDirect => "linux",
             Firmware::LinuxDirectBzImage => "linux_bzimage",
-            Firmware::MicrovmPvh => "microvm_pvh",
+            Firmware::MicrovmTestPvh => "microvm_test_pvh",
             Firmware::Pcat(_) => "pcat",
             Firmware::Uefi(_) => "uefi",
             Firmware::OpenhclLinuxDirect => "openhcl_linux",
@@ -156,7 +156,7 @@ impl ResolvedConfig {
         let guest_prefix = match &self.firmware {
             Firmware::LinuxDirect
             | Firmware::LinuxDirectBzImage
-            | Firmware::MicrovmPvh
+            | Firmware::MicrovmTestPvh
             | Firmware::OpenhclLinuxDirect => None,
             Firmware::Pcat(guest) | Firmware::OpenhclPcat(guest) => Some(guest.name_prefix()),
             Firmware::Uefi(guest) | Firmware::OpenhclUefi(_, guest) => guest.name_prefix(),
@@ -165,7 +165,7 @@ impl ResolvedConfig {
         let options_prefix = match &self.firmware {
             Firmware::LinuxDirect
             | Firmware::LinuxDirectBzImage
-            | Firmware::MicrovmPvh
+            | Firmware::MicrovmTestPvh
             | Firmware::Pcat(_)
             | Firmware::Uefi(_)
             | Firmware::OpenhclLinuxDirect
@@ -252,7 +252,7 @@ impl ToTokens for FirmwareAndArch {
             Firmware::LinuxDirectBzImage => {
                 quote!(::petri::Firmware::linux_direct_bzimage(resolver))
             }
-            Firmware::MicrovmPvh => quote!(::petri::Firmware::microvm_pvh(resolver)),
+            Firmware::MicrovmTestPvh => quote!(::petri::Firmware::microvm_test_pvh(resolver)),
             Firmware::Pcat(guest) => {
                 quote!(::petri::Firmware::pcat(resolver, #guest))
             }
@@ -595,7 +595,7 @@ impl Parse for Config {
         let (arch, firmware) = match remainder {
             "linux_direct_x64" => (MachineArch::X86_64, Firmware::LinuxDirect),
             "linux_direct_bzimage_x64" => (MachineArch::X86_64, Firmware::LinuxDirectBzImage),
-            "microvm_pvh_x64" => (MachineArch::X86_64, Firmware::MicrovmPvh),
+            "microvm_test_pvh_x64" => (MachineArch::X86_64, Firmware::MicrovmTestPvh),
             "linux_direct_aarch64" => (MachineArch::Aarch64, Firmware::LinuxDirect),
             "openhcl_linux_direct_x64" => (MachineArch::X86_64, Firmware::OpenhclLinuxDirect),
             "pcat_x64" => (

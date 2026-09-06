@@ -9,6 +9,7 @@
 pub mod _jobs;
 pub mod artifact_openvmm_hcl_sizecheck;
 pub mod build_and_test_vmgs_lib;
+pub mod build_guest_test_pvh;
 pub mod build_guest_test_uefi;
 pub mod build_guide;
 pub mod build_hypestv;

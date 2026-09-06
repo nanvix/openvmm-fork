@@ -37,6 +37,9 @@ flowey_request! {
         /// Register a guest_test_uefi image
         pub register_guest_test_uefi:
             Option<ReadVar<crate::build_guest_test_uefi::GuestTestUefiOutput>>,
+        /// Register a source-built Xen PVH test guest.
+        pub register_guest_test_pvh:
+            Option<ReadVar<crate::build_guest_test_pvh::GuestTestPvhOutput>>,
         /// Register OpenHCL IGVM files
         pub register_openhcl_igvm_files: Vec<ReadVar<OpenhclIgvmOutput>>,
         /// Register TMK VMM binaries.
@@ -94,6 +97,7 @@ impl SimpleFlowNode for Node {
             register_pipette_windows,
             register_pipette_linux_musl,
             register_guest_test_uefi,
+            register_guest_test_pvh,
             register_tmks,
             register_tmk_vmm,
             register_tmk_vmm_linux_musl,
@@ -157,6 +161,7 @@ impl SimpleFlowNode for Node {
             let pipette_win = register_pipette_windows.claim(ctx);
             let pipette_linux = register_pipette_linux_musl.claim(ctx);
             let guest_test_uefi = register_guest_test_uefi.claim(ctx);
+            let guest_test_pvh = register_guest_test_pvh.claim(ctx);
             let tmks = register_tmks.claim(ctx);
             let tmk_vmm = register_tmk_vmm.claim(ctx);
             let tmk_vmm_linux_musl = register_tmk_vmm_linux_musl.claim(ctx);
@@ -354,6 +359,11 @@ impl SimpleFlowNode for Node {
                         img,
                     } = rt.read(guest_test_uefi);
                     fs_err::copy(img, test_content_dir.join("guest_test_uefi.img"))?;
+                }
+
+                if let Some(guest_test_pvh) = guest_test_pvh {
+                    let guest_test_pvh = rt.read(guest_test_pvh);
+                    fs_err::copy(guest_test_pvh.bin, test_content_dir.join("guest_test_pvh"))?;
                 }
 
                 if let Some(tmks) = tmks {

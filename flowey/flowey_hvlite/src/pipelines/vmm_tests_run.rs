@@ -796,6 +796,10 @@ impl ResolvedArtifactSelections {
                 self.build.tmks = true;
             }
 
+            petri_artifacts_vmm_test::artifacts::loadable::GUEST_TEST_PVH_X64::GLOBAL_UNIQUE_ID => {
+                self.build.guest_test_pvh = true;
+            }
+
             // TMK VMM
             petri_artifacts_vmm_test::artifacts::tmks::TMK_VMM_WIN_X64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::tmks::TMK_VMM_WIN_AARCH64::GLOBAL_UNIQUE_ID => {
@@ -847,8 +851,6 @@ impl ResolvedArtifactSelections {
             | petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_BZIMAGE_X64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_KERNEL_AARCH64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_INITRD_AARCH64::GLOBAL_UNIQUE_ID
-            | petri_artifacts_vmm_test::artifacts::loadable::MICROVM_PVH_TEST_KERNEL_X64::GLOBAL_UNIQUE_ID
-            | petri_artifacts_vmm_test::artifacts::loadable::MICROVM_PVH_TEST_INITRD_X64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::loadable::PCAT_FIRMWARE_X64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::loadable::SVGA_FIRMWARE_X64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::loadable::UEFI_FIRMWARE_X64::GLOBAL_UNIQUE_ID
