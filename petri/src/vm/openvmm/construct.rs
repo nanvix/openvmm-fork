@@ -781,6 +781,9 @@ impl PetriVmConfigOpenVmm {
             microvm_filesystem: None,
             microvm_filesystem_bootstrap: false,
             microvm_sandbox_blocks: Vec::new(),
+            microvm_memory_capacity: None,
+            microvm_snapshot_memory_ranges: Vec::new(),
+            microvm_restore_memory_ranges: Vec::new(),
         };
 
         openvmm_defs::config::validate_machine_config(&config, None)?;

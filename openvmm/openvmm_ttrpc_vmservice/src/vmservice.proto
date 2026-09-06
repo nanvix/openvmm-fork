@@ -594,6 +594,11 @@ message MicrovmSnapshotConfig {
     uint32 restore_processor_count = 6;
     // Maximum time allowed for gated guest repair. Zero selects 60 seconds.
     uint64 restore_gate_timeout_ms = 7;
+    // Immutable total RAM capacity reserved by a captured microVM snapshot.
+    // Zero disables restore-time memory expansion.
+    uint64 memory_capacity_bytes = 8;
+    // Per-launch total RAM target for restore. Zero selects the snapshot base.
+    uint64 restore_memory_bytes = 9;
 }
 
 message CreateVMRequest {

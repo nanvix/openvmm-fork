@@ -156,6 +156,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
   when attached, its negotiated FUSE policy, namespace and handle identifiers,
   aliases, and directory cookies. The host tree remains external live state.
 
+  `--memory-capacity <SIZE>` opts the snapshot into restore-time memory
+  expansion. `SIZE` is an immutable 128-MiB-aligned upper bound, must be at
+  least the base `--memory` size, and reserves the complete canonical GPA
+  aperture without adding it to the initial PVH usable-RAM map or
+  `memory.bin`.
+
   ```bash
   openvmm --machine microvm --hypervisor kvm --memory 128M \
     --kernel vmlinux --initrd initramfs.cpio.gz \
@@ -170,8 +176,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--restore-snapshot <DIR>`: Restore a microVM from a committed snapshot.
   The manifest supplies the authoritative RAM size, topology, ABI,
   fixed device inventory, effective kernel command line, source backend, CPU
-  contract, and TSC frequency. Kernel, initrd, command-line, memory, processor,
-  device, and topology overrides are not accepted. Repeat the
+  contract, and TSC frequency. Kernel, initrd, command-line, ordinary
+  `--memory`, processor, device, and topology overrides are not accepted;
+  expansion-capable snapshots use only `--restore-memory`. Repeat the
   snapshot's exact `--processors` count; a mismatch is rejected before any VP
   starts. Restore requires the same backend kind as capture.
 
@@ -200,6 +207,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
   rejected. A fresh-scratch snapshot instead requires a writable scratch
   argument with matching geometry.
 
+  `--restore-memory <SIZE>` selects the total RAM for this launch. It requires
+  an expansion-capable snapshot and a 128-MiB-aligned value from the exact
+  captured base through the immutable capacity. Base RAM remains a private
+  copy-on-write mapping of `memory.bin`; selected expansion ranges use fresh
+  zeroed private backing. Expansion implies the post-restore repair gate.
+
   ```bash
   openvmm --machine microvm --hypervisor kvm \
     --restore-snapshot snapshot --restore-entropy
@@ -220,6 +233,14 @@ as well as the generated CLI help (via `cargo run -- --help`).
   the private portb restore channel. The guest must consume the packet and
   explicitly reseed its RNG. Restoring cloned RNG state without this option is
   unsafe for cryptographic workloads and emits a warning.
+  Processor activation uses `OPENVMM_ENTROPY_V2`. Memory expansion uses the
+  backward-compatible `OPENVMM_ENTROPY_V3` packet. Its exact format is the
+  19-byte `OPENVMM_ENTROPY_V3\0` header, a one-byte online-VP target (zero
+  means none), a one-byte expansion-range count, that many little-endian
+  `(u64 GPA start, u64 byte length)` pairs, and 64 bytes of fresh entropy.
+  Explicitly selecting the snapshot base size with `--restore-memory` still
+  emits V3 with an expansion-range count of zero; omitting the option preserves
+  V1/V2 behavior.
 * `--restore-processors <COUNT>`: For an opt-in microVM snapshot, bring the
   contiguous VP prefix `0..COUNT-1` online before restore readiness. The
   snapshot's manifest VP count remains immutable capacity and must still match

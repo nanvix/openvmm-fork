@@ -70,10 +70,18 @@ pub struct Config {
     pub microvm_sandbox_blocks: Vec<MicrovmSandboxBlockConfig>,
     /// Whether the effective command line bootstraps the active microVM filesystem.
     pub microvm_filesystem_bootstrap: bool,
+    /// Immutable RAM capacity reserved by the microVM layout.
+    pub microvm_memory_capacity: Option<u64>,
+    /// Snapshot-backed GPA ranges restored from the base `memory.bin`.
+    pub microvm_snapshot_memory_ranges: Vec<MemoryRange>,
+    /// Fresh private GPA ranges selected for this restore launch.
+    pub microvm_restore_memory_ranges: Vec<MemoryRange>,
 }
 
 /// The persisted microVM ABI version.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
+/// Linux memory-block granularity used for microVM restore-time expansion.
+pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Returns whether a processor count is valid for the microVM.
 pub const fn microvm_processor_count_supported(processor_count: u32) -> bool {
@@ -872,6 +880,12 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             config.microvm_sandbox_blocks.is_empty(),
             "microVM sandbox block roles require the microVM profile"
         );
+        anyhow::ensure!(
+            config.microvm_memory_capacity.is_none()
+                && config.microvm_snapshot_memory_ranges.is_empty()
+                && config.microvm_restore_memory_ranges.is_empty(),
+            "microVM memory expansion configuration requires the microVM profile"
+        );
         return Ok(());
     };
 
@@ -910,6 +924,24 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         config.numa.nodes.len() == 1 && config.numa.distances.is_empty(),
         "microVM requires a single NUMA node"
     );
+    let Some(memory) = config.numa.nodes[0].mem.as_ref() else {
+        anyhow::bail!("microVM requires RAM");
+    };
+    let memory_size = memory.mem_size;
+    if let Some(memory_capacity) = config.microvm_memory_capacity {
+        anyhow::ensure!(
+            memory_size <= memory_capacity
+                && memory_size.is_multiple_of(MICROVM_MEMORY_BLOCK_SIZE_BYTES)
+                && memory_capacity.is_multiple_of(MICROVM_MEMORY_BLOCK_SIZE_BYTES),
+            "microVM RAM size and capacity must be ordered and 128-MiB aligned"
+        );
+    } else {
+        anyhow::ensure!(
+            config.microvm_snapshot_memory_ranges.is_empty()
+                && config.microvm_restore_memory_ranges.is_empty(),
+            "microVM snapshot RAM ranges require a RAM capacity"
+        );
+    }
     anyhow::ensure!(
         !config.hypervisor.with_hv
             && config.hypervisor.with_vtl2.is_none()

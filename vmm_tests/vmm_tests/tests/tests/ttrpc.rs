@@ -140,6 +140,7 @@ fn microvm_restore_request(
     snapshot_path: &Path,
     portb_path: &Path,
     restore_ready_path: Option<&Path>,
+    restore_memory_bytes: u64,
 ) -> vmservice::CreateVmRequest {
     vmservice::CreateVmRequest {
         config: Some(vmservice::VmConfig {
@@ -152,6 +153,7 @@ fn microvm_restore_request(
             restore_path: snapshot_path.to_string_lossy().into_owned(),
             restore_entropy: true,
             restore_processor_count: 1,
+            restore_memory_bytes,
             restore_ready_path: restore_ready_path
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -171,7 +173,6 @@ fn test_ttrpc_microvm_pvh_snapshot(
     const READY_MARKER: &[u8] = b"OPENVMM-PVH-TEST-READY";
     const SNAPSHOT_REQUESTED_MARKER: &[u8] = b"SNAPSHOT-REQUESTED";
     const SNAPSHOT_CONTINUED_MARKER: &[u8] = b"SNAPSHOT-CONTINUED=1";
-    const RESTORE_TARGET_MARKER: &[u8] = b"RESTORE-TARGET=1";
     const STATE_MARKER: &[u8] = b"STATE=1";
     const COMMAND_SNAPSHOT: u8 = 3;
     const COMMAND_STATE: u8 = 5;
@@ -226,6 +227,7 @@ fn test_ttrpc_microvm_pvh_snapshot(
                     microvm_snapshot: Some(vmservice::MicrovmSnapshotConfig {
                         destination_path: snapshot_path.to_string_lossy().into_owned(),
                         quiesce_timeout_ms: 5_000,
+                        memory_capacity_bytes: 512 * 1024 * 1024,
                         ..Default::default()
                     }),
                 },
@@ -273,6 +275,16 @@ fn test_ttrpc_microvm_pvh_snapshot(
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         for restore_index in 0..2 {
+            let restore_memory_bytes = if restore_index == 0 {
+                MEMORY_MB * 1024 * 1024
+            } else {
+                256 * 1024 * 1024
+            };
+            let restore_target_marker = if restore_index == 0 {
+                b"RESTORE-TARGET=1 MEMORY-RANGES=0".as_slice()
+            } else {
+                b"RESTORE-TARGET=1 MEMORY-RANGES=1".as_slice()
+            };
             let rpc_path = tempdir
                 .path()
                 .join(format!("restore-{restore_index}-rpc.sock"));
@@ -296,6 +308,7 @@ fn test_ttrpc_microvm_pvh_snapshot(
                         &snapshot_path,
                         &portb_path,
                         Some(restore_ready.path()),
+                        restore_memory_bytes,
                     ),
                 )
                 .await
@@ -332,10 +345,10 @@ fn test_ttrpc_microvm_pvh_snapshot(
             .with_context(|| {
                 format!("PVH restore {restore_index} did not continue after snapshot")
             })?;
-            wait_for_bytes(&mut portb_read, &mut restore_output, RESTORE_TARGET_MARKER)
+            wait_for_bytes(&mut portb_read, &mut restore_output, restore_target_marker)
                 .await
                 .with_context(|| {
-                    format!("PVH restore {restore_index} did not report processor target")
+                    format!("PVH restore {restore_index} did not report restore targets")
                 })?;
             portb_write.write_all(&[COMMAND_STATE]).await?;
             portb_write.flush().await?;
