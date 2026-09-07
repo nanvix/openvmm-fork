@@ -234,6 +234,12 @@ pub struct ProtoPartitionConfig<'a> {
     /// backend recognizes it via [`Hypervisor::recognizes_nested_virt`]; a
     /// backend that receives an unrecognized request may silently ignore it.
     pub nested_virt: bool,
+    /// Whether supported backends should return mapped guest-memory faults to
+    /// the VMM for user-mode resolution.
+    pub user_mode_memory_faults: bool,
+    /// Whether supported backends should register large guest-memory ranges
+    /// incrementally as the guest accesses them.
+    pub lazy_memory_registration: bool,
     /// Build the reproducible CPU/clock contract used by a versioned machine profile.
     pub versioned_cpu_contract: bool,
 }

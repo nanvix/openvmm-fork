@@ -719,6 +719,21 @@ mod x86 {
                 | GpaBackingType::Unaccepted => false,
             };
 
+            if access.AccessInfo.GpaUnmapped() && matches!(backing_type, GpaBackingType::Ram { .. })
+            {
+                match self.current_vtlp().map_deferred_on_fault(access.Gpa) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracelimit::warn_ratelimited!(
+                            gpa = access.Gpa,
+                            error = ?err,
+                            "failed to register deferred gpa range"
+                        );
+                    }
+                }
+            }
+
             if !access.AccessInfo.GpaUnmapped() && should_populate {
                 // This is a mapped GPA that wasn't mapped in the SLAT. Tell the
                 // kernel to populate the SLAT.

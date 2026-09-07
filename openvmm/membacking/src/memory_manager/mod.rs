@@ -761,6 +761,11 @@ impl SharedMemoryBacking {
         self.guest_ram
     }
 
+    /// Returns whether writes to this backing are private to the current VM.
+    pub fn is_copy_on_write(&self) -> bool {
+        self.file_mapping_mode == FileMappingMode::CopyOnWrite
+    }
+
     /// Returns the mappable and mapping mode, consuming this backing.
     pub fn into_parts(self) -> (Mappable, FileMappingMode) {
         (self.guest_ram, self.file_mapping_mode)
