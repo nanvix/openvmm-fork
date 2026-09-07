@@ -4939,7 +4939,7 @@ async fn run_control_inner(
                 restore_memory_size,
             )?;
         }
-        if restore_memory_size > manifest.memory_size_bytes {
+        if !restore_memory_ranges.is_empty() {
             restore_gate_required = true;
         }
         anyhow::ensure!(

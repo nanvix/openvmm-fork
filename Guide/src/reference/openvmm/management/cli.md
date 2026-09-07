@@ -240,7 +240,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `(u64 GPA start, u64 byte length)` pairs, and 64 bytes of fresh entropy.
   Explicitly selecting the snapshot base size with `--restore-memory` still
   emits V3 with an expansion-range count of zero; omitting the option preserves
-  V1/V2 behavior.
+  V1/V2 behavior. Private portb status bit 3 reports a V3 memory target, while
+  bit 4 additionally reports that the packet contains one or more expansion
+  ranges, allowing a zero-range target to avoid post-restore repair.
 * `--restore-processors <COUNT>`: For an opt-in microVM snapshot, bring the
   contiguous VP prefix `0..COUNT-1` online before restore readiness. The
   snapshot's manifest VP count remains immutable capacity and must still match
