@@ -2938,19 +2938,21 @@ async fn vm_config_from_command_line(
         .context("failed to build chipset configuration")?;
 
     if let Some(io) = microvm_portb_cfg {
-        let restore_entropy = if opt.restore_entropy || restore_memory_target_requested {
-            fresh_microvm_restore_packet(
-                opt.restore_processors,
-                restore_memory_target_requested,
-                restore_memory_ranges,
-            )?
-        } else {
-            Vec::new()
-        };
+        let (generation_id, restore_entropy) =
+            if opt.restore_entropy || restore_memory_target_requested {
+                fresh_microvm_restore_packet(
+                    opt.restore_processors,
+                    restore_memory_target_requested,
+                    restore_memory_ranges,
+                )?
+            } else {
+                (fresh_microvm_generation_id()?, Vec::new())
+            };
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmPortbHandle::ID.to_owned(),
             resource: MicrovmPortbHandle {
                 io,
+                generation_id,
                 restore_entropy,
             }
             .into_resource(),
@@ -4512,29 +4514,47 @@ fn microvm_restore_packet(
     Ok(packet)
 }
 
+fn microvm_generation_id(entropy: &[u8; 64]) -> [u8; 16] {
+    let mut generation_id = [0; 16];
+    generation_id.copy_from_slice(&entropy[..16]);
+    generation_id
+}
+
+fn fresh_microvm_generation_id() -> anyhow::Result<[u8; 16]> {
+    let mut generation_id = [0; 16];
+    getrandom::fill(&mut generation_id).context("failed to generate microVM generation ID")?;
+    Ok(generation_id)
+}
+
 pub(crate) fn fresh_microvm_restore_packet(
     restore_online_vp_count: Option<u32>,
     restore_memory_target_requested: bool,
     restore_memory_ranges: &[openvmm_helpers::snapshot::SnapshotMemoryExpansionRange],
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<([u8; 16], Vec<u8>)> {
+    let generation_id_create = openvmm_defs::profile::ProfileSpan::start();
     let mut entropy = [0_u8; 64];
     getrandom::fill(&mut entropy).context("failed to generate restore entropy")?;
-    microvm_restore_packet(
+    let generation_id = microvm_generation_id(&entropy);
+    let packet = microvm_restore_packet(
         &entropy,
         restore_online_vp_count,
         restore_memory_target_requested,
         restore_memory_ranges,
-    )
+    )?;
+    generation_id_create.complete("restore", "generation_id_create", Default::default());
+    Ok((generation_id, packet))
 }
 
 #[cfg(test)]
 mod restore_packet_tests {
+    use super::microvm_generation_id;
     use super::microvm_restore_packet;
     use openvmm_helpers::snapshot::SnapshotMemoryExpansionRange;
 
     #[test]
     fn restore_packet_versions_preserve_entropy_and_online_target() {
         let entropy = [0x5a; 64];
+        assert_eq!(microvm_generation_id(&entropy), [0x5a; 16]);
         let v1 = microvm_restore_packet(&entropy, None, false, &[]).unwrap();
         assert_eq!(&v1[..19], b"OPENVMM_ENTROPY_V1\0");
         assert_eq!(&v1[19..], &entropy);

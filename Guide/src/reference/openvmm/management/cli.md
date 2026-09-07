@@ -243,6 +243,12 @@ as well as the generated CLI help (via `cargo run -- --help`).
   V1/V2 behavior. Private portb status bit 3 reports a V3 memory target, while
   bit 4 additionally reports that the packet contains one or more expansion
   ranges, allowing a zero-range target to avoid post-restore repair.
+  Every microVM portb device also reports generation-ID support in status bit
+  5. Writing `0xa6` to the status port and reading 16 bytes from the data port
+  returns an opaque ID that is stable for that VM process and may be selected
+  repeatedly. OpenVMM creates it before vCPU entry and does not serialize it.
+  On restore, it is the first 16 bytes of the fresh entropy packet, allowing
+  the guest repair path to update clone identity without additional port I/O.
 * `--restore-processors <COUNT>`: For an opt-in microVM snapshot, bring the
   contiguous VP prefix `0..COUNT-1` online before restore readiness. The
   snapshot's manifest VP count remains immutable capacity and must still match

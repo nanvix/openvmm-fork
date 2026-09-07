@@ -644,6 +644,7 @@ impl PetriVmConfigOpenVmm {
                     name: MicrovmPortbHandle::ID.to_owned(),
                     resource: MicrovmPortbHandle {
                         io,
+                        generation_id: [0x5a; 16],
                         restore_entropy: Vec::new(),
                     }
                     .into_resource(),

@@ -800,6 +800,7 @@ pub(crate) struct LoadedVm {
     restore_ready_sink: Option<File>,
     restore_gate_timeout: Option<Duration>,
     restore_gate_deadline: Option<Instant>,
+    restore_gate_profile: Option<openvmm_defs::profile::ProfileSpan>,
     restore_input_gated: bool,
     restored_from_snapshot: bool,
     snapshot_boundary_requests:
@@ -3241,6 +3242,7 @@ impl InitializedVm {
             restore_ready_sink: None,
             restore_gate_timeout: None,
             restore_gate_deadline: None,
+            restore_gate_profile: None,
             restore_input_gated: false,
             restored_from_snapshot,
             snapshot_boundary_requests: None,
@@ -3847,6 +3849,7 @@ impl LoadedVm {
         }
         if let Some(timeout) = self.restore_gate_timeout {
             self.restore_gate_deadline = Some(Instant::now().saturating_add(timeout));
+            self.restore_gate_profile = Some(openvmm_defs::profile::ProfileSpan::start());
         }
         self.restore_start_guard.take();
         self.running = true;
@@ -3973,6 +3976,7 @@ impl LoadedVm {
             .snapshot_stop_guard
             .take()
             .context("snapshot boundary is missing its vCPU stop guard")?;
+        let restore_gate_profile = self.restore_gate_profile.take();
         self.snapshot_capture_wall_clock = None;
         self.snapshot_input_gate_timeout = None;
         self.restore_gate_timeout = None;
@@ -3980,6 +3984,9 @@ impl LoadedVm {
         self.restore_input_gated = false;
         transaction_complete.complete(());
         drop(stop_guard);
+        if let Some(profile) = restore_gate_profile {
+            profile.complete_milestone("restore", "guest_repair_gate", Default::default());
+        }
         Ok(())
     }
 

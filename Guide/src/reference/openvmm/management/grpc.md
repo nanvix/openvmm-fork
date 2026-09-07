@@ -63,7 +63,9 @@ restore flow over both transports:
   fields are rejected. A saved listener is reconstructed from the manifest; a saved
   client requires the matching path configuration.
 * `restore_entropy` requests fresh entropy and is valid only with
-	`restore_path`.
+  `restore_path`. Every microVM process also receives a fresh, non-serialized
+  16-byte generation ID through the fixed portb selector. On restore, the ID is
+  the first 16 bytes of the entropy packet.
 * `restore_processor_count` requests restore-time activation of the contiguous
   VP prefix `0..count-1`. Zero preserves legacy behavior. A nonzero value is
   valid only for a snapshot that advertises processor activation, implies fresh entropy and the

@@ -118,6 +118,14 @@ identities. An instance-checkpoint restore attempt atomically creates
 artifact and configuration validation but before worker construction, so the
 restore attempt remains consumed if later worker startup fails.
 
+The no-ACPI microVM portb contract exposes a process-local 16-byte generation
+ID. Status bit 5 advertises the feature; writing `0xa6` to status port `0xea`
+and reading 16 bytes from data port `0xe9` returns the ID. It is repeatable
+within one process and is never restored from snapshot state. A restore derives
+the ID from the first 16 bytes of the fresh entropy packet, so the guest can
+reject an unchanged clone identity, reseed Linux, refresh runtime identifiers,
+and acknowledge the input gate without another PMIO transfer.
+
 A microVM template may opt into restore-time vCPU activation by booting with an
 explicit canonical `maxcpus=1`, `2`, `4`, or `8` value below or equal to its
 configured VP capacity. The snapshot records that boot-online count while its
