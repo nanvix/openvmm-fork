@@ -226,6 +226,9 @@ impl Manifest {
             layout: config.layout,
             rtc_delta_milliseconds: config.rtc_delta_milliseconds,
             microvm_sandbox_blocks: config.microvm_sandbox_blocks,
+            microvm_memory_capacity: config.microvm_memory_capacity,
+            microvm_snapshot_memory_ranges: config.microvm_snapshot_memory_ranges,
+            microvm_restore_memory_ranges: config.microvm_restore_memory_ranges,
         }
     }
 }
@@ -271,6 +274,9 @@ pub struct Manifest {
     rtc_delta_milliseconds: i64,
     machine_profile: MachineProfile,
     microvm_sandbox_blocks: Vec<openvmm_defs::config::MicrovmSandboxBlockConfig>,
+    microvm_memory_capacity: Option<u64>,
+    microvm_snapshot_memory_ranges: Vec<MemoryRange>,
+    microvm_restore_memory_ranges: Vec<MemoryRange>,
 }
 
 async fn open_simple_disk(
@@ -1015,6 +1021,25 @@ struct GenericInitiatorSource {
     vnode: u32,
 }
 
+fn coalesce_adjacent_ranges(ranges: &[MemoryRange]) -> anyhow::Result<Vec<MemoryRange>> {
+    let mut coalesced: Vec<MemoryRange> = Vec::with_capacity(ranges.len());
+    for &range in ranges {
+        anyhow::ensure!(!range.is_empty(), "snapshot RAM range is empty");
+        if let Some(previous) = coalesced.last_mut() {
+            anyhow::ensure!(
+                range.start() >= previous.end(),
+                "snapshot RAM ranges overlap or are out of order"
+            );
+            if range.start() == previous.end() {
+                *previous = MemoryRange::new(previous.start()..range.end());
+                continue;
+            }
+        }
+        coalesced.push(range);
+    }
+    Ok(coalesced)
+}
+
 impl InitializedVm {
     /// Creates and initializes a VM using the given backend.
     async fn new(
@@ -1222,6 +1247,7 @@ impl InitializedVm {
         };
         let resolved_layout = resolve_memory_layout(MemoryLayoutInput {
             node_mem_sizes: &node_mem_sizes,
+            memory_capacity: cfg.microvm_memory_capacity,
             layout: cfg.layout.clone(),
             pcie_root_complexes: &cfg.pcie_root_complexes,
             virtio_mmio_count,
@@ -1312,8 +1338,55 @@ impl InitializedVm {
                 matches!(cfg.load_mode, LoadMode::Pcat { .. }) || cfg.chipset.with_hyperv_vga,
             );
 
+        let restore_has_split_backing = !cfg.microvm_snapshot_memory_ranges.is_empty();
+        if restore_has_split_backing {
+            anyhow::ensure!(
+                cfg.machine_profile == MachineProfile::Microvm && nodes_with_ranges == 1,
+                "snapshot RAM range restore requires a single-node microVM"
+            );
+            let active_ranges = ranges_by_node
+                .iter()
+                .find(|ranges| !ranges.is_empty())
+                .expect("nodes_with_ranges is one");
+            let mut restored_ranges = cfg.microvm_snapshot_memory_ranges.clone();
+            restored_ranges.extend_from_slice(&cfg.microvm_restore_memory_ranges);
+            anyhow::ensure!(
+                coalesce_adjacent_ranges(&restored_ranges)? == *active_ranges,
+                "snapshot base and expansion ranges do not match the selected RAM layout"
+            );
+
+            let (mappable, file_mapping_mode) = existing_mappable
+                .take()
+                .context("snapshot RAM ranges require an existing memory backing")?;
+            let mem = cfg.numa.nodes[0]
+                .mem
+                .as_ref()
+                .context("snapshot RAM ranges require node 0 memory configuration")?;
+            let base_backing =
+                membacking::RamBackingRequest::new(cfg.microvm_snapshot_memory_ranges.clone())
+                    .prefetch(mem.prefetch_memory)
+                    .transparent_hugepages(mem.transparent_hugepages)
+                    .host_numa_node(mem.host_numa_node)
+                    .existing_mappable(mappable)
+                    .file_mapping_mode(file_mapping_mode);
+            memory_builder = memory_builder.add_backing(base_backing);
+
+            if !cfg.microvm_restore_memory_ranges.is_empty() {
+                let expansion_backing =
+                    membacking::RamBackingRequest::new(cfg.microvm_restore_memory_ranges.clone())
+                        .prefetch(mem.prefetch_memory)
+                        .private_memory(true)
+                        .transparent_hugepages(mem.transparent_hugepages)
+                        .host_numa_node(mem.host_numa_node);
+                memory_builder = memory_builder.add_backing(expansion_backing);
+            }
+        }
+
         for (vnode, ranges) in ranges_by_node.into_iter().enumerate() {
             if ranges.is_empty() {
+                continue;
+            }
+            if restore_has_split_backing {
                 continue;
             }
 
@@ -1344,7 +1417,6 @@ impl InitializedVm {
 
             memory_builder = memory_builder.add_backing(backing);
         }
-
         #[cfg(all(windows, feature = "virt_whp"))]
         if !cfg.vpci_resources.is_empty() {
             memory_builder = memory_builder.pin_mappings(true);
@@ -4619,8 +4691,11 @@ impl LoadedVm {
                 chipset_high_mmio_size: 0,
                 vtl2_chipset_mmio_size: 0,
             }, // TODO
-            rtc_delta_milliseconds: 0,      // TODO
-            microvm_sandbox_blocks: vec![], // TODO
+            rtc_delta_milliseconds: 0,              // TODO
+            microvm_sandbox_blocks: vec![],         // TODO
+            microvm_memory_capacity: None,          // TODO
+            microvm_snapshot_memory_ranges: vec![], // TODO
+            microvm_restore_memory_ranges: vec![],  // TODO
         };
         #[expect(unreachable_code, reason = "TODO")]
         RestartState {

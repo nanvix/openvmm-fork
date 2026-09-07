@@ -51,6 +51,9 @@ restore flow over both transports:
   configuration, including PVH boot files, memory, and the
   processor count. The path
 	must not exist. `quiesce_timeout_ms` defaults to five seconds when zero.
+  `memory_capacity_bytes` optionally reserves an immutable, 128-MiB-aligned
+  RAM capacity while keeping the configured base memory as the exact
+  `memory.bin` payload and initial PVH RAM map.
 * `restore_path` selects manifest-authoritative restore. `config` may be
   absent, or may contain only the matching microVM profile, an optional exact
   processor-count assertion, serial port 0 host
@@ -67,6 +70,12 @@ restore flow over both transports:
   post-restore gate, and must satisfy the snapshot's boot-online and immutable
   capacity bounds. `ProcessorConfig.processor_count`, when present, remains an
   exact capacity assertion.
+* `restore_memory_bytes` selects a 128-MiB-aligned total RAM target between the
+  snapshot base and immutable capacity. Zero selects the base. Expansion uses
+  fresh private zeroed backing, implies fresh restore packet delivery and the
+  post-restore repair gate, and is rejected for legacy snapshots. An explicit
+  base-size value emits restore packet V3 with zero expansion ranges; zero
+  preserves V1/V2 packet selection.
 * `restore_gate_timeout_ms` bounds gated guest repair. Zero selects the
   60-second default; a nonzero value is valid only with `restore_path`.
 * `restore_ready_path` names an existing Unix domain socket on Linux or a

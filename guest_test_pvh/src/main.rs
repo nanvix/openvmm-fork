@@ -23,8 +23,10 @@ mod guest {
     const SNAPSHOT_PORT: u16 = 0x605;
     const STATUS_INPUT_AVAILABLE: u8 = 1 << 0;
     const STATUS_RESTORE_TARGET_AVAILABLE: u8 = 1 << 2;
+    const STATUS_RESTORE_MEMORY_AVAILABLE: u8 = 1 << 3;
     const RESTORE_PACKET_SELECT: u8 = 0xa5;
     const RESTORE_PACKET_V2_HEADER: &[u8; 19] = b"OPENVMM_ENTROPY_V2\0";
+    const RESTORE_PACKET_V3_HEADER: &[u8; 19] = b"OPENVMM_ENTROPY_V3\0";
     const RAW_ECHO: &[u8] = b"\0\r\n\x7f\xffPVH-ECHO\n";
 
     const COMMAND_PING: u8 = 1;
@@ -180,19 +182,45 @@ mod guest {
         write_bytes(b"SNAPSHOT-CONTINUED=");
         write_u32(generation);
         write_byte(b'\n');
-        if port_read(STATUS_PORT) & STATUS_RESTORE_TARGET_AVAILABLE != 0 {
+        if port_read(STATUS_PORT)
+            & (STATUS_RESTORE_TARGET_AVAILABLE | STATUS_RESTORE_MEMORY_AVAILABLE)
+            != 0
+        {
             report_restore_target(true);
         }
     }
 
     fn report_restore_target(release_gate: bool) {
         let status = port_read(STATUS_PORT);
-        if status & STATUS_RESTORE_TARGET_AVAILABLE == 0 {
+        if status & (STATUS_RESTORE_TARGET_AVAILABLE | STATUS_RESTORE_MEMORY_AVAILABLE) == 0 {
             write_bytes(b"RESTORE-TARGET=NONE\n");
             return;
         }
 
         port_write(STATUS_PORT, RESTORE_PACKET_SELECT);
+        if status & STATUS_RESTORE_MEMORY_AVAILABLE != 0 {
+            for expected in RESTORE_PACKET_V3_HEADER {
+                if port_read(DATA_PORT) != *expected {
+                    write_bytes(b"RESTORE-PACKET-INVALID\n");
+                    return;
+                }
+            }
+            let target = port_read(DATA_PORT);
+            let range_count = port_read(DATA_PORT);
+            for _ in 0..usize::from(range_count) * 16 + 64 {
+                let _ = port_read(DATA_PORT);
+            }
+            if release_gate {
+                port_write(SNAPSHOT_PORT, 2);
+            }
+            write_bytes(b"RESTORE-TARGET=");
+            write_u32(target.into());
+            write_bytes(b" MEMORY-RANGES=");
+            write_u32(range_count.into());
+            write_byte(b'\n');
+            return;
+        }
+
         for expected in RESTORE_PACKET_V2_HEADER {
             if port_read(DATA_PORT) != *expected {
                 write_bytes(b"RESTORE-PACKET-INVALID\n");

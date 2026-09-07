@@ -523,7 +523,10 @@ struct Vm {
 struct AuthoritativeMicrovmRestore {
     path: PathBuf,
     snapshot: Option<openvmm_helpers::snapshot::OpenedSnapshot>,
-    memory_size: u64,
+    base_memory_size: u64,
+    selected_memory_size: u64,
+    restore_memory_target_requested: bool,
+    restore_memory_ranges: Vec<openvmm_helpers::snapshot::SnapshotMemoryExpansionRange>,
     vp_count: u32,
     machine_contract: openvmm_helpers::snapshot::SnapshotMachineContract,
 }
@@ -747,6 +750,8 @@ impl VmService {
             restore_ready_path,
             restore_processor_count,
             restore_gate_timeout_ms,
+            memory_capacity_bytes,
+            restore_memory_bytes,
         } = microvm_snapshot.unwrap_or_default();
         let restore_online_vp_count =
             (restore_processor_count != 0).then_some(restore_processor_count);
@@ -789,6 +794,14 @@ impl VmService {
             "restore_gate_timeout_ms requires restore_path"
         );
         anyhow::ensure!(
+            memory_capacity_bytes == 0 || snapshot_destination.is_some(),
+            "memory_capacity_bytes requires destination_path"
+        );
+        anyhow::ensure!(
+            restore_memory_bytes == 0 || restore_path.is_some(),
+            "restore_memory_bytes requires restore_path"
+        );
+        anyhow::ensure!(
             restore_ready_path.is_empty() || restore_path.is_some(),
             "restore_ready_path requires restore_path"
         );
@@ -825,7 +838,21 @@ impl VmService {
                 machine_contract.microvm_sandbox_blocks.is_empty(),
                 "TTRPC restore does not support microVM sandbox-block snapshots"
             );
-            let memory_size = manifest.memory_size_bytes;
+            let base_memory_size = manifest.memory_size_bytes;
+            let restore_memory_target_requested = restore_memory_bytes != 0;
+            let selected_memory_size = if !restore_memory_target_requested {
+                base_memory_size
+            } else {
+                restore_memory_bytes
+            };
+            let restore_memory_ranges = if !restore_memory_target_requested {
+                Vec::new()
+            } else {
+                openvmm_helpers::snapshot::validate_restore_memory_target(
+                    manifest,
+                    selected_memory_size,
+                )?
+            };
             let vp_count = manifest.vp_count;
             if let Some(restore_online_vp_count) = restore_online_vp_count {
                 openvmm_helpers::snapshot::validate_restore_online_vp_count(
@@ -837,7 +864,10 @@ impl VmService {
             Some(AuthoritativeMicrovmRestore {
                 path,
                 snapshot: Some(snapshot),
-                memory_size,
+                base_memory_size,
+                selected_memory_size,
+                restore_memory_target_requested,
+                restore_memory_ranges,
                 vp_count,
                 machine_contract,
             })
@@ -1023,7 +1053,8 @@ impl VmService {
                     .snapshot
                     .take()
                     .context("snapshot restore is missing its opened generation")?,
-                restore.memory_size,
+                restore.base_memory_size,
+                restore.selected_memory_size,
                 restore.vp_count,
                 Some((
                     &source_hypervisor,
@@ -1045,7 +1076,10 @@ impl VmService {
             let restore_time = prepared
                 .restore_time
                 .context("microVM snapshot is missing its restore-time contract")?;
-            if !restore_entropy && restore_online_vp_count.is_none() {
+            if !restore_entropy
+                && restore_online_vp_count.is_none()
+                && !restore.restore_memory_target_requested
+            {
                 tracing::warn!(
                     "restoring cloned guest RNG state without fresh entropy injection; cryptographic workloads are unsafe"
                 );
@@ -1357,8 +1391,22 @@ impl VmService {
             .build()
             .context("failed to build vm configuration")?;
         if let Some(io) = microvm_portb {
-            let restore_entropy = if restore_entropy || restore_online_vp_count.is_some() {
-                crate::fresh_microvm_restore_packet(restore_online_vp_count)?
+            let restore_memory_ranges = authoritative_restore
+                .as_ref()
+                .map(|restore| restore.restore_memory_ranges.as_slice())
+                .unwrap_or_default();
+            let restore_memory_target_requested = authoritative_restore
+                .as_ref()
+                .is_some_and(|restore| restore.restore_memory_target_requested);
+            let restore_entropy = if restore_entropy
+                || restore_online_vp_count.is_some()
+                || restore_memory_target_requested
+            {
+                crate::fresh_microvm_restore_packet(
+                    restore_online_vp_count,
+                    restore_memory_target_requested,
+                    restore_memory_ranges,
+                )?
             } else {
                 Vec::new()
             };
@@ -1391,7 +1439,7 @@ impl VmService {
         // `--numa` conflict). `config_mem_size` is the total guest memory
         // reported to the `VmController`.
         let (numa, config_mem_size) = if let Some(restore) = &authoritative_restore {
-            let mem_size = restore.memory_size;
+            let mem_size = restore.selected_memory_size;
             let numa = NumaTopology {
                 nodes: vec![NumaNode {
                     mem: Some(MemoryConfig {
@@ -1507,6 +1555,39 @@ impl VmService {
                 .is_some_and(|restore| restore.machine_contract.microvm_filesystem.is_some()),
             microvm_filesystem: None,
             microvm_sandbox_blocks: Vec::new(),
+            microvm_memory_capacity: authoritative_restore
+                .as_ref()
+                .and_then(|restore| {
+                    (restore.machine_contract.memory_expansion_version != 0)
+                        .then_some(restore.machine_contract.memory_capacity_bytes)
+                })
+                .or((memory_capacity_bytes != 0).then_some(memory_capacity_bytes)),
+            microvm_snapshot_memory_ranges: authoritative_restore
+                .as_ref()
+                .filter(|restore| restore.machine_contract.memory_expansion_version != 0)
+                .map(|restore| {
+                    restore
+                        .machine_contract
+                        .memory_ranges
+                        .iter()
+                        .map(|range| {
+                            MemoryRange::new(range.gpa_start..range.gpa_start + range.length)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            microvm_restore_memory_ranges: authoritative_restore
+                .as_ref()
+                .map(|restore| {
+                    restore
+                        .restore_memory_ranges
+                        .iter()
+                        .map(|range| {
+                            MemoryRange::new(range.gpa_start..range.gpa_start + range.length)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
 
         let guest_power_actions = {
@@ -1987,6 +2068,7 @@ impl VmService {
 
         let (send, recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
+        let memory_capacity = config.microvm_memory_capacity;
 
         // Create a VmmMesh for local/in-process workers.
         let mesh = VmmMesh::new(&self.driver, true)?;
@@ -2016,7 +2098,11 @@ impl VmService {
                         .and_then(|(_, _, frequency, _)| *frequency),
                     restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
                     restore_ready_sink,
-                    restore_gate_timeout: restore_online_vp_count.map(|_| restore_gate_timeout),
+                    restore_gate_timeout: (restore_online_vp_count.is_some()
+                        || authoritative_restore
+                            .as_ref()
+                            .is_some_and(|restore| !restore.restore_memory_ranges.is_empty()))
+                    .then_some(restore_gate_timeout),
                     restore_vp_count: restore_online_vp_count,
                     rpc: recv,
                     notify: notify_send,
@@ -2024,7 +2110,6 @@ impl VmService {
             )
             .await?;
 
-        let memory = config_mem_size;
         let processors = config_proc_count;
 
         // Create channels for VmController.
@@ -2046,7 +2131,8 @@ impl VmService {
             igvm_path: None,
             memory_backing_file: snapshot_memory_path,
             snapshot_memory_handle,
-            memory,
+            memory: config_mem_size,
+            memory_capacity,
             processors,
             log_file: None,
             crash_dump_path: None,

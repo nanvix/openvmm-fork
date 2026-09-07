@@ -1068,6 +1068,42 @@ mod tests {
         assert_eq!(file_bytes, original);
     }
 
+    #[async_test]
+    async fn test_snapshot_cow_and_fresh_private_expansion_are_independent() {
+        let page = SparseMapping::page_size() as u64;
+        let original = vec![0x5a_u8; page as usize];
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&original).unwrap();
+        file.sync_all().unwrap();
+        let mappable = sparse_mmap::new_mappable_from_file_copy_on_write(&file, false).unwrap();
+
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..page)])
+                    .existing_mappable(mappable.into())
+                    .file_mapping_mode(FileMappingMode::CopyOnWrite),
+            )
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(page..2 * page)]).private_memory(true),
+            )
+            .build(2 * page)
+            .await
+            .unwrap();
+        let memory = manager.client().guest_memory().await.unwrap();
+
+        assert_eq!(memory.read_plain::<u8>(0).unwrap(), 0x5a);
+        assert_eq!(memory.read_plain::<u8>(page).unwrap(), 0);
+        memory.write_at(0, &[0xa5]).unwrap();
+        memory.write_at(page, &[0xcc]).unwrap();
+        assert_eq!(memory.read_plain::<u8>(0).unwrap(), 0xa5);
+        assert_eq!(memory.read_plain::<u8>(page).unwrap(), 0xcc);
+
+        file.rewind().unwrap();
+        let mut file_bytes = Vec::new();
+        file.read_to_end(&mut file_bytes).unwrap();
+        assert_eq!(file_bytes, original);
+    }
+
     #[test]
     fn test_validate_hugepage_size() {
         let page_size = SparseMapping::page_size() as u64;
