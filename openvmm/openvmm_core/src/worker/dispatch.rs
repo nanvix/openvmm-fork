@@ -1159,6 +1159,33 @@ impl InitializedVm {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
 
+        #[cfg(all(windows, feature = "virt_whp"))]
+        let has_vpci_resources = !cfg.vpci_resources.is_empty();
+        #[cfg(not(all(windows, feature = "virt_whp")))]
+        let has_vpci_resources = false;
+        let prefetch_memory = cfg
+            .numa
+            .nodes
+            .iter()
+            .any(|node| node.mem.as_ref().is_some_and(|mem| mem.prefetch_memory));
+
+        // A writable COW-only microVM restore already has fully established host
+        // VA backing. Register a bounded initial range with WHP and extend it on
+        // demand, while leaving mapped first-touch faults to WHP itself. Keep the
+        // eager path for configurations that need pinning, prefetch, expansion,
+        // or VTL2 lazy-commit and protection work.
+        let lazy_memory_registration =
+            cfg!(all(windows, feature = "virt_whp", guest_arch = "x86_64"))
+                && cfg.machine_profile == MachineProfile::Microvm
+                && cfg.hypervisor.with_vtl2.is_none()
+                && cfg.microvm_restore_memory_ranges.is_empty()
+                && !has_vpci_resources
+                && !prefetch_memory
+                && shared_memory
+                    .as_ref()
+                    .is_some_and(SharedMemoryBacking::is_copy_on_write);
+        let user_mode_memory_faults = !lazy_memory_registration;
+
         let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
@@ -1171,6 +1198,8 @@ impl InitializedVm {
                     .map(|typ| typ.into())
                     .unwrap_or(virt::IsolationType::None),
                 nested_virt: cfg.hypervisor.nested_virt,
+                user_mode_memory_faults,
+                lazy_memory_registration,
                 versioned_cpu_contract: cfg.machine_profile == MachineProfile::Microvm,
             })
             .context("failed to create the prototype partition")?;

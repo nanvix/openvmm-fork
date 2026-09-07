@@ -511,6 +511,14 @@ impl MemoryMapper for VtlMemoryMapper {
         }
     }
 
+    fn map_deferred_on_fault(
+        &self,
+        _partition: &dyn SimpleMemoryMap,
+        _gpa: u64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     fn map_deferred(&self, partition: &dyn SimpleMemoryMap) -> anyhow::Result<()> {
         let mut state = self.mapping_state.lock();
         let prev_state = std::mem::replace(state.deref_mut(), MappingState::StateChanging);
