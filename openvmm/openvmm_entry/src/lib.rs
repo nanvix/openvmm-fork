@@ -1545,7 +1545,7 @@ mod microvm_console_attachment_tests {
         let options = Options::try_parse_from([
             "openvmm",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--virtio-console",
             "none",
             "--microvm-control-console",

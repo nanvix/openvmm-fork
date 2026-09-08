@@ -8,11 +8,11 @@
 //! descriptor rings just as a guest driver would.
 
 use crate::VirtioConsoleDevice;
-use chipset_device::io::IoResult;
-use chipset_device::mmio::MmioIntercept;
 use crate::control_session_protocol;
 use crate::control_session_protocol::Record;
 use crate::control_session_protocol::RecordType;
+use chipset_device::io::IoResult;
+use chipset_device::mmio::MmioIntercept;
 use futures::AsyncRead;
 use futures::AsyncWrite;
 use guestmem::GuestMemory;
@@ -46,8 +46,8 @@ use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
 use virtio::transport::VirtioMmioDevice;
 use virtio_resources::console::VirtioConsoleDisconnectPolicy;
-use vmcore::device_state::ChangeDeviceState;
 use virtio_resources::console::VirtioControlConsoleBrokerConfig;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
 use vmcore::line_interrupt::LineInterrupt;
 use vmcore::save_restore::SaveRestore;
@@ -1283,6 +1283,7 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
         partial_transmit: 0,
         staged_rx: staged_rx.clone(),
         disconnect_policy_id: 0,
+        broker: None,
     }));
 
     let destination_harness = TestHarness::new(&driver);
@@ -1327,6 +1328,7 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
         partial_transmit: 0,
         staged_rx: vec![0; super::MAX_STAGED_RX_BYTES + 1],
         disconnect_policy_id: 0,
+        broker: None,
     }));
     let invalid_harness = TestHarness::new(&driver);
     let mut invalid_destination = VirtioMmioDevice::new(
@@ -1340,6 +1342,8 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
     )
     .unwrap();
     assert!(invalid_destination.restore(invalid).is_err());
+}
+
 const BROKER_INSTANCE: [u8; 16] = [0x51; 16];
 const BROKER_CAPABILITY: [u8; 32] = [0xa7; 32];
 

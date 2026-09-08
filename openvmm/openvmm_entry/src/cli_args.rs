@@ -6111,7 +6111,7 @@ mod tests {
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v2",
+                "microvm",
                 "--virtio-console",
                 "none",
                 "--microvm-control-console",
@@ -6120,7 +6120,7 @@ mod tests {
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v2",
+                "microvm",
                 "--virtio-console",
                 "none",
                 "--microvm-control-console",
