@@ -183,6 +183,8 @@ pub mod microvm {
     pub struct MicrovmPortbHandle {
         /// Host serial endpoint used for raw input and output.
         pub io: Resource<SerialBackendHandle>,
+        /// Fresh generation ID for this microVM instance.
+        pub generation_id: [u8; 16],
         /// Fresh entropy exposed only through the private restore-input selector.
         pub restore_entropy: Vec<u8>,
     }

@@ -37,6 +37,8 @@ const STATUS_PORT: u16 = 0xea;
 const SHUTDOWN_PORT: u16 = 0x604;
 const SNAPSHOT_PORT: u16 = 0x605;
 const RESTORE_ENTROPY_SELECT: u8 = 0xa5;
+const GENERATION_ID_SELECT: u8 = 0xa6;
+const GENERATION_ID_SIZE: usize = 16;
 const RESTORE_PROCESSOR_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V2\0";
 const RESTORE_MEMORY_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V3\0";
 const STATUS_INPUT_AVAILABLE: u8 = 1 << 0;
@@ -44,6 +46,7 @@ const STATUS_RESTORE_PACKET_AVAILABLE: u8 = 1 << 1;
 const STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE: u8 = 1 << 2;
 const STATUS_RESTORE_MEMORY_TARGET_AVAILABLE: u8 = 1 << 3;
 const STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE: u8 = 1 << 4;
+const STATUS_GENERATION_ID_AVAILABLE: u8 = 1 << 5;
 const BUFFER_MAX: usize = 1024 * 1024;
 
 /// Raw bidirectional microVM portb console.
@@ -57,6 +60,8 @@ pub struct MicrovmPortb {
     rx_buffer: VecDeque<u8>,
     #[inspect(with = "VecDeque::len")]
     tx_buffer: VecDeque<u8>,
+    generation_id: [u8; GENERATION_ID_SIZE],
+    generation_id_read_index: Option<usize>,
     #[inspect(with = "VecDeque::len")]
     restore_entropy: VecDeque<u8>,
     restore_entropy_selected: bool,
@@ -72,7 +77,11 @@ pub struct MicrovmPortb {
 
 impl MicrovmPortb {
     /// Creates a portb console using `io` as its host endpoint.
-    pub fn new(io: Box<dyn SerialIo>, restore_entropy: Vec<u8>) -> Self {
+    pub fn new(
+        io: Box<dyn SerialIo>,
+        generation_id: [u8; GENERATION_ID_SIZE],
+        restore_entropy: Vec<u8>,
+    ) -> Self {
         let restore_processor_target_available = restore_entropy
             .starts_with(RESTORE_PROCESSOR_TARGET_PACKET_HEADER)
             || (restore_entropy.starts_with(RESTORE_MEMORY_TARGET_PACKET_HEADER)
@@ -89,6 +98,8 @@ impl MicrovmPortb {
             io,
             rx_buffer: VecDeque::new(),
             tx_buffer: VecDeque::new(),
+            generation_id,
+            generation_id_read_index: None,
             restore_entropy: restore_entropy.into(),
             restore_entropy_selected: false,
             restore_processor_target_available,
@@ -187,6 +198,7 @@ impl ChangeDeviceState for MicrovmPortb {
         self.rx_buffer.clear();
         self.tx_buffer.clear();
         self.restore_entropy.clear();
+        self.generation_id_read_index = None;
         self.restore_entropy_selected = false;
         self.restore_processor_target_available = false;
         self.restore_memory_target_available = false;
@@ -235,7 +247,11 @@ impl PortIoIntercept for MicrovmPortb {
         data.fill(0);
         match io_port {
             DATA_PORT => {
-                if self.restore_entropy_selected {
+                if let Some(index) = self.generation_id_read_index {
+                    data[0] = self.generation_id[index];
+                    self.generation_id_read_index =
+                        (index + 1 < self.generation_id.len()).then_some(index + 1);
+                } else if self.restore_entropy_selected {
                     data[0] = self.restore_entropy.pop_front().unwrap_or(0);
                     if self.restore_entropy.is_empty() {
                         self.restore_entropy_selected = false;
@@ -250,6 +266,7 @@ impl PortIoIntercept for MicrovmPortb {
             }
             STATUS_PORT => {
                 data[0] = if !self.input_gated
+                    && self.generation_id_read_index.is_none()
                     && !self.restore_entropy_selected
                     && !self.rx_buffer.is_empty()
                 {
@@ -269,6 +286,7 @@ impl PortIoIntercept for MicrovmPortb {
                 if self.restore_memory_expansion_available {
                     data[0] |= STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE;
                 }
+                data[0] |= STATUS_GENERATION_ID_AVAILABLE;
             }
             _ => return IoResult::Err(IoError::InvalidRegister),
         }
@@ -288,12 +306,17 @@ impl PortIoIntercept for MicrovmPortb {
                 }
                 self.wake_tx();
             }
-            STATUS_PORT => {
-                if data.first() == Some(&RESTORE_ENTROPY_SELECT) && !self.restore_entropy.is_empty()
-                {
+            STATUS_PORT => match data.first() {
+                Some(&RESTORE_ENTROPY_SELECT) if !self.restore_entropy.is_empty() => {
+                    self.generation_id_read_index = None;
                     self.restore_entropy_selected = true;
                 }
-            }
+                Some(&GENERATION_ID_SELECT) => {
+                    self.restore_entropy_selected = false;
+                    self.generation_id_read_index = Some(0);
+                }
+                _ => {}
+            },
             _ => return IoResult::Err(IoError::InvalidRegister),
         }
         IoResult::Ok
@@ -326,6 +349,7 @@ impl SaveRestore for MicrovmPortb {
         }
         self.rx_buffer = state.rx_buffer.into();
         self.tx_buffer = state.tx_buffer.into();
+        self.generation_id_read_index = None;
         self.restore_entropy_selected = false;
         Ok(())
     }
@@ -593,6 +617,8 @@ mod tests {
     use std::task::Context;
     use std::task::Poll;
 
+    const TEST_GENERATION_ID: [u8; GENERATION_ID_SIZE] = [0x3c; GENERATION_ID_SIZE];
+
     struct ConnectWithByte {
         connected: bool,
         byte: Option<u8>,
@@ -653,7 +679,7 @@ mod tests {
 
     #[test]
     fn portb_preserves_wide_binary_output_and_zero_fills_reads() {
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), Vec::new());
+        let mut portb = MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, Vec::new());
         assert!(matches!(
             portb.io_write(DATA_PORT, b"\0\xffA\x80"),
             IoResult::Ok
@@ -666,7 +692,15 @@ mod tests {
             portb.io_read(STATUS_PORT, &mut status),
             IoResult::Ok
         ));
-        assert_eq!(status, [1, 0, 0, 0]);
+        assert_eq!(
+            status,
+            [
+                STATUS_INPUT_AVAILABLE | STATUS_GENERATION_ID_AVAILABLE,
+                0,
+                0,
+                0
+            ]
+        );
 
         let mut data = [0xff; 4];
         assert!(matches!(portb.io_read(DATA_PORT, &mut data), IoResult::Ok));
@@ -675,15 +709,16 @@ mod tests {
 
     #[test]
     fn pending_portb_bytes_survive_restore_and_fresh_entropy_is_private() {
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), Vec::new());
+        let mut portb = MicrovmPortb::new(Box::new(Disconnected), [1; 16], Vec::new());
         portb.rx_buffer.extend([1, 2, 3]);
         portb.tx_buffer.extend([4, 5, 6]);
         let state = portb.save().unwrap();
 
-        let mut restored = MicrovmPortb::new(Box::new(Disconnected), vec![7, 8]);
+        let mut restored = MicrovmPortb::new(Box::new(Disconnected), [2; 16], vec![7, 8]);
         restored.restore(state).unwrap();
         assert_eq!(restored.rx_buffer, [1, 2, 3]);
         assert_eq!(restored.tx_buffer, [4, 5, 6]);
+        assert_eq!(restored.generation_id, [2; 16]);
 
         let mut data = [0];
         for expected in [1, 2, 3] {
@@ -708,7 +743,10 @@ mod tests {
             restored.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
         ));
-        assert_eq!(data, [STATUS_RESTORE_PACKET_AVAILABLE]);
+        assert_eq!(
+            data,
+            [STATUS_RESTORE_PACKET_AVAILABLE | STATUS_GENERATION_ID_AVAILABLE]
+        );
         for expected in [7, 8] {
             assert!(matches!(
                 restored.io_read(DATA_PORT, &mut data),
@@ -719,9 +757,32 @@ mod tests {
     }
 
     #[test]
+    fn generation_id_is_repeatable_and_not_consumed() {
+        let mut portb = MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, Vec::new());
+        let mut data = [0];
+
+        for _ in 0..2 {
+            assert!(matches!(
+                portb.io_read(STATUS_PORT, &mut data),
+                IoResult::Ok
+            ));
+            assert_eq!(data, [STATUS_GENERATION_ID_AVAILABLE]);
+            assert!(matches!(
+                portb.io_write(STATUS_PORT, &[GENERATION_ID_SELECT]),
+                IoResult::Ok
+            ));
+            for expected in TEST_GENERATION_ID {
+                assert!(matches!(portb.io_read(DATA_PORT, &mut data), IoResult::Ok));
+                assert_eq!(data, [expected]);
+            }
+        }
+    }
+
+    #[test]
     fn processor_target_restore_packet_has_distinct_status() {
         let packet = [RESTORE_PROCESSOR_TARGET_PACKET_HEADER, &[2]].concat();
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), packet.clone());
+        let mut portb =
+            MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, packet.clone());
         let mut data = [0];
 
         assert!(matches!(
@@ -730,7 +791,9 @@ mod tests {
         ));
         assert_eq!(
             data,
-            [STATUS_RESTORE_PACKET_AVAILABLE | STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE]
+            [STATUS_RESTORE_PACKET_AVAILABLE
+                | STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
         );
         assert!(matches!(
             portb.io_write(STATUS_PORT, &[RESTORE_ENTROPY_SELECT]),
@@ -744,13 +807,13 @@ mod tests {
             portb.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
         ));
-        assert_eq!(data, [0]);
+        assert_eq!(data, [STATUS_GENERATION_ID_AVAILABLE]);
     }
 
     #[test]
     fn base_memory_target_restore_packet_has_memory_status() {
         let packet = [RESTORE_MEMORY_TARGET_PACKET_HEADER, &[0, 0], &[0x5a; 64]].concat();
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), packet);
+        let mut portb = MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, packet);
         let mut data = [0];
 
         assert!(matches!(
@@ -759,7 +822,9 @@ mod tests {
         ));
         assert_eq!(
             data,
-            [STATUS_RESTORE_PACKET_AVAILABLE | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE]
+            [STATUS_RESTORE_PACKET_AVAILABLE
+                | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
         );
     }
 
@@ -773,7 +838,8 @@ mod tests {
             &[0x5a; 64],
         ]
         .concat();
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), packet.clone());
+        let mut portb =
+            MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, packet.clone());
         let mut data = [0];
 
         assert!(matches!(
@@ -785,7 +851,8 @@ mod tests {
             [STATUS_RESTORE_PACKET_AVAILABLE
                 | STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE
                 | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
-                | STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE]
+                | STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
         );
         assert!(matches!(
             portb.io_write(STATUS_PORT, &[RESTORE_ENTROPY_SELECT]),
@@ -799,7 +866,7 @@ mod tests {
             portb.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
         ));
-        assert_eq!(data, [0]);
+        assert_eq!(data, [STATUS_GENERATION_ID_AVAILABLE]);
 
         let memory_only_packet = [
             RESTORE_MEMORY_TARGET_PACKET_HEADER,
@@ -809,7 +876,11 @@ mod tests {
             &[0x5a; 64],
         ]
         .concat();
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), memory_only_packet);
+        let mut portb = MicrovmPortb::new(
+            Box::new(Disconnected),
+            TEST_GENERATION_ID,
+            memory_only_packet,
+        );
         assert!(matches!(
             portb.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
@@ -818,12 +889,17 @@ mod tests {
             data,
             [STATUS_RESTORE_PACKET_AVAILABLE
                 | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
-                | STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE]
+                | STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
         );
 
         let processor_only_packet =
             [RESTORE_MEMORY_TARGET_PACKET_HEADER, &[2, 0], &[0x5a; 64]].concat();
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), processor_only_packet);
+        let mut portb = MicrovmPortb::new(
+            Box::new(Disconnected),
+            TEST_GENERATION_ID,
+            processor_only_packet,
+        );
         assert!(matches!(
             portb.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
@@ -832,19 +908,26 @@ mod tests {
             data,
             [STATUS_RESTORE_PACKET_AVAILABLE
                 | STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE
-                | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE]
+                | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
         );
 
         let explicit_base_packet =
             [RESTORE_MEMORY_TARGET_PACKET_HEADER, &[0, 0], &[0x5a; 64]].concat();
-        let mut portb = MicrovmPortb::new(Box::new(Disconnected), explicit_base_packet);
+        let mut portb = MicrovmPortb::new(
+            Box::new(Disconnected),
+            TEST_GENERATION_ID,
+            explicit_base_packet,
+        );
         assert!(matches!(
             portb.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
         ));
         assert_eq!(
             data,
-            [STATUS_RESTORE_PACKET_AVAILABLE | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE]
+            [STATUS_RESTORE_PACKET_AVAILABLE
+                | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
         );
     }
 
@@ -855,6 +938,7 @@ mod tests {
                 connected: false,
                 byte: Some(0x5a),
             }),
+            TEST_GENERATION_ID,
             Vec::new(),
         );
         portb.poll_device(&mut Context::from_waker(Waker::noop()));
@@ -868,6 +952,7 @@ mod tests {
                 connected: true,
                 byte: Some(0x5a),
             }),
+            TEST_GENERATION_ID,
             Vec::new(),
         );
         portb.rx_buffer.push_back(0x44);
@@ -879,7 +964,7 @@ mod tests {
             portb.io_read(STATUS_PORT, &mut data),
             IoResult::Ok
         ));
-        assert_eq!(data, [0]);
+        assert_eq!(data, [STATUS_GENERATION_ID_AVAILABLE]);
         assert!(matches!(portb.io_read(DATA_PORT, &mut data), IoResult::Ok));
         assert_eq!(data, [0]);
         assert_eq!(portb.rx_buffer, [0x44]);

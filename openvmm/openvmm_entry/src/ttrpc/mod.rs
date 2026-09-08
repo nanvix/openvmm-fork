@@ -1398,7 +1398,7 @@ impl VmService {
             let restore_memory_target_requested = authoritative_restore
                 .as_ref()
                 .is_some_and(|restore| restore.restore_memory_target_requested);
-            let restore_entropy = if restore_entropy
+            let (generation_id, restore_entropy) = if restore_entropy
                 || restore_online_vp_count.is_some()
                 || restore_memory_target_requested
             {
@@ -1408,13 +1408,14 @@ impl VmService {
                     restore_memory_ranges,
                 )?
             } else {
-                Vec::new()
+                (crate::fresh_microvm_generation_id()?, Vec::new())
             };
             chipset.chipset_devices.extend([
                 ChipsetDeviceHandle {
                     name: MicrovmPortbHandle::ID.to_owned(),
                     resource: MicrovmPortbHandle {
                         io,
+                        generation_id,
                         restore_entropy,
                     }
                     .into_resource(),
