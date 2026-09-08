@@ -4094,6 +4094,15 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
         manifest.snapshot_tier,
     );
     if manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM {
+        let control_tty_count = contract
+            .effective_command_line
+            .split_ascii_whitespace()
+            .filter(|token| *token == openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE)
+            .count();
+        anyhow::ensure!(
+            control_tty_count <= 1,
+            "platform snapshot command line contains duplicate control tty configuration"
+        );
         anyhow::ensure!(
             contract
                 .effective_command_line
@@ -4116,15 +4125,16 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
             | "nvx_sandbox=1"
             | "nvx_config=0xd0010000,65536"
             | "nvx_snapshot_tier=platform"
-    ) || [
-        "virtio_mmio.device=",
-        "virtnet_ip=",
-        "virtnet_mask=",
-        "virtnet_gw=",
-        "virtnet_dns=",
-    ]
-    .iter()
-    .any(|prefix| token.starts_with(prefix))
+    ) || token == openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE
+        || [
+            "virtio_mmio.device=",
+            "virtnet_ip=",
+            "virtnet_mask=",
+            "virtnet_gw=",
+            "virtnet_dns=",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
 }
 
 fn ensure_unique<T>(values: &[T], description: &str) -> anyhow::Result<()>
@@ -4284,6 +4294,58 @@ mod tests {
         manifest
     }
 
+    fn canonical_worker_platform_command_line() -> String {
+        let mut command_line = openvmm_defs::config::build_microvm_v2_command_line(
+            &[
+                "nvx_sandbox=1".to_owned(),
+                "nvx_config=0xd0010000,65536".to_owned(),
+            ],
+            true,
+        )
+        .unwrap();
+        command_line.push_str(" nvx_snapshot_tier=platform");
+        openvmm_defs::config::append_microvm_virtio_discovery(
+            &mut command_line,
+            None,
+            false,
+            None,
+            true,
+            true,
+            &[
+                openvmm_defs::config::MicrovmSandboxBlockConfig {
+                    role: openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
+                    read_only: true,
+                },
+                openvmm_defs::config::MicrovmSandboxBlockConfig {
+                    role: openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+                    read_only: false,
+                },
+            ],
+        )
+        .unwrap();
+        command_line
+    }
+
+    fn make_platform_snapshot(manifest: &mut SnapshotManifest) {
+        manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+        let contract = manifest.machine_contract.as_mut().unwrap();
+        for block in contract
+            .microvm_sandbox_blocks
+            .iter_mut()
+            .filter(|block| block.read_only)
+        {
+            block.identity_kind = "unbound".to_owned();
+            block.identity.clear();
+        }
+        let scratch = contract.microvm_sandbox_blocks.last_mut().unwrap();
+        scratch.identity_kind = "fresh".to_owned();
+        scratch.identity.clear();
+        scratch.artifact.clear();
+        contract.set_effective_command_line(canonical_worker_platform_command_line());
+    }
+
     #[test]
     fn abi_v2_snapshot_tier_contract_is_canonical() {
         let scratch = vec![0x5a; 512];
@@ -4311,32 +4373,7 @@ mod tests {
         manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
         assert!(validate_manifest_version(&manifest).is_err());
 
-        let scratch = manifest
-            .machine_contract
-            .as_mut()
-            .unwrap()
-            .microvm_sandbox_blocks
-            .last_mut()
-            .unwrap();
-        scratch.identity_kind = "fresh".to_owned();
-        scratch.identity.clear();
-        scratch.artifact.clear();
-        for block in manifest
-            .machine_contract
-            .as_mut()
-            .unwrap()
-            .microvm_sandbox_blocks
-            .iter_mut()
-            .filter(|block| block.read_only)
-        {
-            block.identity_kind = "unbound".to_owned();
-            block.identity.clear();
-        }
-        manifest
-            .machine_contract
-            .as_mut()
-            .unwrap()
-            .set_effective_command_line("console=hvc0 nvx_snapshot_tier=platform".to_owned());
+        make_platform_snapshot(&mut manifest);
         validate_manifest_version(&manifest).unwrap();
     }
 
@@ -4380,27 +4417,12 @@ mod tests {
     fn platform_snapshot_rejects_tenant_command_line() {
         let scratch = vec![0x5a; 512];
         let mut manifest = paired_scratch_manifest(&scratch);
-        manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
-        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
-        manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
-        {
-            let contract = manifest.machine_contract.as_mut().unwrap();
-            for block in contract
-                .microvm_sandbox_blocks
-                .iter_mut()
-                .filter(|block| block.read_only)
-            {
-                block.identity_kind = "unbound".to_owned();
-                block.identity.clear();
-            }
-            let scratch = contract.microvm_sandbox_blocks.last_mut().unwrap();
-            scratch.identity_kind = "fresh".to_owned();
-            scratch.identity.clear();
-            scratch.artifact.clear();
-            contract.set_effective_command_line(
-                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_entrypoint=/tenant".to_owned(),
-            );
-        }
+        make_platform_snapshot(&mut manifest);
+        let contract = manifest.machine_contract.as_mut().unwrap();
+        contract.set_effective_command_line(contract.effective_command_line.replace(
+            "nvx_snapshot_tier=platform",
+            "nvx_snapshot_tier=platform nvx_entrypoint=/tenant",
+        ));
 
         assert!(
             validate_manifest_version(&manifest)
@@ -4409,29 +4431,71 @@ mod tests {
                 .contains("contains tenant or unsupported configuration")
         );
 
-        manifest
-            .machine_contract
-            .as_mut()
-            .unwrap()
-            .set_effective_command_line(
-            "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform"
-                .to_owned(),
-        );
+        make_platform_snapshot(&mut manifest);
         validate_manifest_version(&manifest).unwrap();
 
-        manifest
-            .machine_contract
-            .as_mut()
-            .unwrap()
-            .set_effective_command_line(
-                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_config=tenant-data".to_owned(),
-            );
+        let contract = manifest.machine_contract.as_mut().unwrap();
+        contract.set_effective_command_line(
+            contract
+                .effective_command_line
+                .replace("nvx_config=0xd0010000,65536", "nvx_config=tenant-data"),
+        );
         assert!(
             validate_manifest_version(&manifest)
                 .unwrap_err()
                 .to_string()
                 .contains("contains tenant or unsupported configuration")
         );
+    }
+
+    #[test]
+    fn platform_snapshot_accepts_worker_effective_canonical_command_line() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        make_platform_snapshot(&mut manifest);
+
+        assert_eq!(
+            manifest
+                .machine_contract
+                .as_ref()
+                .unwrap()
+                .effective_command_line,
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1 \
+                 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform \
+                 virtio_mmio.device=0x1000@0xd0002000:7 \
+                 virtio_mmio.device=0x1000@0xd0003000:4 \
+                 virtio_mmio.device=0x1000@0xd0006000:11 \
+             virtio_mmio.device=0x1000@0xd0007000:3 \
+             nvx_control_tty=hvc2"
+        );
+        validate_manifest_version(&manifest).unwrap();
+    }
+
+    #[test]
+    fn platform_snapshot_rejects_invalid_control_tokens() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        make_platform_snapshot(&mut manifest);
+        let canonical = manifest
+            .machine_contract
+            .as_ref()
+            .unwrap()
+            .effective_command_line
+            .clone();
+
+        for invalid_control in [
+            "nvx_control_tty=hvc9",
+            "nvx_control_tty=hvc2 nvx_control_tty=hvc2",
+        ] {
+            manifest
+                .machine_contract
+                .as_mut()
+                .unwrap()
+                .set_effective_command_line(
+                    canonical.replace("nvx_control_tty=hvc2", invalid_control),
+                );
+            assert!(validate_manifest_version(&manifest).is_err());
+        }
     }
 
     #[test]
