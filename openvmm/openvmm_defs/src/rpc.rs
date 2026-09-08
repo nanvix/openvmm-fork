@@ -63,6 +63,8 @@ pub struct SnapshotSaveResponse {
     pub saved_state: ProtobufMessage,
     /// Complete state-unit inventory in stable registration order.
     pub state_unit_names: Vec<String>,
+    /// Effective PVH command line loaded into the guest.
+    pub effective_command_line: String,
     /// Effective guest TSC frequency.
     pub tsc_frequency_hz: u64,
     /// Effective local APIC timer frequency.

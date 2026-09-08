@@ -1601,7 +1601,7 @@ impl InitializedVm {
             vmtime_source,
             memory_manager,
             gm,
-            cfg,
+            mut cfg,
             mem_layout,
             resolved_pcie_root_complex_ranges,
             virtio_mmio_region,
@@ -1612,6 +1612,25 @@ impl InitializedVm {
             igvm_file,
             driver_source,
         } = self;
+
+        #[cfg(guest_arch = "x86_64")]
+        if saved_state.is_none()
+            && matches!(cfg.machine_profile, MachineProfile::Microvm { .. })
+            && let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode
+        {
+            match partition
+                .tsc_frequency_hz()
+                .context("failed to query the backend guest TSC frequency")?
+            {
+                Some(frequency_hz) => {
+                    super::vm_loaders::pvh::propagate_tsc_frequency(cmdline, frequency_hz)
+                        .context("failed to propagate the guest TSC frequency")?;
+                }
+                None => tracing::warn!(
+                    "backend does not expose a guest TSC frequency; preserving the microVM command line"
+                ),
+            }
+        }
 
         let mut resolver = ResourceResolver::new();
 
@@ -4255,6 +4274,18 @@ impl LoadedVm {
                                 "mapped_memory_flush",
                                 Default::default(),
                             );
+                            let effective_command_line = match &self.inner.load_mode {
+                                LoadMode::Pvh { cmdline, .. } => cmdline.clone(),
+                                _ => {
+                                    return Err(
+                                        openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                            RemoteError::new(anyhow::anyhow!(
+                                                "microVM snapshot has no effective PVH command line"
+                                            )),
+                                        ),
+                                    );
+                                }
+                            };
                             let tsc_frequency_hz = self
                                 .inner
                                 .partition
@@ -4299,6 +4330,7 @@ impl LoadedVm {
                             Ok(openvmm_defs::rpc::SnapshotSaveResponse {
                                 state_unit_names: saved_state.inventory.clone(),
                                 saved_state: ProtobufMessage::new(saved_state),
+                                effective_command_line,
                                 tsc_frequency_hz,
                                 apic_frequency_hz,
                                 capture_wall_clock,
