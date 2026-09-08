@@ -5,6 +5,7 @@
 
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
+// UNSAFETY: The bare-metal PVH guest requires inline assembly and raw port I/O.
 #![cfg_attr(target_os = "none", expect(unsafe_code))]
 
 #[cfg(not(target_os = "none"))]
