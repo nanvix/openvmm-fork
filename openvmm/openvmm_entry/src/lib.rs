@@ -1545,7 +1545,7 @@ mod microvm_console_attachment_tests {
         let options = Options::try_parse_from([
             "openvmm",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--virtio-console",
             "none",
             "--microvm-control-console",
@@ -1641,6 +1641,7 @@ mod microvm_console_attachment_tests {
             false,
             None,
             false,
+            false,
             &[],
         )
         .unwrap();
@@ -1649,6 +1650,7 @@ mod microvm_console_attachment_tests {
             command_line,
             Some((&network, &policy, microvm_network_attachment())),
             false,
+            None,
             None,
             None,
             Vec::new(),
@@ -1782,6 +1784,7 @@ mod microvm_console_attachment_tests {
             true,
             Some(&filesystem),
             false,
+            false,
             &[],
         )
         .unwrap();
@@ -1791,6 +1794,7 @@ mod microvm_console_attachment_tests {
             None,
             true,
             Some((&filesystem, Path::new(&root_path), attachment)),
+            None,
             None,
             Vec::new(),
             1,
@@ -1826,6 +1830,7 @@ mod microvm_console_attachment_tests {
             true,
             None,
             false,
+            false,
             &[],
         )
         .unwrap();
@@ -1834,6 +1839,7 @@ mod microvm_console_attachment_tests {
             command_line,
             None,
             true,
+            None,
             None,
             None,
             Vec::new(),
@@ -5759,8 +5765,8 @@ async fn run_control_inner(
                         (filesystem, root_path, attachment)
                     }),
                 microvm_console_attachment.as_ref(),
-                    microvm_control_console_attachment.as_ref(),
-                    &microvm_sandbox_block_sources,
+                microvm_control_console_attachment.as_ref(),
+                &microvm_sandbox_block_sources,
             )?;
             (
                 Some(prepared.shared_memory),

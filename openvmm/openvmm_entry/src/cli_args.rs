@@ -5855,16 +5855,8 @@ mod tests {
                 read_only: false,
             },
         ];
-        append_microvm_virtio_discovery(
-            &mut with_devices,
-            None,
-            false,
-            None,
-            true,
-            false,
-            &blocks,
-        )
-        .unwrap();
+        append_microvm_virtio_discovery(&mut with_devices, None, false, None, true, false, &blocks)
+            .unwrap();
         assert_eq!(
             with_devices,
             format!(
@@ -6017,7 +6009,7 @@ mod tests {
         let valid_control_console = Options::try_parse_from([
             "openvmm",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--virtio-console",
             "none",
             "--microvm-control-console",
@@ -6028,7 +6020,7 @@ mod tests {
         let valid_restore_control_console = Options::try_parse_from([
             "openvmm",
             "--machine",
-            "microvm-v2",
+            "microvm",
             "--restore-snapshot",
             "snapshot",
             "--microvm-control-console",
@@ -6104,22 +6096,13 @@ mod tests {
                 "openvmm",
                 "--machine",
                 "microvm",
-                "--virtio-console",
-                "none",
                 "--microvm-control-console",
                 "none",
             ],
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v2",
-                "--microvm-control-console",
-                "none",
-            ],
-            vec![
-                "openvmm",
-                "--machine",
-                "microvm-v2",
+                "microvm",
                 "--virtio-console",
                 "none",
                 "--microvm-control-console",
@@ -6128,7 +6111,7 @@ mod tests {
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v2",
+                "microvm",
                 "--virtio-console",
                 "none",
                 "--microvm-control-console",
@@ -6137,7 +6120,7 @@ mod tests {
             vec![
                 "openvmm",
                 "--machine",
-                "microvm-v2",
+                "microvm",
                 "--virtio-console",
                 "none",
                 "--microvm-control-console",
