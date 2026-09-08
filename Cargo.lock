@@ -5964,7 +5964,6 @@ name = "openvmm_helpers"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "disk_backend_resources",
  "disk_vhd1",
  "disk_vhdmp",
@@ -10741,7 +10740,6 @@ dependencies = [
  "tracing",
  "unix_socket",
  "vfio_assigned_device_resources",
- "virt",
  "virtio_resources",
  "vm_resource",
  "vmgs_resources",
