@@ -1615,7 +1615,7 @@ impl InitializedVm {
 
         #[cfg(guest_arch = "x86_64")]
         if saved_state.is_none()
-            && matches!(cfg.machine_profile, MachineProfile::Microvm { .. })
+            && matches!(cfg.machine_profile, MachineProfile::Microvm)
             && let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode
         {
             match partition
