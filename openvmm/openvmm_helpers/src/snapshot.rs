@@ -2951,7 +2951,7 @@ impl OpenedSnapshotDirectory {
             use nix::fcntl::OFlag;
             use nix::sys::stat::Mode;
 
-            return nix::fcntl::openat(
+            nix::fcntl::openat(
                 &self.file,
                 name,
                 OFlag::O_WRONLY
@@ -2962,7 +2962,7 @@ impl OpenedSnapshotDirectory {
                 Mode::S_IRUSR | Mode::S_IWUSR,
             )
             .map(std::fs::File::from)
-            .map_err(nix_error);
+            .map_err(nix_error)
         }
         #[cfg(windows)]
         {
@@ -4094,6 +4094,16 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
         manifest.snapshot_tier,
     );
     if manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM {
+        let expected_tsc_frequency = format!("tsc_early_khz={}", contract.tsc_frequency_hz / 1000);
+        let tsc_frequency_tokens = contract
+            .effective_command_line
+            .split_ascii_whitespace()
+            .filter(|token| token.starts_with("tsc_early_khz="))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            tsc_frequency_tokens == [expected_tsc_frequency.as_str()],
+            "platform snapshot command line TSC frequency does not match its machine contract"
+        );
         let control_tty_count = contract
             .effective_command_line
             .split_ascii_whitespace()
@@ -4135,6 +4145,7 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
         ]
         .iter()
         .any(|prefix| token.starts_with(prefix))
+        || token.starts_with("tsc_early_khz=")
 }
 
 fn ensure_unique<T>(values: &[T], description: &str) -> anyhow::Result<()>
@@ -4343,7 +4354,11 @@ mod tests {
         scratch.identity_kind = "fresh".to_owned();
         scratch.identity.clear();
         scratch.artifact.clear();
-        contract.set_effective_command_line(canonical_worker_platform_command_line());
+        contract.set_effective_command_line(format!(
+            "{} tsc_early_khz={}",
+            canonical_worker_platform_command_line(),
+            contract.tsc_frequency_hz / 1000
+        ));
     }
 
     #[test]
@@ -4466,9 +4481,34 @@ mod tests {
                  virtio_mmio.device=0x1000@0xd0003000:4 \
                  virtio_mmio.device=0x1000@0xd0006000:11 \
              virtio_mmio.device=0x1000@0xd0007000:3 \
-             nvx_control_tty=hvc2"
+             nvx_control_tty=hvc2 tsc_early_khz=1000000"
         );
         validate_manifest_version(&manifest).unwrap();
+    }
+
+    #[test]
+    fn platform_snapshot_rejects_invalid_tsc_frequency_tokens() {
+        let scratch = vec![0x5a; 512];
+        for invalid in [
+            "tsc_early_khz=999999",
+            "tsc_early_khz=1000000 tsc_early_khz=1000000",
+        ] {
+            let mut manifest = paired_scratch_manifest(&scratch);
+            make_platform_snapshot(&mut manifest);
+            let contract = manifest.machine_contract.as_mut().unwrap();
+            contract.set_effective_command_line(
+                contract
+                    .effective_command_line
+                    .replace("tsc_early_khz=1000000", invalid),
+            );
+
+            assert!(
+                validate_manifest_version(&manifest)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TSC frequency does not match")
+            );
+        }
     }
 
     #[test]
