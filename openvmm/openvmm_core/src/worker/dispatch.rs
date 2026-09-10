@@ -69,6 +69,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::GicConfig;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::NumaTopology;
 use openvmm_defs::config::PcieDeviceConfig;
 use openvmm_defs::config::PcieIommuConfig;
@@ -205,6 +206,7 @@ pub fn new_device_thread() -> (JoinHandle<()>, DefaultDriver) {
 impl Manifest {
     fn from_config(config: Config) -> Self {
         Self {
+            machine_profile: config.machine_profile,
             load_mode: config.load_mode,
             floppy_disks: config.floppy_disks,
             ide_disks: config.ide_disks,
@@ -283,6 +285,7 @@ pub struct Manifest {
     chipset_capabilities: VmChipsetCapabilities,
     layout: vmm_core_defs::LayoutConfig,
     rtc_delta_milliseconds: i64,
+    machine_profile: MachineProfile,
 }
 
 #[derive(Protobuf, SavedStateRoot)]
@@ -338,6 +341,18 @@ impl Worker for VmWorker {
     const ID: WorkerId<Self::Parameters> = VM_WORKER;
 
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+        openvmm_defs::config::validate_machine_config(
+            &parameters.cfg,
+            Some(parameters.hypervisor.id()),
+        )?;
+        if matches!(
+            parameters.cfg.machine_profile,
+            MachineProfile::Microvm { .. }
+        ) && parameters.saved_state.is_some()
+        {
+            anyhow::bail!("saved-state restore is unavailable for microVM ABI version 1");
+        }
+
         let (device_thread, device_driver) = new_device_thread();
 
         let manifest = Manifest::from_config(parameters.cfg);
@@ -827,6 +842,7 @@ struct LoadedVmInner {
     pci_legacy_interrupts: Vec<((u8, Option<u8>), u32)>,
     firmware_event_send: Option<mesh::Sender<get_resources::ged::FirmwareEvent>>,
 
+    machine_profile: MachineProfile,
     load_mode: LoadMode,
     igvm_file: Option<IgvmFile>,
     next_igvm_file: Option<IgvmFile>,
@@ -1183,11 +1199,14 @@ impl InitializedVm {
             None
         };
 
-        let virtio_mmio_count = cfg
-            .virtio_devices
-            .iter()
-            .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
-            .count();
+        let virtio_mmio_count = if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+            0
+        } else {
+            cfg.virtio_devices
+                .iter()
+                .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
+                .count()
+        };
 
         // On aarch64 Linux direct boot, start RAM at 1 GiB to avoid the low GPA
         // region (128 MiB–129 MiB) that iommufd reserves for the host MSI
@@ -1859,7 +1878,14 @@ impl InitializedVm {
                 .into_resource(),
                 century_reg_idx: 0x32, // TODO: automatically sync with FADT
                 initial_cmos: initial_rtc_cmos,
-                mode: dev::GenericCmosRtcMode::Standard,
+                mode: if matches!(
+                    cfg.machine_profile,
+                    MachineProfile::Microvm { abi_version: 1 }
+                ) {
+                    dev::GenericCmosRtcMode::MicrovmV1
+                } else {
+                    dev::GenericCmosRtcMode::Standard
+                },
             }
         });
 
@@ -2024,7 +2050,7 @@ impl InitializedVm {
         .with_device_handles(cfg.chipset_devices)
         .with_pci_device_handles(cfg.pci_chipset_devices)
         .with_isa_dma_handle(cfg.isa_dma_controller)
-        .with_trace_unknown_pio(true) // todo: add CLI param?
+        .with_trace_unknown_pio(matches!(cfg.machine_profile, MachineProfile::Standard))
         .build(&driver_source, &state_units, &resolver)
         .await?;
 
@@ -2960,19 +2986,42 @@ impl InitializedVm {
                 .await?;
             match bus {
                 VirtioBus::Mmio => {
-                    let mmio_start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
-                    virtio_mmio_index += 1;
+                    let (mmio_start, mmio_len, irq, disabled_features) =
+                        if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+                            const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
+                            let start = openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE;
+                            let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
+                            anyhow::ensure!(
+                                start >= chipset_mmio.low.start()
+                                    && start
+                                        .checked_add(len)
+                                        .is_some_and(|end| end <= chipset_mmio.low.end()),
+                                "microVM virtio-blk slot is outside the fixed low-MMIO aperture"
+                            );
+                            (
+                                start,
+                                len,
+                                openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
+                                VIRTIO_F_RING_PACKED,
+                            )
+                        } else {
+                            let start =
+                                virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
+                            virtio_mmio_index += 1;
+                            (start, 0x1000, virtio_mmio_irq, 0)
+                        };
                     let id = format!("{id}-{mmio_start}");
                     let gm = gm.clone();
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
-                        VirtioMmioDevice::new(
+                        VirtioMmioDevice::new_with_disabled_features(
                             device.0,
                             &driver_source.simple(),
                             gm,
-                            services.new_line(IRQ_LINE_SET, "interrupt", virtio_mmio_irq),
+                            services.new_line(IRQ_LINE_SET, "interrupt", irq),
                             partition.clone().into_doorbell_registration(Vtl::Vtl0),
                             mmio_start,
-                            0x1000,
+                            mmio_len,
+                            disabled_features,
                         )
                     })?;
                 }
@@ -3107,6 +3156,7 @@ impl InitializedVm {
                 chipset_cfg: cfg.chipset,
                 chipset_capabilities: cfg.chipset_capabilities,
                 firmware_event_send: cfg.firmware_event_send,
+                machine_profile: cfg.machine_profile,
                 load_mode: cfg.load_mode,
                 virtio_mmio_region,
                 virtio_mmio_irq,
@@ -3259,6 +3309,20 @@ impl LoadedVmInner {
             page_imports: initial_page_imports,
         } = match &self.load_mode {
             LoadMode::None => return Ok(()),
+            #[cfg(guest_arch = "x86_64")]
+            LoadMode::Pvh {
+                kernel,
+                initrd,
+                cmdline,
+            } => super::vm_loaders::pvh::load_pvh(
+                &super::vm_loaders::pvh::KernelConfig {
+                    kernel,
+                    initrd,
+                    cmdline,
+                    mem_layout: &self.mem_layout,
+                },
+                &self.gm,
+            )?,
             #[cfg(guest_arch = "x86_64")]
             &LoadMode::Linux {
                 ref kernel,
@@ -3679,6 +3743,12 @@ impl LoadedVm {
                 Event::WorkerRpc(Ok(message)) => match message {
                     WorkerRpc::Stop => break,
                     WorkerRpc::Restart(rpc) => {
+                        if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                            rpc.complete(Err(RemoteError::new(anyhow::anyhow!(
+                                "worker restart is unavailable for microVM ABI version 1"
+                            ))));
+                            continue;
+                        }
                         let mut stopped = false;
                         // First run the non-destructive operations.
                         let r = async {
@@ -3732,8 +3802,16 @@ impl LoadedVm {
                     VmRpc::Resume(rpc) => rpc.handle(async |()| self.resume().await).await,
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
                     VmRpc::Save(rpc) => {
-                        rpc.handle_failable(async |()| self.save().await.map(ProtobufMessage::new))
-                            .await
+                        if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                            rpc.handle_failable_sync(|()| {
+                                anyhow::bail!("save is unavailable for microVM ABI version 1")
+                            });
+                        } else {
+                            rpc.handle_failable(async |()| {
+                                self.save().await.map(ProtobufMessage::new)
+                            })
+                            .await;
+                        }
                     }
                     VmRpc::Nmi(rpc) => rpc.handle_sync(|vpindex| {
                         if vpindex < self.inner.processor_topology.vp_count() {
@@ -3799,6 +3877,9 @@ impl LoadedVm {
                     }
                     VmRpc::PulseSaveRestore(rpc) => {
                         rpc.handle(async |()| {
+                            if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                                return Err(PulseSaveRestoreError::UnsupportedMachineProfile);
+                            }
                             if !self.inner.partition.supports_reset() {
                                 return Err(PulseSaveRestoreError::ResetNotSupported);
                             }
@@ -4218,6 +4299,7 @@ impl LoadedVm {
         }
 
         let manifest = Manifest {
+            machine_profile: self.inner.machine_profile,
             load_mode: self.inner.load_mode,
             floppy_disks: vec![],            // TODO
             ide_disks: vec![],               // TODO

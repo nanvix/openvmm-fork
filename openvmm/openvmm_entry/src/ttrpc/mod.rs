@@ -59,6 +59,7 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MachineProfile as OpenvmmMachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
 use openvmm_defs::config::NumaNode;
@@ -951,6 +952,7 @@ impl VmService {
 
         let mut config = Config {
             // TODO: devices, other stuff
+            machine_profile: OpenvmmMachineProfile::Standard,
             load_mode,
             ide_disks: vec![],
             floppy_disks: vec![],
@@ -1150,6 +1152,7 @@ impl VmService {
 
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
+            machine_profile: OpenvmmMachineProfile::Standard,
             mesh,
             vm_worker: worker,
             vnc_worker: None,

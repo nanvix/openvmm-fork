@@ -101,7 +101,7 @@ impl PetriVmConfigOpenVmm {
                 LoadMode::Linux { smbios, .. }
                 | LoadMode::Uefi { smbios, .. }
                 | LoadMode::Pcat { smbios, .. } => &mut **smbios,
-                LoadMode::Igvm { .. } | LoadMode::None => {
+                LoadMode::Igvm { .. } | LoadMode::None | LoadMode::Pvh { .. } => {
                     panic!("SMBIOS configuration is not supported for this load mode.")
                 }
             };

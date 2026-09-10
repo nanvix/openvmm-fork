@@ -53,6 +53,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LateMapVtl0MemoryPolicy;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::NumaNode;
 use openvmm_defs::config::NumaTopology;
 use openvmm_defs::config::PcieDeviceConfig;
@@ -643,6 +644,7 @@ impl PetriVmConfigOpenVmm {
 
         let config = Config {
             // Firmware
+            machine_profile: MachineProfile::Standard,
             load_mode,
             firmware_event_send: Some(firmware_event_send),
 

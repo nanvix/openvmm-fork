@@ -72,6 +72,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LateMapVtl0MemoryPolicy;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
 use openvmm_defs::config::NumaNode;
@@ -2022,6 +2023,7 @@ async fn vm_config_from_command_line(
     }
 
     let mut cfg = Config {
+        machine_profile: MachineProfile::Standard,
         chipset,
         load_mode,
         floppy_disks,
@@ -2948,6 +2950,7 @@ async fn run_control_inner(
 
     // Build the VmController with exclusive resources.
     let controller = vm_controller::VmController {
+        machine_profile: MachineProfile::Standard,
         mesh: mesh_slot.take().unwrap(),
         vm_worker,
         vnc_worker,

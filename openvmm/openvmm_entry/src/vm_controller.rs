@@ -18,6 +18,7 @@ use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use mesh_worker::WorkerEvent;
 use mesh_worker::WorkerHandle;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::rpc::VmRpc;
 use std::path::Path;
 use std::path::PathBuf;
@@ -111,6 +112,7 @@ pub enum VmControllerEvent {
 
 /// Owns exclusive VM resources and services RPCs from the REPL.
 pub struct VmController {
+    pub(crate) machine_profile: MachineProfile,
     pub(crate) mesh: VmmMesh,
     pub(crate) vm_worker: WorkerHandle,
     pub(crate) vnc_worker: Option<WorkerHandle>,
@@ -426,6 +428,9 @@ impl VmController {
     }
 
     async fn handle_restart(&mut self) -> anyhow::Result<()> {
+        if matches!(self.machine_profile, MachineProfile::Microvm { .. }) {
+            anyhow::bail!("worker restart is unavailable for microVM ABI version 1");
+        }
         let vm_host = self
             .mesh
             .make_host("vm", self.log_file.clone())
@@ -468,6 +473,9 @@ impl VmController {
     }
 
     async fn handle_save_snapshot(&self, dir: &Path) -> anyhow::Result<()> {
+        if matches!(self.machine_profile, MachineProfile::Microvm { .. }) {
+            anyhow::bail!("disk snapshots are unavailable for microVM ABI version 1");
+        }
         let memory_file_path = self
             .memory_backing_file
             .as_ref()
