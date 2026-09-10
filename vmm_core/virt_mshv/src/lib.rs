@@ -750,6 +750,13 @@ enum ErrorInner {
     #[error("register access error")]
     Register(#[source] KernelError),
     #[cfg(guest_arch = "x86_64")]
+    #[error("failed to synchronize restored VP {vp_index} TSC")]
+    SynchronizeTsc {
+        vp_index: u32,
+        #[source]
+        error: KernelError,
+    },
+    #[cfg(guest_arch = "x86_64")]
     #[error("failed to get VP state {ty}")]
     GetVpState {
         #[source]

@@ -139,6 +139,11 @@ target, and all KVM and WHP restores, instantiate the full VP capacity.
 Versioned MSHV CPU contracts do not expose `IA32_TSC_ADJUST` because snapshot
 state cannot preserve that register independently of `IA32_TSC`; this prevents
 host-side TSC correction from appearing as per-VP firmware adjustment skew.
+After restoring counters and advancing snapshot time, MSHV freezes partition
+time and aligns every VP's TSC to the BSP's advanced counter before any VP
+runs. The first VP run thaws time. Setting counters while time is running
+would introduce inter-VP skew from host scheduling delays, which can make
+Linux reject the TSC clocksource during CPU activation.
 Snapshots without the explicit capture-time `maxcpus` opt-in, including legacy
 snapshots, reject a restore target. This is not a post-readiness hotplug API and
 cannot add VPs absent from the saved topology.
