@@ -4,6 +4,7 @@
 //! Setup directory structure that the VMM tests require to run.
 
 use crate::build_flowey_hvlite::FloweyHvliteOutput;
+use crate::build_guest_test_pvh::GuestTestPvhOutput;
 use crate::build_guest_test_uefi::GuestTestUefiOutput;
 use crate::build_incubator::IncubatorOutput;
 use crate::build_incubator::incubator_profile_dir;
@@ -53,6 +54,7 @@ define_vmm_tests_built_artifacts!(
     openvmm_vhost => OpenvmmVhostOutput,
     pipette_windows => PipetteOutput,
     pipette_linux_musl => PipetteOutput,
+    guest_test_pvh => GuestTestPvhOutput,
     guest_test_uefi => GuestTestUefiOutput,
     openhcl_standard => OpenhclIgvmOutput,
     openhcl_standard_dev => OpenhclIgvmOutput,
@@ -228,6 +230,7 @@ impl SimpleFlowNode for Node {
             openvmm_vhost,
             pipette_windows,
             pipette_linux_musl,
+            guest_test_pvh,
             guest_test_uefi,
             openhcl_standard,
             openhcl_standard_dev,
@@ -269,6 +272,7 @@ impl SimpleFlowNode for Node {
                     openvmm_vhost,
                     pipette_windows,
                     pipette_linux_musl,
+                    guest_test_pvh,
                     guest_test_uefi,
                     openhcl_igvm_files,
                     tmks,
@@ -424,6 +428,11 @@ impl SimpleFlowNode for Node {
                         img,
                     } = rt.read(guest_test_uefi);
                     fs_err::copy(img, test_content_dir.join("guest_test_uefi.img"))?;
+                }
+
+                if let Some(guest_test_pvh) = guest_test_pvh {
+                    let GuestTestPvhOutput { bin } = rt.read(guest_test_pvh);
+                    fs_err::copy(bin, test_content_dir.join("guest_test_pvh"))?;
                 }
 
                 if let Some(tmks) = tmks {
@@ -627,6 +636,7 @@ pub mod vmm_tests_artifact_builders {
             pipette_linux_musl => PipetteOutput,
             prep_steps => PrepStepsOutput,
             // any machine
+            guest_test_pvh => GuestTestPvhOutput,
             guest_test_uefi => GuestTestUefiOutput,
             tmks => TmksOutput,
         )
@@ -653,6 +663,7 @@ pub mod vmm_tests_artifact_builders {
             pipette_linux_musl => PipetteOutput,
             tmk_vmm_linux_musl => TmkVmmOutput,
             // any machine
+            guest_test_pvh => GuestTestPvhOutput,
             guest_test_uefi => GuestTestUefiOutput,
             tmks => TmksOutput,
         )

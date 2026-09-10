@@ -38,6 +38,7 @@ impl SimpleFlowNode for Node {
                     openvmm_vhost,
                     pipette_windows,
                     pipette_linux_musl,
+                    guest_test_pvh,
                     guest_test_uefi,
                     openhcl_standard,
                     openhcl_standard_dev,
@@ -162,6 +163,15 @@ impl SimpleFlowNode for Node {
                 format!("{arch_tag}-guest_test_uefi"),
                 run_id.clone(),
                 guest_test_uefi,
+            );
+        }
+
+        if let Some(guest_test_pvh) = guest_test_pvh {
+            download_artifact(
+                ctx,
+                format!("{arch_tag}-guest_test_pvh"),
+                run_id.clone(),
+                guest_test_pvh,
             );
         }
 

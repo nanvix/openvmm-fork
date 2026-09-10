@@ -1,0 +1,10 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "guest_test_pvh"
+rust-version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

@@ -3194,6 +3194,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest_test_pvh"
+version = "0.0.0"
+
+[[package]]
 name = "guest_test_uefi"
 version = "0.0.0"
 dependencies = [

@@ -475,6 +475,7 @@ impl HyperVNewCustomVMArgs {
         let PetriVmConfig {
             name,
             arch,
+            machine_profile,
             firmware,
             memory,
             proc_topology,
@@ -483,6 +484,13 @@ impl HyperVNewCustomVMArgs {
             physical_nvme_devices,
             ..
         } = config;
+
+        if !matches!(
+            machine_profile,
+            openvmm_defs::config::MachineProfile::Standard
+        ) {
+            anyhow::bail!("the microVM profile is only supported by OpenVMM");
+        }
 
         if firmware
             .openhcl_config()

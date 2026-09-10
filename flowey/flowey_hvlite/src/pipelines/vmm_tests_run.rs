@@ -792,6 +792,10 @@ impl ResolvedArtifactSelections {
                 self.build.tmks = true;
             }
 
+            petri_artifacts_vmm_test::artifacts::loadable::GUEST_TEST_PVH_X64::GLOBAL_UNIQUE_ID => {
+                self.build.guest_test_pvh = true;
+            }
+
             // TMK VMM
             petri_artifacts_vmm_test::artifacts::tmks::TMK_VMM_WIN_X64::GLOBAL_UNIQUE_ID
             | petri_artifacts_vmm_test::artifacts::tmks::TMK_VMM_WIN_AARCH64::GLOBAL_UNIQUE_ID => {
