@@ -3934,29 +3934,12 @@ impl LoadedVm {
             Err(error) => {
                 tracelimit::error_ratelimited!(
                     error = error.as_ref() as &dyn std::error::Error,
-                    "failed to establish snapshot PMIO boundary"
+                    "failed to establish snapshot PMIO boundary; terminating VM worker"
                 );
-                if self.restore_input_gated {
-                    tracelimit::error_ratelimited!(
-                        "failed to establish post-restore acknowledgement boundary; terminating VM worker"
-                    );
-                    request.transaction_complete.complete(());
-                    return false;
-                }
-                if let Err(resume_error) = self
-                    .state_units
-                    .resume_input_after_save(request.input_gate_timeout)
-                    .await
-                {
-                    tracelimit::error_ratelimited!(
-                        error = resume_error.as_ref() as &dyn std::error::Error,
-                        "host input is uncertain after boundary failure; terminating VM worker"
-                    );
-                    request.transaction_complete.complete(());
-                    return false;
-                }
+                // The stop may have taken effect without a resumable guard.
+                // Keep host input gated and tear down the VM.
                 request.transaction_complete.complete(());
-                true
+                false
             }
         }
     }

@@ -291,6 +291,9 @@ impl PartitionUnit {
     }
 
     /// Stops VPs after queuing stop events but before completing deferred I/O.
+    ///
+    /// Failure is terminal: the caller must tear down the partition instead of
+    /// attempting to resume it. An I/O-completion error retains the stop reference.
     pub async fn temporarily_stop_vps_at_io_boundary(
         &mut self,
         release_io: mesh::OneshotSender<()>,
@@ -430,11 +433,12 @@ impl PartitionUnitRunner {
                     }
                     PartitionRequest::StopVpsAtIoBoundary(rpc) => {
                         rpc.handle_failable(async |(release_io, io_completed)| {
+                            // Keep the stop reference on failure too: a failed
+                            // boundary must not be restarted before teardown.
+                            self.vp_stop_count += 1;
                             self.vp_set
                                 .stop_at_io_boundary(release_io, io_completed)
-                                .await?;
-                            self.vp_stop_count += 1;
-                            anyhow::Ok(())
+                                .await
                         })
                         .await
                     }
