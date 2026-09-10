@@ -158,7 +158,9 @@ impl Default for GuestPowerActions {
 /// Decide what to do for a guest halt, given the per-event actions.
 fn action_for(reason: &HaltReason, actions: &GuestPowerActions) -> GuestPowerAction {
     match reason {
-        HaltReason::PowerOff | HaltReason::Hibernate => actions.shutdown,
+        HaltReason::PowerOff | HaltReason::PowerOffWithStatus { .. } | HaltReason::Hibernate => {
+            actions.shutdown
+        }
         HaltReason::Reset => actions.reset,
         HaltReason::TripleFault { .. } => actions.crash,
         HaltReason::Watchdog => actions.watchdog,
@@ -276,6 +278,12 @@ impl VmController {
                 },
                 Event::Halt(reason) => {
                     tracing::info!(?reason, "guest halted");
+                    if let HaltReason::PowerOffWithStatus { code } = reason {
+                        event_send.send(VmControllerEvent::ExitRequested {
+                            code: i32::from(code),
+                        });
+                        return;
+                    }
                     // On a guest crash, write a `.vmrs` dump (if configured)
                     // before applying the crash action, since a `Reset` action
                     // would wipe the guest state we want to capture.

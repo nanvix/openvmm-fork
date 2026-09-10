@@ -170,6 +170,8 @@ pub enum BaseChipsetType {
     UnenlightenedLinuxDirect,
     /// Enlightened Linux VM with a minimal emulated chipset for direct boot.
     EnlightenedLinuxDirect,
+    /// microVM with only its allowlisted architectural devices.
+    Microvm,
 }
 
 /// The machine architecture of the VM.
@@ -278,7 +280,10 @@ impl VmManifestBuilder {
     /// Create a new VM manifest builder for the given chipset type and
     /// architecture.
     pub fn new(ty: BaseChipsetType, arch: MachineArch) -> Self {
-        let vmbus = !matches!(ty, BaseChipsetType::UnenlightenedLinuxDirect);
+        let vmbus = !matches!(
+            ty,
+            BaseChipsetType::UnenlightenedLinuxDirect | BaseChipsetType::Microvm
+        );
         VmManifestBuilder {
             ty,
             arch,
@@ -584,6 +589,18 @@ impl VmManifestBuilder {
                     result.attach_guest_watchdog();
                 }
             }
+            BaseChipsetType::Microvm => {
+                if self.arch != MachineArch::X86_64 {
+                    return Err(Error(ErrorInner::UnsupportedArch));
+                }
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: true,
+                    ..BaseChipsetManifest::empty()
+                };
+                result.attach_generic_ioapic();
+                result.attach_pic();
+                result.attach_pit();
+            }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 result.chipset = BaseChipsetManifest {
                     with_generic_cmos_rtc: is_x86,
@@ -670,6 +687,11 @@ impl VmManifestBuilder {
             | BaseChipsetType::EnlightenedLinuxDirect => LayoutConfig {
                 chipset_low_mmio_size: default_low,
                 chipset_high_mmio_size: if self.vmbus { default_high } else { 0 },
+                vtl2_chipset_mmio_size: 0,
+            },
+            BaseChipsetType::Microvm => LayoutConfig {
+                chipset_low_mmio_size: 1024 * 1024 * 1024,
+                chipset_high_mmio_size: 0,
                 vtl2_chipset_mmio_size: 0,
             },
             BaseChipsetType::HclHost => LayoutConfig {
@@ -1039,6 +1061,32 @@ mod tests {
 
         let builder = builder.with_serial_debugger_mode([true, false, false, true]);
         assert_eq!(builder.serial_debugger_mode, [true, false, false, true]);
+    }
+
+    #[test]
+    fn microvm_microvm_has_only_allowlisted_base_devices() {
+        let builder = VmManifestBuilder::new(BaseChipsetType::Microvm, MachineArch::X86_64);
+        assert!(!builder.vmbus);
+        assert_eq!(
+            builder.layout_config().chipset_low_mmio_size,
+            1024 * 1024 * 1024
+        );
+
+        let result = builder.build().unwrap();
+        assert!(result.chipset.with_generic_cmos_rtc);
+        assert_eq!(
+            result
+                .chipset_devices
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ioapic", PicDeviceHandle::ID, PitDeviceHandle::ID]
+        );
+        assert!(result.capabilities.with_ioapic);
+        assert!(result.capabilities.with_pic);
+        assert!(result.capabilities.with_pit);
+        assert!(result.pci_chipset_devices.is_empty());
+        assert!(result.isa_dma_controller.is_none());
     }
 
     #[test]

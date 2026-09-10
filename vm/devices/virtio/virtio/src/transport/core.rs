@@ -103,6 +103,17 @@ impl VirtioTransportCore {
         guest_memory: GuestMemory,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
     ) -> std::io::Result<Self> {
+        Self::new_with_disabled_features(device, driver, guest_memory, doorbell_registration, 0)
+    }
+
+    /// Creates a transport core after masking guest-visible device features.
+    pub fn new_with_disabled_features(
+        device: Box<dyn DynVirtioDevice>,
+        driver: &impl Spawn,
+        guest_memory: GuestMemory,
+        doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
+        disabled_features: u64,
+    ) -> std::io::Result<Self> {
         let traits = device.traits();
         let queues: Vec<QueueData> = (0..traits.max_queues)
             .map(|i| {
@@ -127,7 +138,8 @@ impl VirtioTransportCore {
         let device_feature = traits
             .device_features
             .with_version_1(true)
-            .with_access_platform(true);
+            .with_access_platform(true)
+            .without_bits(disabled_features);
         let supports_save_restore = device.supports_save_restore();
 
         let (sender, receiver) = mesh::channel();
