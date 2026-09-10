@@ -64,11 +64,11 @@ pub(crate) enum VirtioRestoreError {
         saved: u32,
         device: u32,
     },
-    #[error("saved state has {saved} feature banks, device only has {device}")]
-    TooManyFeatureBanks { saved: usize, device: usize },
+    #[error("saved state has {saved} feature banks, expected {expected}")]
+    FeatureBankCountMismatch { saved: usize, expected: usize },
     #[error("queue count mismatch: saved {saved} vs device {device}")]
     QueueCountMismatch { saved: usize, device: usize },
-    #[error("queue {index}: saved size {size} exceeds max {max}")]
+    #[error("queue {index}: saved size {size} exceeds device maximum {max}")]
     QueueSizeTooLarge { index: usize, size: u16, max: u16 },
 }
 
@@ -81,18 +81,17 @@ pub(crate) enum VirtioRestoreError {
 pub(crate) fn validate_restore(
     common: &state::CommonSavedState,
     device_features: &VirtioDeviceFeatures,
-    queue_sizes: impl Iterator<Item = (usize, u16)>,
+    queue_sizes: impl Iterator<Item = (usize, u16, u16)>,
     device_queue_count: usize,
     saved_queue_count: usize,
-    max_queue_size: u16,
 ) -> Result<(), RestoreError> {
     // Validate feature banks.
     let saved_banks = &common.driver_feature_banks;
-    if saved_banks.len() > 2 {
+    if saved_banks.len() != 2 {
         return Err(RestoreError::InvalidSavedState(
-            VirtioRestoreError::TooManyFeatureBanks {
+            VirtioRestoreError::FeatureBankCountMismatch {
                 saved: saved_banks.len(),
-                device: 2,
+                expected: 2,
             }
             .into(),
         ));
@@ -123,7 +122,7 @@ pub(crate) fn validate_restore(
     }
 
     // Validate queue sizes.
-    for (i, size) in queue_sizes {
+    for (i, size, max_queue_size) in queue_sizes {
         if size > max_queue_size {
             return Err(RestoreError::InvalidSavedState(
                 VirtioRestoreError::QueueSizeTooLarge {

@@ -193,6 +193,24 @@ pub struct QueueParams {
     pub used_addr: u64,
 }
 
+/// Inspect the readable length of the front restored descriptor without
+/// advancing the queue.
+pub fn restored_queue_front_readable_length(
+    features: VirtioDeviceFeatures,
+    params: QueueParams,
+    mem: GuestMemory,
+    initial_state: Option<QueueState>,
+) -> Result<Option<u64>, QueueError> {
+    let (mut queue, _) = new_queue(features, mem, params, initial_state)?;
+    Ok(queue.try_peek_work()?.map(|work| {
+        work.payload
+            .iter()
+            .filter(|payload| !payload.writeable)
+            .map(|payload| u64::from(payload.length))
+            .sum()
+    }))
+}
+
 #[derive(Debug, Inspect)]
 pub(crate) struct QueueCoreGetWork {
     queue_desc: GuestMemory,
