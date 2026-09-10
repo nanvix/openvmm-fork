@@ -355,8 +355,8 @@ Examples:
     #[clap(long, value_name = "COUNT", requires = "restore_snapshot")]
     pub restore_processors: Option<u32>,
 
-    /// Requested total guest RAM size for snapshot restore.
-    #[clap(skip)]
+    /// Restore a capable microVM snapshot with this total guest RAM size.
+    #[clap(long, value_name = "SIZE", requires = "restore_snapshot")]
     pub restore_memory: Option<vmm_cli::MemorySize>,
 
     /// Maximum time allowed for a microVM guest to complete post-restore repair.
@@ -367,8 +367,8 @@ Examples:
     #[clap(long, value_name = "DIR", conflicts_with = "restore_snapshot")]
     pub snapshot_destination: Option<PathBuf>,
 
-    /// Immutable total guest RAM capacity reserved during capture.
-    #[clap(skip)]
+    /// Reserve this immutable total RAM capacity in a captured microVM snapshot.
+    #[clap(long, value_name = "SIZE", requires = "snapshot_destination")]
     pub memory_capacity: Option<vmm_cli::MemorySize>,
 
     /// Sandbox capture tier. Required for microVM snapshot capture with sandbox blocks.
@@ -6100,6 +6100,62 @@ mod tests {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
+    }
+
+    #[test]
+    fn test_microvm_memory_capacity_and_restore_target_parsing() {
+        let capture = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--memory",
+            "512M",
+            "--snapshot-destination",
+            "snapshot",
+            "--memory-capacity",
+            "2G",
+        ])
+        .unwrap();
+        capture.validate_microvm_options().unwrap();
+        assert_eq!(capture.memory_capacity.unwrap().0, 2 * 1024 * 1024 * 1024);
+
+        let restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-memory",
+            "512M",
+        ])
+        .unwrap();
+        restore.validate_microvm_options().unwrap();
+        assert_eq!(restore.restore_memory.unwrap().0, 512 * 1024 * 1024);
+
+        assert!(
+            Options::try_parse_from(
+                ["openvmm", "--machine", "microvm", "--memory-capacity", "2G",]
+            )
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from(["openvmm", "--machine", "microvm", "--restore-memory", "1G",])
+                .is_err()
+        );
+
+        let unaligned = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--memory",
+            "513M",
+            "--snapshot-destination",
+            "snapshot",
+            "--memory-capacity",
+            "2G",
+        ])
+        .unwrap();
+        assert!(unaligned.validate_microvm_options().is_err());
     }
 
     #[test]

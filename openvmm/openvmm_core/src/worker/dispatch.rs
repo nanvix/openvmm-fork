@@ -1090,6 +1090,25 @@ struct GenericInitiatorSource {
     vnode: u32,
 }
 
+fn coalesce_adjacent_ranges(ranges: &[MemoryRange]) -> anyhow::Result<Vec<MemoryRange>> {
+    let mut coalesced: Vec<MemoryRange> = Vec::with_capacity(ranges.len());
+    for &range in ranges {
+        anyhow::ensure!(!range.is_empty(), "snapshot RAM range is empty");
+        if let Some(previous) = coalesced.last_mut() {
+            anyhow::ensure!(
+                range.start() >= previous.end(),
+                "snapshot RAM ranges overlap or are out of order"
+            );
+            if range.start() == previous.end() {
+                *previous = MemoryRange::new(previous.start()..range.end());
+                continue;
+            }
+        }
+        coalesced.push(range);
+    }
+    Ok(coalesced)
+}
+
 impl InitializedVm {
     /// Creates and initializes a VM using the given backend.
     async fn new(
@@ -1232,6 +1251,8 @@ impl InitializedVm {
         #[cfg(guest_arch = "aarch64")]
         let device_assignment_msi_iova_range =
             resolve_device_assignment_msi_iova_range(platform_info.device_assignment_msi_iova);
+        let user_mode_memory_faults = true;
+        let lazy_memory_registration = false;
 
         let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor
@@ -1243,8 +1264,8 @@ impl InitializedVm {
                 nested_virt: cfg.hypervisor.nested_virt,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
-                user_mode_memory_faults: true,
-                lazy_memory_registration: false,
+                user_mode_memory_faults,
+                lazy_memory_registration,
                 versioned_cpu_contract: cfg.machine_profile == MachineProfile::Microvm,
             })
             .context("failed to create the prototype partition")?;
@@ -1321,6 +1342,7 @@ impl InitializedVm {
         };
         let resolved_layout = resolve_memory_layout(MemoryLayoutInput {
             node_mem_sizes: &node_mem_sizes,
+            memory_capacity: cfg.microvm_memory_capacity,
             layout: cfg.layout.clone(),
             pcie_root_complexes: &cfg.pcie_root_complexes,
             virtio_mmio_count,
@@ -1458,8 +1480,55 @@ impl InitializedVm {
                 matches!(cfg.load_mode, LoadMode::Pcat { .. }) || cfg.chipset.with_hyperv_vga,
             );
 
+        let restore_has_split_backing = !cfg.microvm_snapshot_memory_ranges.is_empty();
+        if restore_has_split_backing {
+            anyhow::ensure!(
+                cfg.machine_profile == MachineProfile::Microvm && nodes_with_ranges == 1,
+                "snapshot RAM range restore requires a single-node microVM"
+            );
+            let active_ranges = ranges_by_node
+                .iter()
+                .find(|ranges| !ranges.is_empty())
+                .expect("nodes_with_ranges is one");
+            let mut restored_ranges = cfg.microvm_snapshot_memory_ranges.clone();
+            restored_ranges.extend_from_slice(&cfg.microvm_restore_memory_ranges);
+            anyhow::ensure!(
+                coalesce_adjacent_ranges(&restored_ranges)? == *active_ranges,
+                "snapshot base and expansion ranges do not match the selected RAM layout"
+            );
+
+            let (mappable, file_mapping_mode) = existing_mappable
+                .take()
+                .context("snapshot RAM ranges require an existing memory backing")?;
+            let mem = cfg.numa.nodes[0]
+                .mem
+                .as_ref()
+                .context("snapshot RAM ranges require node 0 memory configuration")?;
+            let base_backing =
+                membacking::RamBackingRequest::new(cfg.microvm_snapshot_memory_ranges.clone())
+                    .prefetch(mem.prefetch_memory)
+                    .transparent_hugepages(mem.transparent_hugepages)
+                    .host_numa_node(mem.host_numa_node)
+                    .existing_mappable(mappable)
+                    .file_mapping_mode(file_mapping_mode);
+            memory_builder = memory_builder.add_backing(base_backing);
+
+            if !cfg.microvm_restore_memory_ranges.is_empty() {
+                let expansion_backing =
+                    membacking::RamBackingRequest::new(cfg.microvm_restore_memory_ranges.clone())
+                        .prefetch(mem.prefetch_memory)
+                        .private_memory(true)
+                        .transparent_hugepages(mem.transparent_hugepages)
+                        .host_numa_node(mem.host_numa_node);
+                memory_builder = memory_builder.add_backing(expansion_backing);
+            }
+        }
+
         for (vnode, ranges) in ranges_by_node.into_iter().enumerate() {
             if ranges.is_empty() {
+                continue;
+            }
+            if restore_has_split_backing {
                 continue;
             }
 
@@ -3079,8 +3148,8 @@ impl InitializedVm {
         // by the memory layout allocator; each slot is a 4 KiB Mmio32
         // allocation indexed by the order of VirtioBus::Mmio devices.
         let mut pci_device_number = 10;
-        let mut microvm_sandbox_blocks = cfg.microvm_sandbox_blocks.iter();
         let mut virtio_mmio_index = 0;
+        let mut microvm_sandbox_blocks = cfg.microvm_sandbox_blocks.iter();
 
         // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
         // configure the line as level-triggered in the MADT (necessary for
@@ -3471,6 +3540,10 @@ impl LoadedVmInner {
                 }
             })
             .collect();
+        let microvm_level_triggered_irqs: &[u32] = match self.machine_profile {
+            MachineProfile::Microvm => &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
+            MachineProfile::Standard => &[],
+        };
         let acpi_builder = AcpiTablesBuilder {
             processor_topology: &self.processor_topology,
             mem_layout: &self.mem_layout,
@@ -3486,7 +3559,7 @@ impl LoadedVmInner {
                 with_pit: self.chipset_capabilities.with_pit,
                 pm_base: PM_BASE,
                 acpi_irq: SYSTEM_IRQ_ACPI,
-                level_triggered_irqs: &[],
+                level_triggered_irqs: microvm_level_triggered_irqs,
                 iommu: match &self.iommu_devices {
                     IommuDevices::AmdVi(devices) => {
                         Some(vmm_core::acpi_builder::X86IommuAcpiConfig::AmdVi(
@@ -4945,11 +5018,11 @@ impl LoadedVm {
                 chipset_high_mmio_size: 0,
                 vtl2_chipset_mmio_size: 0,
             }, // TODO
-            microvm_sandbox_blocks: vec![],
-            microvm_memory_capacity: None,
-            microvm_snapshot_memory_ranges: vec![],
-            microvm_restore_memory_ranges: vec![],
-            rtc_delta_milliseconds: 0, // TODO
+            rtc_delta_milliseconds: 0,              // TODO
+            microvm_sandbox_blocks: vec![],         // TODO
+            microvm_memory_capacity: None,          // TODO
+            microvm_snapshot_memory_ranges: vec![], // TODO
+            microvm_restore_memory_ranges: vec![],  // TODO
         };
         #[expect(unreachable_code, reason = "TODO")]
         RestartState {
