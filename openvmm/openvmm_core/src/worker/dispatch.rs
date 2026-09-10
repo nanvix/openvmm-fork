@@ -2946,6 +2946,10 @@ impl InitializedVm {
                         if matches!(cfg.machine_profile, MachineProfile::Microvm) {
                             const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
                             let (start, irq) = match id.as_str() {
+                                "virtio-net" => (
+                                    openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+                                    openvmm_defs::config::microvm_virtio_net_irq(None)?,
+                                ),
                                 "virtio-console" => (
                                     openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
                                     openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,

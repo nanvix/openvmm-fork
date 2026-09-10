@@ -510,6 +510,142 @@ fn canonical_microvm_memory_ranges(memory_size: u64) -> anyhow::Result<Vec<Snaps
     Ok(ranges)
 }
 
+impl SnapshotMicrovmNetwork {
+    fn new(
+        config: &openvmm_defs::config::MicrovmNetworkConfig,
+        egress_policy: &net_backend_resources::egress::EgressPolicy,
+    ) -> Self {
+        Self {
+            profile: config.profile.as_str().to_owned(),
+            guest_ipv4: u32::from(config.guest_ipv4),
+            prefix_length: u32::from(config.prefix_length),
+            gateway_ipv4: u32::from(config.derived_gateway_ipv4),
+            guest_mac: config.guest_mac.to_bytes().to_vec(),
+            gateway_mac: config.gateway_mac.to_bytes().to_vec(),
+            egress_policy_mode: egress_policy.mode_name().to_owned(),
+            egress_policy_sha256: sha2::Sha256::digest(egress_policy.canonical_bytes()).to_vec(),
+            egress_policy_required: egress_policy.is_active(),
+            egress_policy_encoding_version:
+                net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION,
+        }
+    }
+}
+
+/// Validates a restore-time policy against the snapshot's canonical contract.
+pub fn validate_microvm_network_policy(
+    saved: &SnapshotMicrovmNetwork,
+    policy: &net_backend_resources::egress::EgressPolicy,
+) -> anyhow::Result<()> {
+    let encoding_version = match saved.egress_policy_encoding_version {
+        0 => 1,
+        version => version,
+    };
+    let canonical = policy
+        .canonical_bytes_for_version(encoding_version)
+        .with_context(|| {
+            format!("snapshot egress policy encoding version {encoding_version} is unsupported")
+        })?;
+    let digest = sha2::Sha256::digest(canonical);
+    anyhow::ensure!(
+        saved.egress_policy_mode == policy.mode_name()
+            && saved.egress_policy_sha256 == digest.as_slice()
+            && saved.egress_policy_required == policy.is_active(),
+        "restore-time egress policy does not match the snapshot contract"
+    );
+    Ok(())
+}
+
+/// Adds a portable network identity to a base microVM snapshot contract.
+pub fn add_microvm_network_contract(
+    contract: &mut SnapshotMachineContract,
+    config: &openvmm_defs::config::MicrovmNetworkConfig,
+    policy: &net_backend_resources::egress::EgressPolicy,
+    attachment: SnapshotAttachment,
+) -> anyhow::Result<()> {
+    let source_hypervisor = contract.source_hypervisor.as_str();
+    let effective_command_line = &contract.effective_command_line;
+    let network = Some((config, policy, attachment));
+    let mut devices = Vec::new();
+    let mut attachments = Vec::new();
+    let mmio = |start, length| SnapshotDeviceRange {
+        address_space: "mmio".to_owned(),
+        start,
+        length,
+    };
+    let microvm_network = if let Some((network, egress_policy, attachment)) = network {
+        let policy_is_valid = matches!(source_hypervisor, "kvm" | "mshv" | "whp")
+            && attachment.reconnect_policy == "recreate-endpoint"
+            && !attachment.required
+            && attachment.identity_kind == "user-mode-nat"
+            && attachment.identity == b"consomme";
+        anyhow::ensure!(
+            attachment.stable_id == "net:microvm0"
+                && attachment.kind == "virtio-net"
+                && policy_is_valid
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0
+                && attachment.reconnect_timeout_ms == 0,
+            "microVM network attachment has an unsupported endpoint policy"
+        );
+        let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor))?;
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{irq}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+        );
+        let tokens = effective_command_line
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            tokens.contains(discovery.as_str())
+                && network
+                    .command_line_fragment()
+                    .split_ascii_whitespace()
+                    .all(|token| tokens.contains(token)),
+            "microVM network command line does not match its saved identity"
+        );
+        devices.push(SnapshotDevice {
+            stable_id: "net:microvm0".to_owned(),
+            state_unit_name: format!(
+                "virtio-net-{}",
+                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE
+            ),
+            kind: "virtio-net".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(irq),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![
+                openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES as u32,
+                (openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES >> 32) as u32,
+            ],
+            queue_count: 2,
+            queue_max_sizes: vec![256, 256],
+        });
+        attachments.push(attachment);
+        Some(SnapshotMicrovmNetwork::new(network, egress_policy))
+    } else {
+        None
+    };
+
+    let index = contract
+        .devices
+        .iter()
+        .position(|device| device.transport == "virtio-mmio")
+        .unwrap_or(contract.devices.len());
+    contract.devices.splice(index..index, devices);
+    for (index, device) in contract.devices.iter_mut().enumerate() {
+        device.order = index as u32;
+    }
+    contract.attachments.extend(attachments);
+    contract.microvm_network = microvm_network;
+    Ok(())
+}
+
 /// Builds the authoritative microVM machine contract.
 pub fn microvm_machine_contract(
     source_hypervisor: &str,
@@ -648,7 +784,7 @@ pub fn microvm_machine_contract(
         };
         anyhow::ensure!(
             attachment.stable_id == "console:microvm-virtio0"
-                && attachment.kind == "virtio-console"
+                && matches!(attachment.kind.as_str(), "virtio-console" | "virtio-net")
                 && policy_is_valid
                 && !attachment.identity.is_empty()
                 && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
@@ -3094,6 +3230,45 @@ fn validate_machine_contract_shape(
         "base microVM snapshots do not support memory expansion"
     );
 
+    if let Some(network) = &contract.microvm_network {
+        anyhow::ensure!(
+            network.profile == openvmm_defs::config::MicrovmNetworkProfile::Portable.as_str(),
+            "snapshot microVM network profile '{}' is unsupported",
+            network.profile
+        );
+        let prefix_length = u8::try_from(network.prefix_length)
+            .context("snapshot network prefix does not fit in u8")?;
+        let parsed = format!(
+            "{}/{}",
+            std::net::Ipv4Addr::from(network.guest_ipv4),
+            prefix_length
+        )
+        .parse::<openvmm_defs::config::MicrovmNetworkConfig>()
+        .context("snapshot static network identity is invalid")?;
+        anyhow::ensure!(
+            network.gateway_ipv4 == u32::from(parsed.derived_gateway_ipv4)
+                && network.guest_mac == parsed.guest_mac.to_bytes()
+                && network.gateway_mac == parsed.gateway_mac.to_bytes(),
+            "snapshot static network identity is not canonical"
+        );
+        anyhow::ensure!(
+            matches!(
+                network.egress_policy_mode.as_str(),
+                "allow-all" | "allow-list" | "block-list" | "endpoint"
+            ) && network.egress_policy_required == (network.egress_policy_mode != "allow-all"),
+            "snapshot egress policy requirement is invalid"
+        );
+        anyhow::ensure!(
+            matches!(
+                network.egress_policy_encoding_version,
+                0 | 1 | net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION
+            ),
+            "snapshot egress policy encoding version {} is unsupported",
+            network.egress_policy_encoding_version
+        );
+        validate_sha256(&network.egress_policy_sha256, "egress policy")?;
+    }
+
     let topology = &contract.topology;
     let topology_vp_count = u64::from(topology.sockets)
         .checked_mul(u64::from(topology.dies_per_socket))
@@ -3111,14 +3286,13 @@ fn validate_machine_contract_shape(
     );
     anyhow::ensure!(
         contract.boot_online_vp_count == 0
-            && contract.microvm_network.is_none()
             && contract.microvm_filesystem.is_none()
             && contract.microvm_filesystem_slot_version == 0
             && contract.microvm_sandbox_blocks.is_empty()
-            && contract
-                .attachments
-                .iter()
-                .all(|attachment| attachment.kind == "virtio-console"),
+            && contract.attachments.iter().all(|attachment| matches!(
+                attachment.kind.as_str(),
+                "virtio-console" | "virtio-net"
+            )),
         "base microVM snapshots cannot contain device attachments or expanded topology"
     );
 

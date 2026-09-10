@@ -186,6 +186,8 @@ pub fn openvmm_main() {
 
 #[derive(Default)]
 struct VmResources {
+    microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
     microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
     microvm_snapshot_requests:
@@ -648,6 +650,160 @@ fn effective_microvm_console(
     )?))
 }
 
+const MICROVM_NETWORK_STABLE_ID: &str = "net:microvm0";
+
+#[derive(Clone)]
+struct EffectiveMicrovmNetwork {
+    config: openvmm_defs::config::MicrovmNetworkConfig,
+    policy: net_backend_resources::egress::EgressPolicy,
+    attachment: openvmm_helpers::snapshot::SnapshotAttachment,
+}
+
+fn microvm_network_attachment() -> openvmm_helpers::snapshot::SnapshotAttachment {
+    openvmm_helpers::snapshot::SnapshotAttachment {
+        stable_id: MICROVM_NETWORK_STABLE_ID.to_owned(),
+        kind: "virtio-net".to_owned(),
+        required: false,
+        reconnect_policy: "recreate-endpoint".to_owned(),
+        identity_kind: "user-mode-nat".to_owned(),
+        identity: b"consomme".to_vec(),
+        length: 0,
+        reconnect_timeout_ms: 0,
+    }
+}
+
+fn microvm_network_from_snapshot(
+    saved: &openvmm_helpers::snapshot::SnapshotMicrovmNetwork,
+) -> anyhow::Result<openvmm_defs::config::MicrovmNetworkConfig> {
+    let prefix_length =
+        u8::try_from(saved.prefix_length).context("snapshot network prefix does not fit in u8")?;
+    let config = format!(
+        "{}/{}",
+        std::net::Ipv4Addr::from(saved.guest_ipv4),
+        prefix_length
+    )
+    .parse::<openvmm_defs::config::MicrovmNetworkConfig>()
+    .context("snapshot static network identity is invalid")?;
+    anyhow::ensure!(
+        saved.gateway_ipv4 == u32::from(config.derived_gateway_ipv4)
+            && saved.guest_mac == config.guest_mac.to_bytes()
+            && saved.gateway_mac == config.gateway_mac.to_bytes(),
+        "snapshot static network identity is not canonical"
+    );
+    Ok(config)
+}
+
+fn effective_microvm_network(
+    opt: &Options,
+    restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
+) -> anyhow::Result<Option<EffectiveMicrovmNetwork>> {
+    let requested = match opt.net.as_slice() {
+        [] => None,
+        [network] => match &network.endpoint {
+            EndpointConfigCli::Microvm(config) => Some(config.clone()),
+            _ => anyhow::bail!("microVM --net was not validated as a static IPv4 identity"),
+        },
+        _ => anyhow::bail!("microVM permits at most one virtio-net device"),
+    };
+    let Some(restore) = restore else {
+        return requested
+            .map(|config| {
+                let policy = opt.microvm_egress_policy(&config)?;
+                Ok(EffectiveMicrovmNetwork {
+                    config,
+                    policy,
+                    attachment: microvm_network_attachment(),
+                })
+            })
+            .transpose();
+    };
+    anyhow::ensure!(
+        requested.is_none(),
+        "restore takes microVM network addressing from saved state"
+    );
+
+    let has_device = restore
+        .devices
+        .iter()
+        .any(|device| device.stable_id == MICROVM_NETWORK_STABLE_ID);
+    let saved_attachment = restore
+        .attachments
+        .iter()
+        .find(|attachment| attachment.stable_id == MICROVM_NETWORK_STABLE_ID);
+    anyhow::ensure!(
+        has_device == restore.microvm_network.is_some() && has_device == saved_attachment.is_some(),
+        "snapshot microVM network device, identity, and attachment inventories disagree"
+    );
+    let Some(saved) = restore.microvm_network.as_ref() else {
+        anyhow::ensure!(
+            opt.network_profile.is_none()
+                && opt.net_tap.is_none()
+                && opt.allow_host.is_empty()
+                && opt.block_host.is_empty()
+                && opt.allow_endpoint.is_empty(),
+            "restore-time network resources cannot be added to a snapshot without a NIC"
+        );
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        saved.profile == openvmm_defs::config::MicrovmNetworkProfile::Portable.as_str(),
+        "snapshot microVM network profile is unsupported"
+    );
+    anyhow::ensure!(
+        opt.network_profile == Some(cli_args::MicrovmNetworkProfileCli::Portable),
+        "networked microVM snapshot restore requires --network-profile portable"
+    );
+    let config = microvm_network_from_snapshot(saved)?;
+    let policy = opt.microvm_egress_policy(&config)?;
+    openvmm_helpers::snapshot::validate_microvm_network_policy(saved, &policy)?;
+    let attachment = microvm_network_attachment();
+    anyhow::ensure!(
+        Some(&attachment) == saved_attachment,
+        "restore-time network endpoint does not match the snapshot attachment"
+    );
+    Ok(Some(EffectiveMicrovmNetwork {
+        config,
+        policy,
+        attachment,
+    }))
+}
+
+fn microvm_network_endpoint(
+    network: &openvmm_defs::config::MicrovmNetworkConfig,
+    _resources: &mut VmResources,
+) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
+    Ok(net_backend_resources::consomme::ConsommeHandle {
+        cidr: None,
+        static_ipv4: Some(net_backend_resources::consomme::StaticIpv4Config {
+            guest_ipv4: network.guest_ipv4,
+            prefix_length: network.prefix_length,
+            gateway_ipv4: network.derived_gateway_ipv4,
+            gateway_mac: network.gateway_mac,
+        }),
+        ports: Vec::new(),
+        recv: None,
+    }
+    .into_resource())
+}
+
+fn align_legacy_network_policy_contract(
+    saved: &openvmm_helpers::snapshot::SnapshotMachineContract,
+    expected: &mut openvmm_helpers::snapshot::SnapshotMachineContract,
+) {
+    let (Some(saved), Some(expected)) = (
+        saved.microvm_network.as_ref(),
+        expected.microvm_network.as_mut(),
+    ) else {
+        return;
+    };
+    if matches!(saved.egress_policy_encoding_version, 0 | 1) {
+        expected.egress_policy_encoding_version = saved.egress_policy_encoding_version;
+        expected
+            .egress_policy_sha256
+            .clone_from(&saved.egress_policy_sha256);
+    }
+}
+
 fn build_switch_list(all_switches: &[cli_args::GenericPcieSwitchCli]) -> Vec<PcieSwitchConfig> {
     all_switches
         .iter()
@@ -676,6 +832,20 @@ async fn vm_config_from_command_line(
 ) -> anyhow::Result<(Config, VmResources)> {
     let is_microvm = opt.machine == MachineProfileCli::Microvm;
     opt.validate_microvm_options()?;
+    let effective_microvm_network = if is_microvm {
+        effective_microvm_network(opt, restore_machine_contract)?
+    } else {
+        None
+    };
+    let microvm_network = effective_microvm_network
+        .as_ref()
+        .map(|network| network.config.clone());
+    let microvm_egress_policy = effective_microvm_network
+        .as_ref()
+        .map(|network| network.policy.clone());
+    let microvm_network_attachment = effective_microvm_network
+        .as_ref()
+        .map(|network| network.attachment.clone());
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
 
@@ -989,6 +1159,8 @@ async fn vm_config_from_command_line(
         };
 
     let mut resources = VmResources {
+        microvm_network_attachment,
+        microvm_egress_policy: microvm_egress_policy.clone(),
         microvm_console_attachment: microvm_console
             .as_ref()
             .map(|(_, _, attachment)| attachment.clone()),
@@ -1248,7 +1420,7 @@ async fn vm_config_from_command_line(
     let mut vpci_devices = Vec::new();
 
     let mut nic_index = 0;
-    for cli_cfg in &opt.net {
+    for cli_cfg in opt.net.iter().filter(|_| !is_microvm) {
         if cli_cfg.pcie_port.is_some() {
             anyhow::bail!("`--net` does not support PCIe");
         }
@@ -2341,6 +2513,28 @@ async fn vm_config_from_command_line(
         }
     };
 
+    if let Some(network) = &microvm_network {
+        let endpoint = microvm_network_endpoint(network, &mut resources)?;
+        add_virtio_device(
+            VirtioBusCli::Mmio,
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: Some(1),
+                mac_address: network.guest_mac,
+                endpoint,
+                egress_policy: microvm_egress_policy.clone(),
+                save_restore: true,
+                static_ipv4: Some(net_backend_resources::consomme::StaticIpv4Config {
+                    guest_ipv4: network.guest_ipv4,
+                    prefix_length: network.prefix_length,
+                    gateway_ipv4: network.derived_gateway_ipv4,
+                    gateway_mac: network.gateway_mac,
+                }),
+                effective_features: Some(openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES),
+            }
+            .into_resource(),
+        );
+    }
+
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
             anyhow::bail!("use --net uh:[...] to add underhill NICs")
@@ -2350,6 +2544,11 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
+
+            egress_policy: None,
+            save_restore: false,
+            static_ipv4: None,
+            effective_features: None,
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -2561,6 +2760,7 @@ async fn vm_config_from_command_line(
 
     let mut cfg = Config {
         machine_profile: opt.machine.into(),
+        microvm_network: microvm_network.clone(),
         chipset,
         load_mode,
         floppy_disks,
@@ -2705,7 +2905,20 @@ async fn vm_config_from_command_line(
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
     if cfg.machine_profile == MachineProfile::Microvm && restore_machine_contract.is_none() {
-        openvmm_defs::config::append_microvm_device_discovery(&mut cfg)?;
+        if let Some(network) = &microvm_network {
+            let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode else {
+                unreachable!()
+            };
+            cmdline.push(' ');
+            cmdline.push_str(
+                &network.command_line_fragment_with_dns(
+                    microvm_egress_policy
+                        .as_ref()
+                        .is_some_and(|policy| policy.allows_gateway_dns()),
+                ),
+            );
+        }
+        openvmm_defs::config::append_microvm_device_discovery(&mut cfg, opt.hypervisor.as_deref())?;
     }
     let requested_hypervisor = opt
         .hypervisor
@@ -2800,6 +3013,7 @@ fn parse_endpoint(
             };
             net_backend_resources::consomme::ConsommeHandle {
                 cidr: cidr.clone(),
+                static_ipv4: None,
                 ports,
                 recv,
             }
@@ -2839,6 +3053,9 @@ fn parse_endpoint(
                 let _ = name;
                 bail!("TAP backend is only supported on Linux")
             }
+        }
+        EndpointConfigCli::Microvm(_) => {
+            bail!("a bare IPv4/prefix --net is only supported by the microVM profile")
         }
     };
 
@@ -3113,6 +3330,11 @@ fn prepare_snapshot_restore(
     expected_hypervisor: &str,
     effective_command_line: Option<&str>,
     console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
+    network: Option<(
+        &openvmm_defs::config::MicrovmNetworkConfig,
+        &net_backend_resources::egress::EgressPolicy,
+        &openvmm_helpers::snapshot::SnapshotAttachment,
+    )>,
 ) -> anyhow::Result<PreparedSnapshotRestore> {
     let base_memory_size = snapshot.manifest().memory_size_bytes;
     let expected_microvm_contract = if opt.machine == MachineProfileCli::Microvm {
@@ -3121,6 +3343,7 @@ fn prepare_snapshot_restore(
             effective_command_line
                 .context("microVM restore requires an effective PVH command line")?,
             console_attachment,
+            network,
         ))
     } else {
         None
@@ -3159,6 +3382,11 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         &str,
         &str,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
+        Option<(
+            &openvmm_defs::config::MicrovmNetworkConfig,
+            &net_backend_resources::egress::EgressPolicy,
+            &openvmm_helpers::snapshot::SnapshotAttachment,
+        )>,
     )>,
 ) -> anyhow::Result<PreparedSnapshotRestore> {
     let artifact_prepare = openvmm_defs::profile::ProfileSpan::start();
@@ -3172,14 +3400,14 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         system_page_size(),
     )?;
     let restore_time =
-        if let Some((expected_hypervisor, effective_command_line, console_attachment)) =
+        if let Some((expected_hypervisor, effective_command_line, console_attachment, network)) =
             expected_microvm_contract
         {
             let saved_contract = manifest
                 .machine_contract
                 .as_ref()
                 .context("microVM snapshot is missing its authoritative machine contract")?;
-            let expected_contract = openvmm_helpers::snapshot::microvm_machine_contract(
+            let mut expected_contract = openvmm_helpers::snapshot::microvm_machine_contract(
                 expected_hypervisor,
                 effective_command_line.to_owned(),
                 console_attachment.cloned(),
@@ -3191,6 +3419,15 @@ pub(crate) fn prepare_snapshot_restore_for_config(
                 saved_contract.apic_frequency_hz,
                 saved_contract.cpu_contract.clone(),
             )?;
+            if let Some((network, policy, attachment)) = network {
+                openvmm_helpers::snapshot::add_microvm_network_contract(
+                    &mut expected_contract,
+                    network,
+                    policy,
+                    attachment.clone(),
+                )?;
+                align_legacy_network_policy_contract(saved_contract, &mut expected_contract);
+            }
             openvmm_helpers::snapshot::validate_microvm_machine_contract(
                 manifest,
                 &expected_contract,
@@ -3441,7 +3678,7 @@ async fn run_control_inner(
                 || vm_config
                     .virtio_devices
                     .iter()
-                    .all(|(_, device)| device.id() == "virtio-console"),
+                    .all(|(_, device)| matches!(device.id(), "virtio-console" | "virtio-net")),
             "base microVM snapshots do not support virtio attachments"
         );
     }
@@ -3450,6 +3687,9 @@ async fn run_control_inner(
         _ => None,
     };
     let microvm_console_attachment = resources.microvm_console_attachment.clone();
+    let microvm_network = vm_config.microvm_network.clone();
+    let microvm_egress_policy = resources.microvm_egress_policy.clone();
+    let microvm_network_attachment = resources.microvm_network_attachment.clone();
     let snapshot_destination = opt.snapshot_destination.as_ref().map(|path| {
         if path.is_absolute() {
             path.clone()
@@ -3662,6 +3902,11 @@ async fn run_control_inner(
                 &source_hypervisor,
                 effective_command_line.as_deref(),
                 microvm_console_attachment.as_ref(),
+                microvm_network
+                    .as_ref()
+                    .zip(microvm_egress_policy.as_ref())
+                    .zip(microvm_network_attachment.as_ref())
+                    .map(|((network, policy), attachment)| (network, policy, attachment)),
             )?;
             (
                 Some(prepared.shared_memory),
@@ -3780,6 +4025,9 @@ async fn run_control_inner(
                 .map(|file| file.path().to_owned())
         }),
         microvm_console_attachment,
+        microvm_network,
+        microvm_egress_policy,
+        microvm_network_attachment,
         microvm_console_socket_cleanup: resources.microvm_console_socket_cleanup.take(),
         snapshot_memory_handle,
         memory: opt.memory_size(),
@@ -3947,6 +4195,7 @@ impl InspectMut for DiagInspector {
 #[cfg(test)]
 mod microvm_console_attachment_tests {
     use super::*;
+    use clap::Parser as _;
     use test_with_tracing::test;
 
     fn socket_attachment(path: &Path) -> openvmm_helpers::snapshot::SnapshotAttachment {
@@ -4100,5 +4349,167 @@ mod microvm_console_attachment_tests {
         )
         .unwrap_err();
         assert!(excessive.to_string().contains("exceeds the supported"));
+    }
+    fn network_contract() -> openvmm_helpers::snapshot::SnapshotMachineContract {
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = net_backend_resources::egress::EgressPolicy::bind(
+            network.guest_ipv4,
+            network.prefix_length,
+            network.guest_mac,
+            network.derived_gateway_ipv4,
+            net_backend_resources::egress::EgressPolicyMode::TcpEndpoints(vec![
+                "10.0.0.9:8443".parse().unwrap(),
+                "192.0.2.7:443".parse().unwrap(),
+                "10.0.0.9:443".parse().unwrap(),
+            ]),
+        )
+        .unwrap();
+        let source_hypervisor = if cfg!(windows) { "whp" } else { "kvm" };
+        let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
+        let command_line = format!(
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {}",
+            network.command_line_fragment()
+        );
+        let mut contract = openvmm_helpers::snapshot::microvm_machine_contract(
+            source_hypervisor,
+            command_line,
+            None,
+            1,
+            1024,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtio-net-3489660928",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap();
+        openvmm_helpers::snapshot::add_microvm_network_contract(
+            &mut contract,
+            &network,
+            &policy,
+            microvm_network_attachment(),
+        )
+        .unwrap();
+        contract
+    }
+
+    #[test]
+    fn network_restore_rebinds_endpoint_next_hops_and_requires_policy() {
+        let contract = network_contract();
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--network-profile",
+            "portable",
+            "--allow-endpoint",
+            "192.0.2.7:443",
+            "--allow-endpoint",
+            "10.0.0.9:443",
+            "--allow-endpoint",
+            "10.0.0.9:8443",
+        ])
+        .unwrap();
+        let restored = effective_microvm_network(&options, Some(&contract))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.config.guest_ipv4,
+            std::net::Ipv4Addr::new(10, 0, 0, 2)
+        );
+        assert_eq!(
+            restored.policy.next_hops(),
+            &[
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                std::net::Ipv4Addr::new(10, 0, 0, 9),
+            ]
+        );
+        let restored_again = effective_microvm_network(&options, Some(&contract))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_again.policy, restored.policy);
+
+        let missing_policy = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--network-profile",
+            "portable",
+        ])
+        .unwrap();
+        assert!(effective_microvm_network(&missing_policy, Some(&contract)).is_err());
+    }
+
+    #[test]
+    fn legacy_network_policy_contract_alignment_preserves_validated_digest() {
+        let mut saved = network_contract();
+        let saved_network = saved.microvm_network.as_mut().unwrap();
+        saved_network.egress_policy_encoding_version = 0;
+        saved_network.egress_policy_sha256 = vec![0x5a; 32];
+        let mut expected = network_contract();
+
+        align_legacy_network_policy_contract(&saved, &mut expected);
+        assert_eq!(saved.microvm_network, expected.microvm_network);
+    }
+
+    #[test]
+    fn network_restore_rejects_attachment_identity_change() {
+        let mut contract = network_contract();
+        let attachment = contract
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.stable_id == MICROVM_NETWORK_STABLE_ID)
+            .unwrap();
+        attachment.identity.push(b'x');
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--network-profile",
+            "portable",
+            "--allow-endpoint",
+            "192.0.2.7:443",
+            "--allow-endpoint",
+            "10.0.0.9:443",
+            "--allow-endpoint",
+            "10.0.0.9:8443",
+        ])
+        .unwrap();
+        assert!(effective_microvm_network(&options, Some(&contract)).is_err());
+    }
+
+    #[test]
+    fn network_restore_requires_portable_profile() {
+        let contract = network_contract();
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--allow-host",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        assert!(effective_microvm_network(&options, Some(&contract)).is_err());
     }
 }

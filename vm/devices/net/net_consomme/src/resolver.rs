@@ -29,6 +29,10 @@ pub enum ResolveConsommeError {
     Consomme(consomme::Error),
     #[error(transparent)]
     InvalidCidr(consomme::InvalidCidr),
+    #[error(transparent)]
+    InvalidStaticIpv4(consomme::InvalidStaticIpv4),
+    #[error("Consomme CIDR and exact static IPv4 configuration are mutually exclusive")]
+    ConflictingIpv4Configuration,
     #[error("failed to create socket for port forward ({details})")]
     SocketCreation {
         #[source]
@@ -48,10 +52,23 @@ impl ResolveResource<NetEndpointHandleKind, ConsommeHandle> for ConsommeResolver
     ) -> Result<Self::Output, Self::Error> {
         let mut state = ConsommeParams::new().map_err(ResolveConsommeError::Consomme)?;
         state.client_mac.0 = input.mac_address.to_bytes();
+        if resource.cidr.is_some() && resource.static_ipv4.is_some() {
+            return Err(ResolveConsommeError::ConflictingIpv4Configuration);
+        }
         if let Some(cidr) = &resource.cidr {
             state
                 .set_cidr(cidr)
                 .map_err(ResolveConsommeError::InvalidCidr)?;
+        }
+        if let Some(config) = &resource.static_ipv4 {
+            state
+                .set_static_ipv4(
+                    config.guest_ipv4,
+                    config.prefix_length,
+                    config.gateway_ipv4,
+                    config.gateway_mac.to_bytes(),
+                )
+                .map_err(ResolveConsommeError::InvalidStaticIpv4)?;
         }
         let port_forwards: Vec<PortForwardConfig> = resource
             .ports

@@ -30,6 +30,7 @@ use openvmm_defs::config::MICROVM_BASE_COMMAND_LINE;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_COMMAND_LINE_MAX_SIZE;
 use openvmm_defs::config::MachineProfile;
+use openvmm_defs::config::MicrovmNetworkProfile;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::X2ApicConfig;
@@ -152,6 +153,21 @@ pub enum MachineProfileCli {
     Standard,
     /// The microVM ABI version 1 machine.
     Microvm,
+}
+
+/// Required host-network implementation contract for a microVM NIC.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MicrovmNetworkProfileCli {
+    /// Use the cross-platform user-mode Consomme NAT implementation.
+    Portable,
+}
+
+impl From<MicrovmNetworkProfileCli> for MicrovmNetworkProfile {
+    fn from(value: MicrovmNetworkProfileCli) -> Self {
+        match value {
+            MicrovmNetworkProfileCli::Portable => Self::Portable,
+        }
+    }
 }
 
 impl From<MachineProfileCli> for MachineProfile {
@@ -613,6 +629,28 @@ options:
     ///   --net consomme:10.0.0.0/24,hostfwd=tcp::22-:22,hostfwd=udp::5000-:5000
     #[clap(long)]
     pub net: Vec<NicConfigCli>,
+
+    /// Required host-network implementation contract for microVM `--net`.
+    #[clap(long, value_enum, value_name = "PROFILE")]
+    pub network_profile: Option<MicrovmNetworkProfileCli>,
+
+    /// Select a preconfigured Linux TAP for a microVM NIC.
+    ///
+    /// This is incompatible with the portable microVM network profile.
+    #[clap(long, value_name = "NAME")]
+    pub net_tap: Option<String>,
+
+    /// Permit only these IPv4 destinations or CIDRs from the microVM guest.
+    #[clap(long, value_name = "IPv4[/PREFIX]", conflicts_with_all = ["block_host", "allow_endpoint"])]
+    pub allow_host: Vec<net_backend_resources::egress::Ipv4Cidr>,
+
+    /// Permit IPv4 except for these destinations or CIDRs from the microVM guest.
+    #[clap(long, value_name = "IPv4[/PREFIX]", conflicts_with_all = ["allow_host", "allow_endpoint"])]
+    pub block_host: Vec<net_backend_resources::egress::Ipv4Cidr>,
+
+    /// Permit only these exact IPv4 TCP destinations from the microVM guest.
+    #[clap(long, value_name = "IPv4:TCP-PORT", conflicts_with_all = ["allow_host", "block_host"])]
+    pub allow_endpoint: Vec<net_backend_resources::egress::TcpEndpoint>,
 
     /// expose a virtual NIC using the Windows kernel-mode vmswitch.
     ///
@@ -1421,8 +1459,43 @@ impl Options {
     }
 
     /// Rejects unsupported microVM combinations before opening host resources.
+    pub(crate) fn microvm_egress_policy(
+        &self,
+        network: &openvmm_defs::config::MicrovmNetworkConfig,
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
+        use net_backend_resources::egress::EgressPolicyMode;
+
+        let mode = if !self.allow_host.is_empty() {
+            EgressPolicyMode::AllowList(self.allow_host.clone())
+        } else if !self.block_host.is_empty() {
+            EgressPolicyMode::BlockList(self.block_host.clone())
+        } else if !self.allow_endpoint.is_empty() {
+            EgressPolicyMode::TcpEndpoints(self.allow_endpoint.clone())
+        } else {
+            EgressPolicyMode::AllowAll
+        };
+        net_backend_resources::egress::EgressPolicy::bind(
+            network.guest_ipv4,
+            network.prefix_length,
+            network.guest_mac,
+            network.derived_gateway_ipv4,
+            mode,
+        )
+    }
+
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
         if self.machine != MachineProfileCli::Microvm {
+            anyhow::ensure!(
+                self.network_profile.is_none()
+                    && self.net_tap.is_none()
+                    && self.allow_host.is_empty()
+                    && self.block_host.is_empty()
+                    && self.allow_endpoint.is_empty(),
+                "microVM network policy requires --machine microvm"
+            );
             return Ok(());
         }
 
@@ -1491,6 +1564,17 @@ impl Options {
         }
 
         anyhow::ensure!(
+            self.net.len() <= 1 && self.net_tap.is_none(),
+            "microVM permits one portable NIC and no TAP override"
+        );
+        if let Some(nic) = self.net.first() {
+            anyhow::ensure!(
+                matches!(nic.endpoint, EndpointConfigCli::Microvm(_))
+                    && self.network_profile == Some(MicrovmNetworkProfileCli::Portable),
+                "microVM networking requires a static IPv4/prefix and --network-profile portable"
+            );
+        }
+        anyhow::ensure!(
             self.com1.is_none()
                 && self.com2.is_none()
                 && self.com3.is_none()
@@ -1542,7 +1626,6 @@ impl Options {
         );
         anyhow::ensure!(
             !self.nic
-                && self.net.is_empty()
                 && self.mana.is_empty()
                 && !self.gfx
                 && !self.vtl2_gfx
@@ -2692,6 +2775,7 @@ pub enum EndpointConfigCli {
     Tap {
         name: String,
     },
+    Microvm(openvmm_defs::config::MicrovmNetworkConfig),
 }
 
 /// Parsed host port forwarding configuration from the CLI.
@@ -2789,6 +2873,12 @@ impl FromStr for EndpointConfigCli {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('/') && !s.contains(':') {
+            return s
+                .parse()
+                .map(EndpointConfigCli::Microvm)
+                .map_err(|error| format!("invalid microVM network: {error}"));
+        }
         let ret = match s.split(':').collect::<Vec<_>>().as_slice() {
             ["none"] => EndpointConfigCli::None,
             ["consomme", rest @ ..] => {
