@@ -608,6 +608,16 @@ async fn snapshot_save_to_disk(
         vp_count: 2,
         page_size: 4096,
         architecture: "x86_64".to_string(),
+        state_size_bytes: 0,
+        state_sha256: Vec::new(),
+        memory_sha256: Vec::new(),
+        machine_contract: None,
+        format_magic: openvmm_helpers::snapshot::SNAPSHOT_FORMAT_MAGIC.to_vec(),
+        saved_state_schema_version: openvmm_helpers::snapshot::SAVED_STATE_SCHEMA_VERSION,
+        saved_state_root_type: openvmm_helpers::snapshot::SAVED_STATE_ROOT_TYPE.to_owned(),
+        snapshot_tier: String::new(),
+        restore_policy: String::new(),
+        consumed_config_sections: 0,
     };
     openvmm_helpers::snapshot::write_snapshot(&snap_dir, &manifest, &saved_state_bytes, &mem_path)?;
 
@@ -615,7 +625,8 @@ async fn snapshot_save_to_disk(
     assert!(snap_dir.join("manifest.bin").exists());
     assert!(snap_dir.join("state.bin").exists());
     assert!(snap_dir.join("memory.bin").exists());
-    let (read_manifest, read_state) = openvmm_helpers::snapshot::read_snapshot(&snap_dir)?;
+    let (read_manifest, read_state) =
+        openvmm_helpers::snapshot::read_snapshot(&snap_dir, mem_size)?;
     assert_eq!(
         read_state, saved_state_bytes,
         "state roundtrip through disk should match"

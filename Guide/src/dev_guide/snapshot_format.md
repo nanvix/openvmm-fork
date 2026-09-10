@@ -1,59 +1,48 @@
 # Snapshot Format
 
-This page documents the on-disk format used by OpenVMM snapshots, intended
-for developers working on the save/restore subsystem.
+OpenVMM snapshot I/O validates and publishes one exact local machine-state
+generation at a time.
 
 ## Directory layout
 
-A snapshot is stored as a directory containing three files:
-
 ```text
 snapshot-dir/
-├── manifest.bin   # Protobuf-encoded SnapshotManifest
-├── state.bin      # Protobuf-encoded device saved state
-└── memory.bin     # Hard link to the guest memory backing file
+├── manifest.bin   # Bounded protobuf machine and artifact inventory
+├── state.bin      # Protobuf device state
+└── memory.bin     # Exact RAM backing or an independent copy
 ```
 
-## Manifest format
+## Manifest and publication
 
-The manifest is a protobuf message defined as
-[`SnapshotManifest`](https://openvmm.dev/rustdoc/linux/openvmm_helpers/snapshot/struct.SnapshotManifest.html)
-in `openvmm/openvmm_helpers/src/snapshot.rs`, encoded using the `mesh`
-crate's protobuf encoding.
+`openvmm_helpers::snapshot` records artifact lengths, format and saved-state
+schema identifiers, memory ranges, CPU and clock contracts, and complete
+state-unit inventory. The initial microVM constructor supports the base
+single-vCPU profile without device attachments or memory expansion.
+Additional protobuf fields are reserved but are not accepted by this profile.
 
-## Device state (`state.bin`)
+Publication writes and flushes a private sibling staging directory, then
+renames it without replacing an existing destination. `SnapshotWriteError`
+distinguishes rollback-safe failures, uncertain live-RAM alias cleanup, and
+failures after the publication commit point. An owned RAM handle may be
+promoted only when the source is stopped and will terminate after commit.
+User-supplied RAM is copied independently.
 
-The device state contains every device's saved state, collected via the
-`SaveRestore` trait and encoded as a `mesh` protobuf message. The
-[Save State](contrib/save-state.md) compatibility rules (mesh tag stability,
-default values, forward/backward compatibility) apply.
+The local format is not an authenticated container: structural validation
+does not authenticate same-length payload modifications. Export and transport
+layers must provide any required broader integrity guarantee.
 
-## Memory (`memory.bin`)
+## Private restore memory
 
-`memory.bin` is a hard link to the file-backed guest RAM file. During a save,
-`write_snapshot()` creates this hard link using `std::fs::hard_link`.
+`OpenedSnapshot` retains directory and artifact handles for one generation.
+Artifact names cannot be replaced between validation and mapping to select
+different files. Restore checks exact EOF and observable file generation,
+then creates writable private copy-on-write mappings; snapshot bytes remain
+unchanged. `SnapshotRestoreGuards` keep the exact handles alive through VM
+teardown.
 
-```admonish note
-The hard-link approach means the memory backing file and snapshot directory
-must reside on the same filesystem. If they are on different filesystems,
-`write_snapshot` returns an error with a suggestion to place the backing
-file inside the snapshot directory.
-```
-
-### Same-file detection
-
-If the user passes `--memory file=<snapshot_dir>/memory.bin`, the source and
-target of the hard link are the same file. The code detects this by
-canonicalizing both paths and comparing them. When they match, the hard-link
-step is skipped.
-
-## Code references
-
-- Manifest type and I/O: `openvmm/openvmm_helpers/src/snapshot.rs`
-- Restore entry point: `prepare_snapshot_restore()` in
-  `openvmm/openvmm_entry/src/lib.rs`
-- File-backed memory: `SharedMemoryFd` type alias in
-  `openvmm/openvmm_defs/src/worker.rs`
+Windows rejects reparse points and retains read-only sharing guards. Unix
+retains no-follow descriptors, but descriptors alone do not provide mandatory
+write exclusion.
 
 ## Device state architecture
 
