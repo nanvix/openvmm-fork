@@ -2889,7 +2889,7 @@ impl OpenedSnapshotDirectory {
             use nix::fcntl::OFlag;
             use nix::sys::stat::Mode;
 
-            return nix::fcntl::openat(
+            nix::fcntl::openat(
                 &self.file,
                 name,
                 OFlag::O_WRONLY
@@ -2900,7 +2900,7 @@ impl OpenedSnapshotDirectory {
                 Mode::S_IRUSR | Mode::S_IWUSR,
             )
             .map(std::fs::File::from)
-            .map_err(nix_error);
+            .map_err(nix_error)
         }
         #[cfg(windows)]
         {

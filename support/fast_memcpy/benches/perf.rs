@@ -21,6 +21,10 @@ unsafe extern "C" {
     ) -> *mut core::ffi::c_void;
 }
 
+/// # Safety
+///
+/// `dest` and `src` must be valid for writes and reads of `len` bytes,
+/// respectively, and the regions must not overlap.
 unsafe extern "C" fn system_memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
     // SAFETY: the caller upholds memcpy's pointer validity and overlap requirements.
     unsafe { memcpy(dest.cast(), src.cast(), len).cast() }

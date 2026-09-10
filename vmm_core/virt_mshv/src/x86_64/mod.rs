@@ -1265,17 +1265,6 @@ fn supported_processor_features1(
         .with_sm4_support(true)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn versioned_cpu_contract_does_not_expose_tsc_adjust() {
-        assert!(!supported_processor_features1(true).tsc_adjust_support());
-        assert!(supported_processor_features1(false).tsc_adjust_support());
-    }
-}
-
 /// XSAVE features that we support exposing to guests.
 fn supported_xsave_features() -> hvdef::HvX64PartitionProcessorXsaveFeatures {
     hvdef::HvX64PartitionProcessorXsaveFeatures::new()
@@ -1317,4 +1306,15 @@ fn supported_xsave_features() -> hvdef::HvX64PartitionProcessorXsaveFeatures {
         .with_avx10_1_256_support(true)
         .with_avx10_1_512_support(true)
         .with_amx_fp16_support(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_cpu_contract_does_not_expose_tsc_adjust() {
+        assert!(!supported_processor_features1(true).tsc_adjust_support());
+        assert!(supported_processor_features1(false).tsc_adjust_support());
+    }
 }
