@@ -143,6 +143,10 @@ pub mod net {
         pub max_queues: Option<u16>,
         pub mac_address: MacAddress,
         pub endpoint: Resource<NetEndpointHandleKind>,
+        pub egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+        pub save_restore: bool,
+        pub static_ipv4: Option<net_backend_resources::consomme::StaticIpv4Config>,
+        pub effective_features: Option<u64>,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioNetHandle {

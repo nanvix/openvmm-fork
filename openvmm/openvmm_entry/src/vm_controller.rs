@@ -136,6 +136,9 @@ pub struct VmController {
     pub(crate) snapshot_quiesce_timeout: std::time::Duration,
     pub(crate) source_hypervisor: String,
     pub(crate) effective_command_line: Option<String>,
+    pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
+    pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+    pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
@@ -663,7 +666,7 @@ impl VmController {
         };
 
         let result = (|| -> anyhow::Result<()> {
-            let machine_contract = openvmm_helpers::snapshot::microvm_machine_contract(
+            let mut machine_contract = openvmm_helpers::snapshot::microvm_machine_contract(
                 &self.source_hypervisor,
                 command_line,
                 self.microvm_console_attachment.clone(),
@@ -675,6 +678,19 @@ impl VmController {
                 Some(response.apic_frequency_hz),
                 response.cpu_contract,
             )?;
+            if let Some(((network, policy), attachment)) = self
+                .microvm_network
+                .as_ref()
+                .zip(self.microvm_egress_policy.as_ref())
+                .zip(self.microvm_network_attachment.as_ref())
+            {
+                openvmm_helpers::snapshot::add_microvm_network_contract(
+                    &mut machine_contract,
+                    network,
+                    policy,
+                    attachment.clone(),
+                )?;
+            }
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
                 version: openvmm_helpers::snapshot::MANIFEST_VERSION,
                 created_at: std::time::SystemTime::now().into(),

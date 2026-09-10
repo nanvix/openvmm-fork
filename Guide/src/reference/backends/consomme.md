@@ -38,6 +38,20 @@ flowchart TB
     NIC --> Internet((Internet))
 ```
 
+## microVM portable profile
+
+OpenVMM microVMs select this backend with
+`--net <IPv4/PREFIX> --network-profile portable`. This is the sole microVM
+network profile and has the same Consomme behavior on Linux/KVM, Linux/MSHV,
+and Windows/WHP. It provides gateway DNS over UDP and TCP, ICMP echo, and
+outbound TCP/UDP subject to the microVM egress policy. IPv4 fragments are
+rejected deterministically. `--net-tap` is incompatible.
+
+Snapshot restore creates a fresh endpoint generation. Host sockets and NAT
+flow tables are not saved. Virtio-net capture drains descriptor ownership
+before state is saved, and restored guest software must establish new
+host-side flows.
+
 ## Default network topology
 
 | Role | IPv4 Address |
@@ -197,8 +211,11 @@ are not relayed — see limitations).
 
 ### ARP and NDP
 
-- **ARP** — Responds to requests for the gateway MAC address. All other
-  ARP traffic is dropped.
+- **ARP** — Responds to requests for the gateway and for on-link next hops
+  admitted by exact endpoint policy, using the gateway MAC as the proxy
+  address. The shared egress policy accepts only guest-identity requests for
+  its canonical next-hop set, so resolving an endpoint does not authorize
+  unrelated IPv4 traffic.
 - **NDP** — Responds to Router Solicitations (advertising the IPv6
   prefix and DNS servers) and Neighbor Solicitations for the gateway's
   link-local address. DAD is silently ignored.

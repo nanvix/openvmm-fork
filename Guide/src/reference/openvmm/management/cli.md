@@ -25,6 +25,11 @@ describes the source definitions.
   capture terminates the source; rollback-safe failures resume it.
 * `--snapshot-quiesce-timeout-ms <MILLISECONDS>`: Bound host-input fencing and
   device quiescence. Defaults to 5000 milliseconds.
+* `--network-profile portable --net <IPv4/PREFIX>` on a microVM: Add the
+  fixed-slot virtio NIC with a static address and derived gateway/MAC identity.
+  `--allow-host`, `--block-host`, or `--allow-endpoint` bind its egress policy.
+  Restore takes addressing from the manifest and requires the same policy;
+  host NAT flows are recreated rather than serialized.
 * `--virtio-console <BACKEND>` on a microVM: Add the fixed MMIO console at
   `0xd0002000`, IRQ 7, and use `console=hvc1`. Snapshot restore reconstructs
   `listen=...` listeners or bounded `connect=...` clients. `console` requires

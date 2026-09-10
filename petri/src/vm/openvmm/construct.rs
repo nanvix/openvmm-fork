@@ -706,6 +706,7 @@ impl PetriVmConfigOpenVmm {
         }
 
         let config = Config {
+            microvm_network: None,
             // Firmware
             machine_profile,
             load_mode,

@@ -116,6 +116,7 @@ impl PetriVmConfigOpenVmm {
     pub fn with_nic(mut self) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: Vec::new(),
             recv: None,
         }
@@ -162,6 +163,7 @@ impl PetriVmConfigOpenVmm {
     pub fn with_pcie_nic(mut self, port_name: &str, mac_address: MacAddress) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: Vec::new(),
             recv: None,
         }
@@ -212,6 +214,7 @@ impl PetriVmConfigOpenVmm {
     pub fn with_virtio_nic(mut self, port_name: &str, mac_address: MacAddress) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: Vec::new(),
             recv: None,
         }
@@ -224,6 +227,10 @@ impl PetriVmConfigOpenVmm {
                     max_queues: None,
                     mac_address,
                     endpoint,
+                    egress_policy: None,
+                    save_restore: false,
+                    static_ipv4: None,
+                    effective_features: None,
                 }
                 .into_resource(),
             )
@@ -244,6 +251,7 @@ impl PetriVmConfigOpenVmm {
         let (port_send, port_recv) = mesh::oneshot();
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: vec![net_backend_resources::consomme::HostPortConfig {
                 protocol: net_backend_resources::consomme::HostPortProtocol::Tcp,
                 host_address: Some(net_backend_resources::consomme::HostIpAddress::Ipv4(
@@ -262,6 +270,10 @@ impl PetriVmConfigOpenVmm {
                     max_queues: None,
                     mac_address,
                     endpoint,
+                    egress_policy: None,
+                    save_restore: false,
+                    static_ipv4: None,
+                    effective_features: None,
                 }
                 .into_resource(),
             )

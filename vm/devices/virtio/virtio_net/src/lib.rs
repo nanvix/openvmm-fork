@@ -36,6 +36,9 @@ use net_backend::TxMetadata;
 use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
+use net_backend_resources::consomme::StaticIpv4Config;
+use net_backend_resources::egress::EgressDenied;
+use net_backend_resources::egress::EgressPolicy;
 use net_backend_resources::mac_address::MacAddress;
 use pal_async::wait::PolledWait;
 use std::future::pending;
@@ -47,6 +50,8 @@ use task_control::InspectTaskMut;
 use task_control::StopTask;
 use task_control::TaskControl;
 use thiserror::Error;
+use virtio::DeviceQueueState;
+use virtio::DeviceStateValidator;
 use virtio::DeviceTraits;
 use virtio::DeviceTraitsSharedMemory;
 use virtio::QueueResources;
@@ -57,6 +62,9 @@ use virtio::in_order::InOrderCompletion;
 use virtio::queue::QueueCompletion;
 use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
+use vmcore::save_restore::RestoreError;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 use vmcore::vm_task::VmTaskDriver;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::FromBytes;
@@ -226,6 +234,10 @@ struct Adapter {
     tx_fast_completions: bool,
     mac_address: MacAddress,
     tx_offload_support: TxOffloadSupport,
+    egress_policy: Option<EgressPolicy>,
+    save_restore: bool,
+    static_ipv4: Option<StaticIpv4Config>,
+    effective_features: Option<u64>,
 }
 
 pub struct Device {
@@ -235,6 +247,11 @@ pub struct Device {
     driver_source: VmTaskDriverSource,
     /// Per-pair state tracking.
     pairs: Vec<QueuePairState>,
+    stop_error: Option<anyhow::Error>,
+    stopped_feature_banks: Option<[u32; 2]>,
+    stopped_queue_count: u32,
+    endpoint_generation: u64,
+    input_quiesced: bool,
 }
 
 /// Tracks the state of a queue pair through the start_queue lifecycle.
@@ -248,9 +265,106 @@ enum QueuePairState {
         queue_size: u16,
         /// true if this is the RX queue (even index), false if TX (odd).
         is_rx: bool,
+        feature_banks: [u32; 2],
     },
     /// Both queues started, worker running.
     Active,
+    /// Both queues stopped; each transport call takes its corresponding state.
+    Stopped {
+        rx: Option<QueueState>,
+        tx: Option<QueueState>,
+    },
+}
+
+impl Device {
+    async fn quiesce_active_workers(&mut self, restart: bool) -> anyhow::Result<()> {
+        if !self.coordinator.is_running() && self.coordinator.state().is_none() {
+            return Ok(());
+        }
+        self.coordinator.stop().await;
+        {
+            let coordinator = self
+                .coordinator
+                .state_mut()
+                .context("virtio-net coordinator state is unavailable")?;
+            coordinator.input_quiesced = self.input_quiesced;
+            for worker in &mut coordinator.workers {
+                worker.stop().await;
+            }
+            for worker in &mut coordinator.workers {
+                let (queue, state) = worker.get_mut();
+                let state =
+                    state.context("virtio-net worker state is unavailable during quiesce")?;
+                if let Some(queue) = queue.state.as_mut() {
+                    state
+                        .quiesce_endpoint(queue)
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                }
+            }
+            if restart {
+                for worker in &mut coordinator.workers {
+                    worker.start();
+                }
+            }
+        }
+        if restart {
+            self.coordinator.start();
+        }
+        Ok(())
+    }
+
+    async fn capture_stopped_pairs(&mut self) -> anyhow::Result<()> {
+        self.quiesce_active_workers(false).await?;
+        let mut coordinator = self.coordinator.remove();
+        self.stopped_queue_count = 0;
+        for (pair_index, worker) in coordinator.workers.iter_mut().enumerate() {
+            worker.task_mut().state.take();
+            let worker = worker.remove();
+            let (rx, tx, feature_banks) = worker.into_stopped_state()?;
+            if let Some(previous) = self.stopped_feature_banks {
+                anyhow::ensure!(
+                    previous == feature_banks,
+                    "virtio-net queue pairs negotiated different features"
+                );
+            } else {
+                self.stopped_feature_banks = Some(feature_banks);
+            }
+            self.pairs[pair_index] = QueuePairState::Stopped {
+                rx: Some(rx),
+                tx: Some(tx),
+            };
+            self.stopped_queue_count += 2;
+        }
+        Ok(())
+    }
+
+    async fn resume_quiesced_input(&mut self) -> anyhow::Result<()> {
+        if !self.coordinator.is_running() && self.coordinator.state().is_none() {
+            return Ok(());
+        }
+        self.coordinator.stop().await;
+        {
+            let coordinator = self
+                .coordinator
+                .state_mut()
+                .context("virtio-net coordinator state is unavailable")?;
+            coordinator.input_quiesced = false;
+            for worker in &mut coordinator.workers {
+                worker.stop().await;
+            }
+            for worker in &mut coordinator.workers {
+                let (queue, state) = worker.get_mut();
+                let state = state.context("virtio-net worker state is unavailable")?;
+                if let Some(queue) = queue.state.as_mut() {
+                    state.resume_endpoint(queue)?;
+                }
+                worker.start();
+            }
+        }
+        self.coordinator.start();
+        Ok(())
+    }
 }
 
 impl VirtioDevice for Device {
@@ -339,20 +453,43 @@ impl VirtioDevice for Device {
 
         let negotiated_features = NetworkFeaturesBank0::from(features.bank(0));
         let negotiated_features_bank1 = NetworkFeaturesBank1::from(features.bank(1));
+        let feature_banks = [features.bank(0), features.bank(1)];
         let pair_idx = (idx / 2) as usize;
         let is_rx = idx.is_multiple_of(2);
 
         match &self.pairs[pair_idx] {
             QueuePairState::Empty => {
                 // First queue of the pair — buffer it.
+                self.stopped_queue_count = 0;
                 self.pairs[pair_idx] = QueuePairState::HalfOpen {
                     queue,
                     queue_size,
                     is_rx,
+                    feature_banks,
+                };
+            }
+            QueuePairState::Stopped { rx, tx } => {
+                anyhow::ensure!(
+                    rx.is_none() && tx.is_none(),
+                    "cannot restart virtio-net before all stopped queue states are collected"
+                );
+                if let Some(previous) = self.stopped_feature_banks {
+                    anyhow::ensure!(
+                        previous == feature_banks,
+                        "virtio-net negotiated features changed while restarting queues"
+                    );
+                }
+                self.stopped_queue_count = 0;
+                self.pairs[pair_idx] = QueuePairState::HalfOpen {
+                    queue,
+                    queue_size,
+                    is_rx,
+                    feature_banks,
                 };
             }
             QueuePairState::HalfOpen {
                 is_rx: pending_is_rx,
+                feature_banks: pending_feature_banks,
                 ..
             } => {
                 if *pending_is_rx == is_rx {
@@ -361,6 +498,10 @@ impl VirtioDevice for Device {
                         if is_rx { "RX" } else { "TX" }
                     );
                 }
+                anyhow::ensure!(
+                    *pending_feature_banks == feature_banks,
+                    "virtio-net queue pair negotiated different features"
+                );
 
                 // Second queue — extract the first, form the pair.
                 let first_pair = !self
@@ -373,6 +514,7 @@ impl VirtioDevice for Device {
                     queue: pending_queue,
                     queue_size: pending_queue_size,
                     is_rx: pending_is_rx,
+                    feature_banks: _,
                 } = prev
                 else {
                     unreachable!()
@@ -426,31 +568,159 @@ impl VirtioDevice for Device {
                     // leave the pending half intact.
                     return None;
                 }
-                // Drop the pending half-open queue.
-                self.pairs[pair_idx] = QueuePairState::Empty;
+                let previous = std::mem::replace(&mut self.pairs[pair_idx], QueuePairState::Empty);
+                let QueuePairState::HalfOpen {
+                    queue,
+                    feature_banks,
+                    ..
+                } = previous
+                else {
+                    unreachable!()
+                };
+                self.stopped_feature_banks = Some(feature_banks);
+                self.stopped_queue_count = 1;
+                return Some(queue.queue_state());
             } else if matches!(self.pairs[pair_idx], QueuePairState::Active) {
-                // Stop the coordinator (which stops all workers).
-                self.coordinator.stop().await;
-                if let Some(coordinator) = self.coordinator.state_mut() {
-                    for worker in &mut coordinator.workers {
-                        worker.stop().await;
+                if self.adapter.save_restore {
+                    if let Err(error) = self.capture_stopped_pairs().await {
+                        self.stop_error = Some(error);
+                        return None;
                     }
+                } else {
+                    // Stop the coordinator (which stops all workers).
+                    self.coordinator.stop().await;
+                    if let Some(coordinator) = self.coordinator.state_mut() {
+                        for worker in &mut coordinator.workers {
+                            worker.stop().await;
+                        }
+                    }
+                    let _ = self.coordinator.remove();
+                    self.pairs[pair_idx] = QueuePairState::Empty;
                 }
-                let _ = self.coordinator.remove();
-                self.pairs[pair_idx] = QueuePairState::Empty;
             }
         }
 
-        // We don't support save/restore of virtio-net queue state yet.
-        None
+        match self.pairs.get_mut(pair_idx) {
+            Some(QueuePairState::Stopped { rx, tx }) => {
+                if idx.is_multiple_of(2) {
+                    rx.take()
+                } else {
+                    tx.take()
+                }
+            }
+            _ => None,
+        }
     }
 
     async fn reset(&mut self) {
         self.pairs.fill_with(|| QueuePairState::Empty);
+        self.stop_error = None;
+        self.stopped_feature_banks = None;
+        self.stopped_queue_count = 0;
+        self.input_quiesced = false;
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.adapter.save_restore,
+            "virtio-net input quiesce is unavailable without saved-state configuration"
+        );
+        self.input_quiesced = true;
+        self.quiesce_active_workers(true).await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.resume_quiesced_input().await?;
+        self.input_quiesced = false;
+        Ok(())
     }
 
     fn supports_save_restore(&self) -> bool {
-        true
+        self.adapter.save_restore
+    }
+
+    fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        if let Some(error) = self.stop_error.take() {
+            return Err(SaveError::Other(error));
+        }
+        let static_ipv4 = self.adapter.static_ipv4.as_ref().ok_or_else(|| {
+            SaveError::Other(anyhow::anyhow!(
+                "virtio-net static IPv4 identity is unavailable"
+            ))
+        })?;
+        let effective_features = self.adapter.effective_features.ok_or_else(|| {
+            SaveError::Other(anyhow::anyhow!(
+                "virtio-net effective feature contract is unavailable"
+            ))
+        })?;
+        if !self.pairs.iter().all(|pair| {
+            matches!(
+                pair,
+                QueuePairState::Empty | QueuePairState::Stopped { rx: None, tx: None }
+            )
+        }) {
+            return Err(SaveError::Other(anyhow::anyhow!(
+                "virtio-net queues are still running"
+            )));
+        }
+        let negotiated = match self.stopped_queue_count {
+            0 => [0, 0],
+            1 | 2 => self.stopped_feature_banks.ok_or_else(|| {
+                SaveError::Other(anyhow::anyhow!(
+                    "virtio-net stopped queue features are unavailable"
+                ))
+            })?,
+            count => {
+                return Err(SaveError::Other(anyhow::anyhow!(
+                    "virtio-net stopped queue count {count} is invalid"
+                )));
+            }
+        };
+        Ok(Some(SavedStateBlob::new(saved_state::SavedState {
+            schema_version: SAVED_STATE_VERSION,
+            guest_ipv4: u32::from(static_ipv4.guest_ipv4),
+            prefix_length: u32::from(static_ipv4.prefix_length),
+            gateway_ipv4: u32::from(static_ipv4.gateway_ipv4),
+            guest_mac: self.adapter.mac_address.to_bytes().to_vec(),
+            gateway_mac: static_ipv4.gateway_mac.to_bytes().to_vec(),
+            link_up: NetStatus::from(self.registers.status).link_up(),
+            effective_feature_bank0: effective_features as u32,
+            effective_feature_bank1: (effective_features >> 32) as u32,
+            negotiated_feature_bank0: negotiated[0],
+            negotiated_feature_bank1: negotiated[1],
+            endpoint_offload_bits: endpoint_offload_bits(self.adapter.tx_offload_support),
+            queue_pair_lifecycle: self.stopped_queue_count,
+            rx_in_order_outstanding: 0,
+            tx_in_order_outstanding: 0,
+            pending_rx_packet_count: 0,
+            pending_rx_payload_bytes: 0,
+            pending_tx_packet_count: 0,
+            pending_tx_payload_bytes: 0,
+            endpoint_generation: self.endpoint_generation,
+        })))
+    }
+
+    fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
+        let saved = validate_saved_state(state.as_ref(), &self.adapter, None, None)?;
+        self.registers.status = NetStatus::new().with_link_up(saved.link_up).into();
+        self.endpoint_generation = saved
+            .endpoint_generation
+            .checked_add(1)
+            .ok_or_else(|| invalid_saved_state("virtio-net endpoint generation overflowed"))?;
+        self.stopped_feature_banks = (saved.queue_pair_lifecycle != 0).then_some([
+            saved.negotiated_feature_bank0,
+            saved.negotiated_feature_bank1,
+        ]);
+        self.stopped_queue_count = saved.queue_pair_lifecycle;
+        Ok(())
+    }
+
+    fn device_state_validator(&self) -> DeviceStateValidator {
+        let adapter = self.adapter.clone();
+        Box::new(move |state, features, queues, _guest_memory| {
+            validate_saved_state(state, &adapter, Some(features), Some(queues))?;
+            Ok(())
+        })
     }
 }
 
@@ -464,6 +734,213 @@ struct EndpointQueueState {
 struct NetQueue {
     #[inspect(flatten, mut)]
     state: Option<EndpointQueueState>,
+}
+
+const SAVED_STATE_VERSION: u32 = 1;
+
+fn endpoint_offload_bits(offloads: TxOffloadSupport) -> u32 {
+    u32::from(offloads.ipv4_header)
+        | (u32::from(offloads.tcp) << 1)
+        | (u32::from(offloads.udp) << 2)
+        | (u32::from(offloads.tso) << 3)
+        | (u32::from(offloads.uso) << 4)
+}
+
+fn derived_mac(address: std::net::Ipv4Addr) -> [u8; 6] {
+    let [_, second, third, fourth] = address.octets();
+    [0x52, 0x54, 0, second, third, fourth]
+}
+
+fn invalid_saved_state(message: impl Into<String>) -> RestoreError {
+    RestoreError::InvalidSavedState(anyhow::anyhow!(message.into()))
+}
+
+fn validate_saved_state(
+    state: Option<&SavedStateBlob>,
+    adapter: &Adapter,
+    features: Option<&VirtioDeviceFeatures>,
+    queues: Option<&[DeviceQueueState]>,
+) -> Result<saved_state::SavedState, RestoreError> {
+    let state = state.ok_or_else(|| invalid_saved_state("missing virtio-net private state"))?;
+    let saved: saved_state::SavedState = state.parse()?;
+    if saved.schema_version != SAVED_STATE_VERSION {
+        return Err(invalid_saved_state(format!(
+            "unsupported virtio-net schema version {}",
+            saved.schema_version
+        )));
+    }
+
+    let static_ipv4 = adapter
+        .static_ipv4
+        .as_ref()
+        .ok_or_else(|| invalid_saved_state("virtio-net static IPv4 identity is unavailable"))?;
+    let effective_features = adapter
+        .effective_features
+        .ok_or_else(|| invalid_saved_state("virtio-net effective features are unavailable"))?;
+    if saved.guest_ipv4 != u32::from(static_ipv4.guest_ipv4)
+        || saved.prefix_length != u32::from(static_ipv4.prefix_length)
+        || saved.gateway_ipv4 != u32::from(static_ipv4.gateway_ipv4)
+        || saved.guest_mac != adapter.mac_address.to_bytes()
+        || saved.gateway_mac != static_ipv4.gateway_mac.to_bytes()
+    {
+        return Err(invalid_saved_state(
+            "virtio-net static identity does not match the destination",
+        ));
+    }
+    if saved.guest_mac != derived_mac(static_ipv4.guest_ipv4)
+        || saved.gateway_mac != derived_mac(static_ipv4.gateway_ipv4)
+    {
+        return Err(invalid_saved_state(
+            "virtio-net static identity is not canonical",
+        ));
+    }
+    if !(1..=30).contains(&static_ipv4.prefix_length) {
+        return Err(invalid_saved_state("virtio-net prefix is out of range"));
+    }
+    let mask = u32::MAX << (32 - static_ipv4.prefix_length);
+    let guest = u32::from(static_ipv4.guest_ipv4);
+    let network = guest & mask;
+    if u32::from(static_ipv4.gateway_ipv4) != network + 1
+        || guest == network
+        || guest == (network | !mask)
+        || static_ipv4.guest_ipv4 == static_ipv4.gateway_ipv4
+    {
+        return Err(invalid_saved_state(
+            "virtio-net IPv4 identity is internally inconsistent",
+        ));
+    }
+
+    if saved.effective_feature_bank0 != effective_features as u32
+        || saved.effective_feature_bank1 != (effective_features >> 32) as u32
+        || saved.endpoint_offload_bits != endpoint_offload_bits(adapter.tx_offload_support)
+    {
+        return Err(invalid_saved_state(
+            "virtio-net feature or endpoint capability contract changed",
+        ));
+    }
+    if saved.queue_pair_lifecycle > 2
+        || saved.rx_in_order_outstanding != 0
+        || saved.tx_in_order_outstanding != 0
+        || saved.pending_rx_packet_count != 0
+        || saved.pending_rx_payload_bytes != 0
+        || saved.pending_tx_packet_count != 0
+        || saved.pending_tx_payload_bytes != 0
+    {
+        return Err(invalid_saved_state(
+            "virtio-net saved packet ownership is not fully drained",
+        ));
+    }
+
+    if let Some(features) = features {
+        if features.ring_packed() || (features.into_bits() & !effective_features) != 0 {
+            return Err(invalid_saved_state(
+                "virtio-net negotiated features violate the device contract",
+            ));
+        }
+        if saved.queue_pair_lifecycle == 0 {
+            if saved.negotiated_feature_bank0 != 0 || saved.negotiated_feature_bank1 != 0 {
+                return Err(invalid_saved_state(
+                    "virtio-net inactive queues retain negotiated feature state",
+                ));
+            }
+        } else if saved.negotiated_feature_bank0 != features.bank(0)
+            || saved.negotiated_feature_bank1 != features.bank(1)
+        {
+            return Err(invalid_saved_state(
+                "virtio-net negotiated features do not match saved state",
+            ));
+        }
+    }
+    if let Some(queues) = queues {
+        if queues.len() != 2 {
+            return Err(invalid_saved_state(
+                "virtio-net saved state requires exactly one queue pair",
+            ));
+        }
+        let started_count = queues
+            .iter()
+            .filter(|queue| queue.params.enable && queue.queue_state.is_some())
+            .count();
+        if started_count != usize::try_from(saved.queue_pair_lifecycle).unwrap_or(usize::MAX) {
+            return Err(invalid_saved_state(
+                "virtio-net queue lifecycle does not match transport state",
+            ));
+        }
+        for queue in queues {
+            if !queue.params.enable && queue.queue_state.is_some() {
+                return Err(invalid_saved_state(
+                    "virtio-net disabled queue retains progress state",
+                ));
+            }
+            if !queue.params.enable {
+                continue;
+            }
+            if queue.params.size == 0 || queue.params.size > 256 {
+                return Err(invalid_saved_state(
+                    "virtio-net restored queue size is out of range",
+                ));
+            }
+            if queue
+                .queue_state
+                .is_some_and(|state| state.avail_index != state.used_index)
+            {
+                return Err(invalid_saved_state(
+                    "virtio-net restored queue retains unrepresented ownership",
+                ));
+            }
+        }
+    }
+    Ok(saved)
+}
+
+mod saved_state {
+    use mesh::payload::Protobuf;
+    use vmcore::save_restore::SavedStateRoot;
+
+    #[derive(Protobuf, SavedStateRoot)]
+    #[mesh(package = "virtio.net")]
+    pub struct SavedState {
+        #[mesh(1)]
+        pub schema_version: u32,
+        #[mesh(2)]
+        pub guest_ipv4: u32,
+        #[mesh(3)]
+        pub prefix_length: u32,
+        #[mesh(4)]
+        pub gateway_ipv4: u32,
+        #[mesh(5)]
+        pub guest_mac: Vec<u8>,
+        #[mesh(6)]
+        pub gateway_mac: Vec<u8>,
+        #[mesh(7)]
+        pub link_up: bool,
+        #[mesh(8)]
+        pub effective_feature_bank0: u32,
+        #[mesh(9)]
+        pub effective_feature_bank1: u32,
+        #[mesh(10)]
+        pub negotiated_feature_bank0: u32,
+        #[mesh(11)]
+        pub negotiated_feature_bank1: u32,
+        #[mesh(12)]
+        pub endpoint_offload_bits: u32,
+        #[mesh(13)]
+        pub queue_pair_lifecycle: u32,
+        #[mesh(14)]
+        pub rx_in_order_outstanding: u32,
+        #[mesh(15)]
+        pub tx_in_order_outstanding: u32,
+        #[mesh(16)]
+        pub pending_rx_packet_count: u32,
+        #[mesh(17)]
+        pub pending_rx_payload_bytes: u64,
+        #[mesh(18)]
+        pub pending_tx_packet_count: u32,
+        #[mesh(19)]
+        pub pending_tx_payload_bytes: u64,
+        #[mesh(20)]
+        pub endpoint_generation: u64,
+    }
 }
 
 impl InspectTaskMut<Worker> for NetQueue {
@@ -532,11 +1009,23 @@ struct PendingTxPacket {
 
 pub struct NicBuilder {
     max_queue_pairs: u16,
+    egress_policy: Option<EgressPolicy>,
+    save_restore: Option<(StaticIpv4Config, u64)>,
 }
 
 impl NicBuilder {
     pub fn max_queues(mut self, max_queue_pairs: u16) -> Self {
         self.max_queue_pairs = max_queue_pairs;
+        self
+    }
+
+    pub fn egress_policy(mut self, egress_policy: EgressPolicy) -> Self {
+        self.egress_policy = Some(egress_policy);
+        self
+    }
+
+    pub fn save_restore(mut self, static_ipv4: StaticIpv4Config, effective_features: u64) -> Self {
+        self.save_restore = Some((static_ipv4, effective_features));
         self
     }
 
@@ -552,7 +1041,7 @@ impl NicBuilder {
     pub fn build(
         self,
         driver_source: &VmTaskDriverSource,
-        endpoint: Box<dyn Endpoint>,
+        mut endpoint: Box<dyn Endpoint>,
         mac_address: MacAddress,
     ) -> anyhow::Result<Device> {
         if !endpoint.is_ordered() {
@@ -562,6 +1051,19 @@ impl NicBuilder {
                 endpoint.endpoint_type()
             );
         }
+        if let Some(policy) = &self.egress_policy {
+            policy
+                .validate()
+                .context("network device received an invalid egress policy")?;
+            endpoint
+                .set_egress_policy(policy.clone())
+                .with_context(|| {
+                    format!(
+                        "network backend '{}' rejected egress policy",
+                        endpoint.endpoint_type()
+                    )
+                })?;
+        }
 
         // TODO: Implement VIRTIO_NET_F_MQ and VIRTIO_NET_F_RSS logic based on mulitqueue support.
         // let multiqueue = endpoint.multiqueue_support();
@@ -570,12 +1072,22 @@ impl NicBuilder {
 
         let driver = driver_source.simple();
         let tx_offload_support = endpoint.tx_offload_support();
+        let (save_restore, static_ipv4, effective_features) = match self.save_restore {
+            Some((static_ipv4, effective_features)) => {
+                (true, Some(static_ipv4), Some(effective_features))
+            }
+            None => (false, None, None),
+        };
         let adapter = Arc::new(Adapter {
             driver,
             max_queue_pairs,
             tx_fast_completions: endpoint.tx_fast_completions(),
             mac_address,
             tx_offload_support,
+            egress_policy: self.egress_policy,
+            save_restore,
+            static_ipv4,
+            effective_features,
         });
 
         let coordinator = TaskControl::new(CoordinatorState {
@@ -603,6 +1115,11 @@ impl NicBuilder {
             pairs: (0..max_queue_pairs)
                 .map(|_| QueuePairState::Empty)
                 .collect(),
+            stop_error: None,
+            stopped_feature_banks: None,
+            stopped_queue_count: 0,
+            endpoint_generation: 0,
+            input_quiesced: false,
         })
     }
 }
@@ -611,6 +1128,8 @@ impl Device {
     pub fn builder() -> NicBuilder {
         NicBuilder {
             max_queue_pairs: !0,
+            egress_policy: None,
+            save_restore: None,
         }
     }
 }
@@ -632,6 +1151,7 @@ impl Device {
                     .collect(),
                 num_queues,
                 restart: true,
+                input_quiesced: self.input_quiesced,
             },
         );
     }
@@ -667,11 +1187,11 @@ impl Device {
             active_state,
             negotiated_features,
             negotiated_features_bank1,
+            egress_policy: self.adapter.egress_policy.clone(),
         };
         let coordinator = self.coordinator.state_mut().unwrap();
         let worker_task = &mut coordinator.workers[idx];
         worker_task.insert(&driver, "virtio-net".to_string(), worker);
-        worker_task.start();
     }
 }
 
@@ -679,6 +1199,7 @@ struct Coordinator {
     workers: Vec<TaskControl<NetQueue, Worker>>,
     num_queues: u16,
     restart: bool,
+    input_quiesced: bool,
 }
 
 struct CoordinatorState {
@@ -739,6 +1260,15 @@ impl Coordinator {
                         "failed to restart queues"
                     );
                 }
+                if self.input_quiesced
+                    && let Err(err) = stop.until_stopped(self.quiesce_workers()).await?
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to establish virtio-net input gate"
+                    );
+                    stop.until_stopped(pending::<()>()).await?;
+                }
                 self.restart = false;
             }
             self.start_workers();
@@ -758,6 +1288,20 @@ impl Coordinator {
         for worker in &mut self.workers {
             worker.stop().await;
         }
+    }
+
+    async fn quiesce_workers(&mut self) -> anyhow::Result<()> {
+        for worker in &mut self.workers {
+            let (queue, state) = worker.get_mut();
+            let state = state.context("virtio-net worker state is unavailable")?;
+            if let Some(queue) = queue.state.as_mut() {
+                state
+                    .quiesce_endpoint(queue)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+            }
+        }
+        Ok(())
     }
 
     async fn restart_queues(&mut self, c_state: &mut CoordinatorState) -> Result<(), WorkerError> {
@@ -851,8 +1395,12 @@ enum TxPacketError {
     Empty,
     #[error("too many segments")]
     TooManySegments,
+    #[error("packet length {0} exceeds the 65535-byte backend bound")]
+    TooLarge(u32),
     #[error("descriptor index {0} already in use")]
     DuplicateIndex(u16),
+    #[error("egress policy denied packet")]
+    EgressDenied(#[source] EgressDenied),
 }
 
 impl From<task_control::Cancelled> for WorkerError {
@@ -869,9 +1417,106 @@ struct Worker {
     negotiated_features: NetworkFeaturesBank0,
     #[inspect(skip)]
     negotiated_features_bank1: NetworkFeaturesBank1,
+    #[inspect(skip)]
+    egress_policy: Option<EgressPolicy>,
 }
 
 impl Worker {
+    async fn quiesce_endpoint(
+        &mut self,
+        queue_state: &mut EndpointQueueState,
+    ) -> Result<(), WorkerError> {
+        for _ in 0..=usize::from(self.virtio_state.tx_queue_size) {
+            while self.transmit_pending_segments(queue_state)? {}
+
+            queue_state
+                .queue
+                .quiesce(&mut self.active_state.pending_rx_packets)
+                .await
+                .map_err(WorkerError::Endpoint)?;
+            self.process_endpoint_rx(queue_state.queue.as_mut())?;
+            self.process_endpoint_tx(queue_state.queue.as_mut())?;
+
+            if self.active_state.data.tx_segments.is_empty()
+                && self
+                    .active_state
+                    .pending_tx_packets
+                    .iter()
+                    .all(Option::is_none)
+            {
+                let ownership = queue_state
+                    .queue
+                    .quiesce(&mut self.active_state.pending_rx_packets)
+                    .await
+                    .map_err(WorkerError::Endpoint)?;
+                if ownership.rx_ready != 0 || ownership.tx_ready != 0 {
+                    return Err(WorkerError::Endpoint(anyhow::anyhow!(
+                        "network endpoint retained completions after quiesce drain"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+        Err(WorkerError::Endpoint(anyhow::anyhow!(
+            "network endpoint did not drain within the queue-size bound"
+        )))
+    }
+
+    fn resume_endpoint(&mut self, queue_state: &mut EndpointQueueState) -> anyhow::Result<()> {
+        queue_state.queue.resume()?;
+        let count = self
+            .active_state
+            .pending_rx_packets
+            .fill_ready(&mut self.active_state.data.rx_ready);
+        queue_state.queue.rx_avail(
+            &mut self.active_state.pending_rx_packets,
+            &self.active_state.data.rx_ready[..count],
+        );
+        Ok(())
+    }
+
+    fn into_stopped_state(self) -> anyhow::Result<(QueueState, QueueState, [u32; 2])> {
+        anyhow::ensure!(
+            self.active_state.data.tx_segments.is_empty()
+                && self
+                    .active_state
+                    .pending_tx_packets
+                    .iter()
+                    .all(Option::is_none)
+                && self.virtio_state.tx_in_order.outstanding() == 0,
+            "virtio-net TX ownership remained after endpoint quiesce"
+        );
+
+        let pending_rx = self.active_state.pending_rx_packets.pending_count();
+        anyhow::ensure!(
+            pending_rx == self.virtio_state.rx_in_order.outstanding(),
+            "virtio-net RX ownership does not match its completion cursor"
+        );
+        let current_rx = self.virtio_state.rx_queue.queue_state();
+        anyhow::ensure!(
+            usize::from(current_rx.avail_index.wrapping_sub(current_rx.used_index)) == pending_rx,
+            "virtio-net RX queue cursors do not match pending descriptor ownership"
+        );
+        let rx = QueueState {
+            avail_index: current_rx.used_index,
+            used_index: current_rx.used_index,
+        };
+
+        let tx = self.virtio_state.tx_queue.queue_state();
+        anyhow::ensure!(
+            tx.avail_index == tx.used_index,
+            "virtio-net TX queue retained an incomplete descriptor"
+        );
+        Ok((
+            rx,
+            tx,
+            [
+                self.negotiated_features.into_bits(),
+                self.negotiated_features_bank1.into_bits(),
+            ],
+        ))
+    }
+
     async fn process(
         &mut self,
         stop: &mut StopTask<'_>,
@@ -1017,15 +1662,18 @@ impl Worker {
             .checked_sub(header_size())
             .and_then(|len| u32::try_from(len).ok())
             .ok_or(TxPacketError::Empty)?;
+        if packet_len > u16::MAX.into() {
+            return Err(TxPacketError::TooLarge(packet_len));
+        }
 
         // Read the virtio-net header + enough of the Ethernet frame to parse
         // the EtherType (and a potential VLAN tag).
-        const ETH_PEEK: usize = 18; // 14 standard + 4 for VLAN tag
-        let mut peek_buf = [0u8; size_of::<VirtioNetHeader>() + ETH_PEEK];
+        const PACKET_PEEK: usize = 98; // Ethernet + VLAN + max IPv4 + TCP header.
+        let mut peek_buf = [0u8; size_of::<VirtioNetHeader>() + PACKET_PEEK];
         let bytes_read = work
             .read(
                 self.active_state.pending_rx_packets.mem(),
-                &mut peek_buf[..header_size() + ETH_PEEK],
+                &mut peek_buf[..header_size() + PACKET_PEEK],
             )
             .map_err(TxPacketError::ReadHeader)?;
 
@@ -1037,6 +1685,11 @@ impl Worker {
         } else {
             &[]
         };
+        if let Some(policy) = &self.egress_policy {
+            policy
+                .authorize_frame(packet_prefix, packet_len as usize)
+                .map_err(TxPacketError::EgressDenied)?;
+        }
 
         let segments = &mut self.active_state.data.tx_segments;
         let seg_start = segments.len();
