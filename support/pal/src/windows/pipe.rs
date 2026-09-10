@@ -300,6 +300,7 @@ pub trait PipeExt {
     fn set_pipe_select_event(&self, event: &Event, event_types: u32) -> io::Result<()>;
     fn get_pipe_select_events(&self) -> io::Result<u32>;
     fn is_pipe_connected(&self) -> io::Result<bool>;
+    fn is_pipe_peer_closed(&self) -> io::Result<bool>;
     fn disconnect_pipe(&self) -> io::Result<()>;
 }
 
@@ -459,6 +460,26 @@ impl PipeExt for File {
             _ => false,
         };
         Ok(connected)
+    }
+
+    fn is_pipe_peer_closed(&self) -> io::Result<bool> {
+        // SAFETY: calling with an appropriately sized output buffer.
+        let state = unsafe {
+            let mut iosb = zeroed();
+            let mut info: FILE_PIPE_LOCAL_INFORMATION = zeroed();
+            chk_status(NtQueryInformationFile(
+                self.as_raw_handle().cast::<c_void>(),
+                &mut iosb,
+                std::ptr::from_mut(&mut info).cast(),
+                size_of_val(&info) as u32,
+                FilePipeLocalInformation,
+            ))?;
+            info.NamedPipeState
+        };
+        Ok(matches!(
+            state,
+            FILE_PIPE_DISCONNECTED_STATE | FILE_PIPE_CLOSING_STATE
+        ))
     }
 
     fn disconnect_pipe(&self) -> io::Result<()> {
