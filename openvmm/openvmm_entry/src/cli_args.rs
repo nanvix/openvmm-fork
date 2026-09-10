@@ -1608,9 +1608,9 @@ impl Options {
                 && self.vmbus_com1_serial.is_none()
                 && self.vmbus_com2_serial.is_none()
                 && self.debugcon.is_none()
-                && self.virtio_console.is_none()
+                && self.virtio_console_pcie_port.is_none()
                 && !self.serial_tx_only,
-            "microVM ABI version 1 exposes only its portb console"
+            "microVM supports portb and its fixed-slot virtio console, not UART or PCIe consoles"
         );
         anyhow::ensure!(
             self.disk.is_empty()
@@ -2904,6 +2904,8 @@ pub enum SerialConfigCli {
     Stderr,
     Pipe(PathBuf),
     Tcp(SocketAddr),
+    ConnectPipe(PathBuf),
+    ConnectTcp(SocketAddr),
     File(PathBuf),
 }
 
@@ -2950,6 +2952,21 @@ impl FromStr for SerialConfigCli {
                 }
                 None => Err(
                     "invalid serial configuration: listen requires a value of tcp:addr or pipe",
+                )?,
+            },
+            "connect" => match first_value {
+                Some(path) => {
+                    if let Some(tcp) = path.strip_prefix("tcp:") {
+                        let addr = tcp
+                            .parse()
+                            .map_err(|err| format!("invalid tcp address: {err}"))?;
+                        SerialConfigCli::ConnectTcp(addr)
+                    } else {
+                        SerialConfigCli::ConnectPipe(path.into())
+                    }
+                }
+                None => Err(
+                    "invalid serial configuration: connect requires a value of tcp:addr or pipe",
                 )?,
             },
             _ => {

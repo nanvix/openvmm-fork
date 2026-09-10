@@ -1248,7 +1248,13 @@ impl VmService {
                             )
                         })?;
                     let resource: Resource<VirtioDeviceHandle> =
-                        virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
+                        virtio_resources::console::VirtioConsoleHandle {
+                            backend,
+                            disconnect_policy:
+                                virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                            attachment: None,
+                        }
+                        .into_resource();
                     if cfg!(windows) || cfg!(target_os = "macos") {
                         config.vpci_devices.push(VpciDeviceConfig {
                             vtl: DeviceVtl::Vtl0,
@@ -1324,6 +1330,8 @@ impl VmService {
 
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
+            microvm_console_attachment: None,
+            microvm_console_socket_cleanup: None,
             snapshot_memory_handle: None,
             snapshot_requests: None,
             snapshot_destination: None,
@@ -2293,7 +2301,13 @@ async fn build_virtio_device(
         }
         Kind::Console(vmservice::VirtioConsole { backend }) => {
             let backend = build_serial_backend(backend.context("missing console backend")?)?;
-            virtio_resources::console::VirtioConsoleHandle { backend }.into_resource()
+            virtio_resources::console::VirtioConsoleHandle {
+                backend,
+                disconnect_policy:
+                    virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                attachment: None,
+            }
+            .into_resource()
         }
         Kind::VhostUser(vhost_user) => build_vhost_user_device(vhost_user)?,
         Kind::Fs(vmservice::VirtioFs { tag, root_path }) => {
