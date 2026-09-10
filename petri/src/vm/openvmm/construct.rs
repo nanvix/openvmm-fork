@@ -136,7 +136,7 @@ impl PetriVmConfigOpenVmm {
             physical_nvme_devices,
         } = petri_vm_config;
 
-        let is_microvm = matches!(machine_profile, MachineProfile::Microvm);
+        let is_microvm = machine_profile == MachineProfile::Microvm;
         if is_microvm {
             anyhow::ensure!(
                 matches!(arch, MachineArch::X86_64),
@@ -219,7 +219,7 @@ impl PetriVmConfigOpenVmm {
                 LoadMode::Linux { kernel, initrd, .. } => LoadMode::Pvh {
                     kernel,
                     initrd,
-                    cmdline: build_microvm_command_line(&[])?,
+                    cmdline: build_microvm_command_line(&[], false)?,
                 },
                 _ => unreachable!("microVM firmware was validated as LinuxDirect"),
             };
@@ -707,8 +707,6 @@ impl PetriVmConfigOpenVmm {
         }
 
         let config = Config {
-            microvm_filesystem: None,
-            microvm_network: None,
             // Firmware
             machine_profile,
             load_mode,
@@ -780,6 +778,13 @@ impl PetriVmConfigOpenVmm {
             vpci_resources: vec![],
             debugger_rpc: None,
             rtc_delta_milliseconds: 0,
+            microvm_network: None,
+            microvm_filesystem: None,
+            microvm_filesystem_bootstrap: false,
+            microvm_sandbox_blocks: Vec::new(),
+            microvm_memory_capacity: None,
+            microvm_snapshot_memory_ranges: Vec::new(),
+            microvm_restore_memory_ranges: Vec::new(),
         };
 
         openvmm_defs::config::validate_machine_config(&config, None)?;

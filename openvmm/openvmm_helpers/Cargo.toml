@@ -7,12 +7,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-net_backend_resources.workspace = true
 disk_backend_resources.workspace = true
 disk_vhd1.workspace = true
 disklayer_vhdx.workspace = true
 get_resources.workspace = true
 hypervisor_resources.workspace = true
+net_backend_resources.workspace = true
 openvmm_defs.workspace = true
 pal.workspace = true
 vm_resource.workspace = true

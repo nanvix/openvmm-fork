@@ -225,6 +225,10 @@ impl Manifest {
             chipset_capabilities: config.chipset_capabilities,
             layout: config.layout,
             rtc_delta_milliseconds: config.rtc_delta_milliseconds,
+            microvm_sandbox_blocks: config.microvm_sandbox_blocks,
+            microvm_memory_capacity: config.microvm_memory_capacity,
+            microvm_snapshot_memory_ranges: config.microvm_snapshot_memory_ranges,
+            microvm_restore_memory_ranges: config.microvm_restore_memory_ranges,
         }
     }
 }
@@ -269,6 +273,10 @@ pub struct Manifest {
     layout: vmm_core_defs::LayoutConfig,
     rtc_delta_milliseconds: i64,
     machine_profile: MachineProfile,
+    microvm_sandbox_blocks: Vec<openvmm_defs::config::MicrovmSandboxBlockConfig>,
+    microvm_memory_capacity: Option<u64>,
+    microvm_snapshot_memory_ranges: Vec<MemoryRange>,
+    microvm_restore_memory_ranges: Vec<MemoryRange>,
 }
 
 async fn open_simple_disk(
@@ -2925,6 +2933,7 @@ impl InitializedVm {
         // by the memory layout allocator; each slot is a 4 KiB Mmio32
         // allocation indexed by the order of VirtioBus::Mmio devices.
         let mut pci_device_number = 10;
+        let mut microvm_sandbox_blocks = cfg.microvm_sandbox_blocks.iter();
         let mut virtio_mmio_index = 0;
 
         // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
@@ -2951,53 +2960,72 @@ impl InitializedVm {
                 .await?;
             match bus {
                 VirtioBus::Mmio => {
-                    let (mmio_start, mmio_len, irq, disabled_features) =
-                        if matches!(cfg.machine_profile, MachineProfile::Microvm) {
-                            const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
-                            let (start, irq) = match id.as_str() {
-                                "virtio-net" => (
-                                    openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
-                                    openvmm_defs::config::microvm_virtio_net_irq(None)?,
-                                ),
-                                "virtiofs" => (
-                                    openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
-                                    openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
-                                ),
-                                "virtio-console" => (
-                                    openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
-                                    openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
-                                ),
-                                "virtio-blk" => (
-                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
-                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
-                                ),
-                                _ => anyhow::bail!("unsupported microVM virtio device '{id}'"),
-                            };
-                            let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
-                            anyhow::ensure!(
-                                start >= chipset_mmio.low.start()
-                                    && start
-                                        .checked_add(len)
-                                        .is_some_and(|end| end <= chipset_mmio.low.end()),
-                                "microVM virtio-blk slot is outside the fixed low-MMIO aperture"
-                            );
-                            (start, len, irq, VIRTIO_F_RING_PACKED)
-                        } else {
-                            let start =
-                                virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
-                            virtio_mmio_index += 1;
-                            (start, 0x1000, virtio_mmio_irq, 0)
+                    let (mmio_start, mmio_len, irq, disabled_features, interrupt_mode) = if cfg
+                        .machine_profile
+                        == MachineProfile::Microvm
+                    {
+                        let (start, irq) = match id.as_str() {
+                            "virtio-net" => (
+                                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+                                openvmm_defs::config::microvm_virtio_net_irq(None)?,
+                            ),
+                            "virtiofs" => (
+                                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                                openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
+                            ),
+                            "virtio-console" => (
+                                openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+                                openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
+                            ),
+                            "virtio-blk" => {
+                                let block = microvm_sandbox_blocks
+                                    .next()
+                                    .context("microVM virtio-blk device has no sandbox role")?;
+                                (block.role.mmio_base(), block.role.irq())
+                            }
+                            _ => anyhow::bail!(
+                                "unsupported microVM virtio device '{id}' reached worker construction"
+                            ),
                         };
+                        let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
+                        anyhow::ensure!(
+                            start >= chipset_mmio.low.start()
+                                && start
+                                    .checked_add(len)
+                                    .is_some_and(|end| end <= chipset_mmio.low.end()),
+                            "microVM virtio slot for '{id}' is outside the fixed low-MMIO aperture"
+                        );
+                        let disabled_features = match id.as_str() {
+                            "virtio-net" => !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES,
+                            "virtiofs" => !openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES,
+                            "virtio-blk" => {
+                                let block = cfg
+                                    .microvm_sandbox_blocks
+                                    .iter()
+                                    .find(|block| block.role.mmio_base() == start)
+                                    .context("microVM block slot has no role")?;
+                                !openvmm_defs::config::microvm_sandbox_block_features(block.role)
+                            }
+                            _ => 1 << 34,
+                        };
+                        let interrupt_mode = VirtioMmioInterruptMode::SharedStatus {
+                            status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(start)
+                                .context("microVM slot has no shared-status word")?,
+                        };
+                        (start, len, irq, disabled_features, interrupt_mode)
+                    } else {
+                        let start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
+                        virtio_mmio_index += 1;
+                        (
+                            start,
+                            0x1000,
+                            virtio_mmio_irq,
+                            0,
+                            VirtioMmioInterruptMode::Legacy,
+                        )
+                    };
                     let id = format!("{id}-{mmio_start}");
                     let gm = gm.clone();
-                    let interrupt_mode = if cfg.machine_profile == MachineProfile::Microvm {
-                        VirtioMmioInterruptMode::SharedStatus {
-                            status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(mmio_start)
-                                .context("microVM device has no shared status slot")?,
-                        }
-                    } else {
-                        VirtioMmioInterruptMode::Legacy
-                    };
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
                         VirtioMmioDevice::new_with_disabled_features_and_interrupt_mode(
                             device.0,
@@ -4601,6 +4629,10 @@ impl LoadedVm {
                 chipset_high_mmio_size: 0,
                 vtl2_chipset_mmio_size: 0,
             }, // TODO
+            microvm_sandbox_blocks: vec![],
+            microvm_memory_capacity: None,
+            microvm_snapshot_memory_ranges: vec![],
+            microvm_restore_memory_ranges: vec![],
             rtc_delta_milliseconds: 0, // TODO
         };
         #[expect(unreachable_code, reason = "TODO")]

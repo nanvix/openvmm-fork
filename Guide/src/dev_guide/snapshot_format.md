@@ -1,48 +1,109 @@
 # Snapshot Format
 
-OpenVMM snapshot I/O validates and publishes one exact local machine-state
-generation at a time.
+This page documents the on-disk format used by OpenVMM snapshots, intended
+for developers working on the save/restore subsystem.
 
 ## Directory layout
 
+A snapshot is stored as a directory containing three required files and, for
+a mounted microVM scratch capture, one paired scratch image:
+
 ```text
 snapshot-dir/
-├── manifest.bin   # Bounded protobuf machine and artifact inventory
-├── state.bin      # Protobuf device state
-└── memory.bin     # Exact RAM backing or an independent copy
+├── manifest.bin   # Protobuf-encoded SnapshotManifest
+├── state.bin      # Protobuf-encoded device saved state
+├── memory.bin     # Exact automatic RAM file or independent supplied-RAM clone
+└── scratch.img    # Optional paired microVM writable scratch image
 ```
 
-## Manifest and publication
+## Manifest format
 
-`openvmm_helpers::snapshot` records artifact lengths, format and saved-state
-schema identifiers, memory ranges, CPU and clock contracts, and complete
-state-unit inventory. The initial microVM constructor supports the base
-single-vCPU profile without device attachments or memory expansion.
-Additional protobuf fields are reserved but are not accepted by this profile.
+The manifest is a protobuf message defined as
+[`SnapshotManifest`](https://openvmm.dev/rustdoc/linux/openvmm_helpers/snapshot/struct.SnapshotManifest.html)
+in `openvmm/openvmm_helpers/src/snapshot.rs`, encoded using the `mesh`
+crate's protobuf encoding.
 
-Publication writes and flushes a private sibling staging directory, then
-renames it without replacing an existing destination. `SnapshotWriteError`
-distinguishes rollback-safe failures, uncertain live-RAM alias cleanup, and
-failures after the publication commit point. An owned RAM handle may be
-promoted only when the source is stopped and will terminate after commit.
-User-supplied RAM is copied independently.
+New snapshots use manifest version 5. The legacy `state_sha256` and
+`memory_sha256` protobuf tags remain reserved so version 2 manifests can be
+decoded; versions 3 through 5 require both fields to be absent. Restore accepts
+versions 2 through 4 for compatibility. Tiered microVM snapshots require version
+5, which records capture tier, clone/resume policy, and consumed configuration
+sections.
 
-The local format is not an authenticated container: structural validation
-does not authenticate same-length payload modifications. Export and transport
-layers must provide any required broader integrity guarantee.
+The default format is a local machine-state contract, not an authenticated
+container. All versions receive the same regular-file, no-follow/no-reparse,
+bounded decoding, exact-length, inventory, and machine-contract validation,
+but the on-disk format does not authenticate same-length payload changes.
+Versions 4 and 5 record the SHA-256 and exact length of `scratch.img`, because guest
+RAM and a mounted writable filesystem must be restored as one exact pair.
+Export or transport layers must provide broader integrity and authentication
+outside this format.
 
-## Private restore memory
+The optional microVM network contract stores a versioned SHA-256 digest of its
+bound egress policy. Encoding version 2 includes the static prefix, guest MAC,
+and canonical ARP next-hop set in addition to the policy rules. An absent
+encoding-version field denotes version 1, allowing network snapshots produced
+before endpoint next-hop binding to retain their original digest semantics.
 
-`OpenedSnapshot` retains directory and artifact handles for one generation.
-Artifact names cannot be replaced between validation and mapping to select
-different files. Restore checks exact EOF and observable file generation,
-then creates writable private copy-on-write mappings; snapshot bytes remain
-unchanged. `SnapshotRestoreGuards` keep the exact handles alive through VM
-teardown.
+## Device state (`state.bin`)
 
-Windows rejects reparse points and retains read-only sharing guards. Unix
-retains no-follow descriptors, but descriptors alone do not provide mandatory
-write exclusion.
+The device state contains every device's saved state, collected via the
+`SaveRestore` trait and encoded as a `mesh` protobuf message. The
+[Save State](contrib/save-state.md) compatibility rules (mesh tag stability,
+default values, forward/backward compatibility) apply.
+
+## Memory (`memory.bin`)
+
+For automatically allocated microVM RAM, `memory.bin` is a hard link to the
+exact OpenVMM-owned backing handle. State and manifest are written and flushed
+first; OpenVMM then flushes the stopped guest's shared RAM mappings and exact
+backing handle, creates the link last, and verifies the linked handle's file
+identity and EOF before the staging directory is renamed into place. Linux
+prefers `linkat(AT_EMPTY_PATH)` and can use a `/proc/self/fd` link with a
+device/inode proof. Windows uses handle-relative `FileLinkInformation` and
+verifies `FILE_ID_INFO`. Filesystems that cannot create the link fall back to
+an independent sparse-aware copy.
+
+User-supplied RAM always uses the independent-copy path, never a hard link.
+Clone support is used when available, with allocated-range or zero-scan copying
+as a fallback on Linux; Windows uses a dense copy. Both paths use an
+already-open handle rather than reopening its pathname, so replacing the source
+path cannot substitute different bytes.
+Successful guest-requested capture is terminal for the source. If publication
+fails after the automatic link exists, OpenVMM removes and durably flushes the
+private staging directory before allowing rollback; uncertain cleanup makes
+the source terminate instead of resume.
+
+Restore likewise opens the snapshot directory once and resolves its artifacts
+relative to that handle. Windows uses read-only handles with `FILE_SHARE_READ`
+only, rejects reparse points, compares `FILE_ID_INFO` and EOF before and after
+creating the private COW section, and keeps the directory and artifact guards
+in the VM worker until teardown. Linux keeps the exact `O_NOFOLLOW` directory
+and regular-file descriptors and rejects observable metadata changes before
+handoff, so renaming or replacing the original path cannot substitute another
+generation. Linux file descriptors do not provide mandatory write exclusion;
+deployments that need authenticated or write-proof local artifacts must add a
+stronger mode such as a lease, fs-verity, or a verified artifact broker.
+
+## Scratch (`scratch.img`)
+
+The microVM block contract records every fixed role, access mode, geometry, and
+immutable read-only layer digest. A paired capture copies the exact opened
+writable scratch handle into the same staging directory after device queues
+drain, verifies its SHA-256, and publishes it atomically with VM state. Restore
+verifies the artifact before worker construction and makes a private copy for
+each process, so repeated restores cannot mutate the snapshot.
+
+A pre-mount capture instead records the `fresh` scratch policy and geometry,
+contains no `scratch.img`, and requires a new matching scratch file on restore.
+
+## Code references
+
+- Manifest type and I/O: `openvmm/openvmm_helpers/src/snapshot.rs`
+- Restore entry point: `prepare_snapshot_restore()` in
+  `openvmm/openvmm_entry/src/lib.rs`
+- File-backed memory: `SharedMemoryFd` type alias in
+  `openvmm/openvmm_defs/src/worker.rs`
 
 ## Device state architecture
 
@@ -99,10 +160,16 @@ Key unsupported categories:
 - **Pass-through PCI** — `AssignedPciDevice`, `RelayedVpciDevice`.
 - **VGA / GDMA** — marked `todo!()` (will panic on save).
 - **Virtio devices** — the `VirtioDevice` trait defaults
-  `supports_save_restore()` to `false`. Only `virtio-blk`,
-  `virtio-net`, `virtio-pmem`, and `virtio-rng` override it to `true`.
-  Devices with host-side session state (`virtio-9p`, `virtiofs`,
-  `virtio-console`) intentionally leave it `false`.
+  `supports_save_restore()` to `false`. `virtio-blk`, `virtio-console`,
+  `virtio-pmem`, and `virtio-rng` override it to `true`. `virtio-net` enables
+  it only for resources with an explicit static identity and feature contract,
+  such as the microVM NIC; ordinary virtio-net resources remain
+  disabled.
+  The transport stores an opaque typed device-private payload in addition to
+  common queue state. Devices with unsupported host-side session state, such
+  as `virtio-9p`, leave save/restore disabled. `virtiofs` enables typed
+  device-private state only for the constrained microVM HostFs profile;
+  ordinary, aggregate, and SectionFs resources remain disabled.
 - **Some VMBus devices** — `GuestCrashDevice`, `GuestEmulationDevice`,
   `VmbusSerialHost`, `Vmbfs` return `None` from
   `supports_save_restore()`.
