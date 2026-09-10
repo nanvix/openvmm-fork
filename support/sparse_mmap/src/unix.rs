@@ -61,6 +61,14 @@ pub fn new_mappable_from_file(
     file.as_fd().try_clone_to_owned()
 }
 
+/// Creates a mappable whose writable views are private to the mapping.
+pub fn new_mappable_from_file_copy_on_write(
+    file: &File,
+    _executable: bool,
+) -> io::Result<Mappable> {
+    file.as_fd().try_clone_to_owned()
+}
+
 // SAFETY: SparseMapping's internal pointer represents an owned virtual address
 // range. There is no safety issue accessing this pointer across threads.
 unsafe impl Send for SparseMapping {}
@@ -178,6 +186,17 @@ impl SparseMapping {
         self.len
     }
 
+    /// Flushes modified shared file pages in a populated range.
+    pub fn flush(&self, offset: usize, len: usize) -> Result<(), Error> {
+        let _ = self.validate_offset_len(offset, len)?;
+        // SAFETY: `validate_offset_len` proves the range is within this
+        // reservation. Callers use this only for populated shared mappings.
+        if unsafe { libc::msync(self.address.add(offset), len, libc::MS_SYNC) } < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn validate_offset_len(&self, offset: usize, len: usize) -> io::Result<usize> {
         let end = offset.checked_add(len).ok_or(io::ErrorKind::InvalidInput)?;
         let page_size = page_size();
@@ -258,6 +277,34 @@ impl SparseMapping {
                 len,
                 prot,
                 libc::MAP_SHARED,
+                file_mapping.as_fd(),
+                file_offset as i64,
+            )
+        }
+    }
+
+    /// Maps a portion of a file privately at `offset`.
+    pub fn map_file_copy_on_write(
+        &self,
+        offset: usize,
+        len: usize,
+        file_mapping: impl AsFd,
+        file_offset: u64,
+        writable: bool,
+    ) -> Result<(), Error> {
+        let prot = if writable {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+
+        // SAFETY: The flags passed in are guaranteed to be valid.
+        unsafe {
+            self.mmap(
+                offset,
+                len,
+                prot,
+                libc::MAP_PRIVATE,
                 file_mapping.as_fd(),
                 file_offset as i64,
             )
