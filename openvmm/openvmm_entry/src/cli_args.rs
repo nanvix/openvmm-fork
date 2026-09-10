@@ -878,6 +878,16 @@ options:
     #[clap(long, value_name = "BUS", default_value = "auto")]
     pub virtio_fs_bus: VirtioBusCli,
 
+    /// attach the microVM virtio-fs device
+    ///
+    /// Restore requires the same canonical host path, guest target, and mode.
+    #[clap(
+        long = "mount",
+        value_name = "GUEST_TARGET,HOST_PATH[,ro|rw]",
+        conflicts_with_all = ["virtio_fs", "virtio_fs_shmem"]
+    )]
+    pub microvm_mount: Option<MicrovmMountCli>,
+
     /// virtio PMEM device
     ///
     /// Prefix with `pcie_port=<port_name>:` to expose the device over
@@ -1599,6 +1609,10 @@ impl Options {
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
         if self.machine != MachineProfileCli::Microvm {
             anyhow::ensure!(
+                self.microvm_mount.is_none(),
+                "microVM filesystem attachments require --machine microvm"
+            );
+            anyhow::ensure!(
                 self.network_profile.is_none()
                     && self.net_tap.is_none()
                     && self.allow_host.is_empty()
@@ -1831,6 +1845,43 @@ impl FromStr for FsArgsWithOptions {
 /// What the VMM does on a guest power event (reset, power-off/hibernate,
 /// triple-fault, or watchdog timeout). Parsed from `reset`, `halt`, `exit`, or
 /// `exit:<code>`; a bare `exit` uses status 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmMountCli {
+    /// Absolute guest mount target.
+    pub guest_target: String,
+    /// Live host directory supplied for this run.
+    pub host_path: PathBuf,
+    /// Snapshot-authoritative access policy.
+    pub access: openvmm_defs::config::MicrovmFilesystemAccess,
+}
+
+impl FromStr for MicrovmMountCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut fields = value.splitn(3, ',');
+        let guest_target = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
+        let host_path = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
+        let access = match fields.next().unwrap_or("ro") {
+            "ro" => openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+            "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
+            mode => anyhow::bail!("invalid microVM mount mode '{mode}'; expected ro or rw"),
+        };
+        openvmm_defs::config::MicrovmFilesystemConfig::new(guest_target.to_owned(), access)?;
+        Ok(Self {
+            guest_target: guest_target.to_owned(),
+            host_path: PathBuf::from(host_path),
+            access,
+        })
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GuestPowerAction {
     /// Restart the guest.

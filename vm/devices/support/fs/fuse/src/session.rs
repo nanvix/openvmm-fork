@@ -50,6 +50,103 @@ pub struct Session {
     info: RwLock<SessionInfo>,
 }
 
+/// Serializable FUSE session information.
+///
+/// This is intentionally independent from any transport or filesystem
+/// implementation. It contains only negotiated protocol values, never a file
+/// handle, task, or native resource.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionInfoState {
+    /// Negotiated FUSE major version.
+    pub major: u32,
+    /// Negotiated FUSE minor version.
+    pub minor: u32,
+    /// Guest maximum readahead.
+    pub max_readahead: u32,
+    /// Feature flags advertised by the guest.
+    pub capable: u32,
+    /// Extended feature flags advertised by the guest.
+    pub capable2: u32,
+    /// Feature flags accepted by the server.
+    pub want: u32,
+    /// Extended feature flags accepted by the server.
+    pub want2: u32,
+    /// Maximum background requests.
+    pub max_background: u16,
+    /// Congestion threshold.
+    pub congestion_threshold: u16,
+    /// Maximum write size.
+    pub max_write: u32,
+    /// Timestamp granularity.
+    pub time_gran: u32,
+}
+
+/// Serializable state of a FUSE session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionState {
+    /// Whether the session has completed FUSE_INIT.
+    pub initialized: bool,
+    /// Negotiated session information.
+    pub info: SessionInfoState,
+}
+
+/// Invalid FUSE session state.
+#[derive(Debug, Error)]
+pub enum SessionStateError {
+    /// The state does not describe a supported FUSE protocol.
+    #[error("unsupported FUSE protocol version")]
+    UnsupportedVersion,
+    /// Accepted feature bits were not advertised by the guest.
+    #[error("FUSE negotiated flags are not a subset of guest capabilities")]
+    InvalidFlags,
+    /// The extended-init flags are inconsistent.
+    #[error("FUSE extended-init flags are inconsistent")]
+    InvalidExtendedFlags,
+    /// A negotiated protocol limit is invalid.
+    #[error("FUSE negotiated protocol limit is invalid")]
+    InvalidLimits,
+    /// An uninitialized session retained negotiation state.
+    #[error("uninitialized FUSE session retained negotiation state")]
+    UninitializedWithInfo,
+}
+
+impl SessionState {
+    /// Validates that the state can be restored by this implementation.
+    pub fn validate(&self) -> Result<(), SessionStateError> {
+        let info = self.info;
+        if !self.initialized {
+            return if info == SessionInfoState::default() {
+                Ok(())
+            } else {
+                Err(SessionStateError::UninitializedWithInfo)
+            };
+        }
+        if info.major != FUSE_KERNEL_VERSION
+            || !(27..=FUSE_KERNEL_MINOR_VERSION).contains(&info.minor)
+        {
+            return Err(SessionStateError::UnsupportedVersion);
+        }
+        if info.want & !info.capable != 0 {
+            return Err(SessionStateError::InvalidFlags);
+        }
+        if info.capable & FUSE_INIT_EXT == 0 {
+            if info.capable2 != 0 || info.want2 != 0 {
+                return Err(SessionStateError::InvalidExtendedFlags);
+            }
+        } else if info.want & FUSE_INIT_EXT == 0 {
+            if info.want2 != 0 {
+                return Err(SessionStateError::InvalidExtendedFlags);
+            }
+        } else if info.want2 & !info.capable2 != 0 {
+            return Err(SessionStateError::InvalidExtendedFlags);
+        }
+        if info.max_write == 0 || info.time_gran == 0 {
+            return Err(SessionStateError::InvalidLimits);
+        }
+        Ok(())
+    }
+}
+
 impl Session {
     /// Create a new `Session`.
     pub fn new<T>(fs: T) -> Self
@@ -70,6 +167,25 @@ impl Session {
         self.initialized.load(atomic::Ordering::Acquire)
     }
 
+    /// Saves typed negotiated protocol state for device-private migration.
+    pub fn save_state(&self) -> SessionState {
+        let initialized = self.is_initialized();
+        let info = SessionInfoState::from(*self.info.read());
+        SessionState { initialized, info }
+    }
+
+    /// Restores a previously validated FUSE negotiation.
+    ///
+    /// The caller must ensure no request dispatch is active while invoking
+    /// this method.
+    pub fn restore_state(&self, state: SessionState) -> Result<(), SessionStateError> {
+        state.validate()?;
+        *self.info.write() = state.info.into();
+        self.initialized
+            .store(state.initialized, atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Dispatch a FUSE request to the file system.
     pub fn dispatch(
         &self,
@@ -87,7 +203,7 @@ impl Session {
         match result {
             Err(OperationError::FsError(e)) => {
                 if let Err(e) = sender.send_error(unique, e.value()) {
-                    tracing::error!(
+                    tracelimit::error_ratelimited!(
                         unique,
                         error = &e as &dyn std::error::Error,
                         "Failed to send reply",
@@ -98,7 +214,7 @@ impl Session {
                 if e.kind() == io::ErrorKind::NotFound {
                     tracing::trace!(unique, "Request was interrupted.");
                 } else {
-                    tracing::error!(
+                    tracelimit::error_ratelimited!(
                         unique,
                         error = &e as &dyn std::error::Error,
                         "Failed to send reply",
@@ -119,6 +235,7 @@ impl Session {
         if self.initialized.swap(false, atomic::Ordering::AcqRel) {
             self.fs.destroy();
         }
+        *self.info.write() = SessionInfo::default();
     }
 
     /// Perform the actual dispatch. This allows the caller to send an error reply if any operation
@@ -267,7 +384,7 @@ impl Session {
                 sender.send_empty(request.unique())?;
             }
             FuseOperation::Init { arg: _ } => {
-                tracing::warn!("Duplicate init message.");
+                tracelimit::warn_ratelimited!("Duplicate init message.");
                 return Err(lx::Error::EIO.into());
             }
             FuseOperation::OpenDir { arg } => {
@@ -316,7 +433,7 @@ impl Session {
             FuseOperation::Interrupt { arg: _ } => {
                 // Interrupt is potentially complicated, and none of the sample file systems seem
                 // to use it, so it's left as TODO for now.
-                tracing::warn!("FUSE_INTERRUPT not supported.");
+                tracelimit::warn_ratelimited!("FUSE_INTERRUPT not supported.");
                 return Err(lx::Error::ENOSYS.into());
             }
             FuseOperation::BMap { arg } => {
@@ -352,12 +469,12 @@ impl Session {
                 // Poll is not currently needed, and complicated to support. It appears to have some
                 // way of registering for later notifications, but I can't figure out how that
                 // works without libfuse source.
-                tracing::warn!("FUSE_POLL not supported.");
+                tracelimit::warn_ratelimited!("FUSE_POLL not supported.");
                 return Err(lx::Error::ENOSYS.into());
             }
             FuseOperation::NotifyReply { arg: _, data: _ } => {
                 // Not sure what this is. It has something to do with poll, I think.
-                tracing::warn!("FUSE_NOTIFY_REPLY not supported.");
+                tracelimit::warn_ratelimited!("FUSE_NOTIFY_REPLY not supported.");
                 return Err(lx::Error::ENOSYS.into());
             }
             FuseOperation::BatchForget { arg, nodes } => {
@@ -447,13 +564,13 @@ impl Session {
         let init: &fuse_init_in = if let FuseOperation::Init { arg } = request.operation() {
             arg
         } else {
-            tracing::error!(opcode = request.opcode(), "Expected FUSE_INIT");
+            tracelimit::error_ratelimited!(opcode = request.opcode(), "Expected FUSE_INIT");
             return Err(lx::Error::EIO.into());
         };
 
         let mut info = self.info.write();
         if self.is_initialized() {
-            tracing::error!("Racy FUSE_INIT requests.");
+            tracelimit::error_ratelimited!("Racy FUSE_INIT requests.");
             return Err(lx::Error::EIO.into());
         }
 
@@ -471,7 +588,7 @@ impl Session {
         // Don't bother supporting old versions. Version 7.27 is what kernel 4.19 uses, and can
         // be supported without needing to change the daemon's behavior for compatibility.
         if init.major < FUSE_KERNEL_VERSION || init.minor < 27 {
-            tracing::error!(
+            tracelimit::error_ratelimited!(
                 major = init.major,
                 minor = init.minor,
                 "Got unsupported kernel version",
@@ -481,7 +598,7 @@ impl Session {
 
         // Prepare the session info and call the file system to negotiate.
         info.major = init.major;
-        info.minor = init.minor;
+        info.minor = init.minor.min(FUSE_KERNEL_MINOR_VERSION);
         info.max_readahead = init.max_readahead;
         info.capable = init.flags;
         info.want = DEFAULT_FLAGS & init.flags;
@@ -606,7 +723,7 @@ impl Session {
 }
 
 /// Provides information about a session. Public fields may be modified during `init`.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct SessionInfo {
     major: u32,
     minor: u32,
@@ -637,6 +754,42 @@ impl SessionInfo {
 
     pub fn capable2(&self) -> u32 {
         self.capable2
+    }
+}
+
+impl From<SessionInfo> for SessionInfoState {
+    fn from(info: SessionInfo) -> Self {
+        Self {
+            major: info.major,
+            minor: info.minor,
+            max_readahead: info.max_readahead,
+            capable: info.capable,
+            capable2: info.capable2,
+            want: info.want,
+            want2: info.want2,
+            max_background: info.max_background,
+            congestion_threshold: info.congestion_threshold,
+            max_write: info.max_write,
+            time_gran: info.time_gran,
+        }
+    }
+}
+
+impl From<SessionInfoState> for SessionInfo {
+    fn from(state: SessionInfoState) -> Self {
+        Self {
+            major: state.major,
+            minor: state.minor,
+            max_readahead: state.max_readahead,
+            capable: state.capable,
+            capable2: state.capable2,
+            want: state.want,
+            want2: state.want2,
+            max_background: state.max_background,
+            congestion_threshold: state.congestion_threshold,
+            max_write: state.max_write,
+            time_gran: state.time_gran,
+        }
     }
 }
 
@@ -717,6 +870,80 @@ mod tests {
             state.lock().called,
             INIT_CALLED | GETATTR_CALLED | LOOKUP_CALLED
         );
+    }
+
+    #[test]
+    fn initialized_session_state_restores_without_a_second_init() {
+        let mut init_sender = MockSender::default();
+        let source = Session::new(TestFs::default());
+        source.dispatch(
+            Request::new(FUSE_INIT_REQUEST).unwrap(),
+            &mut init_sender,
+            None,
+        );
+        let saved = source.save_state();
+        assert!(saved.initialized);
+
+        let fs = TestFs::default();
+        let state = Arc::clone(&fs.state);
+        let destination = Session::new(fs);
+        destination.restore_state(saved).unwrap();
+        assert!(destination.is_initialized());
+
+        let mut sender = MockSender { state: 1 };
+        destination.dispatch(
+            Request::new(FUSE_GETATTR_REQUEST).unwrap(),
+            &mut sender,
+            None,
+        );
+        assert_eq!(state.lock().called, GETATTR_CALLED);
+    }
+
+    #[test]
+    fn malformed_session_state_is_rejected() {
+        let state = SessionState {
+            initialized: true,
+            info: SessionInfoState {
+                major: FUSE_KERNEL_VERSION,
+                minor: 27,
+                capable: FUSE_ASYNC_READ,
+                want: FUSE_ASYNC_READ | FUSE_BIG_WRITES,
+                max_write: PAGE_SIZE,
+                time_gran: 1,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            state.validate(),
+            Err(SessionStateError::InvalidFlags)
+        ));
+
+        let state = SessionState {
+            initialized: false,
+            info: SessionInfoState {
+                max_write: PAGE_SIZE,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            state.validate(),
+            Err(SessionStateError::UninitializedWithInfo)
+        ));
+
+        let state = SessionState {
+            initialized: true,
+            info: SessionInfoState {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION + 1,
+                max_write: PAGE_SIZE,
+                time_gran: 1,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            state.validate(),
+            Err(SessionStateError::UnsupportedVersion)
+        ));
     }
 
     #[derive(Default)]
@@ -1011,6 +1238,27 @@ mod tests {
             "Reply flags must NOT include FUSE_INIT_EXT"
         );
         assert_eq!(init_out.flags2, 0, "Reply flags2 must be zero");
+    }
+
+    #[test]
+    fn init_newer_minor_is_capped_to_the_supported_version() {
+        let request_data = make_init_request(
+            FUSE_KERNEL_VERSION,
+            FUSE_KERNEL_MINOR_VERSION + 1,
+            131072,
+            0,
+            0,
+        );
+        let session = Session::new(InitCapturingFs::default());
+        let mut sender = CapturingSender::default();
+
+        session.dispatch(
+            Request::new(request_data.as_slice()).unwrap(),
+            &mut sender,
+            None,
+        );
+
+        assert_eq!(session.save_state().info.minor, FUSE_KERNEL_MINOR_VERSION);
     }
 
     #[test]

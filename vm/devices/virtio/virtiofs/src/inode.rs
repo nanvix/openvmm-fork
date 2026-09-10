@@ -10,7 +10,10 @@ use lxutil::LxCreateOptions;
 use lxutil::LxVolume;
 use lxutil::PathBufExt;
 use parking_lot::RwLock;
+use std::collections::BTreeSet;
 use std::ops::Deref;
+use std::path::Component;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -41,14 +44,25 @@ pub(crate) struct VirtioFsVolume {
     volume: Arc<LxVolume>,
     id: u32,
     readonly: bool,
+    strict_paths: bool,
 }
 
 impl VirtioFsVolume {
     pub(crate) fn new(volume: LxVolume, id: u32, readonly: bool) -> Self {
+        Self::new_with_strict_paths(volume, id, readonly, false)
+    }
+
+    pub(crate) fn new_with_strict_paths(
+        volume: LxVolume,
+        id: u32,
+        readonly: bool,
+        strict_paths: bool,
+    ) -> Self {
         Self {
             volume: Arc::new(volume),
             id,
             readonly,
+            strict_paths,
         }
     }
 
@@ -58,6 +72,10 @@ impl VirtioFsVolume {
 
     pub(crate) fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    pub(crate) fn strict_paths(&self) -> bool {
+        self.strict_paths
     }
 
     pub(crate) fn map_inode(&self, raw: lx::ino_t) -> lx::ino_t {
@@ -93,6 +111,7 @@ pub(crate) enum DedupKey {
 pub struct VirtioFsInode {
     pub(crate) volume: Arc<VirtioFsVolume>,
     path: RwLock<PathBuf>,
+    aliases: RwLock<BTreeSet<PathBuf>>,
     lookup_count: AtomicU64,
     inode_nr: lx::ino_t,
     /// This inode's number as reported to the guest: its namespaced inode
@@ -111,13 +130,40 @@ impl VirtioFsInode {
     /// Create a new inode for the specified path, with previously retrieved attributes.
     pub fn with_attr(volume: Arc<VirtioFsVolume>, path: PathBuf, stat: &lx::Stat) -> Self {
         let guest_inode_nr = volume.map_inode(stat.inode_nr);
+        let mut aliases = BTreeSet::new();
+        aliases.insert(path.clone());
         Self {
             volume,
             path: RwLock::new(path),
+            aliases: RwLock::new(aliases),
             lookup_count: AtomicU64::new(1),
             inode_nr: stat.inode_nr,
             guest_inode_nr,
         }
+    }
+
+    /// Rebuilds an inode after a saved attachment identity has been
+    /// independently revalidated.
+    pub(crate) fn from_saved(
+        volume: Arc<VirtioFsVolume>,
+        aliases: Vec<PathBuf>,
+        lookup_count: u64,
+        stat: &lx::Stat,
+    ) -> lx::Result<Self> {
+        let Some(path) = aliases.first().cloned() else {
+            return Err(lx::Error::EINVAL);
+        };
+        if lookup_count == 0 {
+            return Err(lx::Error::EINVAL);
+        }
+        let mut inode = Self::with_attr(volume, path, stat);
+        inode.lookup_count = AtomicU64::new(lookup_count);
+        let aliases: BTreeSet<_> = aliases.into_iter().collect();
+        if aliases.is_empty() {
+            return Err(lx::Error::EINVAL);
+        }
+        *inode.aliases.write() = aliases;
+        Ok(inode)
     }
 
     /// Return the files inode number as reported by the underlying file system.
@@ -141,6 +187,19 @@ impl VirtioFsInode {
     /// number under the shared superblock. Fixed for the inode's lifetime.
     pub(crate) fn guest_inode_nr(&self) -> lx::ino_t {
         self.guest_inode_nr
+    }
+
+    pub(crate) fn lookup_count(&self) -> u64 {
+        self.lookup_count.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn volume(&self) -> Arc<VirtioFsVolume> {
+        Arc::clone(&self.volume)
+    }
+
+    pub(crate) fn object_stat(&self) -> lx::Result<lx::Stat> {
+        self.validate_confined()?;
+        self.volume.lstat(&*self.get_path())
     }
 
     /// Maps a raw host inode number from this inode's volume for guest use. For
@@ -172,6 +231,7 @@ impl VirtioFsInode {
     /// Increments the lookup count.
     pub fn lookup(&self, new_path: PathBuf) {
         self.lookup_count.fetch_add(1, Ordering::AcqRel);
+        self.aliases.write().insert(new_path.clone());
         let mut path = self.path.write();
         *path = new_path;
     }
@@ -189,7 +249,7 @@ impl VirtioFsInode {
         let mut old_count = self.lookup_count.load(Ordering::Acquire);
         loop {
             let new_count = if lookup_count > old_count {
-                tracing::warn!(node_id, "Too many forgets for inode");
+                tracelimit::warn_ratelimited!(node_id, "Too many forgets for inode");
                 0
             } else {
                 old_count - lookup_count
@@ -209,6 +269,7 @@ impl VirtioFsInode {
 
     /// Performs a lookup for a child of this inode.
     pub fn lookup_child(&self, name: &LxStr) -> lx::Result<(VirtioFsInode, fuse_attr)> {
+        self.validate_confined()?;
         let path = self.child_path(name)?;
         let (inode, stat) = VirtioFsInode::new(Arc::clone(&self.volume), path)?;
         let attr = inode.attr_from_stat(&stat);
@@ -217,18 +278,21 @@ impl VirtioFsInode {
 
     /// Retrieves the attributes of this inode.
     pub fn get_attr(&self) -> lx::Result<fuse_attr> {
+        self.validate_confined()?;
         let stat = self.volume.lstat(&*self.get_path())?;
         Ok(self.attr_from_stat(&stat))
     }
 
     /// Retrieves the extended attributes of this inode.
     pub fn get_statx(&self) -> lx::Result<fuse_statx> {
+        self.validate_confined()?;
         let statx = self.volume.statx(&*self.get_path())?;
         Ok(self.statx_from(&statx))
     }
 
     /// Sets the attributes of this inode.
     pub fn set_attr(&self, arg: &fuse_setattr_in, request_uid: lx::uid_t) -> lx::Result<fuse_attr> {
+        self.validate_confined()?;
         let attr = util::fuse_set_attr_to_lxutil(arg, request_uid);
 
         // Because FUSE_HANDLE_KILLPRIV is set, set-user-ID and set-group-ID must be cleared
@@ -240,9 +304,10 @@ impl VirtioFsInode {
 
     /// Opens the inode, creating a file object.
     pub fn open(self: Arc<VirtioFsInode>, flags: u32) -> lx::Result<VirtioFsFile> {
+        self.validate_confined()?;
         let flags = (flags as i32) | lx::O_NOFOLLOW;
         let file = self.volume.open(&*self.get_path(), flags, None)?;
-        Ok(VirtioFsFile::new(file, self))
+        Ok(VirtioFsFile::new(file, self, flags as u32))
     }
 
     /// Creates a new file as a child of this inode, and opens it.
@@ -254,6 +319,7 @@ impl VirtioFsInode {
         uid: u32,
         gid: u32,
     ) -> lx::Result<(VirtioFsInode, fuse_attr, lxutil::LxFile)> {
+        self.validate_confined()?;
         let path = self.child_path(name)?;
         let options = LxCreateOptions::new(mode, uid, gid);
         let flags = (flags as i32) | lx::O_CREAT | lx::O_NOFOLLOW;
@@ -272,6 +338,7 @@ impl VirtioFsInode {
         uid: u32,
         gid: u32,
     ) -> lx::Result<(VirtioFsInode, fuse_attr)> {
+        self.validate_confined()?;
         let path = self.child_path(name)?;
         let stat = self
             .volume
@@ -291,6 +358,7 @@ impl VirtioFsInode {
         gid: u32,
         device_id: u32,
     ) -> lx::Result<(VirtioFsInode, fuse_attr)> {
+        self.validate_confined()?;
         let path = self.child_path(name)?;
         let stat = self.volume.mknod_stat(
             &path,
@@ -311,6 +379,7 @@ impl VirtioFsInode {
         uid: u32,
         gid: u32,
     ) -> lx::Result<(VirtioFsInode, fuse_attr)> {
+        self.validate_confined()?;
         let path = self.child_path(name)?;
         let stat = self.volume.symlink_stat(
             &path,
@@ -325,6 +394,8 @@ impl VirtioFsInode {
 
     /// Creates a new hard link as a child of this inode.
     pub fn link(&self, name: &LxStr, target: &VirtioFsInode) -> lx::Result<fuse_attr> {
+        self.validate_confined()?;
+        target.validate_confined()?;
         if self.volume.id() != target.volume.id() {
             return Err(lx::Error::EXDEV);
         }
@@ -337,11 +408,13 @@ impl VirtioFsInode {
 
     /// Reads the target of the symbolic link, if this inode is a symbolic link.
     pub fn read_link(&self) -> lx::Result<LxString> {
+        self.validate_confined()?;
         self.volume.read_link(&*self.get_path())
     }
 
     /// Removes a file or directory child of this inode.
     pub fn unlink(&self, name: &LxStr, flags: i32) -> lx::Result<()> {
+        self.validate_confined()?;
         let path = self.child_path(name)?;
         self.volume.unlink(path, flags)
     }
@@ -354,6 +427,8 @@ impl VirtioFsInode {
         new_name: &LxStr,
         flags: u32,
     ) -> lx::Result<()> {
+        self.validate_confined()?;
+        new_dir.validate_confined()?;
         let path = self.child_path(name)?;
         let new_path = new_dir.child_path(new_name)?;
         self.volume.rename(path, new_path, flags)
@@ -361,6 +436,7 @@ impl VirtioFsInode {
 
     /// Gets the attributes of the file system that the inode resides on.
     pub fn stat_fs(&self) -> lx::Result<fuse_kstatfs> {
+        self.validate_confined()?;
         let stat_fs = self.volume.stat_fs(&*self.get_path())?;
         Ok(fuse_kstatfs::new(
             stat_fs.block_count,
@@ -376,28 +452,82 @@ impl VirtioFsInode {
 
     /// Gets the value or the size of an extended attribute on this inode.
     pub fn get_xattr(&self, name: &LxStr, value: Option<&mut [u8]>) -> lx::Result<usize> {
+        self.validate_confined()?;
         self.volume.get_xattr(&*self.get_path(), name, value)
     }
 
     /// Sets an extended attribute on this inode.
     pub fn set_xattr(&self, name: &LxStr, value: &[u8], flags: u32) -> lx::Result<()> {
+        self.validate_confined()?;
         self.volume
             .set_xattr(&*self.get_path(), name, value, flags as i32)
     }
 
     /// Lists the extended attributes on this inode.
     pub fn list_xattr(&self, list: Option<&mut [u8]>) -> lx::Result<usize> {
+        self.validate_confined()?;
         self.volume.list_xattr(&*self.get_path(), list)
     }
 
     /// Removes an extended attribute from this inode.
     pub fn remove_xattr(&self, name: &LxStr) -> lx::Result<()> {
+        self.validate_confined()?;
         self.volume.remove_xattr(&*self.get_path(), name)
     }
 
     /// Gets a clone of the stored path.
     pub fn clone_path(&self) -> PathBuf {
         self.get_path().clone()
+    }
+
+    /// Returns all host-relative aliases currently known to the guest.
+    pub(crate) fn aliases(&self) -> Vec<PathBuf> {
+        self.aliases.read().iter().cloned().collect()
+    }
+
+    /// Adds an alias after a successful hard link.
+    pub(crate) fn add_alias(&self, path: PathBuf) {
+        self.aliases.write().insert(path);
+    }
+
+    /// Removes all aliases at or below an unlinked directory path.
+    pub(crate) fn remove_alias_prefix(&self, path: &Path) {
+        let mut aliases = self.aliases.write();
+        let removed_primary = self.path.read().starts_with(path);
+        aliases.retain(|alias| !alias.starts_with(path));
+        if removed_primary {
+            if let Some(alias) = aliases.first() {
+                *self.path.write() = alias.clone();
+            }
+        }
+    }
+
+    /// Replaces an alias prefix after a successful rename.
+    pub(crate) fn rename_alias_prefix(&self, old: &Path, new: &Path) {
+        let mut aliases = self.aliases.write();
+        let replacements: Vec<_> = aliases
+            .iter()
+            .filter_map(|alias| {
+                alias.strip_prefix(old).ok().map(|suffix| {
+                    let mut replacement = new.to_path_buf();
+                    replacement.push(suffix);
+                    (alias.clone(), replacement)
+                })
+            })
+            .collect();
+        for (old_alias, new_alias) in &replacements {
+            aliases.remove(old_alias);
+            aliases.insert(new_alias.clone());
+        }
+        drop(aliases);
+
+        let mut path = self.path.write();
+        let suffix = path.strip_prefix(old).ok().map(ToOwned::to_owned);
+        if let Some(suffix) = suffix {
+            let mut replacement = new.to_path_buf();
+            replacement.push(&suffix);
+            *path = replacement;
+        }
     }
 
     /// The key used to deduplicate this inode in the `InodeMap`, so that
@@ -416,27 +546,54 @@ impl VirtioFsInode {
         DedupKey::Path(self.volume_id(), self.get_path().clone())
     }
 
-    /// The [`DedupKey::Path`] that a child named `name` of this inode would use,
-    /// for path-keyed (non-stable-id) volumes only.
-    pub(crate) fn child_path_dedup_key(&self, name: &LxStr) -> Option<DedupKey> {
-        if self.volume.supports_stable_file_id() {
-            return None;
-        }
-        let path = self.child_path(name).ok()?;
-        Some(DedupKey::Path(self.volume_id(), path))
-    }
-
     /// Appends a child name to this inode's path.
-    fn child_path(&self, name: &LxStr) -> lx::Result<PathBuf> {
-        // Defense in depth: the FUSE request parser already validates names,
-        // but assert here to catch any bypass.
-        assert!(!name.is_empty(), "empty child name");
-        assert!(!name.as_bytes().contains(&b'/'), "child name contains '/'");
-        assert!(name != "." && name != "..", "child name is '.' or '..'");
+    pub(crate) fn child_path(&self, name: &LxStr) -> lx::Result<PathBuf> {
+        let name = name.as_bytes();
+        if name.is_empty()
+            || name.contains(&b'/')
+            || name.contains(&b'\0')
+            || name == b"."
+            || name == b".."
+            || (self.volume.strict_paths() && (name.contains(&b'\\') || name.contains(&b':')))
+        {
+            return Err(lx::Error::EINVAL);
+        }
 
         let mut path = self.clone_path();
-        path.push_lx(name)?;
+        path.push_lx(LxStr::from_bytes(name))?;
+        crate::validate_relative_path(&path, self.volume.strict_paths())?;
+        if self.volume.strict_paths()
+            && crate::relative_path_encoded_len(&path)? > crate::saved_state::MAX_PATH_BYTES
+        {
+            return Err(lx::Error::E2BIG);
+        }
         Ok(path)
+    }
+
+    /// Checks that a microVM path is relative and has no symlink component.
+    ///
+    /// LxVolume intentionally does not promise this property for arbitrary
+    /// callers, so the profile applies a conservative check before each
+    /// namespace operation. A handle-relative, race-free traversal primitive
+    /// remains necessary for a complete cross-platform guarantee.
+    pub(crate) fn validate_confined(&self) -> lx::Result<()> {
+        if !self.volume.strict_paths() {
+            return Ok(());
+        }
+        let path = self.clone_path();
+        crate::validate_relative_path(&path, true)?;
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            let Component::Normal(component) = component else {
+                return Err(lx::Error::EINVAL);
+            };
+            prefix.push(component);
+            let stat = self.volume.lstat(&prefix)?;
+            if stat.mode & lx::S_IFMT == lx::S_IFLNK {
+                return Err(lx::Error::ELOOP);
+            }
+        }
+        Ok(())
     }
 
     /// Locks the path and returns the value.

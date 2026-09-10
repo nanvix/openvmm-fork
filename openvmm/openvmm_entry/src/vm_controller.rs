@@ -139,6 +139,9 @@ pub struct VmController {
     pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
     pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
     pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_filesystem: Option<openvmm_defs::config::MicrovmFilesystemConfig>,
+    pub(crate) microvm_filesystem_root_path: Option<PathBuf>,
+    pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
@@ -688,6 +691,19 @@ impl VmController {
                     &mut machine_contract,
                     network,
                     policy,
+                    attachment.clone(),
+                )?;
+            }
+            if let Some(((filesystem, root_path), attachment)) = self
+                .microvm_filesystem
+                .as_ref()
+                .zip(self.microvm_filesystem_root_path.as_deref())
+                .zip(self.microvm_filesystem_attachment.as_ref())
+            {
+                openvmm_helpers::snapshot::add_microvm_filesystem_contract(
+                    &mut machine_contract,
+                    filesystem,
+                    root_path,
                     attachment.clone(),
                 )?;
             }
