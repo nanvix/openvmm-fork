@@ -39,6 +39,7 @@ use hvdef::hypercall::HvRegisterAssoc;
 use memory_range::MemoryRange;
 use mshv_ioctls::InterruptRequest;
 use mshv_ioctls::VcpuFd;
+use mshv_ioctls::VmFd;
 use pal::unix::pthread::Pthread;
 use parking_lot::Mutex;
 use pci_core::msi::SignalMsi;
@@ -362,7 +363,7 @@ impl MshvPartitionInner {
             hv1_reference_tsc_page_supported(caps.hv1, isolation, caps.hv1_reference_tsc_page);
         caps.tsc_deadline = false;
         caps.xsaves_state_bv_broken = true;
-        // TimeFreeze stops reference time but not the virtual TSC.
+        // Ordinary state access does not freeze the partition clock.
         caps.can_freeze_time = false;
         Ok(caps)
     }
@@ -692,6 +693,21 @@ impl virt::Partition for MshvPartition {
         Ok(())
     }
 
+    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
+        if self.inner.vps.len() <= 1 {
+            return Ok(());
+        }
+
+        // Per-VP counter writes run at different host times. Freeze before
+        // aligning them to the advanced BSP counter; the first VP run thaws time.
+        self.inner.freeze_time()?;
+        synchronize_restored_tscs(
+            &self.inner.vmfd,
+            &self.inner.finalized()?.bsp_vcpufd,
+            self.inner.vps.len(),
+        )
+    }
+
     fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
         Ok(Some(
             self.inner
@@ -783,6 +799,51 @@ impl virt::X86Partition for MshvPartition {
                 .expect("thread interrupt signal failed");
         }
     }
+}
+
+fn synchronize_restored_tscs(vmfd: &VmFd, bsp: &VcpuFd, vp_count: usize) -> Result<(), Error> {
+    let mut registers = [HvRegisterAssoc::from((HvX64RegisterName::Tsc, 0_u64))];
+    bsp.get_hvdef_regs(&mut registers)
+        .map_err(ErrorInner::Register)?;
+
+    #[repr(C)]
+    struct SetTsc {
+        header: hvdef::hypercall::GetSetVpRegisters,
+        register: HvRegisterAssoc,
+    }
+
+    let mut input = SetTsc {
+        header: hvdef::hypercall::GetSetVpRegisters {
+            partition_id: 0,
+            vp_index: 0,
+            target_vtl: hvdef::hypercall::HvInputVtl::CURRENT_VTL,
+            rsvd: [0; 3],
+        },
+        register: registers[0],
+    };
+    for vp_index in 1..vp_count as u32 {
+        input.header.vp_index = vp_index;
+        let mut args = mshv_bindings::mshv_root_hvcall {
+            code: hvdef::HypercallCode::HvCallSetVpRegisters.0,
+            in_sz: size_of::<SetTsc>() as u16,
+            in_ptr: std::ptr::addr_of!(input) as u64,
+            reps: 1,
+            ..Default::default()
+        };
+        vmfd.hvcall(&mut args)
+            .map_err(|error| ErrorInner::SynchronizeTsc {
+                vp_index,
+                error: error.into(),
+            })?;
+        if args.reps != 1 {
+            return Err(ErrorInner::SynchronizeTsc {
+                vp_index,
+                error: KernelError::Kernel(std::io::Error::from_raw_os_error(libc::EINTR)),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 impl virt::ResetPartition for MshvPartition {
@@ -1668,6 +1729,7 @@ fn supported_xsave_features() -> hvdef::HvX64PartitionProcessorXsaveFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mshv_ioctls::Mshv;
     use test_with_tracing::test;
 
     #[test]
@@ -1785,10 +1847,45 @@ mod tests {
             mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16
         );
     }
-
     #[test]
     fn versioned_cpu_contract_does_not_expose_tsc_adjust() {
         assert!(!supported_processor_features1(true).tsc_adjust_support());
         assert!(supported_processor_features1(false).tsc_adjust_support());
+    }
+
+    #[test]
+    #[ignore = "requires /dev/mshv"]
+    fn restored_tscs_are_identical_while_partition_time_is_frozen() {
+        for vp_count in [1, 2, 4, 8] {
+            let mshv = Mshv::new().unwrap();
+            let vmfd = mshv.create_vm().unwrap();
+            vmfd.initialize().unwrap();
+            let vps: Vec<_> = (0..vp_count)
+                .map(|index| vmfd.create_vcpu(index).unwrap())
+                .collect();
+            vmfd.set_partition_property(HvPartitionPropertyCode::TimeFreeze.0, 1)
+                .unwrap();
+            let expected_tsc = 1_000_000_u64;
+            for (index, vp) in vps.iter().enumerate() {
+                vp.set_hvdef_regs(&[HvRegisterAssoc::from((
+                    HvX64RegisterName::Tsc,
+                    expected_tsc + index as u64 * 100_000,
+                ))])
+                .unwrap();
+            }
+
+            synchronize_restored_tscs(&vmfd, &vps[0], vps.len()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            for (index, vp) in vps.iter().enumerate() {
+                let mut registers = [HvRegisterAssoc::from((HvX64RegisterName::Tsc, 0_u64))];
+                vp.get_hvdef_regs(&mut registers).unwrap();
+                assert_eq!(
+                    registers[0].value.as_u64(),
+                    expected_tsc,
+                    "VP {index} TSC differs with {vp_count} VPs"
+                );
+            }
+        }
     }
 }
