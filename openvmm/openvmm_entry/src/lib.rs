@@ -2834,7 +2834,7 @@ async fn run_control_inner(
     }
 
     if !opt.paused {
-        vm_rpc.call(VmRpc::Resume, ()).await?;
+        vm_rpc.call_failable(VmRpc::Resume, ()).await?;
     }
 
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(

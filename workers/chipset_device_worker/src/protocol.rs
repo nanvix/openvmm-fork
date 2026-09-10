@@ -60,7 +60,11 @@ pub(crate) enum DeviceRequest {
     /// Perform a PCI config space write.
     PciConfigWrite(WriteRequest<u16, u32>, PciConfigByteEnable),
     /// Start the device
-    Start,
+    Start(mesh::rpc::FailableRpc<(), ()>),
+    /// Stop accepting new host input before snapshot.
+    QuiesceInput(mesh::rpc::FailableRpc<(), ()>),
+    /// Resume host input after a failed snapshot.
+    ResumeInput(mesh::rpc::FailableRpc<(), ()>),
     /// Stop the device
     Stop(Rpc<(), ()>),
     /// Reset the device

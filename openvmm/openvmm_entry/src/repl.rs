@@ -604,7 +604,7 @@ pub(crate) async fn run_repl(
 
     enum StateChange {
         Pause(bool),
-        Resume(bool),
+        Resume(Result<bool, RemoteError>),
         Reset(Result<(), RemoteError>),
         PulseSaveRestore(Result<(), PulseSaveRestoreError>),
         ServiceVtl2(anyhow::Result<Duration>),
@@ -706,13 +706,14 @@ pub(crate) async fn run_repl(
                                 tracing::warn!("already paused");
                             }
                         }
-                        StateChange::Resume(success) => {
-                            if success {
-                                tracing::info!("resumed complete");
-                            } else {
-                                tracing::warn!("already running");
-                            }
-                        }
+                        StateChange::Resume(result) => match result {
+                            Ok(true) => tracing::info!("resumed complete"),
+                            Ok(false) => tracing::warn!("already running"),
+                            Err(err) => tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                "resume failed"
+                            ),
+                        },
                         StateChange::Reset(r) => match r {
                             Ok(()) => tracing::info!("reset complete"),
                             Err(err) => tracing::error!(
