@@ -565,6 +565,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 name = "chipset"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bitfield-struct 0.11.0",
  "chipset_device",
@@ -676,6 +677,7 @@ dependencies = [
 name = "chipset_legacy"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset",
  "chipset_device",
@@ -9505,6 +9507,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "slab",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
@@ -10615,6 +10618,7 @@ dependencies = [
  "power_resources",
  "slab",
  "state_unit",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracing",
  "virt",

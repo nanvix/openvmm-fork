@@ -55,6 +55,8 @@ pub enum KvmError {
     State(#[from] Box<StateError<KvmError>>),
     #[error("invalid state while restoring: {0}")]
     InvalidState(&'static str),
+    #[error("snapshot clock downtime adjustment overflows")]
+    SnapshotClockOverflow,
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
     #[error("cannot resize KVM guest_memfd memory slot")]
@@ -76,6 +78,9 @@ pub enum KvmError {
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to compute topology cpuid")]
     TopologyCpuid(#[source] virt::x86::topology::UnknownVendor),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    TscFrequencyCpuid(#[from] virt::x86::TscFrequencyCpuidError),
 }
 
 #[derive(Inspect)]
