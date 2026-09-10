@@ -136,6 +136,8 @@ pub struct VmController {
     pub(crate) snapshot_quiesce_timeout: std::time::Duration,
     pub(crate) source_hypervisor: String,
     pub(crate) effective_command_line: Option<String>,
+    pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     pub(crate) guest_power_actions: GuestPowerActions,
 }
@@ -664,6 +666,7 @@ impl VmController {
             let machine_contract = openvmm_helpers::snapshot::microvm_machine_contract(
                 &self.source_hypervisor,
                 command_line,
+                self.microvm_console_attachment.clone(),
                 self.processors,
                 self.memory,
                 response.state_unit_names,
@@ -741,6 +744,23 @@ impl VmController {
 
         match result {
             Ok(()) => {
+                if let Some(cleanup) = self.microvm_console_socket_cleanup.take()
+                    && let Err(error) = cleanup.remove_if_owned()
+                {
+                    if let Some(cleanup) = self.microvm_console_socket_cleanup.take()
+                        && let Err(cleanup_error) = cleanup.remove_if_owned()
+                    {
+                        tracing::error!(
+                            error = cleanup_error.as_ref() as &dyn std::error::Error,
+                            "committed snapshot console socket could not be removed"
+                        );
+                    }
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot committed but the source console socket could not be removed"
+                    );
+                    return GuestSnapshotAction::Terminate { exit_code: 1 };
+                }
                 tracing::info!(
                     path = %destination.display(),
                     "microVM snapshot committed; terminating source process"

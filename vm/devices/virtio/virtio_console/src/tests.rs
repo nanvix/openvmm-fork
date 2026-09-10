@@ -8,6 +8,8 @@
 //! descriptor rings just as a guest driver would.
 
 use crate::VirtioConsoleDevice;
+use chipset_device::io::IoResult;
+use chipset_device::mmio::MmioIntercept;
 use futures::AsyncRead;
 use futures::AsyncWrite;
 use guestmem::GuestMemory;
@@ -25,9 +27,11 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 use test_with_tracing::test;
+use virtio::DeviceQueueState;
 use virtio::QueueResources;
 use virtio::VirtioDevice;
 use virtio::queue::QueueParams;
+use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
 use virtio::spec::queue::DescriptorFlags;
 use virtio::test_helpers::init_avail_ring;
@@ -35,7 +39,13 @@ use virtio::test_helpers::init_used_ring;
 use virtio::test_helpers::make_available;
 use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
+use virtio::transport::VirtioMmioDevice;
+use virtio_resources::console::VirtioConsoleDisconnectPolicy;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
+use vmcore::line_interrupt::LineInterrupt;
+use vmcore::save_restore::SaveRestore;
+use vmcore::save_restore::SavedStateBlob;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -77,6 +87,8 @@ struct MockShared {
     write_limit_then_disconnect: Option<usize>,
     /// If set, each poll_write accepts at most this many bytes (persistent).
     max_write_size: Option<usize>,
+    read_error_then_disconnect: bool,
+    disconnect_poll_count: usize,
 }
 
 /// A mock `SerialIo` implementation backed by shared state.
@@ -111,6 +123,12 @@ impl SerialIo for MockSerialIo {
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut shared = self.shared.lock();
+        shared.disconnect_poll_count += 1;
+        if shared.read_error_then_disconnect {
+            shared.read_error_then_disconnect = false;
+            shared.connected = false;
+            return Poll::Ready(Ok(()));
+        }
         if !shared.connected {
             Poll::Ready(Ok(()))
         } else {
@@ -129,6 +147,9 @@ impl AsyncRead for MockSerialIo {
         let mut shared = self.shared.lock();
         if !shared.connected {
             return Poll::Ready(Ok(0)); // EOF = disconnected
+        }
+        if shared.read_error_then_disconnect {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
         if shared.rx_buf.is_empty() {
             shared.rx_waker = Some(cx.waker().clone());
@@ -201,6 +222,14 @@ impl MockSerialHandle {
         std::mem::take(&mut shared.tx_buf)
     }
 
+    fn tx_data(&self) -> Vec<u8> {
+        self.shared.lock().tx_buf.clone()
+    }
+
+    fn pending_rx_len(&self) -> usize {
+        self.shared.lock().rx_buf.len()
+    }
+
     /// Simulate backend disconnect.
     fn disconnect(&self) {
         let mut shared = self.shared.lock();
@@ -233,6 +262,18 @@ impl MockSerialHandle {
     fn set_max_write_size(&self, max: usize) {
         self.shared.lock().max_write_size = Some(max);
     }
+
+    fn set_read_error_then_disconnect(&self) {
+        let mut shared = self.shared.lock();
+        shared.read_error_then_disconnect = true;
+        if let Some(waker) = shared.rx_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn disconnect_poll_count(&self) -> usize {
+        self.shared.lock().disconnect_poll_count
+    }
 }
 
 fn new_mock_serial() -> (MockSerialIo, MockSerialHandle) {
@@ -245,6 +286,8 @@ fn new_mock_serial() -> (MockSerialIo, MockSerialHandle) {
         disconnect_waker: None,
         write_limit_then_disconnect: None,
         max_write_size: None,
+        read_error_then_disconnect: false,
+        disconnect_poll_count: 0,
     }));
     (
         MockSerialIo {
@@ -274,6 +317,13 @@ struct TestHarness {
 
 impl TestHarness {
     fn new(driver: &DefaultDriver) -> Self {
+        Self::new_with_policy(driver, VirtioConsoleDisconnectPolicy::Discard)
+    }
+
+    fn new_with_policy(
+        driver: &DefaultDriver,
+        disconnect_policy: VirtioConsoleDisconnectPolicy,
+    ) -> Self {
         let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
 
         init_avail_ring(&mem, RX_AVAIL_ADDR);
@@ -284,7 +334,8 @@ impl TestHarness {
         let (io, handle) = new_mock_serial();
 
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
-        let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+        let device =
+            VirtioConsoleDevice::new_with_policy(&driver_source, Box::new(io), disconnect_policy);
 
         let rx_event = Event::new();
         let rx_interrupt_event = Event::new();
@@ -310,6 +361,14 @@ impl TestHarness {
 
     /// Enable the device with both queues.
     async fn enable(&mut self) {
+        self.enable_with_state(None, None).await;
+    }
+
+    async fn enable_with_state(
+        &mut self,
+        receive_state: Option<QueueState>,
+        transmit_state: Option<QueueState>,
+    ) {
         let features = VirtioDeviceFeatures::new();
 
         // Queue 0: receiveq (host→guest)
@@ -329,7 +388,7 @@ impl TestHarness {
                     guest_memory: self.mem.clone(),
                 },
                 &features,
-                None,
+                receive_state,
             )
             .await
             .unwrap();
@@ -351,10 +410,18 @@ impl TestHarness {
                     guest_memory: self.mem.clone(),
                 },
                 &features,
-                None,
+                transmit_state,
             )
             .await
             .unwrap();
+    }
+
+    fn replace_device(&mut self, disconnect_policy: VirtioConsoleDisconnectPolicy) {
+        let (io, handle) = new_mock_serial();
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(self.driver.clone()));
+        self.device =
+            VirtioConsoleDevice::new_with_policy(&driver_source, Box::new(io), disconnect_policy);
+        self.handle = handle;
     }
 
     /// Allocate a data region in guest memory and return its GPA.
@@ -470,6 +537,30 @@ impl TestHarness {
         self.tx_used_idx = 0;
         self.next_data_offset = DATA_BASE;
     }
+}
+
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+async fn yield_until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if condition() {
+            return;
+        }
+        yield_now().await;
+    }
+    assert!(condition(), "condition did not become true");
 }
 
 // --- Tests ---
@@ -859,4 +950,257 @@ async fn rx_only_single_queue(driver: DefaultDriver) {
     let mut readback = vec![0u8; b"rx-only".len()];
     harness.mem.read_at(gpa, &mut readback).unwrap();
     assert_eq!(&readback, b"rx-only");
+}
+
+#[async_test]
+async fn staged_rx_restores_before_new_endpoint_bytes(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+
+    harness.handle.inject_rx_data(b"before-snapshot");
+    yield_until(|| harness.handle.pending_rx_len() == 0).await;
+
+    let receive_state = harness.device.stop_queue(0).await.unwrap();
+    let transmit_state = harness.device.stop_queue(1).await.unwrap();
+    let saved = harness.device.save_device().unwrap().unwrap();
+
+    harness.replace_device(VirtioConsoleDisconnectPolicy::Discard);
+    harness.device.restore_device(Some(saved)).unwrap();
+    harness
+        .enable_with_state(Some(receive_state), Some(transmit_state))
+        .await;
+    harness.handle.inject_rx_data(b"after-restore");
+
+    let first_gpa = harness.post_rx_buffer_and_signal(0, 64);
+    let (_, first_len) = harness.wait_for_rx_used().await;
+    let mut first = vec![0; first_len as usize];
+    harness.mem.read_at(first_gpa, &mut first).unwrap();
+    assert_eq!(first, b"before-snapshot");
+
+    let second_gpa = harness.post_rx_buffer_and_signal(1, 64);
+    let (_, second_len) = harness.wait_for_rx_used().await;
+    let mut second = vec![0; second_len as usize];
+    harness.mem.read_at(second_gpa, &mut second).unwrap();
+    assert_eq!(second, b"after-restore");
+}
+
+#[async_test]
+async fn partial_tx_restores_without_replay(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_with_policy(&driver, VirtioConsoleDisconnectPolicy::Retain);
+    harness.enable().await;
+    harness.handle.set_write_limit_then_disconnect(3);
+    harness.post_tx_and_signal(0, b"abcdef");
+    yield_until(|| harness.handle.tx_data() == b"abc").await;
+
+    let receive_state = harness.device.stop_queue(0).await.unwrap();
+    let transmit_state = harness.device.stop_queue(1).await.unwrap();
+    let saved = harness.device.save_device().unwrap().unwrap();
+
+    harness.replace_device(VirtioConsoleDisconnectPolicy::Retain);
+    harness.device.restore_device(Some(saved)).unwrap();
+    harness
+        .enable_with_state(Some(receive_state), Some(transmit_state))
+        .await;
+
+    let (used_id, _) = harness.wait_for_tx_used().await;
+    assert_eq!(used_id, 0);
+    assert_eq!(harness.handle.take_tx_data(), b"def");
+}
+
+#[async_test]
+async fn input_gate_cancels_rx_but_keeps_tx_running(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    harness.device.quiesce_input().await.unwrap();
+
+    harness.handle.inject_rx_data(b"gated-input");
+    for _ in 0..10 {
+        yield_now().await;
+    }
+    assert_eq!(harness.handle.pending_rx_len(), b"gated-input".len());
+
+    harness.post_tx_and_signal(0, b"tx-while-gated");
+    let (used_id, _) = harness.wait_for_tx_used().await;
+    assert_eq!(used_id, 0);
+    assert_eq!(harness.handle.take_tx_data(), b"tx-while-gated");
+
+    harness.device.resume_input().await.unwrap();
+    let gpa = harness.post_rx_buffer_and_signal(0, 64);
+    let (_, used_len) = harness.wait_for_rx_used().await;
+    let mut received = vec![0; used_len as usize];
+    harness.mem.read_at(gpa, &mut received).unwrap();
+    assert_eq!(received, b"gated-input");
+}
+
+#[async_test]
+async fn read_error_drives_disconnect_before_reconnect(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    harness.handle.set_read_error_then_disconnect();
+    yield_until(|| harness.handle.disconnect_poll_count() != 0).await;
+
+    harness.handle.reconnect();
+    let gpa = harness.post_rx_buffer_and_signal(0, 64);
+    harness.handle.inject_rx_data(b"after-read-error");
+    let (_, used_len) = harness.wait_for_rx_used().await;
+    let mut received = vec![0; used_len as usize];
+    harness.mem.read_at(gpa, &mut received).unwrap();
+    assert_eq!(received, b"after-read-error");
+}
+
+#[async_test]
+async fn saved_state_validator_rejects_wrong_schema(driver: DefaultDriver) {
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    let validator = device.device_state_validator();
+    let state = SavedStateBlob::new(crate::saved_state::SavedState {
+        schema_version: super::SAVED_STATE_VERSION + 1,
+        columns: 0,
+        rows: 0,
+        partial_transmit: 0,
+        staged_rx: Vec::new(),
+        disconnect_policy_id: 0,
+    });
+    assert!(
+        validator(
+            Some(&state),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
+}
+
+#[async_test]
+async fn saved_state_validator_rejects_tx_offset_past_descriptor(driver: DefaultDriver) {
+    let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
+    init_avail_ring(&mem, TX_AVAIL_ADDR);
+    init_used_ring(&mem, TX_USED_ADDR);
+    let payload_gpa = DATA_BASE;
+    mem.write_at(payload_gpa, b"short").unwrap();
+    write_descriptor(
+        &mem,
+        TX_DESC_ADDR,
+        0,
+        payload_gpa,
+        5,
+        DescriptorFlags::new(),
+        0,
+    );
+    let mut avail_index = 0;
+    make_available(&mem, TX_AVAIL_ADDR, QUEUE_SIZE, 0, &mut avail_index);
+
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    let validator = device.device_state_validator();
+    let state = SavedStateBlob::new(crate::saved_state::SavedState {
+        schema_version: super::SAVED_STATE_VERSION,
+        columns: 0,
+        rows: 0,
+        partial_transmit: 6,
+        staged_rx: Vec::new(),
+        disconnect_policy_id: 0,
+    });
+    let queues = [
+        DeviceQueueState {
+            params: QueueParams::default(),
+            queue_state: None,
+        },
+        DeviceQueueState {
+            params: QueueParams {
+                size: QUEUE_SIZE,
+                enable: true,
+                desc_addr: TX_DESC_ADDR,
+                avail_addr: TX_AVAIL_ADDR,
+                used_addr: TX_USED_ADDR,
+            },
+            queue_state: Some(QueueState::default()),
+        },
+    ];
+    assert!(validator(Some(&state), &VirtioDeviceFeatures::new(), &queues, &mem,).is_err());
+}
+
+#[async_test]
+async fn inactive_transport_restore_defers_console_private_state(driver: DefaultDriver) {
+    let source_harness = TestHarness::new(&driver);
+    let mut source = VirtioMmioDevice::new(
+        Box::new(source_harness.device),
+        &driver,
+        source_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    source.stop().await;
+    let mut saved = source.save().unwrap();
+    let staged_rx = b"deferred console input".to_vec();
+    saved.device_state = Some(SavedStateBlob::new(crate::saved_state::SavedState {
+        schema_version: super::SAVED_STATE_VERSION,
+        columns: 123,
+        rows: 45,
+        partial_transmit: 0,
+        staged_rx: staged_rx.clone(),
+        disconnect_policy_id: 0,
+    }));
+
+    let destination_harness = TestHarness::new(&driver);
+    let mut destination = VirtioMmioDevice::new(
+        Box::new(destination_harness.device),
+        &driver,
+        destination_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    destination.restore(saved).unwrap();
+    destination.start_fallible().await.unwrap();
+    destination.stop().await;
+    let staged = destination.save().unwrap();
+    let staged_private = staged
+        .device_state
+        .as_ref()
+        .unwrap()
+        .parse::<crate::saved_state::SavedState>()
+        .unwrap();
+    assert_eq!(staged_private.columns, 123);
+    assert_eq!(staged_private.rows, 45);
+    assert_eq!(staged_private.staged_rx, staged_rx);
+
+    destination.start_fallible().await.unwrap();
+    let mut config = [0; 4];
+    match destination.mmio_read(0x100, &mut config) {
+        IoResult::Defer(token) => token.read_future(&mut config).await.unwrap(),
+        other => panic!("expected deferred config read, got {other:?}"),
+    }
+    assert_eq!(u16::from_ne_bytes(config[..2].try_into().unwrap()), 123);
+    assert_eq!(u16::from_ne_bytes(config[2..].try_into().unwrap()), 45);
+
+    let mut invalid = staged;
+    invalid.device_state = Some(SavedStateBlob::new(crate::saved_state::SavedState {
+        schema_version: super::SAVED_STATE_VERSION,
+        columns: 80,
+        rows: 25,
+        partial_transmit: 0,
+        staged_rx: vec![0; super::MAX_STAGED_RX_BYTES + 1],
+        disconnect_policy_id: 0,
+    }));
+    let invalid_harness = TestHarness::new(&driver);
+    let mut invalid_destination = VirtioMmioDevice::new(
+        Box::new(invalid_harness.device),
+        &driver,
+        invalid_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    assert!(invalid_destination.restore(invalid).is_err());
 }

@@ -514,6 +514,7 @@ fn canonical_microvm_memory_ranges(memory_size: u64) -> anyhow::Result<Vec<Snaps
 pub fn microvm_machine_contract(
     source_hypervisor: &str,
     effective_command_line: String,
+    console_attachment: Option<SnapshotAttachment>,
     processor_count: u32,
     memory_size: u64,
     state_unit_names: Vec<String>,
@@ -556,7 +557,7 @@ pub fn microvm_machine_contract(
         length,
     };
 
-    let devices = vec![
+    let mut devices = vec![
         device("partition", "partition", "partition", Vec::new(), None, 0),
         device("vp0", "partition", "vcpu", Vec::new(), None, 1),
         device("vmtime", "vmtime", "clock", Vec::new(), None, 2),
@@ -611,6 +612,70 @@ pub fn microvm_machine_contract(
             10,
         ),
     ];
+    let mut attachments = Vec::new();
+    if let Some(attachment) = console_attachment {
+        let policy_is_valid = match attachment.reconnect_policy.as_str() {
+            "recreate-listener" => {
+                !attachment.required
+                    && attachment.reconnect_timeout_ms == 0
+                    && matches!(
+                        attachment.identity_kind.as_str(),
+                        "unix-socket" | "named-pipe" | "tcp"
+                    )
+            }
+            "reconnect-client" => {
+                attachment.required
+                    && attachment.reconnect_timeout_ms
+                        == openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS
+                    && matches!(
+                        attachment.identity_kind.as_str(),
+                        "unix-socket" | "named-pipe" | "tcp"
+                    )
+            }
+            "require-inherited-attachment" => {
+                attachment.required
+                    && attachment.reconnect_timeout_ms == 0
+                    && attachment.identity_kind == "provider"
+                    && attachment.identity == b"console"
+            }
+            "discard-while-disconnected" => {
+                !attachment.required
+                    && attachment.reconnect_timeout_ms == 0
+                    && attachment.identity_kind == "disconnected"
+                    && attachment.identity == b"discard"
+            }
+            _ => false,
+        };
+        anyhow::ensure!(
+            attachment.stable_id == "console:microvm-virtio0"
+                && attachment.kind == "virtio-console"
+                && policy_is_valid
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0,
+            "microVM console attachment has an unsupported reconnect policy"
+        );
+        devices.push(SnapshotDevice {
+            stable_id: "console:microvm-virtio0".to_owned(),
+            state_unit_name: format!(
+                "virtio-console-{}",
+                openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE
+            ),
+            kind: "virtio-console".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![0x3000_0001, 0x0000_0003],
+            queue_count: 2,
+            queue_max_sizes: vec![256, 256],
+        });
+        attachments.push(attachment);
+    }
+
     let mut contract = SnapshotMachineContract {
         machine_profile: "microvm".to_owned(),
         microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
@@ -621,7 +686,7 @@ pub fn microvm_machine_contract(
         topology,
         devices,
         state_unit_names,
-        attachments: Vec::new(),
+        attachments,
         capture_wall_clock,
         tsc_frequency_hz,
         tsc_tolerance_ppm: 0,
@@ -3050,7 +3115,10 @@ fn validate_machine_contract_shape(
             && contract.microvm_filesystem.is_none()
             && contract.microvm_filesystem_slot_version == 0
             && contract.microvm_sandbox_blocks.is_empty()
-            && contract.attachments.is_empty(),
+            && contract
+                .attachments
+                .iter()
+                .all(|attachment| attachment.kind == "virtio-console"),
         "base microVM snapshots cannot contain device attachments or expanded topology"
     );
 

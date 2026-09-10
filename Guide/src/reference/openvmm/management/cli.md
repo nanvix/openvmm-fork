@@ -15,6 +15,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
   capture terminates the source; rollback-safe failures resume it.
 * `--snapshot-quiesce-timeout-ms <MILLISECONDS>`: Bound host-input fencing and
   device quiescence. Defaults to 5000 milliseconds.
+* `--virtio-console <BACKEND>` on a microVM: Add the fixed MMIO console at
+  `0xd0002000`, IRQ 7, and use `console=hvc1`. Snapshot restore reconstructs
+  `listen=...` listeners or bounded `connect=...` clients. `console` requires
+  a replacement inherited endpoint; `none` records an explicit discard policy.
+  Pending bytes and queue progress are restored before host workers start.
 * `--restore-ready-path <PATH>`: With `--restore-snapshot`, emit
   `OPENVMM_RESTORE_READY_V1` to a Unix socket or Windows named pipe after
   restore startup succeeds and before guest execution.

@@ -195,11 +195,16 @@ impl AsyncWrite for WindowsPipeSerialBackend {
         match &mut self.state {
             PipeState::Done | PipeState::Listening(_) => Poll::Ready(Ok(buf.len())),
             PipeState::Connected(pipe) => {
-                let r = ready!(Pin::new(pipe).poll_write(cx, buf));
-                if matches!(&r, Err(err) if err.kind() == io::ErrorKind::BrokenPipe) {
-                    return Poll::Ready(Ok(buf.len()));
+                let result = ready!(Pin::new(pipe).poll_write(cx, buf));
+                if result.is_err()
+                    && let Err(error) = self.disconnect()
+                {
+                    tracing::error!(
+                        error = &error as &dyn std::error::Error,
+                        "failed to prepare named pipe after a write failure"
+                    );
                 }
-                Poll::Ready(r)
+                Poll::Ready(result)
             }
         }
     }

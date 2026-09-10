@@ -2945,7 +2945,17 @@ impl InitializedVm {
                     let (mmio_start, mmio_len, irq, disabled_features) =
                         if matches!(cfg.machine_profile, MachineProfile::Microvm) {
                             const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
-                            let start = openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE;
+                            let (start, irq) = match id.as_str() {
+                                "virtio-console" => (
+                                    openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+                                    openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
+                                ),
+                                "virtio-blk" => (
+                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
+                                    openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
+                                ),
+                                _ => anyhow::bail!("unsupported microVM virtio device '{id}'"),
+                            };
                             let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
                             anyhow::ensure!(
                                 start >= chipset_mmio.low.start()
@@ -2954,12 +2964,7 @@ impl InitializedVm {
                                         .is_some_and(|end| end <= chipset_mmio.low.end()),
                                 "microVM virtio-blk slot is outside the fixed low-MMIO aperture"
                             );
-                            (
-                                start,
-                                len,
-                                openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
-                                VIRTIO_F_RING_PACKED,
-                            )
+                            (start, len, irq, VIRTIO_F_RING_PACKED)
                         } else {
                             let start =
                                 virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
