@@ -34,13 +34,13 @@ pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
 /// Capability version for the always-present dormant microVM virtio-fs slot.
 pub const MICROVM_FILESYSTEM_SLOT_VERSION: u32 = 1;
 /// SMP-safe Xen PVH layout with shared interrupt status used by the microVM.
-pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 1;
+pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 2;
 /// Contract version for one-shot restore-time microVM memory expansion.
 pub const MICROVM_MEMORY_EXPANSION_VERSION: u32 = 1;
 /// Linux memory-block granularity used by the x86-64 microVM guest.
 pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 /// Snapshot contract name for shared-status edge interrupts.
-pub const MICROVM_SHARED_STATUS_INTERRUPT_MODE: &str = "";
+pub const MICROVM_SHARED_STATUS_INTERRUPT_MODE: &str = "edge-shared-status";
 /// Clock policy applied when a snapshot is restored.
 pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
 /// Fleet-wide snapshot captured before image and sandbox configuration is consumed.
@@ -474,7 +474,7 @@ impl SnapshotMachineContract {
 
 fn microvm_snapshot_topology(processor_count: u32) -> anyhow::Result<SnapshotProcessorTopology> {
     anyhow::ensure!(
-        processor_count == 1,
+        openvmm_defs::config::microvm_processor_count_supported(processor_count),
         "microVM does not support {processor_count} vCPUs"
     );
     Ok(SnapshotProcessorTopology {
@@ -953,7 +953,7 @@ pub fn microvm_machine_contract(
 
     let mut contract = SnapshotMachineContract {
         machine_profile: "microvm".to_owned(),
-        microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
+        microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
         source_hypervisor: source_hypervisor.to_owned(),
         effective_command_line: String::new(),
         effective_command_line_sha256: Vec::new(),
@@ -976,8 +976,8 @@ pub fn microvm_machine_contract(
         microvm_filesystem_slot_version: 0,
         boot_online_vp_count: 0,
         virtio_interrupt_mode: MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned(),
-        virtio_shared_status_page_gpa: 0,
-        virtio_shared_status_page_size: 0,
+        virtio_shared_status_page_gpa: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
+        virtio_shared_status_page_size: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
         memory_expansion_version: 0,
         memory_capacity_bytes: 0,
         memory_block_size_bytes: 0,
@@ -1654,7 +1654,7 @@ pub fn requires_post_restore_gate(manifest: &SnapshotManifest) -> bool {
         && manifest.machine_contract.as_ref().is_some_and(|contract| {
             matches!(
                 contract.microvm_abi_version,
-                openvmm_defs::config::MICROVM_ABI_VERSION_1
+                openvmm_defs::config::MICROVM_ABI_VERSION_2
             )
         })
         && !manifest.snapshot_tier.is_empty()
@@ -3124,10 +3124,10 @@ pub fn validate_supported_microvm_contract(
     contract: &SnapshotMachineContract,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_1,
+        contract.microvm_abi_version == openvmm_defs::config::MICROVM_ABI_VERSION_2,
         "snapshot microVM ABI version {} is unsupported; this OpenVMM supports version {}",
         contract.microvm_abi_version,
-        openvmm_defs::config::MICROVM_ABI_VERSION_1,
+        openvmm_defs::config::MICROVM_ABI_VERSION_2,
     );
     anyhow::ensure!(
         contract.pvh_layout_version == MICROVM_PVH_LAYOUT_VERSION,
@@ -3271,8 +3271,10 @@ fn validate_machine_contract_shape(
     validate_supported_microvm_contract(contract)?;
     anyhow::ensure!(
         contract.virtio_interrupt_mode == MICROVM_SHARED_STATUS_INTERRUPT_MODE
-            && contract.virtio_shared_status_page_gpa == 0
-            && contract.virtio_shared_status_page_size == 0,
+            && contract.virtio_shared_status_page_gpa
+                == openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+            && contract.virtio_shared_status_page_size
+                == openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
         "snapshot microVM shared-status interrupt contract is invalid"
     );
     anyhow::ensure!(
@@ -3799,7 +3801,7 @@ mod tests {
     fn test_machine_contract() -> SnapshotMachineContract {
         let mut contract = SnapshotMachineContract {
             machine_profile: "microvm".to_owned(),
-            microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
+            microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
             source_hypervisor: "whp".to_owned(),
             effective_command_line: String::new(),
             effective_command_line_sha256: Vec::new(),
@@ -3865,8 +3867,8 @@ mod tests {
             microvm_filesystem_slot_version: 0,
             boot_online_vp_count: 0,
             virtio_interrupt_mode: MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned(),
-            virtio_shared_status_page_gpa: 0,
-            virtio_shared_status_page_size: 0,
+            virtio_shared_status_page_gpa: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
+            virtio_shared_status_page_size: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
             memory_expansion_version: 0,
             memory_capacity_bytes: 0,
             memory_block_size_bytes: 0,
@@ -4929,5 +4931,21 @@ mod tests {
         manifest.saved_state_root_type = "other.SavedState".to_owned();
         let err = validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap_err();
         assert!(err.to_string().contains("root type"));
+    }
+    #[test]
+    fn microvm_snapshot_topology_is_canonical() {
+        for processor_count in [1, 2, 4, 8] {
+            let topology = microvm_snapshot_topology(processor_count).unwrap();
+            assert_eq!(topology.sockets, 1);
+            assert_eq!(topology.dies_per_socket, 1);
+            assert_eq!(topology.cores_per_die, processor_count);
+            assert_eq!(topology.threads_per_core, 1);
+            assert_eq!(topology.apic_ids, (0..processor_count).collect::<Vec<_>>());
+            assert_eq!(MICROVM_PVH_LAYOUT_VERSION, 2);
+        }
+
+        for processor_count in [0, 3, 5, 16] {
+            assert!(microvm_snapshot_topology(processor_count).is_err());
+        }
     }
 }

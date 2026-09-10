@@ -2782,7 +2782,11 @@ async fn vm_config_from_command_line(
     let topology_arch =
         openvmm_defs::config::ArchTopologyConfig::X86(openvmm_defs::config::X86TopologyConfig {
             apic_id_offset: opt.apic_id_offset,
-            x2apic: opt.x2apic,
+            x2apic: if is_microvm {
+                openvmm_defs::config::X2ApicConfig::Unsupported
+            } else {
+                opt.x2apic
+            },
         });
 
     let with_isolation = if let Some(isolation) = &opt.isolation {
@@ -3213,11 +3217,19 @@ async fn vm_config_from_command_line(
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: opt.processors,
-            vps_per_socket: opt.vps_per_socket,
-            enable_smt: match opt.smt {
-                cli_args::SmtConfigCli::Auto => None,
-                cli_args::SmtConfigCli::Force => Some(true),
-                cli_args::SmtConfigCli::Off => Some(false),
+            vps_per_socket: if is_microvm {
+                Some(opt.processors)
+            } else {
+                opt.vps_per_socket
+            },
+            enable_smt: if is_microvm {
+                Some(false)
+            } else {
+                match opt.smt {
+                    cli_args::SmtConfigCli::Auto => None,
+                    cli_args::SmtConfigCli::Force => Some(true),
+                    cli_args::SmtConfigCli::Off => Some(false),
+                }
             },
             arch: Some(topology_arch),
         },

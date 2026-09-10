@@ -33,8 +33,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `OPENVMM_RESTORE_READY_V1` to a Unix socket or Windows named pipe after
   restore startup succeeds and before guest execution.
 * `--machine <PROFILE>`: Select the guest-visible machine contract. The
-  default is `standard`. `microvm` selects microVM ABI version 1, an x86-64
-  Xen PVH machine that runs on KVM or WHP with exactly one vCPU:
+  default is `standard`. `microvm` selects microVM ABI version 2, an x86-64
+  Xen PVH machine that runs on KVM or WHP with 1, 2, 4, or 8 vCPUs:
 
   ```bash
   openvmm --machine microvm --hypervisor kvm \
@@ -49,6 +49,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   from 3 to 4 GiB, and exposes only PIC/IOAPIC, PIT, UTC RTC, the microVM
   portb console, and lifecycle ports. User arguments cannot override
   `earlycon=`, `console=`, or `virtio_mmio.device=`.
+  The profile owns the single-socket, non-SMT APIC topology and reserves the
+  shared virtio interrupt-status page at guest address `0x30000`. PVH ACPI
+  tables and per-vCPU CPUID reproduce that same topology.
 
   One optional `--virtio-blk <DISK>` is exposed at MMIO `0xd0003000`, IRQ 4,
   using split rings. Firmware, ACPI, SMBIOS, PCI, VMBus, UARTs, graphics,

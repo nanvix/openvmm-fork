@@ -51,5 +51,7 @@ x86emu.workspace = true
 [build-dependencies]
 build_rs_guest_arch.workspace = true
 
+[dev-dependencies]
+
 [lints]
 workspace = true

@@ -13,6 +13,7 @@ use x86defs::cpuid::ExtendedAddressSpaceSizesEcx;
 use x86defs::cpuid::ExtendedTopologyEax;
 use x86defs::cpuid::ExtendedTopologyEbx;
 use x86defs::cpuid::ExtendedTopologyEcx;
+use x86defs::cpuid::ProcessorTopologyDefinitionEax;
 use x86defs::cpuid::ProcessorTopologyDefinitionEbx;
 use x86defs::cpuid::ProcessorTopologyDefinitionEcx;
 use x86defs::cpuid::TopologyLevelType;
@@ -45,6 +46,7 @@ pub fn topology_cpuid<'a>(
     };
 
     // Set the number of VPs per socket in leaf 01h.
+    let bsp_apic_id = topology.vp_arch(crate::VpIndex::BSP).apic_id as u8;
     leaves.push(
         CpuidLeaf::new(
             CpuidFunction::VersionAndFeatures.0,
@@ -52,6 +54,7 @@ pub fn topology_cpuid<'a>(
                 0,
                 VersionAndFeaturesEbx::new()
                     .with_lps_per_package(topology.reserved_vps_per_socket() as u8)
+                    .with_initial_apic_id(bsp_apic_id)
                     .into(),
                 0,
                 0,
@@ -61,6 +64,7 @@ pub fn topology_cpuid<'a>(
             0,
             VersionAndFeaturesEbx::new()
                 .with_lps_per_package(0xff)
+                .with_initial_apic_id(0xff)
                 .into(),
             0,
             0,
@@ -146,8 +150,8 @@ fn cache_parameters_cpuid(
 
 /// Returns topology information in cpuid format (0Bh and 1Fh leaves).
 ///
-/// The x2APIC values in edx will be zero. The caller will need to ensure
-/// these are set correctly for each VP.
+/// The x2APIC values in edx use the BSP identity. The caller must replace
+/// these for each VP.
 fn extended_topology_cpuid(
     topology: &ProcessorTopology,
     function: CpuidFunction,
@@ -157,6 +161,7 @@ fn extended_topology_cpuid(
         function == CpuidFunction::ExtendedTopologyEnumeration
             || function == CpuidFunction::V2ExtendedTopologyEnumeration
     );
+    let bsp_apic_id = topology.vp_arch(crate::VpIndex::BSP).apic_id;
     for (index, (level_type, num_lps)) in [
         (
             TopologyLevelType::SMT,
@@ -176,12 +181,13 @@ fn extended_topology_cpuid(
                 .with_level_number(index as u8)
                 .with_level_type(level_type.0);
 
-            // Don't include edx in the mask: it is the x2APIC ID, which
-            // must be filled in by the caller separately for each VP.
             leaves.push(
-                CpuidLeaf::new(function.0, [eax.into(), ebx.into(), ecx.into(), 0])
-                    .indexed(index as u32)
-                    .masked([!0, !0, !0, 0]),
+                CpuidLeaf::new(
+                    function.0,
+                    [eax.into(), ebx.into(), ecx.into(), bsp_apic_id],
+                )
+                .indexed(index as u32)
+                .masked([!0, !0, !0, !0]),
             );
         }
     }
@@ -218,22 +224,35 @@ fn amd_processor_topology_definition_cpuid(
     topology: &ProcessorTopology,
     leaves: &mut Vec<CpuidLeaf>,
 ) {
+    let bsp_apic_id = topology.vp_arch(crate::VpIndex::BSP).apic_id;
+    let eax = ProcessorTopologyDefinitionEax::new().with_extended_apic_id(bsp_apic_id);
+    let eax_mask = ProcessorTopologyDefinitionEax::new().with_extended_apic_id(!0);
     // threads_per_compute_unit is (threads per core - 1).
     let threads_per_compute_unit = if topology.smt_enabled() { 1 } else { 0 };
     let ebx = ProcessorTopologyDefinitionEbx::new()
+        .with_compute_unit_id(
+            (bsp_apic_id % topology.reserved_vps_per_socket()
+                / (u32::from(threads_per_compute_unit) + 1)) as u8,
+        )
         .with_threads_per_compute_unit(threads_per_compute_unit);
 
-    let ebx_mask = ProcessorTopologyDefinitionEbx::new().with_threads_per_compute_unit(!0);
+    let ebx_mask = ProcessorTopologyDefinitionEbx::new()
+        .with_compute_unit_id(!0)
+        .with_threads_per_compute_unit(!0);
 
     // TODO: support AMD's nodes per socket concept.
-    let ecx = ProcessorTopologyDefinitionEcx::new().with_nodes_per_processor(0);
-    let ecx_mask = ProcessorTopologyDefinitionEcx::new().with_nodes_per_processor(0x7);
+    let ecx = ProcessorTopologyDefinitionEcx::new()
+        .with_node_id((bsp_apic_id / topology.reserved_vps_per_socket()) as u8)
+        .with_nodes_per_processor(0);
+    let ecx_mask = ProcessorTopologyDefinitionEcx::new()
+        .with_node_id(!0)
+        .with_nodes_per_processor(0x7);
 
     leaves.push(
         CpuidLeaf::new(
             CpuidFunction::ProcessorTopologyDefinition.0,
-            [0, ebx.into(), ecx.into(), 0],
+            [eax.into(), ebx.into(), ecx.into(), 0],
         )
-        .masked([0, ebx_mask.into(), ecx_mask.into(), 0]),
+        .masked([eax_mask.into(), ebx_mask.into(), ecx_mask.into(), 0]),
     );
 }

@@ -124,6 +124,10 @@ struct WhpPartitionInner {
     cpuid: virt::CpuidLeafSet,
     #[cfg(guest_arch = "x86_64")]
     tsc_frequency_hz: u64,
+    #[cfg(guest_arch = "x86_64")]
+    reserved_vps_per_socket: u32,
+    #[cfg(guest_arch = "x86_64")]
+    smt_enabled: bool,
     vtl0_alias_map_offset: Option<u64>,
     monitor_page: MonitorPage,
     hvstate: Hv1State,
@@ -1359,6 +1363,10 @@ impl WhpPartitionInner {
             cpuid,
             #[cfg(guest_arch = "x86_64")]
             tsc_frequency_hz,
+            #[cfg(guest_arch = "x86_64")]
+            reserved_vps_per_socket: proto_config.processor_topology.reserved_vps_per_socket(),
+            #[cfg(guest_arch = "x86_64")]
+            smt_enabled: proto_config.processor_topology.smt_enabled(),
             vtl0_alias_map_offset,
             monitor_page: MonitorPage::new(),
             hvstate,
