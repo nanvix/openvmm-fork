@@ -66,6 +66,14 @@ message DirectBoot {
     string kernel_cmdline = 3;
 }
 
+// Xen PVH direct boot for the microVM profile.
+message PvhBoot {
+    string kernel_path = 1;
+    string initrd_path = 2;
+    // Additional arguments only. The microVM profile owns console and discovery tokens.
+    string kernel_cmdline = 3;
+}
+
 message UEFI {
     // Variables used to initialize an empty UEFI variable store. These are
     // ignored when the store already contains any variables.
@@ -130,6 +138,8 @@ message DevicesConfig {
     repeated WindowsPCIDevice windows_device = 4;
     repeated VirtioFSConfig virtiofs_config = 5;
     VirtioConsoleConfig virtio_console = 6;
+    // microVM ABI-v1 optional fixed-slot virtio-blk device.
+    VirtioBlk virtio_blk = 7;
 }
 
 // An endpoint PCIe device function. Attached behind a port in the topology
@@ -488,6 +498,12 @@ message PcieAttachment {
 }
 
 message VMConfig {
+    // Guest-visible machine contract.
+    enum MachineProfile {
+        STANDARD = 0;
+        MICROVM = 1;
+    }
+
     // Action for the VMM to take when the guest triggers a power event.
     enum GuestPowerAction {
         // Use the default for this event.
@@ -517,6 +533,7 @@ message VMConfig {
     oneof BootConfig {
         DirectBoot direct_boot = 5;
         UEFI uefi = 6;
+        PvhBoot pvh_boot = 14;
     }
     WindowsOptions windows_options = 7;
     // Field 8 was previously map<string, string> extra_data.
@@ -532,6 +549,8 @@ message VMConfig {
     // Actions to take on guest power events. Each unset action uses its
     // default.
     GuestPowerActions guest_power_actions = 12;
+    // Machine selection is independent from hypervisor selection.
+    MachineProfile machine_profile = 13;
 }
 
 // WindowsOptions contains virtual machine configurations that are only present on a Windows host.

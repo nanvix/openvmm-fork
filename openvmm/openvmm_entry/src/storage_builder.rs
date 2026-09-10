@@ -18,7 +18,9 @@ use nvme_resources::NvmeControllerRequest;
 use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::PcieDeviceConfig;
+use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VpciDeviceConfig;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use scsidisk_resources::SimpleScsiDvdHandle;
@@ -880,25 +882,40 @@ impl StorageBuilder {
             resources.nvme_vtl2_rpc = Some(send);
         }
 
-        for (i, vblk) in std::mem::take(&mut self.vtl0_virtio_blk_disks)
-            .into_iter()
-            .enumerate()
-        {
-            let mut instance_id = VIRTIO_BLK_INSTANCE_ID_TEMPLATE;
-            instance_id.data1 = i as u32;
-            config.vpci_devices.push(VpciDeviceConfig {
-                vtl: DeviceVtl::Vtl0,
-                instance_id,
-                resource: VirtioPciDeviceHandle(
+        let vtl0_virtio_blk_disks = std::mem::take(&mut self.vtl0_virtio_blk_disks);
+        if matches!(config.machine_profile, MachineProfile::Microvm { .. }) {
+            anyhow::ensure!(
+                vtl0_virtio_blk_disks.len() <= 1,
+                "microVM ABI version 1 permits at most one virtio-blk device"
+            );
+            for vblk in vtl0_virtio_blk_disks {
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
                     VirtioBlkHandle {
                         disk: vblk.disk,
                         read_only: vblk.read_only,
                     }
                     .into_resource(),
-                )
-                .into_resource(),
-                vnode: None,
-            });
+                ));
+            }
+        } else {
+            for (i, vblk) in vtl0_virtio_blk_disks.into_iter().enumerate() {
+                let mut instance_id = VIRTIO_BLK_INSTANCE_ID_TEMPLATE;
+                instance_id.data1 = i as u32;
+                config.vpci_devices.push(VpciDeviceConfig {
+                    vtl: DeviceVtl::Vtl0,
+                    instance_id,
+                    resource: VirtioPciDeviceHandle(
+                        VirtioBlkHandle {
+                            disk: vblk.disk,
+                            read_only: vblk.read_only,
+                        }
+                        .into_resource(),
+                    )
+                    .into_resource(),
+                    vnode: None,
+                });
+            }
         }
 
         for (port_name, vblk) in std::mem::take(&mut self.pcie_virtio_blk_disks) {

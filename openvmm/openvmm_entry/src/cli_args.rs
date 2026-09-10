@@ -25,9 +25,17 @@ use cxl_spec::spec::CfmwsWindowRestrictions;
 use guid::Guid;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
+use openvmm_defs::config::MICROVM_ABI_VERSION_1;
+#[cfg(test)]
+use openvmm_defs::config::MICROVM_BASE_COMMAND_LINE;
+#[cfg(test)]
+use openvmm_defs::config::MICROVM_COMMAND_LINE_MAX_SIZE;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::X2ApicConfig;
+#[cfg(test)]
+use openvmm_defs::config::build_microvm_command_line;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -138,6 +146,26 @@ pub struct NumaDistanceCli {
     pub distance: u8,
 }
 
+/// Guest-visible machine profile.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MachineProfileCli {
+    /// The standard OpenVMM machine.
+    Standard,
+    /// The microVM ABI version 1 machine.
+    Microvm,
+}
+
+impl From<MachineProfileCli> for MachineProfile {
+    fn from(value: MachineProfileCli) -> Self {
+        match value {
+            MachineProfileCli::Standard => Self::Standard,
+            MachineProfileCli::Microvm => Self::Microvm {
+                abi_version: MICROVM_ABI_VERSION_1,
+            },
+        }
+    }
+}
+
 /// OpenVMM virtual machine monitor.
 ///
 /// This is not yet a stable interface and may change radically between
@@ -149,6 +177,10 @@ pub struct NumaDistanceCli {
     long_version = openvmm_build_info::get().long_version(),
 )]
 pub struct Options {
+    /// guest machine profile
+    #[clap(long, value_enum, default_value = "standard")]
+    pub machine: MachineProfileCli,
+
     /// processor count
     #[clap(short = 'p', long, value_name = "COUNT", default_value = "1")]
     pub processors: u32,
@@ -1375,6 +1407,165 @@ impl Options {
         if self.memory.shared == Some(true) && self.deprecated_private_memory {
             anyhow::bail!("--memory shared=on conflicts with --private-memory");
         }
+        Ok(())
+    }
+
+    /// Rejects unsupported microVM combinations before opening host resources.
+    pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
+        if self.machine != MachineProfileCli::Microvm {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            cfg!(guest_arch = "x86_64"),
+            "the microVM machine requires an x86-64 guest"
+        );
+        anyhow::ensure!(
+            self.processors == 1,
+            "microVM ABI version 1 requires exactly one vCPU"
+        );
+        anyhow::ensure!(
+            self.numa.is_none() && self.numa_distance.is_none(),
+            "microVM ABI version 1 does not support custom NUMA topology"
+        );
+        anyhow::ensure!(
+            self.vps_per_socket.is_none()
+                && self.smt == SmtConfigCli::Auto
+                && self.apic_id_offset == 0
+                && matches!(self.x2apic, X2ApicConfig::Auto),
+            "microVM ABI version 1 owns CPU topology and APIC configuration"
+        );
+        anyhow::ensure!(
+            self.restore_snapshot.is_none(),
+            "snapshot restore is unavailable for microVM ABI version 1"
+        );
+        anyhow::ensure!(
+            !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
+            "microVM ABI version 1 requires Xen PVH direct boot"
+        );
+        anyhow::ensure!(
+            !self.uefi_debug
+                && !self.uefi_enable_memory_protections
+                && !self.uefi_force_dma_bounce
+                && !self.disable_frontpage
+                && self.pcat_firmware.is_none()
+                && self.pcat_boot_order.is_none()
+                && self.vga_firmware.is_none()
+                && !self.secure_boot
+                && self.secure_boot_template.is_none()
+                && self.custom_uefi_json.is_none()
+                && self.uefi_console_mode.is_none()
+                && self.efi_diagnostics_log_level.is_none()
+                && !self.default_boot_always_attempt,
+            "microVM ABI version 1 does not support firmware options"
+        );
+        anyhow::ensure!(
+            !self.hv
+                && !self.vtl2
+                && self.isolation.is_none()
+                && !self.nested_virt
+                && !self.get
+                && !self.vmbus_redirect
+                && self.vmbus_vsock_path.is_none()
+                && self.vmbus_vtl2_vsock_path.is_none()
+                && self.openhcl_dump_path.is_none()
+                && self.gdb.is_none(),
+            "microVM ABI version 1 does not support Hyper-V, VTL2, isolation, nested virtualization, GET, or VMBus"
+        );
+        if let Some(hypervisor) = self.hypervisor.as_deref() {
+            let name = hypervisor.split(':').next().unwrap_or(hypervisor);
+            anyhow::ensure!(
+                matches!(name, "kvm" | "whp"),
+                "microVM ABI version 1 requires KVM or WHP"
+            );
+        }
+
+        anyhow::ensure!(
+            self.com1.is_none()
+                && self.com2.is_none()
+                && self.com3.is_none()
+                && self.com4.is_none()
+                && self.vmbus_com1_serial.is_none()
+                && self.vmbus_com2_serial.is_none()
+                && self.debugcon.is_none()
+                && self.virtio_console.is_none()
+                && !self.serial_tx_only,
+            "microVM ABI version 1 exposes only its portb console"
+        );
+        anyhow::ensure!(
+            self.disk.is_empty()
+                && self.nvme.is_empty()
+                && self.nvme_pci.is_empty()
+                && self.vmbus_scsi.is_empty()
+                && self.openhcl_controller.is_empty()
+                && self.ide.is_empty()
+                && self.floppy.is_empty(),
+            "microVM ABI version 1 supports only the optional virtio-blk extension"
+        );
+        anyhow::ensure!(
+            self.virtio_blk.len() <= 1,
+            "microVM ABI version 1 permits at most one virtio-blk device"
+        );
+        anyhow::ensure!(
+            self.virtio_blk.iter().all(|disk| disk.pcie_port.is_none()),
+            "microVM virtio-blk cannot use PCIe"
+        );
+        anyhow::ensure!(
+            self.virtio_9p.is_empty()
+                && self.virtio_fs.is_empty()
+                && self.virtio_fs_shmem.is_empty()
+                && self.virtio_pmem.is_none()
+                && !self.virtio_rng
+                && self.virtio_vsock_path.is_none()
+                && self.virtio_net.is_empty(),
+            "microVM ABI version 1 does not expose additional virtio devices"
+        );
+        #[cfg(target_os = "linux")]
+        anyhow::ensure!(
+            self.vhost_user.is_empty(),
+            "microVM ABI version 1 does not support vhost-user devices"
+        );
+        #[cfg(target_os = "linux")]
+        anyhow::ensure!(
+            self.virtio_vsock_vhost_cid.is_none(),
+            "microVM ABI version 1 does not support vhost-vsock"
+        );
+        anyhow::ensure!(
+            !self.nic
+                && self.net.is_empty()
+                && self.mana.is_empty()
+                && !self.gfx
+                && !self.vtl2_gfx
+                && !self.vnc.vnc
+                && !self.tpm
+                && !self.guest_watchdog
+                && self.imc.is_none()
+                && !self.battery
+                && self.vmgs.is_none(),
+            "microVM ABI version 1 does not expose network, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
+        );
+        anyhow::ensure!(
+            self.cxl_test.is_empty()
+                && self.pcie_root_complex.is_empty()
+                && self.pcie_root_port.is_empty()
+                && self.pcie_switch.is_empty()
+                && self.pcie_generic_initiator.is_empty()
+                && self.pcie_remote.is_empty()
+                && self.amd_iommu.is_empty()
+                && self.intel_vtd.is_empty(),
+            "microVM ABI version 1 does not support PCIe or IOMMU devices"
+        );
+        #[cfg(windows)]
+        anyhow::ensure!(
+            self.device.is_empty() && self.kernel_vmnic.is_empty(),
+            "microVM ABI version 1 does not support assigned devices or kernel VM NICs"
+        );
+        #[cfg(target_os = "linux")]
+        anyhow::ensure!(
+            self.vfio.is_empty() && self.iommu.is_empty(),
+            "microVM ABI version 1 does not support VFIO or IOMMU devices"
+        );
+
         Ok(())
     }
 }
@@ -4834,6 +5025,60 @@ mod tests {
         assert!(opt.prefetch_memory());
         assert!(opt.private_memory());
         assert!(opt.transparent_hugepages());
+    }
+
+    #[test]
+    fn test_machine_profile_option_parsed() {
+        let opt = Options::try_parse_from(["openvmm"]).unwrap();
+        assert_eq!(opt.machine, MachineProfileCli::Standard);
+        assert_eq!(MachineProfile::from(opt.machine), MachineProfile::Standard);
+
+        let opt = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
+        assert_eq!(opt.machine, MachineProfileCli::Microvm);
+        assert_eq!(
+            MachineProfile::from(opt.machine),
+            MachineProfile::Microvm {
+                abi_version: MICROVM_ABI_VERSION_1
+            }
+        );
+
+        assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn test_microvm_command_line_is_owned_and_bounded() {
+        assert_eq!(
+            build_microvm_command_line(&[]).unwrap(),
+            MICROVM_BASE_COMMAND_LINE
+        );
+        assert_eq!(
+            build_microvm_command_line(&["foo=bar".into()]).unwrap(),
+            format!("{MICROVM_BASE_COMMAND_LINE} foo=bar")
+        );
+
+        for reserved in ["earlycon=uart", "console=ttyS0", "virtio_mmio.device=bad"] {
+            assert!(build_microvm_command_line(&[reserved.into()]).is_err());
+        }
+        assert!(build_microvm_command_line(&["foo=bar\0baz".into()]).is_err());
+        assert!(build_microvm_command_line(&["x".repeat(MICROVM_COMMAND_LINE_MAX_SIZE)]).is_err());
+    }
+
+    #[test]
+    fn test_microvm_preflight_rejects_unsupported_combinations() {
+        let valid = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
+        valid.validate_microvm_options().unwrap();
+
+        for args in [
+            vec!["openvmm", "--machine", "microvm", "--processors", "2"],
+            vec!["openvmm", "--machine", "microvm", "--uefi"],
+            vec!["openvmm", "--machine", "microvm", "--hypervisor", "mshv"],
+            vec!["openvmm", "--machine", "microvm", "--virtio-rng"],
+            vec!["openvmm", "--machine", "microvm", "--com1", "none"],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
     }
 
     #[test]
