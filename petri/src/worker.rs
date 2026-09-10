@@ -30,7 +30,7 @@ impl Worker {
         let (vm_rpc, rpc_recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
-        let hypervisor = if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+        let hypervisor = if cfg.machine_profile == MachineProfile::Microvm {
             openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
         } else {
             openvmm_helpers::hypervisor::choose_hypervisor()?
@@ -40,6 +40,17 @@ impl Worker {
             cfg,
             saved_state: None,
             shared_memory,
+            shared_memory_copy_on_write: false,
+            snapshot_restore_guards: None,
+            snapshot_boundary_requests: None,
+            snapshot_ready: None,
+            restore_downtime: None,
+            restore_tsc_frequency_hz: None,
+            restore_apic_frequency_hz: None,
+            restore_cpu_contract: None,
+            restore_ready_sink: None,
+            restore_gate_timeout: None,
+            restore_vp_count: None,
             rpc: rpc_recv,
             notify: notify_send,
         };

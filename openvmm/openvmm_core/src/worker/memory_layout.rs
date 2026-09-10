@@ -119,6 +119,10 @@ pub(super) struct MemoryLayoutInput<'a> {
     /// memory-less nodes (e.g. device-only NUMA nodes). The request
     /// order is the vnode assignment order.
     pub node_mem_sizes: &'a [u64],
+    /// Optional single-node RAM capacity used for restore-time expansion.
+    /// The layout reserves this full amount while publishing only
+    /// `node_mem_sizes[0]` as guest-visible RAM.
+    pub memory_capacity: Option<u64>,
     /// Chipset MMIO sizing from the manifest builder.
     pub layout: vmm_core_defs::LayoutConfig,
     /// PCIe root complex address-space intents. These are resolved by this
@@ -154,8 +158,23 @@ pub(super) fn resolve_memory_layout(
     input: MemoryLayoutInput<'_>,
 ) -> anyhow::Result<ResolvedMemoryLayout> {
     validate_node_mem_sizes(input.node_mem_sizes)?;
+    if let Some(memory_capacity) = input.memory_capacity {
+        anyhow::ensure!(
+            input.node_mem_sizes.len() == 1,
+            "RAM capacity requires a single NUMA node"
+        );
+        anyhow::ensure!(
+            memory_capacity >= input.node_mem_sizes[0],
+            "RAM capacity {memory_capacity:#x} is below active RAM size {:#x}",
+            input.node_mem_sizes[0]
+        );
+        anyhow::ensure!(
+            memory_capacity.is_multiple_of(PAGE_SIZE),
+            "RAM capacity {memory_capacity:#x} is not page-aligned"
+        );
+    }
 
-    let mut ram_ranges_by_node = vec![Vec::new(); input.node_mem_sizes.len()];
+    let mut layout_ram_ranges_by_node = vec![Vec::new(); input.node_mem_sizes.len()];
     let mut pcie_root_complex_ranges = input
         .pcie_root_complexes
         .iter()
@@ -363,7 +382,7 @@ pub(super) fn resolve_memory_layout(
     // zero-size request. For GB-sized nodes, use GB alignment so holes do not
     // create sub-GB RAM chunks. For sub-GB nodes, use 2 MB alignment to avoid
     // wasting a full GB of address space per small node.
-    for (vnode, (ram_ranges, &ram_size)) in ram_ranges_by_node
+    for (vnode, (ram_ranges, &ram_size)) in layout_ram_ranges_by_node
         .iter_mut()
         .zip(input.node_mem_sizes)
         .enumerate()
@@ -371,8 +390,18 @@ pub(super) fn resolve_memory_layout(
         if ram_size == 0 {
             continue;
         }
-        let ram_alignment = if ram_size < GB { TWO_MB } else { GB };
-        builder.ram(format!("ram{vnode}"), ram_ranges, ram_size, ram_alignment);
+        let layout_ram_size = if vnode == 0 {
+            input.memory_capacity.unwrap_or(ram_size)
+        } else {
+            ram_size
+        };
+        let ram_alignment = if layout_ram_size < GB { TWO_MB } else { GB };
+        builder.ram(
+            format!("ram{vnode}"),
+            ram_ranges,
+            layout_ram_size,
+            ram_alignment,
+        );
     }
 
     // VTL2 chipset MMIO is implementation-private — placed after all
@@ -471,14 +500,18 @@ pub(super) fn resolve_memory_layout(
         }
     }
 
-    let ram = ram_ranges_by_node
+    let ram = layout_ram_ranges_by_node
         .into_iter()
+        .zip(input.node_mem_sizes)
         .enumerate()
-        .flat_map(|(vnode, ranges)| {
-            ranges.into_iter().map(move |range| MemoryRangeWithNode {
-                range,
-                vnode: vnode as u32,
-            })
+        .flat_map(|(vnode, (ranges, &active_size))| {
+            memory_range_prefix(&ranges, active_size)
+                .expect("layout RAM must cover active RAM")
+                .into_iter()
+                .map(move |range| MemoryRangeWithNode {
+                    range,
+                    vnode: vnode as u32,
+                })
         })
         .collect::<Vec<_>>();
 
@@ -546,6 +579,21 @@ pub(super) fn resolve_memory_layout(
         },
         iommu_ranges,
     })
+}
+
+fn memory_range_prefix(ranges: &[MemoryRange], size: u64) -> anyhow::Result<Vec<MemoryRange>> {
+    let mut remaining = size;
+    let mut prefix = Vec::new();
+    for range in ranges {
+        if remaining == 0 {
+            break;
+        }
+        let length = range.len().min(remaining);
+        prefix.push(MemoryRange::new(range.start()..range.start() + length));
+        remaining -= length;
+    }
+    anyhow::ensure!(remaining == 0, "RAM ranges do not cover requested prefix");
+    Ok(prefix)
 }
 
 fn add_mmio_range<'a>(
@@ -632,6 +680,7 @@ mod tests {
     ) -> MemoryLayoutInput<'_> {
         MemoryLayoutInput {
             node_mem_sizes,
+            memory_capacity: None,
             layout: DEFAULT_LAYOUT,
             pcie_root_complexes: &[],
             virtio_mmio_count: 0,
@@ -666,6 +715,42 @@ mod tests {
                 MemoryRange::new(4 * GB..5 * GB),
             ]
         );
+    }
+
+    #[test]
+    fn memory_capacity_reserves_aperture_without_publishing_it_as_ram() {
+        let mut config = input(&[512 * MB], None);
+        config.memory_capacity = Some(2 * GB);
+        config.layout = vmm_core_defs::LayoutConfig {
+            chipset_low_mmio_size: GB as u32,
+            chipset_high_mmio_size: GB,
+            vtl2_chipset_mmio_size: 0,
+        };
+        let layout = config.layout.clone();
+
+        let resolved = resolve_memory_layout(config).unwrap();
+
+        assert_eq!(
+            resolved.memory_layout.ram(),
+            &[MemoryRangeWithNode {
+                range: MemoryRange::new(0..512 * MB),
+                vnode: 0,
+            }]
+        );
+        let reserved_high_mmio_start = resolved.chipset_mmio.high.start();
+
+        let mut expanded = input(&[GB], None);
+        expanded.memory_capacity = Some(2 * GB);
+        expanded.layout = layout;
+        let expanded = resolve_memory_layout(expanded).unwrap();
+        assert_eq!(
+            expanded.memory_layout.ram(),
+            &[MemoryRangeWithNode {
+                range: MemoryRange::new(0..GB),
+                vnode: 0,
+            }]
+        );
+        assert_eq!(expanded.chipset_mmio.high.start(), reserved_high_mmio_start);
     }
 
     fn vtl2_layout(size: u64) -> Vtl2MemoryLayoutRequest {

@@ -22,12 +22,10 @@ pub fn choose_hypervisor() -> anyhow::Result<Resource<HypervisorKind>> {
 
 /// Returns the native backend supported by the microVM profile.
 pub fn choose_microvm_hypervisor() -> anyhow::Result<Resource<HypervisorKind>> {
-    #[cfg(target_os = "linux")]
-    return hypervisor_resource("kvm");
-    #[cfg(windows)]
-    return hypervisor_resource("whp");
+    #[cfg(any(target_os = "linux", windows))]
+    return choose_hypervisor();
     #[cfg(not(any(target_os = "linux", windows)))]
-    anyhow::bail!("the microVM profile requires a Linux/KVM or Windows/WHP host");
+    anyhow::bail!("the microVM profile requires a Linux KVM/MSHV or Windows WHP host");
 }
 
 /// Parses a hypervisor specifier of the form `name` or `name:key=val,key,...`.

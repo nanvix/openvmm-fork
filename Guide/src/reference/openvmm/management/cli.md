@@ -10,28 +10,275 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--version`, `-V`: Print the OpenVMM build identity and exit. `-V` prints the concise identity. `--version` also prints the upstream product version, build kind, full Git revision when available, and build target. An ordinary checkout reports `MAJOR.MINOR.PATCH+g<SHORT_REVISION>`. This includes an exact checkout of an `openvmm-vMAJOR.MINOR.PATCH` release tag. A checkout detected with tracked changes appends `.dirty`; staged changes refresh this reliably, while an unstaged-only transition may remain cached until another build-script input changes. A Git-free source tree reports `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
 * `--machine <PROFILE>`: Select the guest-visible machine contract. The
-  default is `standard`. `microvm` selects microVM ABI version 1, an x86-64
-  Xen PVH machine that runs on KVM or WHP with exactly one vCPU:
+  default is `standard`. `microvm` selects the x86-64 Xen PVH microVM, which
+  runs on KVM, MSHV, or WHP with exactly 1, 2, 4, or 8 vCPUs. On
+  Linux, auto-detection prefers MSHV when `/dev/mshv` is available and falls
+  back to KVM:
 
   ```bash
   openvmm --machine microvm --hypervisor kvm \
     --kernel vmlinux --initrd initramfs.cpio.gz
+  openvmm --machine microvm --hypervisor mshv \
+    --kernel vmlinux --initrd initramfs.cpio.gz
   openvmm --machine microvm --hypervisor whp \
+    --kernel vmlinux --initrd initramfs.cpio.gz
+  openvmm --machine microvm --processors 8 --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz
   ```
 
   The kernel must be an uncompressed ELF64 image containing
   `XEN_ELFNOTE_PHYS32_ENTRY`. The profile owns the base command line
-  (`earlycon=xe9 console=hvc0 reboot=t panic=-1`), reserves a 1-GiB MMIO gap
-  from 3 to 4 GiB, and exposes only PIC/IOAPIC, PIT, binary UTC RTC, the microVM
-  portb console, and lifecycle ports. User arguments cannot override
-  `earlycon=`, `console=`, or `virtio_mmio.device=`.
+  (`earlycon=xe9 console=hvc0 reboot=t panic=-1`) and switches the primary
+  console to `hvc1` when `--virtio-console` is present. It reserves a 1-GiB
+  MMIO gap from 3 to 4 GiB and exposes only PIC/IOAPIC, PIT, a CMOS RTC
+  anchored to UTC,
+  the microVM portb console, lifecycle ports, and the optional fixed virtio
+  devices described below. User arguments cannot override `earlycon=`,
+  `console=`, `virtio_mmio.device=`, `virtnet_*=`, or `virtfs_*=`.
 
-  One optional `--virtio-blk <DISK>` is exposed at MMIO `0xd0003000`, IRQ 4,
-  using split rings. Firmware, ACPI, SMBIOS, PCI, VMBus, UARTs, graphics,
-  isolation, nested virtualization, and other devices are rejected. Snapshot
-  capture, restore, pulse-save/restore, and worker restart are unavailable in
-  ABI version 1 Phase 1.
+  One virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and remains
+  dormant when `--mount` is omitted; an optional `--mount` binds HostFs to it;
+  one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
+  IRQ 7; and `--microvm-sandbox-block` exposes fixed distro, runtime, custom,
+  and scratch slots starting at MMIO `0xd0003000`. Ordinary `--virtio-blk`
+  is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
+  VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
+  are rejected. Host-driven save/restore, pulse-save/restore, and worker
+  restart remain unavailable.
+
+  `microvm` uses one socket and one die,
+  with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
+  Guest-requested snapshot capture and new-process restore are available for
+  blockless and fixed-block machines on Linux/KVM, Linux/MSHV, and Windows/WHP.
+
+  ```admonish warning title="microVM migration"
+  The canonical `microvm` spelling now selects the contract formerly exposed
+  as `microvm-v2`; the `microvm-v2` selector and the former ABI-v1 behavior are
+  removed. Snapshot ABI and PVH layout fields remain numeric value 2. ABI or
+  layout value 1 snapshots are rejected and must be run with OpenVMM commit
+  `1b70365613517a10718e00284a62bdffbd80e41c` or an earlier compatible build.
+  ```
+* `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
+  at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
+  `/1` through `/30` are accepted. The first usable subnet address becomes
+  the gateway; network, broadcast, and gateway addresses cannot be assigned
+  to the guest. Guest and gateway MAC addresses are derived as
+  `52:54:00:<second>:<third>:<fourth>` from their IPv4 addresses. Networking
+  requires the only supported capability profile, `--network-profile portable`;
+  omitting it rejects the command before OpenVMM opens host resources.
+
+  ```bash
+  openvmm --machine microvm --hypervisor whp \
+    --kernel vmlinux --initrd initramfs.cpio.gz \
+    --net 10.0.0.2/24 --network-profile portable
+  ```
+
+  `portable` uses an in-process Consomme endpoint on Linux/KVM, Linux/MSHV,
+  and Windows/WHP. It needs no TAP, root access, driver, or host network
+  configuration. `--net-tap` is incompatible and is rejected before any
+  endpoint or host resource is created. The gateway provides DNS over UDP and
+  TCP, ICMP echo, and outbound TCP/UDP through ordinary host sockets. Consomme
+  rejects IPv4 fragments deterministically; policy filtering remains before
+  host socket creation. Its per-connection TCP buffers start at 16 KiB and
+  are bounded at 4 MiB; UDP bindings expire after five minutes; and at most
+  256 DNS requests are pending at once. At most 128 TCP, 256 UDP, and 16 ICMP
+  guest flows are active at once; excess flows are deterministically rejected
+  before a host socket is created.
+
+  `--allow-host <IPv4[/PREFIX]>`, `--block-host <IPv4[/PREFIX]>`, and
+  `--allow-endpoint <IPv4:TCP-PORT>` are repeatable, mutually exclusive
+  egress modes. Filtering runs before host socket creation. Active policy
+  fails closed for malformed packets, non-IPv4 traffic, and IPv4 options.
+  Exact endpoint mode also rejects UDP, ICMP, VLAN, fragments, and every TCP
+  destination not listed. Endpoint addresses must be usable unicast identities;
+  unspecified, current-network, loopback, link-local, multicast, reserved,
+  guest-self, subnet-network, and subnet-broadcast addresses are rejected before
+  host resources are opened. For each endpoint, ARP may resolve the endpoint
+  itself when it is on-link, or the gateway otherwise. Duplicate endpoint
+  addresses share one canonical next hop. This layer-2 permission does not relax
+  the independent destination, TCP, or port check. No implicit DNS exception is
+  added.
+
+  Networked snapshots record the `portable` profile, drain accepted TX and
+  endpoint-ready RX at the capture boundary, rewind unused guest RX
+  descriptors, and recreate a fresh Consomme endpoint generation on restore.
+  Restore of a networked snapshot requires `--network-profile portable` and
+  the same active egress policy rules. The policy digest binds the saved static
+  identity and its derived ARP next hops, which are reconstructed before vCPUs
+  start. Native sockets and NAT flow tables are not serialized. The capture
+  protocol does not retain pre-capture endpoint completions; restored guest
+  software must establish new host-side flows.
+* `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
+  one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
+  The default mode is read-only; `rw` must be explicit. The guest target must
+  be an absolute, non-root Linux path without dot, parent, empty, whitespace,
+  backslash, or `=` components.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm \
+    --kernel path/to/vmlinux --initrd path/to/initramfs.cpio.gz \
+    --mount /mnt/share,path/to/share,ro
+  ```
+
+  The device has one high-priority queue, one request queue, direct-I/O file
+  behavior, zero entry and attribute cache lifetimes, and no shared-memory
+  window. `--mount` conflicts with `--virtio-fs` and
+  `--virtio-fs-shmem`; those standard-machine options cannot select the
+  microVM filesystem profile.
+
+  Filesystem snapshots contain guest-visible FUSE and queue state, not host
+  directory contents or native handles. An active snapshot requires
+  `--mount` again with the exact canonical host path, guest target, and access
+  mode; the live root and every saved object identity are also revalidated
+  before vCPUs start. A snapshot captured without `--mount` may remain dormant
+  or bind a new attachment. The resumed guest must then explicitly run
+  `mount -t virtiofs microvm <GUEST_TARGET>` because its cold-boot mount hook
+  has already completed.
+  See [virtio-fs](../../devices/virtio/virtio-fs.md).
+* `--snapshot-destination <DIR>`: Publish a microVM snapshot when the guest
+  writes to PMIO port `0x605`. The destination must not exist and its parent
+  must already be a directory. OpenVMM automatically creates file-backed RAM
+  in that parent when no memory backing file was supplied, quiesces the VM,
+  writes and flushes a sibling staging directory, and atomically renames it to
+  `DIR`. After a successful commit, the source VM terminates without executing
+  the instruction after the snapshot `out`.
+
+  `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
+  timeout and defaults to 5000. A request with no configured destination is
+  ignored and the guest continues. Capture requires 1, 2, 4, or 8 vCPUs,
+  KVM, MSHV, or WHP, and shared file-backed RAM. Sandbox block media must
+  be cached regular raw files with nonzero 512-byte-aligned geometry. An
+  attached virtio console saves accepted but undelivered input and the offset
+  of a partially forwarded guest transmit descriptor. An attached microVM
+  virtio-net device saves its static identity, queue progress, drained packet
+  ownership, endpoint generation, and policy requirement.
+  The fixed microVM virtio-fs slot saves either an explicit dormant state or,
+  when attached, its negotiated FUSE policy, namespace and handle identifiers,
+  aliases, and directory cookies. The host tree remains external live state.
+
+  `--memory-capacity <SIZE>` opts the snapshot into restore-time memory
+  expansion. `SIZE` is an immutable 128-MiB-aligned upper bound, must be at
+  least the base `--memory` size, and reserves the complete canonical GPA
+  aperture without adding it to the initial PVH usable-RAM map or
+  `memory.bin`.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm --memory 128M \
+    --kernel vmlinux --initrd initramfs.cpio.gz \
+    --snapshot-destination snapshot
+  ```
+
+  `/sbin/nvx-snapshot` requests a paired capture by default. When scratch is
+  mounted, it freezes the workload cgroup with a bounded wait, syncs, freezes
+  the scratch filesystem, and asks OpenVMM to drain queues and atomically
+  publish `scratch.img`. `/sbin/nvx-snapshot --fresh-scratch` is for a
+  pre-mount boundary and records that restore must supply a fresh scratch.
+* `--restore-snapshot <DIR>`: Restore a microVM from a committed snapshot.
+  The manifest supplies the authoritative RAM size, topology, ABI,
+  fixed device inventory, effective kernel command line, source backend, CPU
+  contract, and TSC frequency. Kernel, initrd, command-line, ordinary
+  `--memory`, processor, device, and topology overrides are not accepted;
+  expansion-capable snapshots use only `--restore-memory`. Repeat the
+  snapshot's exact `--processors` count; a mismatch is rejected before any VP
+  starts. Restore requires the same backend kind as capture.
+
+  When the snapshot contains a virtio console, its attachment policy comes
+  from the manifest. OpenVMM recreates listeners, reconnects required clients,
+  or requires an inherited replacement before creating the partition. Restore
+  fails before any vCPU starts when a required attachment cannot be rebuilt.
+  A listener peer may connect after restore; guest transmit descriptors remain
+  pending while no peer is connected.
+
+  When the snapshot contains an active virtio-fs attachment, restore requires
+  a fresh `--mount`. The argument must reproduce the manifest's exact
+  canonical host path, guest target, and `ro`/`rw` mode while also supplying a
+  live root with the same saved identity. A snapshot advertising the dormant
+  slot may instead accept a new attachment; snapshots without that capability
+  reject additive attachment.
+
+  When the snapshot contains virtio-net, restore also requires
+  `--network-profile portable`; the snapshot's profile and canonical egress
+  policy must match the supplied portable configuration.
+
+  For sandbox-block snapshots, restore repeats each read-only
+  `--microvm-sandbox-block` argument. Its role, access, geometry, and SHA-256
+  must match the manifest. A paired snapshot supplies scratch internally from
+  a verified process-private copy of `scratch.img`; passing another scratch is
+  rejected. A fresh-scratch snapshot instead requires a writable scratch
+  argument with matching geometry.
+
+  `--restore-memory <SIZE>` selects the total RAM for this launch. It requires
+  an expansion-capable snapshot and a 128-MiB-aligned value from the exact
+  captured base through the immutable capacity. Base RAM remains a private
+  copy-on-write mapping of `memory.bin`; selected expansion ranges use fresh
+  zeroed private backing. Expansion implies the post-restore repair gate.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm \
+    --restore-snapshot snapshot --restore-entropy
+  ```
+* `--restore-ready-path <PATH>`: Connect to an existing Unix domain socket on
+  Linux or a `//./pipe/...` named pipe on Windows and write exactly
+  `OPENVMM_RESTORE_READY_V1\n` once all restored state, required attachments,
+  and execution-owned workers are ready. Ungated restores flush the event
+  before releasing the restored vCPU. Gated microVM restores flush it after the
+  guest acknowledges post-restore repair and external input is re-enabled,
+  while the restored vCPU remains stopped.
+  It is valid only with `--restore-snapshot` and is process-local; it is not
+  saved in the snapshot. A connection, write, or flush failure aborts startup
+  and stops the VM. The peer must accept and read the event while startup is
+  in progress; Windows flush completion waits for the named-pipe peer to
+  consume the complete frame.
+* `--restore-entropy`: Make a fresh `OPENVMM_ENTROPY_V1` packet available on
+  the private portb restore channel. The guest must consume the packet and
+  explicitly reseed its RNG. Restoring cloned RNG state without this option is
+  unsafe for cryptographic workloads and emits a warning.
+  Processor activation uses `OPENVMM_ENTROPY_V2`. Memory expansion uses the
+  backward-compatible `OPENVMM_ENTROPY_V3` packet. Its exact format is the
+  19-byte `OPENVMM_ENTROPY_V3\0` header, a one-byte online-VP target (zero
+  means none), a one-byte expansion-range count, that many little-endian
+  `(u64 GPA start, u64 byte length)` pairs, and 64 bytes of fresh entropy.
+  Explicitly selecting the snapshot base size with `--restore-memory` still
+  emits V3 with an expansion-range count of zero; omitting the option preserves
+  V1/V2 behavior. Private portb status bit 3 reports a V3 memory target, while
+  bit 4 additionally reports that the packet contains one or more expansion
+  ranges, allowing a zero-range target to avoid post-restore repair.
+  Every microVM portb device also reports generation-ID support in status bit
+  5. Writing `0xa6` to the status port and reading 16 bytes from the data port
+  returns an opaque ID that is stable for that VM process and may be selected
+  repeatedly. OpenVMM creates it before vCPU entry and does not serialize it.
+  On restore, it is the first 16 bytes of the fresh entropy packet, allowing
+  the guest repair path to update clone identity without additional port I/O.
+* `--restore-processors <COUNT>`: For an opt-in microVM snapshot, bring the
+  contiguous VP prefix `0..COUNT-1` online before restore readiness. The
+  snapshot's manifest VP count remains immutable capacity and must still match
+  `--processors`. The target must be 1, 2, 4, or 8 and satisfy
+  `boot-online <= target <= capacity`. This option implies a version-2 private
+  restore packet and the post-restore gate. Snapshots without activation
+  metadata reject it. An
+  explicit MSHV restore instantiates and binds only the requested prefix while
+  validating the full saved VP inventory; that reduced-prefix process cannot
+  be saved again. MSHV restores without this option, and KVM and WHP restores,
+  instantiate the full VP capacity.
+* `--restore-gate-timeout-ms <MILLISECONDS>`: Bound microVM guest repair and
+  gate acknowledgement after restore. The default is 60000 milliseconds.
+* `--snapshot-tier <TIER>`: Required for snapshot capture with sandbox blocks. Choose
+  `platform`, `workload-start`, or `instance-checkpoint`. The first two are
+  reusable clone policies; instance checkpoints use single-use resume policy.
+
+A committed snapshot contains `manifest.bin`, `state.bin`, `memory.bin`, and
+optionally the manifest-declared `scratch.img`. Restore rejects unknown files,
+symlinks, malformed or oversized data, length or scratch-digest mismatches, and
+incompatible machine contracts before starting a vCPU. `memory.bin` uses a
+private writable copy-on-write mapping and paired scratch is privately copied,
+so clone-policy snapshots can be restored repeatedly without modifying
+artifacts. Instance-checkpoint snapshots permit one restore attempt.
+
+Versions 3 through 5 do not embed or validate checksums for `state.bin` or `memory.bin`;
+legacy version 2 checksum fields are accepted without re-hashing their
+payloads. This format does not detect same-length payload changes,
+authenticate, or encrypt a snapshot. Treat all three artifacts as sensitive
+guest state and protect the directory with host access controls.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:
@@ -232,8 +479,30 @@ Serial devices can be configured to appear as different devices inside the guest
   dropped bytes with its own retransmission. Debugger mode is chosen
   independently per COM port, so one port can talk to WinDbg while another
   behaves normally.
-* `--virtio-console <BACKEND>`: Expose a virtio console device (appears as
-  `/dev/hvc0` inside the guest).
+* `--virtio-console <BACKEND>`: Expose a virtio console device. It normally
+  appears as `/dev/hvc0`. Under `--machine microvm`, it occupies fixed MMIO
+  `0xd0002000`, IRQ 7, and is selected as `/dev/hvc1`; the raw portb path
+  remains available as `hvc0` for early output and recovery.
+
+  A microVM accepts these explicit attachment policies:
+
+  * `listen=PATH` or `listen=tcp:IP:PORT`: save the canonical endpoint and
+    recreate the optional listener on restore. Unix sockets must be beside the
+    snapshot directory. Windows pipes use the
+    `//./pipe/openvmm-microvm-<NAME>` namespace. TCP ports must be nonzero.
+    TCP addresses must be loopback addresses.
+  * `connect=PATH` or `connect=tcp:IP:PORT`: require a client connection before
+    vCPUs start. Cold boot and restore use a five-second timeout. The
+    restore command must explicitly resupply the matching client attachment.
+  * `console`: require the restore caller to supply the same inherited terminal
+    attachment. Portb recovery output moves to stderr while the terminal is
+    attached to `hvc1`.
+  * `none`: keep the device present and explicitly discard guest TX while
+    disconnected.
+
+  A generic byte stream guarantees no replay up to OpenVMM's backend write
+  boundary; it cannot prove that the remote application consumed bytes without
+  its own acknowledgment protocol.
 
 The `BACKEND` argument is the same for all serial devices:
 
@@ -244,8 +513,10 @@ The `BACKEND` argument is the same for all serial devices:
       up to listen on the given path. Serial input and output is relayed to this
       pipe/socket.
   * `listen=tcp:IP:PORT`: As with `listen=PATH`, but listen for TCP
-      connections on the given IP address and port. Typically IP will be
-      127.0.0.1, to restrict connections to the current host.
+      connections on the given IP address and port. A microVM requires a
+      loopback IP such as `127.0.0.1` or `::1`.
+  * `connect=PATH`: Connect to an existing named pipe or Unix socket.
+  * `connect=tcp:IP:PORT`: Connect to an existing TCP listener.
 
 ## Guest power events
 

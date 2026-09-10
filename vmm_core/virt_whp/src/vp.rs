@@ -544,6 +544,14 @@ mod x86 {
     // to the bottom of what's going on here.
     const MYSTERY_MSRS: &[u32] = &[0x88, 0x89, 0x8a, 0x116, 0x118, 0x119, 0x11a, 0x11b, 0x11e];
 
+    fn fixup_extended_topology(index: u32, apic_id: u32, result: &mut [u32; 4]) {
+        if index >= 2 {
+            *result = [0; 4];
+        } else {
+            result[3] = apic_id;
+        }
+    }
+
     impl WhpProcessor<'_> {
         pub(super) async fn handle_exit(
             &mut self,
@@ -710,6 +718,21 @@ mod x86 {
                 | GpaBackingType::VtlProtected(_)
                 | GpaBackingType::Unaccepted => false,
             };
+
+            if access.AccessInfo.GpaUnmapped() && matches!(backing_type, GpaBackingType::Ram { .. })
+            {
+                match self.current_vtlp().map_deferred_on_fault(access.Gpa) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracelimit::warn_ratelimited!(
+                            gpa = access.Gpa,
+                            error = ?err,
+                            "failed to register deferred gpa range"
+                        );
+                    }
+                }
+            }
 
             if !access.AccessInfo.GpaUnmapped() && should_populate {
                 // This is a mapped GPA that wasn't mapped in the SLAT. Tell the
@@ -1087,10 +1110,34 @@ mod x86 {
             let mut default = self.vp.partition.cpuid.result(function, index, &default);
 
             match CpuidFunction(function) {
+                CpuidFunction::VersionAndFeatures => {
+                    let ebx = x86defs::cpuid::VersionAndFeaturesEbx::from(default[1]);
+                    default[1] = ebx
+                        .with_initial_apic_id(self.inner.vp_info.apic_id as u8)
+                        .into();
+                }
                 // The hypervisor does not consistently set this.
                 CpuidFunction::ExtendedTopologyEnumeration
                 | CpuidFunction::V2ExtendedTopologyEnumeration => {
-                    default[3] = self.inner.vp_info.apic_id;
+                    fixup_extended_topology(index, self.inner.vp_info.apic_id, &mut default);
+                }
+                CpuidFunction::ProcessorTopologyDefinition => {
+                    let apic_id = self.inner.vp_info.apic_id;
+                    default[0] = x86defs::cpuid::ProcessorTopologyDefinitionEax::from(default[0])
+                        .with_extended_apic_id(apic_id)
+                        .into();
+                    let threads_per_core = if self.vp.partition.smt_enabled { 2 } else { 1 };
+                    default[1] = x86defs::cpuid::ProcessorTopologyDefinitionEbx::from(default[1])
+                        .with_compute_unit_id(
+                            ((apic_id % self.vp.partition.reserved_vps_per_socket)
+                                / threads_per_core) as u8,
+                        )
+                        .with_threads_per_compute_unit((threads_per_core - 1) as u8)
+                        .into();
+                    default[2] = x86defs::cpuid::ProcessorTopologyDefinitionEcx::from(default[2])
+                        .with_node_id((apic_id / self.vp.partition.reserved_vps_per_socket) as u8)
+                        .with_nodes_per_processor(0)
+                        .into();
                 }
                 CpuidFunction(n) if matches!(n, 0x40000000..=0x400000ff) => {
                     match n {
@@ -1728,6 +1775,26 @@ mod x86 {
             limit: reg.Limit,
             selector: reg.Selector,
             attributes: reg.Attributes,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::fixup_extended_topology;
+
+        #[test]
+        fn extended_topology_uses_canonical_levels_and_terminates() {
+            for index in [0, 1] {
+                let mut result = [1, 2, 3, 99];
+                fixup_extended_topology(index, 7, &mut result);
+                assert_eq!(result, [1, 2, 3, 7]);
+            }
+
+            for index in [2, 3, u32::MAX] {
+                let mut result = [1, 2, 3, 99];
+                fixup_extended_topology(index, 7, &mut result);
+                assert_eq!(result, [0; 4]);
+            }
         }
     }
 }

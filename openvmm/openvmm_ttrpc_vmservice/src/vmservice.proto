@@ -138,8 +138,8 @@ message DevicesConfig {
     repeated WindowsPCIDevice windows_device = 4;
     repeated VirtioFSConfig virtiofs_config = 5;
     VirtioConsoleConfig virtio_console = 6;
-    // microVM ABI-v1 optional fixed-slot virtio-blk device.
-    VirtioBlk virtio_blk = 7;
+    reserved 7;
+    reserved "virtio_blk";
 }
 
 // An endpoint PCIe device function. Attached behind a port in the topology
@@ -501,7 +501,9 @@ message VMConfig {
     // Guest-visible machine contract.
     enum MachineProfile {
         STANDARD = 0;
-        MICROVM = 1;
+        // Deterministic SMP-capable microVM ABI.
+        MICROVM = 2;
+        reserved 1, 3, 4;
     }
 
     // Action for the VMM to take when the guest triggers a power event.
@@ -574,12 +576,39 @@ message HVSocketConfig {
     string path = 1;
 }
 
+// Snapshot options for the microVM machine profile.
+message MicrovmSnapshotConfig {
+    // Publish a guest-requested snapshot to this previously nonexistent path.
+    string destination_path = 1;
+    // Restore authoritatively from this snapshot directory.
+    string restore_path = 2;
+    // Expose fresh host entropy through the private portb restore channel.
+    bool restore_entropy = 3;
+    // Maximum quiesce time for capture. Zero selects the five-second default.
+    uint64 quiesce_timeout_ms = 4;
+    // Unix socket (Linux) or named pipe (Windows) that receives exactly one
+    // OPENVMM_RESTORE_READY_V1 event before restored guest execution begins.
+    string restore_ready_path = 5;
+    // Bring this contiguous prefix of capacity VPs online before restore readiness.
+    // Zero preserves legacy restore behavior.
+    uint32 restore_processor_count = 6;
+    // Maximum time allowed for gated guest repair. Zero selects 60 seconds.
+    uint64 restore_gate_timeout_ms = 7;
+    // Immutable total RAM capacity reserved by a captured microVM snapshot.
+    // Zero disables restore-time memory expansion.
+    uint64 memory_capacity_bytes = 8;
+    // Per-launch total RAM target for restore. Zero selects the snapshot base.
+    uint64 restore_memory_bytes = 9;
+}
+
 message CreateVMRequest {
     VMConfig config = 1;
     // Optional ID to be used by the VM service in log messages. It's up to the
     // server/virtstack to make use of this field. Useful for debugging to be able to
     // correlate events in the virtstack for a given vm that the client launched.
     string log_id = 2;
+    // Optional microVM snapshot capture or restore configuration.
+    MicrovmSnapshotConfig microvm_snapshot = 3;
 }
 
 message MemoryStats {
@@ -731,6 +760,12 @@ message WindowsPCIDevice {
 message VirtioFSConfig {
     string tag = 1;
     string root_path = 2;
+    // Absolute guest target for the microVM fixed HostFs device.
+    // Must be empty for a standard-machine virtio-fs device.
+    string guest_mount_target = 3;
+    // Enable the microVM common read-write contract. False selects read-only.
+    // Must be false for a standard-machine virtio-fs device.
+    bool read_write = 4;
 }
 
 message VirtioConsoleConfig {

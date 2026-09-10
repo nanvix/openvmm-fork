@@ -60,7 +60,12 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, MicrovmPortbHandle> for Micro
             )
             .await
             .map_err(ResolveMicrovmPortbError::ResolveBackend)?;
-        Ok(MicrovmPortb::new(io.0.into_io()).into())
+        Ok(MicrovmPortb::new(
+            io.0.into_io(),
+            resource.generation_id,
+            resource.restore_entropy,
+        )
+        .into())
     }
 }
 
@@ -112,6 +117,6 @@ impl ResolveResource<ChipsetDeviceHandleKind, MicrovmSnapshotRequestHandle>
         resource: MicrovmSnapshotRequestHandle,
         _input: ResolveChipsetDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        Ok(MicrovmSnapshotRequest::new(resource.notify).into())
+        Ok(MicrovmSnapshotRequest::new(resource.notify, resource.input_gate_timeout).into())
     }
 }

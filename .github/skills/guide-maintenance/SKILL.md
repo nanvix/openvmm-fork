@@ -141,3 +141,17 @@ Each row in the mapping table follows:
 - Guide paths are relative to `Guide/src/`
 - Multiple Guide pages for one code path: comma-separated
 - Use glob-style `*` in code paths for crate families (e.g., `nvme*/`)
+
+## Code-to-Guide Mapping
+
+| Code path | Guide page |
+|---|---|
+| `vm/devices/virtio/virtiofs/` | `reference/devices/virtio/virtio-fs.md` |
+| `vm/devices/virtio/virtio_resources/` | `reference/devices/virtio/virtio-fs.md` |
+| `vm/devices/support/fs/fuse/` | `reference/devices/virtio/virtio-fs.md` |
+
+## What to Flag
+
+- Changes to virtio-fs backends, queue/cache policy, save/restore, or microVM
+  attachment semantics require an update to
+  `reference/devices/virtio/virtio-fs.md`.

@@ -2671,6 +2671,7 @@ async fn new_underhill_vm(
                     with_psp: dps.general.psp_enabled,
                     pm_base: DEFAULT_PM_PIO_BASE,
                     acpi_irq: DEFAULT_ACPI_IRQ,
+                    level_triggered_irqs: &[],
                     iommu: None,
                 },
             };
@@ -3688,6 +3689,7 @@ async fn new_underhill_vm(
         WrappedPartition(partition.clone()),
         PartitionUnitParams {
             processor_topology: &processor_topology,
+            active_vp_count: None,
             halt_vps,
             halt_request_recv,
             client_notify_send: halt_notify_send,

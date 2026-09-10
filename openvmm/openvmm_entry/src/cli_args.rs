@@ -25,15 +25,20 @@ use cxl_spec::spec::CfmwsWindowRestrictions;
 use guid::Guid;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
-use openvmm_defs::config::MICROVM_ABI_VERSION_1;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_BASE_COMMAND_LINE;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_COMMAND_LINE_MAX_SIZE;
+#[cfg(test)]
+use openvmm_defs::config::MICROVM_CONSOLE_COMMAND_LINE;
 use openvmm_defs::config::MachineProfile;
+use openvmm_defs::config::MicrovmNetworkProfile;
+use openvmm_defs::config::MicrovmSandboxBlockRole;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::X2ApicConfig;
+#[cfg(test)]
+use openvmm_defs::config::append_microvm_virtio_discovery;
 #[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
 use std::ffi::OsString;
@@ -151,17 +156,66 @@ pub struct NumaDistanceCli {
 pub enum MachineProfileCli {
     /// The standard OpenVMM machine.
     Standard,
-    /// The microVM ABI version 1 machine.
+    /// The microVM fixed-topology shared-status machine.
     Microvm,
+}
+
+/// Required host-network implementation contract for a microVM NIC.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MicrovmNetworkProfileCli {
+    /// Use the cross-platform user-mode Consomme NAT implementation.
+    Portable,
+}
+
+/// Capture tier for a microVM sandbox snapshot.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum SnapshotTierCli {
+    /// Fleet-wide clone point before image or sandbox configuration is consumed.
+    Platform,
+    /// Tenant-scoped reusable clone point at the workload handoff.
+    WorkloadStart,
+    /// Single-use continuation of one stopped instance.
+    InstanceCheckpoint,
+}
+
+impl SnapshotTierCli {
+    pub(crate) fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Platform => openvmm_helpers::snapshot::SNAPSHOT_TIER_PLATFORM,
+            Self::WorkloadStart => openvmm_helpers::snapshot::SNAPSHOT_TIER_WORKLOAD_START,
+            Self::InstanceCheckpoint => {
+                openvmm_helpers::snapshot::SNAPSHOT_TIER_INSTANCE_CHECKPOINT
+            }
+        }
+    }
+
+    pub(crate) fn restore_policy(self) -> &'static str {
+        match self {
+            Self::Platform | Self::WorkloadStart => {
+                openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_CLONE
+            }
+            Self::InstanceCheckpoint => openvmm_helpers::snapshot::SNAPSHOT_RESTORE_POLICY_RESUME,
+        }
+    }
+
+    pub(crate) fn requires_paired_scratch(self) -> bool {
+        !matches!(self, Self::Platform)
+    }
+}
+
+impl From<MicrovmNetworkProfileCli> for MicrovmNetworkProfile {
+    fn from(value: MicrovmNetworkProfileCli) -> Self {
+        match value {
+            MicrovmNetworkProfileCli::Portable => Self::Portable,
+        }
+    }
 }
 
 impl From<MachineProfileCli> for MachineProfile {
     fn from(value: MachineProfileCli) -> Self {
         match value {
             MachineProfileCli::Standard => Self::Standard,
-            MachineProfileCli::Microvm => Self::Microvm {
-                abi_version: MICROVM_ABI_VERSION_1,
-            },
+            MachineProfileCli::Microvm => Self::Microvm,
         }
     }
 }
@@ -190,7 +244,7 @@ pub struct Options {
         short = 'm',
         long,
         value_name = "PARAMS",
-        default_value = "1GB",
+        default_value = "",
         value_parser = parse_memory_config,
         conflicts_with = "numa",
         long_help = r#"Configure guest RAM.
@@ -284,9 +338,51 @@ Examples:
     #[clap(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["deprecated_memory_backing_file", "numa"]
+        conflicts_with_all = ["deprecated_memory_backing_file", "numa", "kernel", "initrd"]
     )]
     pub restore_snapshot: Option<PathBuf>,
+
+    /// Write OPENVMM_RESTORE_READY_V1 to this Unix socket or Windows named pipe
+    /// after restore startup completes and before guest execution begins.
+    #[clap(long, value_name = "PATH", requires = "restore_snapshot")]
+    pub restore_ready_path: Option<PathBuf>,
+
+    /// Expose a fresh OPENVMM_ENTROPY_V1 packet through the private portb restore channel.
+    #[clap(long, requires = "restore_snapshot")]
+    pub restore_entropy: bool,
+
+    /// Bring this contiguous prefix of capacity VPs online before restore readiness.
+    #[clap(long, value_name = "COUNT", requires = "restore_snapshot")]
+    pub restore_processors: Option<u32>,
+
+    /// Restore a capable microVM snapshot with this total guest RAM size.
+    #[clap(long, value_name = "SIZE", requires = "restore_snapshot")]
+    pub restore_memory: Option<vmm_cli::MemorySize>,
+
+    /// Maximum time allowed for a microVM guest to complete post-restore repair.
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 60000)]
+    pub restore_gate_timeout_ms: u64,
+
+    /// Capture a microVM snapshot to this directory when the guest writes PMIO 0x605.
+    #[clap(long, value_name = "DIR", conflicts_with = "restore_snapshot")]
+    pub snapshot_destination: Option<PathBuf>,
+
+    /// Reserve this immutable total RAM capacity in a captured microVM snapshot.
+    #[clap(long, value_name = "SIZE", requires = "snapshot_destination")]
+    pub memory_capacity: Option<vmm_cli::MemorySize>,
+
+    /// Sandbox capture tier. Required for microVM snapshot capture with sandbox blocks.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "TIER",
+        requires = "snapshot_destination"
+    )]
+    pub snapshot_tier: Option<SnapshotTierCli>,
+
+    /// Maximum time allowed to quiesce the VM for a guest-requested snapshot.
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 5000)]
+    pub snapshot_quiesce_timeout_ms: u64,
 
     /// use private anonymous memory for guest RAM
     #[clap(long = "private-memory", hide = true, conflicts_with_all = ["deprecated_memory_backing_file", "restore_snapshot", "numa"])]
@@ -554,6 +650,15 @@ options:
     #[clap(long = "virtio-blk")]
     pub virtio_blk: Vec<DiskCli>,
 
+    /// Attach a fixed-role microVM sandbox block device.
+    ///
+    /// The value is `<role>:<disk>`, where the roles are `distro`, `runtime`,
+    /// `custom`, and `scratch`. Lower-layer roles must use `,ro`; `scratch`
+    /// must be writable. The profile assigns each role a fixed virtio-mmio
+    /// address and IRQ independent of option order.
+    #[clap(long, value_name = "ROLE:DISK")]
+    pub microvm_sandbox_block: Vec<MicrovmSandboxBlockCli>,
+
     /// Attach a vhost-user device via a Unix socket.
     ///
     /// The first positional argument is the socket path. Options:
@@ -603,6 +708,28 @@ options:
     ///   --net consomme:10.0.0.0/24,hostfwd=tcp::22-:22,hostfwd=udp::5000-:5000
     #[clap(long)]
     pub net: Vec<NicConfigCli>,
+
+    /// Required host-network implementation contract for microVM `--net`.
+    #[clap(long, value_enum, value_name = "PROFILE")]
+    pub network_profile: Option<MicrovmNetworkProfileCli>,
+
+    /// Select a preconfigured Linux TAP for a microVM NIC.
+    ///
+    /// This is incompatible with the portable microVM network profile.
+    #[clap(long, value_name = "NAME")]
+    pub net_tap: Option<String>,
+
+    /// Permit only these IPv4 destinations or CIDRs from the microVM guest.
+    #[clap(long, value_name = "IPv4[/PREFIX]", conflicts_with_all = ["block_host", "allow_endpoint"])]
+    pub allow_host: Vec<net_backend_resources::egress::Ipv4Cidr>,
+
+    /// Permit IPv4 except for these destinations or CIDRs from the microVM guest.
+    #[clap(long, value_name = "IPv4[/PREFIX]", conflicts_with_all = ["allow_host", "allow_endpoint"])]
+    pub block_host: Vec<net_backend_resources::egress::Ipv4Cidr>,
+
+    /// Permit only these exact IPv4 TCP destinations from the microVM guest.
+    #[clap(long, value_name = "IPv4:TCP-PORT", conflicts_with_all = ["allow_host", "block_host"])]
+    pub allow_endpoint: Vec<net_backend_resources::egress::TcpEndpoint>,
 
     /// expose a virtual NIC using the Windows kernel-mode vmswitch.
     ///
@@ -776,6 +903,18 @@ options:
     #[clap(long, value_name = "BUS", default_value = "auto")]
     pub virtio_fs_bus: VirtioBusCli,
 
+    /// attach the microVM virtio-fs device
+    ///
+    /// An active snapshot requires the same canonical host path, guest target,
+    /// and mode. A dormant-slot snapshot may bind a new attachment on restore;
+    /// the resumed guest must mount the `microvm` tag explicitly.
+    #[clap(
+        long = "mount",
+        value_name = "GUEST_TARGET,HOST_PATH[,ro|rw]",
+        conflicts_with_all = ["virtio_fs", "virtio_fs_shmem"]
+    )]
+    pub microvm_mount: Option<MicrovmMountCli>,
+
     /// virtio PMEM device
     ///
     /// Prefix with `pcie_port=<port_name>:` to expose the device over
@@ -797,7 +936,7 @@ options:
 
     /// virtio console device backed by a serial backend (/dev/hvc0 in guest)
     ///
-    /// Accepts serial config (console | stderr | listen=\<path\> |
+    /// Accepts serial config (console | stderr | listen=\<path\> | connect=\<path\> |
     /// file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> |
     /// term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[clap(long)]
@@ -1413,35 +1552,93 @@ impl Options {
     /// Rejects unsupported microVM combinations before opening host resources.
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
         if self.machine != MachineProfileCli::Microvm {
+            anyhow::ensure!(
+                self.net_tap.is_none()
+                    && self.network_profile.is_none()
+                    && self.allow_host.is_empty()
+                    && self.block_host.is_empty()
+                    && self.allow_endpoint.is_empty()
+                    && self.microvm_mount.is_none()
+                    && self.microvm_sandbox_block.is_empty()
+                    && self.restore_processors.is_none()
+                    && self.restore_memory.is_none()
+                    && self.memory_capacity.is_none(),
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --restore-processors, --restore-memory, --memory-capacity, and microVM egress policy require a microVM machine"
+            );
             return Ok(());
         }
 
         anyhow::ensure!(
             cfg!(guest_arch = "x86_64"),
-            "the microVM machine requires an x86-64 guest"
+            "microVM requires an x86-64 guest"
         );
         anyhow::ensure!(
-            self.processors == 1,
-            "microVM ABI version 1 requires exactly one vCPU"
+            openvmm_defs::config::microvm_processor_count_supported(self.processors),
+            "microVM does not support {} vCPUs",
+            self.processors
         );
         anyhow::ensure!(
             self.numa.is_none() && self.numa_distance.is_none(),
-            "microVM ABI version 1 does not support custom NUMA topology"
+            "microVM does not support custom NUMA topology"
         );
         anyhow::ensure!(
             self.vps_per_socket.is_none()
                 && self.smt == SmtConfigCli::Auto
                 && self.apic_id_offset == 0
                 && matches!(self.x2apic, X2ApicConfig::Auto),
-            "microVM ABI version 1 owns CPU topology and APIC configuration"
+            "microVM owns CPU topology and APIC configuration"
         );
-        anyhow::ensure!(
-            self.restore_snapshot.is_none(),
-            "snapshot restore is unavailable for microVM ABI version 1"
-        );
+        if self.snapshot_destination.is_some() {
+            anyhow::ensure!(
+                !self.private_memory(),
+                "microVM snapshot capture requires shared file-backed RAM"
+            );
+            anyhow::ensure!(
+                !self.memory.hugepages,
+                "microVM snapshot capture does not support explicit hugepage backing"
+            );
+            anyhow::ensure!(
+                self.snapshot_quiesce_timeout_ms != 0,
+                "microVM snapshot quiesce timeout must be nonzero"
+            );
+            anyhow::ensure!(
+                self.snapshot_tier.is_some() == !self.microvm_sandbox_block.is_empty(),
+                "--snapshot-tier is required exactly for microVM snapshot capture with sandbox blocks"
+            );
+            if let Some(memory_capacity) = self.memory_capacity {
+                anyhow::ensure!(
+                    memory_capacity.0 >= self.memory_size(),
+                    "--memory-capacity must be at least the base --memory size"
+                );
+                anyhow::ensure!(
+                    self.memory_size()
+                        .is_multiple_of(openvmm_helpers::snapshot::MICROVM_MEMORY_BLOCK_SIZE_BYTES)
+                        && memory_capacity.0.is_multiple_of(
+                            openvmm_helpers::snapshot::MICROVM_MEMORY_BLOCK_SIZE_BYTES
+                        ),
+                    "--memory and --memory-capacity must be aligned to the 128-MiB microVM memory block size"
+                );
+            }
+        }
+        if self.restore_snapshot.is_some() {
+            anyhow::ensure!(
+                self.net.is_empty(),
+                "microVM restore takes network addressing from saved state; do not pass --net"
+            );
+            anyhow::ensure!(
+                self.restore_gate_timeout_ms != 0,
+                "microVM post-restore gate timeout must be nonzero"
+            );
+            if let Some(restore_processors) = self.restore_processors {
+                anyhow::ensure!(
+                    openvmm_defs::config::microvm_processor_count_supported(restore_processors,),
+                    "microVM does not support a restore-online count of {restore_processors}"
+                );
+            }
+        }
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
-            "microVM ABI version 1 requires Xen PVH direct boot"
+            "microVM requires Xen PVH direct boot"
         );
         anyhow::ensure!(
             !self.uefi_debug
@@ -1457,7 +1654,7 @@ impl Options {
                 && self.uefi_console_mode.is_none()
                 && self.efi_diagnostics_log_level.is_none()
                 && !self.default_boot_always_attempt,
-            "microVM ABI version 1 does not support firmware options"
+            "microVM does not support firmware options"
         );
         anyhow::ensure!(
             !self.hv
@@ -1470,13 +1667,14 @@ impl Options {
                 && self.vmbus_vtl2_vsock_path.is_none()
                 && self.openhcl_dump_path.is_none()
                 && self.gdb.is_none(),
-            "microVM ABI version 1 does not support Hyper-V, VTL2, isolation, nested virtualization, GET, or VMBus"
+            "microVM does not support Hyper-V, VTL2, isolation, nested virtualization, GET, or VMBus"
         );
         if let Some(hypervisor) = self.hypervisor.as_deref() {
             let name = hypervisor.split(':').next().unwrap_or(hypervisor);
             anyhow::ensure!(
-                matches!(name, "kvm" | "whp"),
-                "microVM ABI version 1 requires KVM or WHP"
+                (cfg!(target_os = "linux") && matches!(name, "kvm" | "mshv"))
+                    || (cfg!(windows) && name == "whp"),
+                "microVM requires KVM or MSHV on Linux, or WHP on Windows"
             );
         }
 
@@ -1488,9 +1686,30 @@ impl Options {
                 && self.vmbus_com1_serial.is_none()
                 && self.vmbus_com2_serial.is_none()
                 && self.debugcon.is_none()
-                && self.virtio_console.is_none()
                 && !self.serial_tx_only,
-            "microVM ABI version 1 exposes only its portb console"
+            "microVM exposes only portb and virtio-console serial devices"
+        );
+        anyhow::ensure!(
+            self.virtio_console_pcie_port.is_none(),
+            "microVM requires virtio-console on its fixed MMIO transport"
+        );
+        if let Some(console) = &self.virtio_console {
+            anyhow::ensure!(
+                matches!(
+                    console,
+                    SerialConfigCli::Pipe(_)
+                        | SerialConfigCli::Tcp(_)
+                        | SerialConfigCli::ConnectPipe(_)
+                        | SerialConfigCli::ConnectTcp(_)
+                        | SerialConfigCli::Console
+                        | SerialConfigCli::None
+                ),
+                "microVM virtio-console requires listen=..., connect=..., console, or none"
+            );
+        }
+        anyhow::ensure!(
+            self.virtio_console.is_some() || self.virtio_console_pcie_port.is_none(),
+            "--virtio-console-pcie-port requires --virtio-console"
         );
         anyhow::ensure!(
             self.disk.is_empty()
@@ -1500,16 +1719,45 @@ impl Options {
                 && self.openhcl_controller.is_empty()
                 && self.ide.is_empty()
                 && self.floppy.is_empty(),
-            "microVM ABI version 1 supports only the optional virtio-blk extension"
+            "microVM supports only its fixed MMIO storage devices"
         );
         anyhow::ensure!(
-            self.virtio_blk.len() <= 1,
-            "microVM ABI version 1 permits at most one virtio-blk device"
+            self.virtio_blk.is_empty(),
+            "microVM requires --microvm-sandbox-block instead of --virtio-blk"
         );
         anyhow::ensure!(
-            self.virtio_blk.iter().all(|disk| disk.pcie_port.is_none()),
-            "microVM virtio-blk cannot use PCIe"
+            self.microvm_sandbox_block.len() <= 4,
+            "microVM permits at most three read-only layers and one writable scratch device"
         );
+        for (index, block) in self.microvm_sandbox_block.iter().enumerate() {
+            anyhow::ensure!(
+                block.disk.read_only == block.role.is_read_only(),
+                "microVM sandbox block role {:?} must be {}",
+                block.role,
+                if block.role.is_read_only() {
+                    "read-only"
+                } else {
+                    "writable"
+                }
+            );
+            if let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|index| self.microvm_sandbox_block.get(index))
+            {
+                anyhow::ensure!(
+                    previous.role < block.role,
+                    "microVM sandbox block roles must be unique and in fixed order"
+                );
+            }
+        }
+        if !self.microvm_sandbox_block.is_empty() && self.restore_snapshot.is_none() {
+            anyhow::ensure!(
+                self.microvm_sandbox_block
+                    .last()
+                    .is_some_and(|block| block.role == MicrovmSandboxBlockRole::Scratch),
+                "microVM sandbox block topology requires a writable scratch device"
+            );
+        }
         anyhow::ensure!(
             self.virtio_9p.is_empty()
                 && self.virtio_fs.is_empty()
@@ -1518,21 +1766,20 @@ impl Options {
                 && !self.virtio_rng
                 && self.virtio_vsock_path.is_none()
                 && self.virtio_net.is_empty(),
-            "microVM ABI version 1 does not expose additional virtio devices"
+            "microVM does not expose additional virtio devices"
         );
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
             self.vhost_user.is_empty(),
-            "microVM ABI version 1 does not support vhost-user devices"
+            "microVM does not support vhost-user devices"
         );
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
             self.virtio_vsock_vhost_cid.is_none(),
-            "microVM ABI version 1 does not support vhost-vsock"
+            "microVM does not support vhost-vsock"
         );
         anyhow::ensure!(
             !self.nic
-                && self.net.is_empty()
                 && self.mana.is_empty()
                 && !self.gfx
                 && !self.vtl2_gfx
@@ -1542,7 +1789,48 @@ impl Options {
                 && self.imc.is_none()
                 && !self.battery
                 && self.vmgs.is_none(),
-            "microVM ABI version 1 does not expose network, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
+            "microVM does not expose legacy NIC, MANA, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
+        );
+        anyhow::ensure!(
+            self.net.len() <= 1,
+            "microVM permits at most one virtio-net device"
+        );
+        anyhow::ensure!(
+            self.net.is_empty() || self.network_profile == Some(MicrovmNetworkProfileCli::Portable),
+            "microVM --net requires --network-profile portable"
+        );
+        anyhow::ensure!(
+            self.network_profile.is_none()
+                || !self.net.is_empty()
+                || self.restore_snapshot.is_some(),
+            "--network-profile portable requires --net or --restore-snapshot"
+        );
+        anyhow::ensure!(
+            self.net.iter().all(|network| {
+                matches!(network.endpoint, EndpointConfigCli::Microvm(_))
+                    && network.vtl == DeviceVtl::Vtl0
+                    && network.max_queues.is_none()
+                    && !network.underhill
+                    && network.pcie_port.is_none()
+            }),
+            "microVM --net requires a bare IPv4/prefix and does not permit queue, VTL, Underhill, or PCIe modifiers"
+        );
+        if let [network] = self.net.as_slice()
+            && let EndpointConfigCli::Microvm(config) = &network.endpoint
+        {
+            self.microvm_egress_policy(config)?;
+        }
+        anyhow::ensure!(
+            self.net_tap.is_none(),
+            "--net-tap is incompatible with the portable microVM network profile"
+        );
+        anyhow::ensure!(
+            (self.allow_host.is_empty()
+                && self.block_host.is_empty()
+                && self.allow_endpoint.is_empty())
+                || !self.net.is_empty()
+                || self.restore_snapshot.is_some(),
+            "--allow-host, --block-host, and --allow-endpoint require --net or a networked snapshot restore"
         );
         anyhow::ensure!(
             self.cxl_test.is_empty()
@@ -1553,20 +1841,47 @@ impl Options {
                 && self.pcie_remote.is_empty()
                 && self.amd_iommu.is_empty()
                 && self.intel_vtd.is_empty(),
-            "microVM ABI version 1 does not support PCIe or IOMMU devices"
+            "microVM does not support PCIe or IOMMU devices"
         );
         #[cfg(windows)]
         anyhow::ensure!(
             self.device.is_empty() && self.kernel_vmnic.is_empty(),
-            "microVM ABI version 1 does not support assigned devices or kernel VM NICs"
+            "microVM does not support assigned devices or kernel VM NICs"
         );
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
             self.vfio.is_empty() && self.iommu.is_empty(),
-            "microVM ABI version 1 does not support VFIO or IOMMU devices"
+            "microVM does not support VFIO or IOMMU devices"
         );
 
         Ok(())
+    }
+
+    pub(crate) fn microvm_egress_policy(
+        &self,
+        network: &openvmm_defs::config::MicrovmNetworkConfig,
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
+        use net_backend_resources::egress::EgressPolicyMode;
+
+        let mode = if !self.allow_host.is_empty() {
+            EgressPolicyMode::AllowList(self.allow_host.clone())
+        } else if !self.block_host.is_empty() {
+            EgressPolicyMode::BlockList(self.block_host.clone())
+        } else if !self.allow_endpoint.is_empty() {
+            EgressPolicyMode::TcpEndpoints(self.allow_endpoint.clone())
+        } else {
+            EgressPolicyMode::AllowAll
+        };
+        net_backend_resources::egress::EgressPolicy::bind(
+            network.guest_ipv4,
+            network.prefix_length,
+            network.guest_mac,
+            network.derived_gateway_ipv4,
+            mode,
+        )
     }
 }
 
@@ -1604,6 +1919,43 @@ pub struct FsArgsWithOptions {
     pub options: String,
     /// Optional PCIe port name.
     pub pcie_port: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmMountCli {
+    /// Absolute guest mount target.
+    pub guest_target: String,
+    /// Live host directory supplied for this run.
+    pub host_path: PathBuf,
+    /// Snapshot-authoritative access policy.
+    pub access: openvmm_defs::config::MicrovmFilesystemAccess,
+}
+
+impl FromStr for MicrovmMountCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut fields = value.splitn(3, ',');
+        let guest_target = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
+        let host_path = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
+        let access = match fields.next().unwrap_or("ro") {
+            "ro" => openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+            "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
+            mode => anyhow::bail!("invalid microVM mount mode '{mode}'; expected ro or rw"),
+        };
+        openvmm_defs::config::MicrovmFilesystemConfig::new(guest_target.to_owned(), access)?;
+        Ok(Self {
+            guest_target: guest_target.to_owned(),
+            host_path: PathBuf::from(host_path),
+            access,
+        })
+    }
 }
 
 impl FromStr for FsArgsWithOptions {
@@ -1777,7 +2129,9 @@ fn parse_acs_capability_mask(value: &str) -> anyhow::Result<u16> {
 
 fn parse_memory_config(s: &str) -> anyhow::Result<MemoryCli> {
     // Bare shortcut: `--memory 64G` sets only the size.
-    let memory = if !s.contains('=') && !s.contains(',') {
+    let memory = if s.is_empty() {
+        MemoryCli::default()
+    } else if !s.contains('=') && !s.contains(',') {
         MemoryCli {
             size: Some(s.parse::<vmm_cli::MemorySize>()?),
             ..Default::default()
@@ -2000,6 +2354,13 @@ impl FromStr for DiskCliKind {
                     Self::parse_autocache(arg, std::env::var("OPENVMM_AUTO_CACHE_PATH"))?
                 }
                 "prwrap" => DiskCliKind::PersistentReservationsWrapper(Box::new(arg.parse()?)),
+                "delay" => {
+                    let (delay_ms, kind) = arg.split_once(':').context("expected delay_ms:kind")?;
+                    DiskCliKind::DelayDiskWrapper {
+                        delay_ms: delay_ms.parse().context("invalid disk delay")?,
+                        disk: Box::new(kind.parse()?),
+                    }
+                }
                 "file" => {
                     let FileOpts {
                         path,
@@ -2196,6 +2557,38 @@ pub struct DiskCli {
     pub nsid: Option<u32>,
     pub lun: Option<u8>,
     pub relay: Option<(String, Option<u32>)>,
+}
+
+/// A fixed-role microVM sandbox block-device CLI argument.
+#[derive(Clone)]
+pub struct MicrovmSandboxBlockCli {
+    /// The stable guest-visible role.
+    pub role: MicrovmSandboxBlockRole,
+    /// The generic disk backend and access mode.
+    pub disk: DiskCli,
+}
+
+impl FromStr for MicrovmSandboxBlockCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        let (role, disk) = value
+            .split_once(':')
+            .context("expected ROLE:DISK for --microvm-sandbox-block")?;
+        let role = match role {
+            "distro" => MicrovmSandboxBlockRole::Distro,
+            "runtime" => MicrovmSandboxBlockRole::Runtime,
+            "custom" => MicrovmSandboxBlockRole::Custom,
+            "scratch" => MicrovmSandboxBlockRole::Scratch,
+            _ => anyhow::bail!(
+                "unknown microVM sandbox block role '{role}'; expected distro, runtime, custom, or scratch"
+            ),
+        };
+        Ok(Self {
+            role,
+            disk: disk.parse()?,
+        })
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2558,7 +2951,7 @@ impl FromStr for ComSerialConfigCli {
     }
 }
 
-/// (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
+/// (console | stderr | listen=\<path\> | connect=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | connect=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
 #[derive(Clone, Debug, PartialEq)]
 pub enum SerialConfigCli {
     None,
@@ -2567,6 +2960,8 @@ pub enum SerialConfigCli {
     Stderr,
     Pipe(PathBuf),
     Tcp(SocketAddr),
+    ConnectPipe(PathBuf),
+    ConnectTcp(SocketAddr),
     File(PathBuf),
 }
 
@@ -2613,6 +3008,21 @@ impl FromStr for SerialConfigCli {
                 }
                 None => Err(
                     "invalid serial configuration: listen requires a value of tcp:addr or pipe",
+                )?,
+            },
+            "connect" => match first_value {
+                Some(path) => {
+                    if let Some(tcp) = path.strip_prefix("tcp:") {
+                        let addr = tcp
+                            .parse()
+                            .map_err(|err| format!("invalid tcp address: {err}"))?;
+                        SerialConfigCli::ConnectTcp(addr)
+                    } else {
+                        SerialConfigCli::ConnectPipe(path.into())
+                    }
+                }
+                None => Err(
+                    "invalid serial configuration: connect requires a value of tcp:addr or pipe",
                 )?,
             },
             _ => {
@@ -2665,6 +3075,7 @@ pub enum EndpointConfigCli {
     Tap {
         name: String,
     },
+    Microvm(openvmm_defs::config::MicrovmNetworkConfig),
 }
 
 /// Parsed host port forwarding configuration from the CLI.
@@ -2762,6 +3173,12 @@ impl FromStr for EndpointConfigCli {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('/') && !s.contains(':') {
+            return s
+                .parse()
+                .map(EndpointConfigCli::Microvm)
+                .map_err(|error| format!("invalid microVM network: {error}"));
+        }
         let ret = match s.split(':').collect::<Vec<_>>().as_slice() {
             ["none"] => EndpointConfigCli::None,
             ["consomme", rest @ ..] => {
@@ -3955,6 +4372,26 @@ mod tests {
     }
 
     #[test]
+    fn test_microvm_mount_from_str() {
+        let read_only = MicrovmMountCli::from_str("/mnt/share,host").unwrap();
+        assert_eq!(read_only.guest_target, "/mnt/share");
+        assert_eq!(read_only.host_path, PathBuf::from("host"));
+        assert_eq!(
+            read_only.access,
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+        );
+
+        let read_write = MicrovmMountCli::from_str("/srv/data,host,rw").unwrap();
+        assert_eq!(
+            read_write.access,
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+        );
+        assert!(MicrovmMountCli::from_str("relative,host").is_err());
+        assert!(MicrovmMountCli::from_str("/mnt/../escape,host").is_err());
+        assert!(MicrovmMountCli::from_str("/mnt/share,host,write").is_err());
+    }
+
+    #[test]
     fn test_serial_config_from_str() {
         assert_eq!(
             SerialConfigCli::from_str("none").unwrap(),
@@ -4024,11 +4461,26 @@ mod tests {
             _ => panic!("Expected Pipe variant"),
         }
 
+        match SerialConfigCli::from_str("connect=tcp:127.0.0.1:1234").unwrap() {
+            SerialConfigCli::ConnectTcp(addr) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:1234");
+            }
+            _ => panic!("Expected ConnectTcp variant"),
+        }
+
+        match SerialConfigCli::from_str("connect=/path/to/pipe").unwrap() {
+            SerialConfigCli::ConnectPipe(path) => {
+                assert_eq!(path.to_str().unwrap(), "/path/to/pipe");
+            }
+            _ => panic!("Expected ConnectPipe variant"),
+        }
+
         // Test error cases
         assert!(SerialConfigCli::from_str("").is_err());
         assert!(SerialConfigCli::from_str("unknown").is_err());
         assert!(SerialConfigCli::from_str("file").is_err());
         assert!(SerialConfigCli::from_str("listen").is_err());
+        assert!(SerialConfigCli::from_str("connect").is_err());
     }
 
     #[test]
@@ -4175,6 +4627,32 @@ mod tests {
                 assert_eq!(name, "tap0");
             }
             _ => panic!("Expected Tap variant"),
+        }
+
+        match EndpointConfigCli::from_str("10.0.0.2/24").unwrap() {
+            EndpointConfigCli::Microvm(network) => {
+                assert_eq!(network.guest_ipv4, std::net::Ipv4Addr::new(10, 0, 0, 2));
+                assert_eq!(network.prefix_length, 24);
+                assert_eq!(network.netmask(), std::net::Ipv4Addr::new(255, 255, 255, 0));
+                assert_eq!(
+                    network.derived_gateway_ipv4,
+                    std::net::Ipv4Addr::new(10, 0, 0, 1)
+                );
+                assert_eq!(network.guest_mac.to_bytes(), [0x52, 0x54, 0, 0, 0, 2]);
+                assert_eq!(network.gateway_mac.to_bytes(), [0x52, 0x54, 0, 0, 0, 1]);
+            }
+            _ => panic!("Expected microVM network variant"),
+        }
+        for invalid in [
+            "10.0.0.2",
+            "10.0.0.2/0",
+            "10.0.0.2/31",
+            "10.0.0.0/24",
+            "10.0.0.1/24",
+            "10.0.0.255/24",
+            "fd00::2/64",
+        ] {
+            assert!(EndpointConfigCli::from_str(invalid).is_err(), "{invalid}");
         }
 
         // Test error case
@@ -5035,49 +5513,583 @@ mod tests {
 
         let opt = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
         assert_eq!(opt.machine, MachineProfileCli::Microvm);
-        assert_eq!(
-            MachineProfile::from(opt.machine),
-            MachineProfile::Microvm {
-                abi_version: MICROVM_ABI_VERSION_1
-            }
-        );
+        assert_eq!(MachineProfile::from(opt.machine), MachineProfile::Microvm);
 
+        assert!(Options::try_parse_from(["openvmm", "--machine", "microvm-v2"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
     }
 
     #[test]
+    fn test_microvm_processor_validation() {
+        for processors in [1, 2, 4, 8] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--processors",
+                &processors.to_string(),
+            ])
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+        }
+
+        for processors in [0, 3, 5, 16] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--processors",
+                &processors.to_string(),
+            ])
+            .unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
+
+        for restore_processors in [1, 2, 4, 8] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--restore-snapshot",
+                "snapshot",
+                "--restore-processors",
+                &restore_processors.to_string(),
+            ])
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+        }
+        let noncanonical_restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-processors",
+            "3",
+        ])
+        .unwrap();
+        assert!(noncanonical_restore.validate_microvm_options().is_err());
+
+        for args in [
+            vec!["openvmm", "--machine", "microvm", "--vps-per-socket", "1"],
+            vec!["openvmm", "--machine", "microvm", "--smt", "off"],
+            vec!["openvmm", "--machine", "microvm", "--apic-id-offset", "1"],
+            vec!["openvmm", "--machine", "microvm", "--x2apic", "on"],
+            vec!["openvmm", "--machine", "microvm", "--numa", "size=128M"],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
+    }
+
+    #[test]
+    fn test_microvm_memory_capacity_and_restore_target_parsing() {
+        let capture = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--memory",
+            "512M",
+            "--snapshot-destination",
+            "snapshot",
+            "--memory-capacity",
+            "2G",
+        ])
+        .unwrap();
+        capture.validate_microvm_options().unwrap();
+        assert_eq!(capture.memory_capacity.unwrap().0, 2 * 1024 * 1024 * 1024);
+
+        let restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-memory",
+            "512M",
+        ])
+        .unwrap();
+        restore.validate_microvm_options().unwrap();
+        assert_eq!(restore.restore_memory.unwrap().0, 512 * 1024 * 1024);
+
+        assert!(
+            Options::try_parse_from(
+                ["openvmm", "--machine", "microvm", "--memory-capacity", "2G",]
+            )
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from(["openvmm", "--machine", "microvm", "--restore-memory", "1G",])
+                .is_err()
+        );
+
+        let unaligned = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--memory",
+            "513M",
+            "--snapshot-destination",
+            "snapshot",
+            "--memory-capacity",
+            "2G",
+        ])
+        .unwrap();
+        assert!(unaligned.validate_microvm_options().is_err());
+    }
+
+    #[test]
+    fn test_microvm_sandbox_block_parser_and_validation() {
+        let valid = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "runtime:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "custom:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        valid.validate_microvm_options().unwrap();
+
+        for args in [
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-sandbox-block",
+                "distro:mem:1M",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M,ro",
+            ],
+            vec!["openvmm", "--machine", "microvm", "--virtio-blk", "mem:1M"],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
+    }
+
+    #[test]
+    fn test_microvm_snapshot_tier_is_explicit() {
+        for tier in ["platform", "workload-start", "instance-checkpoint"] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                tier,
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ])
+            .unwrap();
+            assert_eq!(options.restore_gate_timeout_ms, 60_000);
+            options.validate_microvm_options().unwrap();
+        }
+
+        let missing = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--snapshot-destination",
+            "snapshot",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        assert!(missing.validate_microvm_options().is_err());
+
+        let blockless = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--processors",
+            "2",
+            "--snapshot-destination",
+            "snapshot",
+        ])
+        .unwrap();
+        blockless.validate_microvm_options().unwrap();
+
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--snapshot-tier",
+                "platform",
+            ])
+            .is_err()
+        );
+
+        let zero_timeout = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-gate-timeout-ms",
+            "0",
+        ])
+        .unwrap();
+        assert!(zero_timeout.validate_microvm_options().is_err());
+    }
+
+    #[test]
     fn test_microvm_command_line_is_owned_and_bounded() {
         assert_eq!(
-            build_microvm_command_line(&[]).unwrap(),
+            build_microvm_command_line(&[], false).unwrap(),
             MICROVM_BASE_COMMAND_LINE
         );
         assert_eq!(
-            build_microvm_command_line(&["foo=bar".into()]).unwrap(),
+            build_microvm_command_line(&["foo=bar".into()], false).unwrap(),
             format!("{MICROVM_BASE_COMMAND_LINE} foo=bar")
         );
+        assert_eq!(
+            build_microvm_command_line(&[], true).unwrap(),
+            MICROVM_CONSOLE_COMMAND_LINE
+        );
 
-        for reserved in ["earlycon=uart", "console=ttyS0", "virtio_mmio.device=bad"] {
-            assert!(build_microvm_command_line(&[reserved.into()]).is_err());
+        let mut with_devices = build_microvm_command_line(&[], true).unwrap();
+        let blocks = [
+            openvmm_defs::config::MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Distro,
+                read_only: true,
+            },
+            openvmm_defs::config::MicrovmSandboxBlockConfig {
+                role: MicrovmSandboxBlockRole::Scratch,
+                read_only: false,
+            },
+        ];
+        append_microvm_virtio_discovery(&mut with_devices, None, false, None, true, &blocks)
+            .unwrap();
+        assert_eq!(
+            with_devices,
+            format!(
+                "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0003000:4 virtio_mmio.device=0x1000@0xd0006000:11"
+            )
+        );
+
+        let network = "10.0.0.2/24".parse().unwrap();
+        let mut with_network = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_network,
+            Some((
+                &network,
+                openvmm_defs::config::MICROVM_VIRTIO_NET_KVM_IRQ,
+                false,
+            )),
+            false,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            with_network,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0000000:10 virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1"
+            )
+        );
+        let mut with_whp_network = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_whp_network,
+            Some((
+                &network,
+                openvmm_defs::config::MICROVM_VIRTIO_NET_WHP_IRQ,
+                true,
+            )),
+            false,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(with_whp_network.ends_with("virtnet_dns=10.0.0.1"));
+
+        let filesystem = openvmm_defs::config::MicrovmFilesystemConfig::new(
+            "/mnt/share".to_owned(),
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+        )
+        .unwrap();
+        let mut with_filesystem = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_filesystem,
+            None,
+            true,
+            Some(&filesystem),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            with_filesystem,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0001000:6 virtfs_dir=/mnt/share virtfs_tag=microvm virtfs_mode=ro"
+            )
+        );
+
+        for reserved in [
+            "earlycon=uart",
+            "console=ttyS0",
+            "virtio_mmio.device=bad",
+            "virtnet_ip=10.0.0.3",
+            "virtnet_mask=255.255.255.0",
+            "virtnet_gw=10.0.0.1",
+            "virtnet_dns=10.0.0.1",
+            "virtfs_dir=/other",
+            "virtfs_tag=other",
+            "virtfs_mode=rw",
+        ] {
+            assert!(build_microvm_command_line(&[reserved.into()], false).is_err());
         }
-        assert!(build_microvm_command_line(&["foo=bar\0baz".into()]).is_err());
-        assert!(build_microvm_command_line(&["x".repeat(MICROVM_COMMAND_LINE_MAX_SIZE)]).is_err());
+        assert!(build_microvm_command_line(&["foo=bar\0baz".into()], false).is_err());
+        assert!(
+            build_microvm_command_line(&["x".repeat(MICROVM_COMMAND_LINE_MAX_SIZE)], false)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_microvm_preflight_rejects_unsupported_combinations() {
         let valid = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
         valid.validate_microvm_options().unwrap();
+        if cfg!(target_os = "linux") {
+            let valid_mshv = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--hypervisor",
+                "mshv",
+            ])
+            .unwrap();
+            valid_mshv.validate_microvm_options().unwrap();
+        }
+        let valid_console = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "listen=tcp:127.0.0.1:5555",
+        ])
+        .unwrap();
+        valid_console.validate_microvm_options().unwrap();
+        let valid_network = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+        ])
+        .unwrap();
+        valid_network.validate_microvm_options().unwrap();
+        let valid_filesystem = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--mount",
+            "/mnt/share,host,ro",
+        ])
+        .unwrap();
+        valid_filesystem.validate_microvm_options().unwrap();
 
         for args in [
-            vec!["openvmm", "--machine", "microvm", "--processors", "2"],
+            vec!["openvmm", "--machine", "microvm", "--net", "10.0.0.2/24"],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--network-profile",
+                "portable",
+                "--net-tap",
+                "tap0",
+            ],
             vec!["openvmm", "--machine", "microvm", "--uefi"],
-            vec!["openvmm", "--machine", "microvm", "--hypervisor", "mshv"],
+            vec!["openvmm", "--machine", "microvm", "--hypervisor", "unknown"],
             vec!["openvmm", "--machine", "microvm", "--virtio-rng"],
             vec!["openvmm", "--machine", "microvm", "--com1", "none"],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "stderr",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "listen=tcp:127.0.0.1:5555",
+                "--virtio-console-pcie-port",
+                "port0",
+            ],
+            vec!["openvmm", "--machine", "microvm", "--net", "consomme"],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--net",
+                "10.0.1.2/24",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "queues=1:10.0.0.2/24",
+            ],
         ] {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
+        }
+    }
+
+    #[test]
+    fn test_microvm_egress_policy_is_typed_and_canonical() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--allow-host",
+            "192.168.1.9/24",
+            "--allow-host",
+            "10.0.0.1",
+            "--allow-host",
+            "192.168.1.0/24",
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = options.microvm_egress_policy(&network).unwrap();
+        let net_backend_resources::egress::EgressPolicyMode::AllowList(rules) = policy.mode()
+        else {
+            panic!("expected allow-list policy")
+        };
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].network(), std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(rules[1].network(), std::net::Ipv4Addr::new(192, 168, 1, 0));
+        assert!(policy.allows_gateway_dns());
+
+        let endpoint = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--allow-endpoint",
+            "10.0.0.9:8443",
+            "--allow-endpoint",
+            "192.0.2.7:443",
+            "--allow-endpoint",
+            "10.0.0.9:443",
+        ])
+        .unwrap();
+        endpoint.validate_microvm_options().unwrap();
+        let endpoint_policy = endpoint.microvm_egress_policy(&network).unwrap();
+        assert_eq!(
+            endpoint_policy.next_hops(),
+            &[
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                std::net::Ipv4Addr::new(10, 0, 0, 9),
+            ]
+        );
+
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--allow-host",
+                "192.0.2.0/24",
+                "--block-host",
+                "198.51.100.1",
+            ])
+            .is_err()
+        );
+        let missing_network = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--allow-host",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        assert!(missing_network.validate_microvm_options().is_err());
+        let standard =
+            Options::try_parse_from(["openvmm", "--allow-endpoint", "192.0.2.7:443"]).unwrap();
+        assert!(standard.validate_microvm_options().is_err());
+    }
+
+    #[test]
+    fn test_microvm_endpoint_policy_rejects_invalid_identities_before_resources() {
+        for address in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "10.0.0.0",
+            "10.0.0.2",
+            "10.0.0.255",
+        ] {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--allow-endpoint",
+                &format!("{address}:443"),
+            ])
+            .unwrap();
+            assert!(
+                options.validate_microvm_options().is_err(),
+                "invalid endpoint address {address} was accepted"
+            );
         }
     }
 

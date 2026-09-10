@@ -221,6 +221,8 @@ pub enum AcpiArchConfig {
         pm_base: u16,
         /// ACPI IRQ number.
         acpi_irq: u32,
+        /// Legacy IRQs that must be described as active-high, level-triggered.
+        level_triggered_irqs: &'static [u32],
         /// x86 IOMMU ACPI table configuration. Generates an IVRS (AMD) or
         /// DMAR (Intel VT-d) table when set. At most one x86 IOMMU type
         /// is active per VM.
@@ -545,6 +547,7 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
         if let AcpiArchConfig::X86 {
             with_ioapic,
             acpi_irq,
+            level_triggered_irqs,
             with_pit,
             ..
         } = self.arch
@@ -575,6 +578,18 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
                 // IO-APIC IRQ0 is interrupt 2, which the PIT is attached to.
                 madt_extra.extend_from_slice(
                     acpi_spec::madt::MadtInterruptSourceOverride::new(0, 2, None, None).as_bytes(),
+                );
+            }
+
+            for &irq in level_triggered_irqs {
+                madt_extra.extend_from_slice(
+                    acpi_spec::madt::MadtInterruptSourceOverride::new(
+                        irq.try_into().expect("legacy IRQ should be in range"),
+                        irq,
+                        Some(InterruptPolarity::ActiveHigh),
+                        Some(InterruptTriggerMode::Level),
+                    )
+                    .as_bytes(),
                 );
             }
         }
@@ -1422,6 +1437,7 @@ mod test {
     use virt::VpIndex;
     use virt::VpInfo;
     use vm_topology::processor::TopologyBuilder;
+    use vm_topology::processor::x86::X2ApicState;
     use vm_topology::processor::x86::X86VpInfo;
 
     const KB: u64 = 1024;
@@ -1457,6 +1473,7 @@ mod test {
                 with_psp: false,
                 pm_base: 1234,
                 acpi_irq: 2,
+                level_triggered_irqs: &[],
                 iommu: None,
             },
         }
@@ -1501,6 +1518,75 @@ mod test {
         assert_eq!(
             entries,
             apic_ids.iter().map(|e| Some(*e)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_microvm_smp_madt_matches_pvh_mp_table() {
+        for processor_count in [1, 2, 4, 8] {
+            let mut topology_builder = TopologyBuilder::new_x86();
+            topology_builder
+                .vps_per_socket(processor_count)
+                .smt_enabled(false)
+                .x2apic(X2ApicState::Unsupported);
+            let topology = topology_builder.build(processor_count).unwrap();
+            let apic_ids = topology.vps_arch().map(|vp| vp.apic_id).collect::<Vec<_>>();
+
+            let mem = new_mem();
+            let pcie = vec![];
+            let madt = new_builder(&mem, &topology, &pcie).build_madt();
+            let madt_ids = MadtParser::new(&madt)
+                .unwrap()
+                .parse_apic_ids()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+
+            let mp_table = loader::pvh::build_mp_config_table(&loader::pvh::BootConfig {
+                apic_ids: &apic_ids,
+                level_triggered_irqs: &[],
+                reserved_memory_ranges: &[],
+            })
+            .unwrap();
+            let mp_ids = mp_table[44..44 + apic_ids.len() * 20]
+                .chunks_exact(20)
+                .map(|entry| {
+                    assert_eq!(entry[0], 0);
+                    u32::from(entry[1])
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(mp_ids, apic_ids);
+            assert_eq!(madt_ids, apic_ids);
+        }
+    }
+
+    #[test]
+    fn test_madt_level_triggered_irq_override() {
+        let mem = new_mem();
+        let topology = TopologyBuilder::new_x86().build(1).unwrap();
+        let pcie = vec![];
+        let mut builder = new_builder(&mem, &topology, &pcie);
+        let AcpiArchConfig::X86 {
+            level_triggered_irqs,
+            ..
+        } = &mut builder.arch
+        else {
+            unreachable!()
+        };
+        *level_triggered_irqs = &[5];
+
+        let madt = builder.build_madt();
+        let expected = acpi_spec::madt::MadtInterruptSourceOverride::new(
+            5,
+            5,
+            Some(InterruptPolarity::ActiveHigh),
+            Some(InterruptTriggerMode::Level),
+        );
+        assert!(
+            madt.windows(expected.as_bytes().len())
+                .any(|bytes| bytes == expected.as_bytes())
         );
     }
 

@@ -19,6 +19,7 @@ use mesh::rpc::RpcSend;
 use mesh_worker::WorkerEvent;
 use mesh_worker::WorkerHandle;
 use openvmm_defs::config::MachineProfile;
+use openvmm_defs::rpc::SnapshotQuiesceError;
 use openvmm_defs::rpc::VmRpc;
 use std::path::Path;
 use std::path::PathBuf;
@@ -124,11 +125,38 @@ pub struct VmController {
     pub(crate) paravisor_diag: Option<Arc<diag_client::DiagClient>>,
     pub(crate) igvm_path: Option<PathBuf>,
     pub(crate) memory_backing_file: Option<PathBuf>,
+    pub(crate) snapshot_memory_handle: Option<std::fs::File>,
     pub(crate) memory: u64,
+    pub(crate) memory_capacity: Option<u64>,
     pub(crate) processors: u32,
     pub(crate) log_file: Option<PathBuf>,
     pub(crate) crash_dump_path: Option<PathBuf>,
+    pub(crate) snapshot_requests:
+        Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
+    pub(crate) snapshot_destination: Option<PathBuf>,
+    pub(crate) snapshot_tier: Option<crate::cli_args::SnapshotTierCli>,
+    pub(crate) snapshot_quiesce_timeout: std::time::Duration,
+    pub(crate) source_hypervisor: String,
+    pub(crate) effective_command_line: Option<String>,
+    pub(crate) microvm_sandbox_block_sources:
+        Vec<crate::storage_builder::MicrovmSandboxBlockSource>,
+    pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
+    pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+    pub(crate) microvm_filesystem_slot: bool,
+    pub(crate) microvm_filesystem: Option<openvmm_defs::config::MicrovmFilesystemConfig>,
+    pub(crate) microvm_filesystem_root_path: Option<PathBuf>,
+    pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
+    pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
+    pub(crate) _private_scratch_dir: Option<tempfile::TempDir>,
     pub(crate) guest_power_actions: GuestPowerActions,
+}
+
+enum GuestSnapshotAction {
+    Continue,
+    Terminate { exit_code: i32 },
 }
 
 /// The action to take for each guest power event.
@@ -186,6 +214,7 @@ impl VmController {
             Worker(WorkerEvent),
             VncWorker(WorkerEvent),
             Halt(HaltReason),
+            SnapshotRequest(chipset_resources::microvm::MicrovmSnapshotScratchPolicy),
         }
 
         let mut quit = false;
@@ -207,8 +236,11 @@ impl VmController {
                     .flatten()
                     .map(Event::VncWorker);
                 let halt = (&mut notify_recv).map(Event::Halt);
+                let snapshot_request = futures::stream::iter(self.snapshot_requests.as_mut())
+                    .flatten()
+                    .map(Event::SnapshotRequest);
 
-                (rpc.into_stream(), vm, vnc, halt)
+                (rpc.into_stream(), vm, vnc, halt, snapshot_request)
                     .merge()
                     .next()
                     .await
@@ -234,7 +266,9 @@ impl VmController {
                         } else {
                             tracing::error!("vm worker unexpectedly stopped");
                         }
-                        event_send.send(VmControllerEvent::WorkerStopped { error: None });
+                        event_send.send(VmControllerEvent::WorkerStopped {
+                            error: (!quit).then(|| "VM worker unexpectedly stopped".to_owned()),
+                        });
                         break;
                     }
                     WorkerEvent::Failed(err) => {
@@ -334,6 +368,13 @@ impl VmController {
                         }
                     }
                 }
+                Event::SnapshotRequest(scratch_policy) => {
+                    let action = self.handle_guest_snapshot_request(scratch_policy).await;
+                    if let GuestSnapshotAction::Terminate { exit_code } = action {
+                        event_send.send(VmControllerEvent::ExitRequested { code: exit_code });
+                        break;
+                    }
+                }
             }
         }
 
@@ -428,8 +469,8 @@ impl VmController {
     }
 
     async fn handle_restart(&mut self) -> anyhow::Result<()> {
-        if matches!(self.machine_profile, MachineProfile::Microvm { .. }) {
-            anyhow::bail!("worker restart is unavailable for microVM ABI version 1");
+        if self.machine_profile == MachineProfile::Microvm {
+            anyhow::bail!("worker restart is unavailable for microVM");
         }
         let vm_host = self
             .mesh
@@ -473,8 +514,8 @@ impl VmController {
     }
 
     async fn handle_save_snapshot(&self, dir: &Path) -> anyhow::Result<()> {
-        if matches!(self.machine_profile, MachineProfile::Microvm { .. }) {
-            anyhow::bail!("disk snapshots are unavailable for microVM ABI version 1");
+        if self.machine_profile == MachineProfile::Microvm {
+            anyhow::bail!("disk snapshots are unavailable for microVM");
         }
         let memory_file_path = self
             .memory_backing_file
@@ -512,6 +553,16 @@ impl VmController {
             vp_count: self.processors,
             page_size: crate::system_page_size(),
             architecture: crate::GUEST_ARCH.to_string(),
+            state_size_bytes: 0,
+            state_sha256: Vec::new(),
+            memory_sha256: Vec::new(),
+            machine_contract: None,
+            format_magic: openvmm_helpers::snapshot::SNAPSHOT_FORMAT_MAGIC.to_vec(),
+            saved_state_schema_version: openvmm_helpers::snapshot::SAVED_STATE_SCHEMA_VERSION,
+            saved_state_root_type: openvmm_helpers::snapshot::SAVED_STATE_ROOT_TYPE.to_owned(),
+            snapshot_tier: String::new(),
+            restore_policy: String::new(),
+            consumed_config_sections: 0,
         };
 
         // Write snapshot directory.
@@ -524,6 +575,373 @@ impl VmController {
 
         // VM stays paused. Do NOT resume.
         Ok(())
+    }
+
+    async fn handle_guest_snapshot_request(
+        &mut self,
+        scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
+    ) -> GuestSnapshotAction {
+        let Some(destination) = self.snapshot_destination.clone() else {
+            tracelimit::warn_ratelimited!(
+                "ignoring microVM snapshot request because no destination is configured"
+            );
+            return self.release_snapshot_boundary_without_capture().await;
+        };
+
+        let preflight = (|| -> anyhow::Result<String> {
+            anyhow::ensure!(
+                self.machine_profile == MachineProfile::Microvm,
+                "guest-requested snapshot capture requires the microVM profile"
+            );
+            anyhow::ensure!(
+                matches!(self.source_hypervisor.as_str(), "kvm" | "mshv" | "whp"),
+                "microVM snapshot source backend must be KVM, MSHV, or WHP"
+            );
+            anyhow::ensure!(
+                self.microvm_sandbox_block_sources.is_empty()
+                    || (self.microvm_sandbox_block_sources.len() >= 2
+                        && self
+                            .microvm_sandbox_block_sources
+                            .last()
+                            .is_some_and(|source| {
+                                source.role
+                                    == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                            })),
+                "microVM snapshot requires either no blocks or at least one lower layer and scratch"
+            );
+            if self.microvm_sandbox_block_sources.is_empty() {
+                anyhow::ensure!(
+                    self.snapshot_tier.is_none(),
+                    "blockless microVM snapshot capture does not use a tier"
+                );
+            } else {
+                let tier = self
+                    .snapshot_tier
+                    .context("microVM sandbox snapshot capture requires a tier")?;
+                let paired_scratch = scratch_policy
+                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
+                anyhow::ensure!(
+                    paired_scratch == tier.requires_paired_scratch(),
+                    "snapshot tier '{}' requires {} scratch capture",
+                    tier.manifest_name(),
+                    if tier.requires_paired_scratch() {
+                        "paired"
+                    } else {
+                        "fresh"
+                    }
+                );
+            }
+            anyhow::ensure!(
+                fs_err::symlink_metadata(&destination)
+                    .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
+                "snapshot destination already exists or cannot be inspected: {}",
+                destination.display()
+            );
+            let memory_path = self
+                .memory_backing_file
+                .clone()
+                .context("microVM snapshot capture requires file-backed RAM")?;
+            let memory_file = self
+                .snapshot_memory_handle
+                .as_ref()
+                .context("microVM snapshot capture lost its exact RAM handle")?;
+            anyhow::ensure!(
+                memory_file
+                    .metadata()
+                    .context("failed to inspect snapshot RAM handle")?
+                    .len()
+                    == self.memory,
+                "snapshot RAM handle size does not match the VM"
+            );
+            if let Some(file) = &self.snapshot_memory_file {
+                anyhow::ensure!(
+                    file.path() == memory_path,
+                    "automatic snapshot memory backing path changed unexpectedly"
+                );
+            }
+            let command_line = self
+                .effective_command_line
+                .clone()
+                .context("microVM snapshot capture requires an effective PVH command line")?;
+            Ok(command_line)
+        })();
+        let command_line = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                tracing::error!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "microVM snapshot preflight failed; guest continues"
+                );
+                return self.release_snapshot_boundary_without_capture().await;
+            }
+        };
+
+        let response = match self
+            .vm_rpc
+            .call(VmRpc::QuiesceForSnapshot, self.snapshot_quiesce_timeout)
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(SnapshotQuiesceError::Rejected(error))) => {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    "microVM snapshot request was rejected; guest continues"
+                );
+                return self.release_snapshot_boundary_without_capture().await;
+            }
+            Ok(Err(SnapshotQuiesceError::RollbackSafe(error))) => {
+                return self.rollback_failed_guest_snapshot(error.into()).await;
+            }
+            Ok(Err(SnapshotQuiesceError::Uncertain(error))) => {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    "microVM snapshot quiesce left uncertain state; terminating source"
+                );
+                return GuestSnapshotAction::Terminate { exit_code: 1 };
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    "lost VM worker during snapshot quiesce; terminating source"
+                );
+                return GuestSnapshotAction::Terminate { exit_code: 1 };
+            }
+        };
+
+        let result = (|| -> anyhow::Result<()> {
+            let network = self
+                .microvm_network
+                .as_ref()
+                .zip(self.microvm_egress_policy.as_ref())
+                .zip(self.microvm_network_attachment.clone())
+                .map(|((network, policy), attachment)| (network, policy, attachment));
+            let filesystem = self
+                .microvm_filesystem
+                .as_ref()
+                .zip(self.microvm_filesystem_root_path.as_deref())
+                .zip(self.microvm_filesystem_attachment.clone())
+                .map(|((filesystem, root_path), attachment)| (filesystem, root_path, attachment));
+            let mut blocks = crate::storage_builder::snapshot_block_contract(
+                &self.microvm_sandbox_block_sources,
+                scratch_policy,
+            )?;
+            if self.snapshot_tier == Some(crate::cli_args::SnapshotTierCli::Platform) {
+                for block in blocks.iter_mut().filter(|block| block.read_only) {
+                    block.identity_kind = "unbound".to_owned();
+                    block.identity.clear();
+                }
+            }
+            let machine_contract = openvmm_helpers::snapshot::microvm_machine_contract(
+                &self.source_hypervisor,
+                command_line,
+                network,
+                self.microvm_filesystem_slot,
+                filesystem,
+                self.microvm_console_attachment.clone(),
+                blocks,
+                self.processors,
+                self.memory,
+                self.memory_capacity,
+                response.state_unit_names,
+                response.capture_wall_clock,
+                response.tsc_frequency_hz,
+                Some(response.apic_frequency_hz),
+                response.cpu_contract,
+            )?;
+            let manifest = openvmm_helpers::snapshot::SnapshotManifest {
+                version: openvmm_helpers::snapshot::MANIFEST_VERSION,
+                created_at: std::time::SystemTime::now().into(),
+                openvmm_version: env!("CARGO_PKG_VERSION").to_owned(),
+                memory_size_bytes: self.memory,
+                vp_count: self.processors,
+                page_size: crate::system_page_size(),
+                architecture: crate::GUEST_ARCH.to_owned(),
+                state_size_bytes: 0,
+                state_sha256: Vec::new(),
+                memory_sha256: Vec::new(),
+                machine_contract: Some(machine_contract),
+                format_magic: openvmm_helpers::snapshot::SNAPSHOT_FORMAT_MAGIC.to_vec(),
+                saved_state_schema_version: openvmm_helpers::snapshot::SAVED_STATE_SCHEMA_VERSION,
+                saved_state_root_type: openvmm_helpers::snapshot::SAVED_STATE_ROOT_TYPE.to_owned(),
+                snapshot_tier: self
+                    .snapshot_tier
+                    .map(crate::cli_args::SnapshotTierCli::manifest_name)
+                    .unwrap_or_default()
+                    .to_owned(),
+                restore_policy: self
+                    .snapshot_tier
+                    .map(crate::cli_args::SnapshotTierCli::restore_policy)
+                    .unwrap_or_default()
+                    .to_owned(),
+                consumed_config_sections: match self.snapshot_tier {
+                    Some(crate::cli_args::SnapshotTierCli::Platform) => {
+                        openvmm_helpers::snapshot::SNAPSHOT_CONFIG_INVARIANTS
+                    }
+                    Some(
+                        crate::cli_args::SnapshotTierCli::WorkloadStart
+                        | crate::cli_args::SnapshotTierCli::InstanceCheckpoint,
+                    ) => {
+                        openvmm_helpers::snapshot::SNAPSHOT_CONFIG_INVARIANTS
+                            | openvmm_helpers::snapshot::SNAPSHOT_CONFIG_IMAGE_BINDING
+                            | openvmm_helpers::snapshot::SNAPSHOT_CONFIG_SANDBOX
+                    }
+                    None => 0,
+                },
+            };
+            let saved_state_bytes = mesh::payload::encode(response.saved_state);
+            let memory_file = self
+                .snapshot_memory_handle
+                .as_ref()
+                .context("microVM snapshot capture lost its exact RAM handle")?;
+            let memory_handle_flush = openvmm_defs::profile::ProfileSpan::start();
+            memory_file
+                .sync_all()
+                .context("failed to flush snapshot RAM handle")?;
+            memory_handle_flush.complete(
+                "capture",
+                "memory_handle_flush",
+                openvmm_defs::profile::ProfileCounters {
+                    logical_bytes: Some(self.memory),
+                    ..Default::default()
+                },
+            );
+            let scratch_file = (!self.microvm_sandbox_block_sources.is_empty()
+                && scratch_policy
+                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired)
+                .then(|| {
+                    self.microvm_sandbox_block_sources
+                        .iter()
+                        .find(|source| {
+                            source.role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch
+                        })
+                        .map(|source| &source.file)
+                        .context("paired snapshot lost its scratch backing handle")
+                })
+                .transpose()?;
+            let publication = openvmm_defs::profile::ProfileSpan::start();
+            let write_result = if self.snapshot_memory_file.is_some() {
+                openvmm_helpers::snapshot::write_snapshot_from_owned_memory_and_scratch_files(
+                    &destination,
+                    &manifest,
+                    &saved_state_bytes,
+                    memory_file,
+                    scratch_file,
+                )
+            } else {
+                openvmm_helpers::snapshot::write_snapshot_from_memory_and_scratch_files(
+                    &destination,
+                    &manifest,
+                    &saved_state_bytes,
+                    memory_file,
+                    scratch_file,
+                )
+            };
+            if write_result.is_ok() {
+                publication.complete_milestone(
+                    "capture",
+                    "publication",
+                    openvmm_defs::profile::ProfileCounters {
+                        logical_bytes: Some(self.memory),
+                        ..Default::default()
+                    },
+                );
+            }
+            write_result.map_err(anyhow::Error::new)
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Some(cleanup) = self.microvm_console_socket_cleanup.take()
+                    && let Err(error) = cleanup.remove_if_owned()
+                {
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot committed but the source console socket could not be removed"
+                    );
+                    return GuestSnapshotAction::Terminate { exit_code: 1 };
+                }
+                tracing::info!(
+                    path = %destination.display(),
+                    "microVM snapshot committed; terminating source process"
+                );
+                GuestSnapshotAction::Terminate { exit_code: 0 }
+            }
+            Err(error) => {
+                let write_error =
+                    error.downcast_ref::<openvmm_helpers::snapshot::SnapshotWriteError>();
+                if write_error.is_some_and(|error| error.is_committed()) {
+                    if let Some(cleanup) = self.microvm_console_socket_cleanup.take()
+                        && let Err(cleanup_error) = cleanup.remove_if_owned()
+                    {
+                        tracing::error!(
+                            error = cleanup_error.as_ref() as &dyn std::error::Error,
+                            "committed snapshot console socket could not be removed"
+                        );
+                    }
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        path = %destination.display(),
+                        "snapshot committed but final durability reporting failed; terminating source"
+                    );
+                    GuestSnapshotAction::Terminate { exit_code: 1 }
+                } else if write_error.is_some_and(|error| !error.is_rollback_safe()) {
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot failed before commit but automatic RAM alias cleanup is uncertain; terminating source"
+                    );
+                    GuestSnapshotAction::Terminate { exit_code: 1 }
+                } else {
+                    self.rollback_failed_guest_snapshot(error).await
+                }
+            }
+        }
+    }
+
+    async fn rollback_failed_guest_snapshot(
+        &mut self,
+        error: anyhow::Error,
+    ) -> GuestSnapshotAction {
+        tracing::error!(
+            error = error.as_ref() as &dyn std::error::Error,
+            "microVM snapshot failed before commit; attempting rollback"
+        );
+        match self
+            .vm_rpc
+            .call_failable(
+                VmRpc::ResumeAfterFailedSnapshot,
+                self.snapshot_quiesce_timeout,
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!("microVM snapshot rollback succeeded; guest resumed");
+                GuestSnapshotAction::Continue
+            }
+            Err(rollback_error) => {
+                tracing::error!(
+                    error = &rollback_error as &dyn std::error::Error,
+                    "microVM snapshot rollback failed; terminating source"
+                );
+                GuestSnapshotAction::Terminate { exit_code: 1 }
+            }
+        }
+    }
+
+    async fn release_snapshot_boundary_without_capture(&mut self) -> GuestSnapshotAction {
+        match self
+            .vm_rpc
+            .call_failable(VmRpc::ReleaseSnapshotBoundary, ())
+            .await
+        {
+            Ok(()) => GuestSnapshotAction::Continue,
+            Err(error) => {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    "failed to release microVM snapshot boundary; terminating source"
+                );
+                GuestSnapshotAction::Terminate { exit_code: 1 }
+            }
+        }
     }
 
     async fn handle_dump_state(&self, path: &Path) -> anyhow::Result<()> {

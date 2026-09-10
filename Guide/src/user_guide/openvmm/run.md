@@ -37,6 +37,63 @@ To run these examples using a pre-compiled copy of OpenVMM, swap `cargo run
 --` with `/path/to/openvmm`.
 ```
 
+### microVM sandbox block devices
+
+`--machine microvm` is the only microVM profile. It assigns up to three
+read-only lower layers and one writable scratch device to fixed virtio-mmio
+locations:
+
+| Role | Access | MMIO address | IRQ |
+| --- | --- | ---: | ---: |
+| `distro` | read-only | `0xd0003000` | 4 |
+| `runtime` | read-only | `0xd0004000` | 12 |
+| `custom` | read-only | `0xd0005000` | 9 |
+| `scratch` | writable | `0xd0006000` | 11 |
+
+Use `--microvm-sandbox-block ROLE:DISK`, in the order shown. Lower-layer
+roles require the normal disk `,ro` option and a non-empty topology must end
+with `scratch`; ordinary `--virtio-blk` is intentionally rejected.
+For example:
+
+```shell
+openvmm --machine microvm --kernel vmlinux --initrd initramfs.cpio.gz \
+  --microvm-sandbox-block distro:file:distro.erofs,ro \
+  --microvm-sandbox-block runtime:file:runtime.erofs,ro \
+  --microvm-sandbox-block custom:file:custom.erofs,ro \
+  --microvm-sandbox-block scratch:file:scratch.img
+```
+
+Capture and restore support cached regular raw files. Capture records
+the role, access mode, exact geometry, and SHA-256 of every read-only layer. A
+normal snapshot request pairs the writable scratch as `scratch.img`; restore
+accepts the read-only layer arguments again and creates a private scratch copy
+from that artifact. A pre-mount request may select fresh-scratch policy instead,
+in which case restore requires a new writable scratch file of matching size.
+
+### microVM deterministic SMP
+
+`--machine microvm --processors N` selects the microVM machine.
+`N` must be exactly `1`, `2`, `4`, or `8`. The guest topology is independent
+of the host: one socket, one die, `N` cores, one thread per core, no SMT or
+NUMA, xAPIC mode, and contiguous APIC IDs `0..N-1`; APIC ID 0 is the BSP.
+Custom socket, SMT, APIC, x2APIC, and NUMA options are rejected.
+
+The microVM uses fixed virtio device slots and sandbox block roles. Its
+persisted ABI and Xen PVH layout values remain 2: the MP table still begins at
+`0x400`, while
+the boot GDT moves to `0x800` so the eight-processor table cannot overlap it.
+The MP table and ACPI MADT are generated from the same canonical topology.
+ABI and layout value 1 snapshots are rejected.
+
+Snapshots record the ABI version, processor count, full topology, APIC IDs,
+and PVH layout version. Restore requires an exact match before any VP starts.
+For example:
+
+```shell
+openvmm --machine microvm --processors 8 \
+  --kernel vmlinux --initrd initramfs.cpio.gz
+```
+
 ~~~admonish tip title="UEFI firmware required when running outside cargo"
 When running via `cargo run`, environment variables in `.cargo/config.toml`
 automatically point OpenVMM to the `mu_msvm` UEFI firmware (`MSVM.fd`)

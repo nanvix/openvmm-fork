@@ -275,7 +275,6 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
         };
         let events = self.kvm().get_vcpu_events()?;
 
-        // N.B. KVM has no way to get back the pending extint vector.
         let event = if events.exception.pending != 0 {
             Some(vp::PendingEvent::Exception {
                 vector: events.exception.nr,
@@ -288,7 +287,10 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
                 },
             })
         } else {
-            None
+            self.vp
+                .runner
+                .pending_extint()
+                .map(|vector| vp::PendingEvent::ExtInt { vector })
         };
 
         let interruption = if events.exception.injected != 0 {
@@ -386,9 +388,7 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
                 let _ = parameter;
             }
             Some(vp::PendingEvent::ExtInt { vector }) => {
-                // N.B. KVM has no way to clear a pending (but non-injected)
-                //      extint interrupt.
-                self.kvm().interrupt(vector.into())?;
+                self.vp.runner.restore_pending_extint(vector)?;
             }
             None => {}
         }
@@ -527,6 +527,14 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
         self.set_register_state(tsc)
     }
 
+    fn tsc_deadline(&mut self) -> Result<vp::TscDeadline, Self::Error> {
+        self.get_register_state()
+    }
+
+    fn set_tsc_deadline(&mut self, value: &vp::TscDeadline) -> Result<(), Self::Error> {
+        self.set_register_state(value)
+    }
+
     fn cet(&mut self) -> Result<vp::Cet, Self::Error> {
         self.get_register_state()
     }
@@ -556,11 +564,41 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
     }
 
     fn synic_msrs(&mut self) -> Result<vp::SyntheticMsrs, Self::Error> {
-        self.get_register_state()
+        const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
+        const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+
+        let mut value = if self.caps().hv1 {
+            self.get_register_state()?
+        } else {
+            vp::SyntheticMsrs::default()
+        };
+        if self.caps().kvm_clock {
+            let mut msrs = [0; 2];
+            self.kvm().get_msrs(
+                &[MSR_KVM_WALL_CLOCK_NEW, MSR_KVM_SYSTEM_TIME_NEW],
+                &mut msrs,
+            )?;
+            [value.kvm_wall_clock, value.kvm_system_time] = msrs;
+        }
+        Ok(value)
     }
 
     fn set_synic_msrs(&mut self, value: &vp::SyntheticMsrs) -> Result<(), Self::Error> {
-        self.set_register_state(value)?;
+        const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
+        const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+
+        if self.caps().hv1 {
+            self.set_register_state(value)?;
+        }
+        if self.caps().kvm_clock {
+            self.kvm().set_msrs(&[
+                (MSR_KVM_WALL_CLOCK_NEW, value.kvm_wall_clock),
+                (MSR_KVM_SYSTEM_TIME_NEW, value.kvm_system_time),
+            ])?;
+        }
+        if !self.caps().hv1 {
+            return Ok(());
+        }
 
         // Mirror the restored synic MSRs into the processor's tracked state and
         // overlay pages. Runs before set_synic_{message,event_flags}_page (per
