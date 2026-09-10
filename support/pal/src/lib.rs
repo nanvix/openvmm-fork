@@ -24,6 +24,7 @@ pub use windows_result;
 pub use windows_sys;
 
 pub use sys::close_stdout;
+pub use sys::fs;
 pub use sys::pipe::pair as pipe_pair;
 
 #[cfg(unix)]
