@@ -27,12 +27,30 @@ use guestmem::GuestMemoryError;
 use inspect::Inspect;
 use inspect::InspectMut;
 #[cfg(target_os = "linux")]
+use pal_async::driver::PollImpl;
+#[cfg(target_os = "linux")]
 use pal_async::driver::SpawnDriver as MmioDriver;
+#[cfg(target_os = "linux")]
+use pal_async::fd::PollFdReady;
+#[cfg(target_os = "linux")]
+use pal_async::interest::InterestSlot;
+#[cfg(target_os = "linux")]
+use pal_async::interest::PollEvents;
 #[cfg(not(target_os = "linux"))]
 use pal_async::task::Spawn as MmioDriver;
+#[cfg(target_os = "linux")]
+use pal_async::task::Task;
+#[cfg(target_os = "linux")]
+use pal_event::Event;
 use parking_lot::Mutex;
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::future::poll_fn;
 use std::ops::RangeInclusive;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::task::Context;
 use vmcore::device_state::ChangeDeviceState;
@@ -49,6 +67,40 @@ struct MmioTransport {
     #[inspect(hex)]
     vendor_id: u32,
     interrupt_state: Arc<Mutex<InterruptState>>,
+    #[cfg(target_os = "linux")]
+    #[inspect(skip)]
+    _interrupt_ack_task: Option<Task<()>>,
+    #[cfg(target_os = "linux")]
+    #[inspect(skip)]
+    _interrupt_ack_doorbell: Option<Box<dyn Send + Sync>>,
+    #[cfg(target_os = "linux")]
+    #[inspect(skip)]
+    interrupt_ack_event: Option<Event>,
+}
+
+#[cfg(target_os = "linux")]
+struct InterruptAckWait {
+    ready: PollImpl<dyn PollFdReady>,
+    event: Event,
+    interrupt_state: Arc<Mutex<InterruptState>>,
+}
+
+#[cfg(target_os = "linux")]
+impl InterruptAckWait {
+    async fn run(mut self) {
+        loop {
+            poll_fn(|cx| {
+                self.ready
+                    .poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN)
+            })
+            .await;
+            self.ready.clear_fd_ready(InterestSlot::Read);
+            let mut state = self.interrupt_state.lock();
+            if self.event.try_wait() {
+                state.acknowledge_used_buffer();
+            }
+        }
+    }
 }
 
 #[derive(Inspect)]
@@ -133,11 +185,32 @@ impl InterruptState {
         }
         self.status
     }
+
+    #[cfg(target_os = "linux")]
+    fn acknowledge_used_buffer(&mut self) {
+        if self.shared_status.is_some() {
+            return;
+        }
+        if self.observed_used_buffer_generation == Some(self.used_buffer_generation) {
+            self.update(false, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+        } else {
+            self.observed_used_buffer_generation = None;
+        }
+    }
 }
 
 impl MmioTransport {
     fn lock_interrupt_state(&self) -> parking_lot::MutexGuard<'_, InterruptState> {
-        self.interrupt_state.lock()
+        let state = self.interrupt_state.lock();
+        #[cfg(target_os = "linux")]
+        let mut state = state;
+        #[cfg(target_os = "linux")]
+        if let Some(event) = &self.interrupt_ack_event {
+            if event.try_wait() {
+                state.acknowledge_used_buffer();
+            }
+        }
+        state
     }
 
     fn read_interrupt_status(&self) -> u32 {
@@ -279,6 +352,8 @@ impl VirtioMmioDevice {
         interrupt_mode: VirtioMmioInterruptMode,
     ) -> std::io::Result<Self> {
         let traits = device.traits();
+        #[cfg(target_os = "linux")]
+        let supports_accelerated_doorbells = device.supports_accelerated_doorbells();
         let shared_status = match interrupt_mode {
             VirtioMmioInterruptMode::Legacy => None,
             VirtioMmioInterruptMode::SharedStatus { status_gpa } => {
@@ -312,6 +387,41 @@ impl VirtioMmioDevice {
             observed_used_buffer_generation: None,
             shared_status,
         }));
+        #[cfg(target_os = "linux")]
+        let (interrupt_ack_event, interrupt_ack_task, interrupt_ack_doorbell) = if interrupt_mode
+            == VirtioMmioInterruptMode::Legacy
+            && supports_accelerated_doorbells
+            && let Some(registration) = &doorbell_registration
+        {
+            let event = Event::new();
+            match registration.register_doorbell(
+                mmio_gpa + VirtioMmioRegister::INTERRUPT_ACK.0 as u64,
+                Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+                Some(4),
+                &event,
+            ) {
+                Ok(doorbell) => match driver.new_dyn_fd_ready(event.as_fd().as_raw_fd()) {
+                    Ok(ready) => {
+                        let interrupt_ack_event = event.clone();
+                        let task = driver.spawn(
+                            "virtio-mmio-interrupt-ack",
+                            InterruptAckWait {
+                                ready,
+                                event,
+                                interrupt_state: interrupt_state.clone(),
+                            }
+                            .run(),
+                        );
+                        (Some(interrupt_ack_event), Some(task), Some(doorbell))
+                    }
+                    Err(_) => (None, None, None),
+                },
+                Err(_) => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+
         let core = VirtioTransportCore::new_with_disabled_features(
             device,
             driver,
@@ -327,6 +437,12 @@ impl VirtioMmioDevice {
                 device_id: traits.device_id.0 as u32,
                 vendor_id: 0x1af4,
                 interrupt_state,
+                #[cfg(target_os = "linux")]
+                _interrupt_ack_task: interrupt_ack_task,
+                #[cfg(target_os = "linux")]
+                _interrupt_ack_doorbell: interrupt_ack_doorbell,
+                #[cfg(target_os = "linux")]
+                interrupt_ack_event,
             },
         })
     }
@@ -854,6 +970,12 @@ mod tests {
                 &guest_memory,
                 target.clone(),
             ))),
+            #[cfg(target_os = "linux")]
+            _interrupt_ack_task: None,
+            #[cfg(target_os = "linux")]
+            _interrupt_ack_doorbell: None,
+            #[cfg(target_os = "linux")]
+            interrupt_ack_event: None,
         };
         state
             .interrupt_state
@@ -880,6 +1002,12 @@ mod tests {
                 &guest_memory,
                 target.clone(),
             ))),
+            #[cfg(target_os = "linux")]
+            _interrupt_ack_task: None,
+            #[cfg(target_os = "linux")]
+            _interrupt_ack_doorbell: None,
+            #[cfg(target_os = "linux")]
+            interrupt_ack_event: None,
         };
         transport
             .interrupt_state
