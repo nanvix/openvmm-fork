@@ -1251,8 +1251,32 @@ impl InitializedVm {
         #[cfg(guest_arch = "aarch64")]
         let device_assignment_msi_iova_range =
             resolve_device_assignment_msi_iova_range(platform_info.device_assignment_msi_iova);
-        let user_mode_memory_faults = true;
-        let lazy_memory_registration = false;
+        #[cfg(all(windows, feature = "virt_whp"))]
+        let has_vpci_resources = !cfg.vpci_resources.is_empty();
+        #[cfg(not(all(windows, feature = "virt_whp")))]
+        let has_vpci_resources = false;
+        let prefetch_memory = cfg
+            .numa
+            .nodes
+            .iter()
+            .any(|node| node.mem.as_ref().is_some_and(|mem| mem.prefetch_memory));
+
+        // A writable COW-only microVM restore already has fully established host
+        // VA backing. Register a bounded initial range with WHP and extend it on
+        // demand, while leaving mapped first-touch faults to WHP itself. Keep the
+        // eager path for configurations that need pinning, prefetch, expansion,
+        // or VTL2 lazy-commit and protection work.
+        let lazy_memory_registration =
+            cfg!(all(windows, feature = "virt_whp", guest_arch = "x86_64"))
+                && cfg.machine_profile == MachineProfile::Microvm
+                && cfg.hypervisor.with_vtl2.is_none()
+                && cfg.microvm_restore_memory_ranges.is_empty()
+                && !has_vpci_resources
+                && !prefetch_memory
+                && shared_memory
+                    .as_ref()
+                    .is_some_and(SharedMemoryBacking::is_copy_on_write);
+        let user_mode_memory_faults = !lazy_memory_registration;
 
         let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor

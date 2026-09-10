@@ -123,11 +123,11 @@ struct WhpPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     cpuid: virt::CpuidLeafSet,
     #[cfg(guest_arch = "x86_64")]
-    tsc_frequency_hz: u64,
-    #[cfg(guest_arch = "x86_64")]
     reserved_vps_per_socket: u32,
     #[cfg(guest_arch = "x86_64")]
     smt_enabled: bool,
+    #[cfg(guest_arch = "x86_64")]
+    tsc_frequency_hz: u64,
     vtl0_alias_map_offset: Option<u64>,
     monitor_page: MonitorPage,
     hvstate: Hv1State,
@@ -1026,11 +1026,11 @@ impl ProtoPartition for WhpProtoPartition<'_> {
     }
 
     fn supports_memory_fault_resolution(&self) -> bool {
-        // On x86-64, WHP forwards guest memory-access faults back to the VMM, so
-        // the memory backing can resolve them on demand (soft large pages, lazy
-        // commit). WHP on aarch64 does not deliver these faults, so the backing
-        // must not defer any commit or protection to a fault.
-        cfg!(guest_arch = "x86_64")
+        // On x86-64, WHP can forward guest memory-access faults back to the VMM
+        // so the memory backing can resolve them on demand (soft large pages,
+        // lazy commit). Pure COW restores intentionally leave these faults to
+        // WHP. WHP on aarch64 does not deliver them.
+        cfg!(guest_arch = "x86_64") && self.config.user_mode_memory_faults
     }
 
     fn build(
@@ -1374,11 +1374,11 @@ impl WhpPartitionInner {
             #[cfg(guest_arch = "x86_64")]
             cpuid,
             #[cfg(guest_arch = "x86_64")]
-            tsc_frequency_hz,
-            #[cfg(guest_arch = "x86_64")]
             reserved_vps_per_socket: proto_config.processor_topology.reserved_vps_per_socket(),
             #[cfg(guest_arch = "x86_64")]
             smt_enabled: proto_config.processor_topology.smt_enabled(),
+            #[cfg(guest_arch = "x86_64")]
+            tsc_frequency_hz,
             vtl0_alias_map_offset,
             monitor_page: MonitorPage::new(),
             hvstate,
@@ -1656,12 +1656,13 @@ impl VtlPartition {
                 .for_op("set gic parameters")?;
         }
 
-        // Request GPA access fault exits here because WHP tries to handle these
-        // for ROM regions, resulting in an extra syscall and C++ exception for
-        // each such exit. We know locally whether memory is supposed to be
-        // mapped writable, so we can avoid this.
+        // Request GPA access fault exits when the memory backing needs
+        // user-mode resolution. Pure writable-COW microVM restores leave them
+        // to WHP, avoiding one VP exit and populate call per first-touch page.
+        // For other VMs this also avoids WHP's extra syscall and C++ exception
+        // while it attempts to handle ROM access faults itself.
         // TODO-aarch64
-        if cfg!(guest_arch = "x86_64") {
+        if cfg!(guest_arch = "x86_64") && config.user_mode_memory_faults {
             extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::GpaAccessFaultExit;
         }
 
@@ -1853,7 +1854,10 @@ impl VtlPartition {
 
             Box::new(memory::vtl2_mapper::VtlMemoryMapper::new(mapping_state))
         } else {
-            Box::new(memory::WhpMemoryMapper::new(with_overlays))
+            Box::new(memory::WhpMemoryMapper::new(
+                with_overlays,
+                config.lazy_memory_registration,
+            ))
         };
 
         Ok(Self {
