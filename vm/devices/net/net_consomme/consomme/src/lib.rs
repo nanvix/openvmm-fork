@@ -40,6 +40,20 @@ const DEFAULT_TCP_BUFFER_BOUNDS: TcpBufferBounds = TcpBufferBounds {
     max: 4 * 1024 * 1024,
 };
 
+/// Default maximum number of simultaneously active guest TCP flows.
+///
+/// The limit is checked before creating a host TCP socket or allocating
+/// per-flow TCP buffers.
+pub const DEFAULT_MAX_ACTIVE_TCP_FLOWS: usize = 128;
+/// Default maximum number of simultaneously active guest UDP flows.
+///
+/// The limit is checked before binding a host UDP socket.
+pub const DEFAULT_MAX_ACTIVE_UDP_FLOWS: usize = 256;
+/// Default maximum number of simultaneously active guest ICMP source flows.
+///
+/// The limit is checked before opening a host ICMP socket.
+pub const DEFAULT_MAX_ACTIVE_ICMP_FLOWS: usize = 16;
+
 pub use dns_resolver::StaticDnsRecord;
 pub use dns_resolver::StaticDnsRecordError;
 use inspect::Inspect;
@@ -712,6 +726,15 @@ pub enum DropReason {
     /// The send buffer is invalid.
     #[error("send buffer full")]
     SendBufferFull,
+    /// The active TCP flow limit was reached before a host socket was created.
+    #[error("active TCP flow limit reached")]
+    TcpConnectionLimit,
+    /// The active UDP flow limit was reached before a host socket was bound.
+    #[error("active UDP flow limit reached")]
+    UdpConnectionLimit,
+    /// The active ICMP flow limit was reached before a host socket was opened.
+    #[error("active ICMP flow limit reached")]
+    IcmpConnectionLimit,
     /// There was an IO error.
     #[error("io error")]
     Io(#[source] std::io::Error),
@@ -885,9 +908,9 @@ impl Consomme {
                 buffer: Box::new([0; 65536]),
                 local_addr_map: local_addr_map::LocalAddrMap::new(),
             },
-            tcp: tcp::Tcp::new(tcp_rx_buffer, tcp_tx_buffer),
-            udp: udp::Udp::new(udp_timeout),
-            icmp: icmp::Icmp::new(),
+            tcp: tcp::Tcp::new(tcp_rx_buffer, tcp_tx_buffer, DEFAULT_MAX_ACTIVE_TCP_FLOWS),
+            udp: udp::Udp::new(udp_timeout, DEFAULT_MAX_ACTIVE_UDP_FLOWS),
+            icmp: icmp::Icmp::new(DEFAULT_MAX_ACTIVE_ICMP_FLOWS),
             dns,
             host_has_ipv6,
         }

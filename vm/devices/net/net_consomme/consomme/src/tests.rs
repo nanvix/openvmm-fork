@@ -41,6 +41,30 @@ impl Client for TestClient {
     }
 }
 
+#[test]
+fn default_resource_limits_are_pinned() {
+    let params = ConsommeParams::new().unwrap();
+    assert_eq!(params.udp_timeout, Duration::from_secs(300));
+    assert_eq!(
+        params.tcp_rx_buffer,
+        TcpBufferBounds {
+            initial: 16 << 10,
+            max: 4 << 20,
+        }
+    );
+    assert_eq!(
+        params.tcp_tx_buffer,
+        TcpBufferBounds {
+            initial: 16 << 10,
+            max: 4 << 20,
+        }
+    );
+    assert_eq!(DEFAULT_MAX_ACTIVE_TCP_FLOWS, 128);
+    assert_eq!(DEFAULT_MAX_ACTIVE_UDP_FLOWS, 256);
+    assert_eq!(dns_resolver::DEFAULT_MAX_PENDING_DNS_REQUESTS, 256);
+    assert_eq!(DEFAULT_MAX_ACTIVE_ICMP_FLOWS, 16);
+}
+
 /// Build a minimal TCP SYN packet inside an Ethernet/IPv4 frame.
 fn build_ipv4_syn(
     buf: &mut [u8],
