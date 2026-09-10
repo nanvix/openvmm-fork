@@ -1221,10 +1221,12 @@ impl VmService {
                 }
             }
             VmControllerEvent::ExitRequested { code } => {
-                // The protocol has no `exit` power action, so this should not
-                // occur in ttrpc/grpc mode; log rather than exiting the server
-                // out from under its clients.
-                tracing::warn!(code, "unexpected exit request in server mode");
+                let reason = format!("guest exited with status {code}");
+                tracing::info!(code, "guest halted with process status");
+                self.lifecycle = VmLifecycle::Halted(reason);
+                if let Some((_, response)) = self.wait_vm_response.take() {
+                    response.send(Ok(()));
+                }
             }
             VmControllerEvent::WorkerStopped { error } => {
                 if let Some(err) = &error {
