@@ -49,12 +49,14 @@ const ICMPV4_HEADER_LEN: usize = 8;
 
 pub(crate) struct Icmp {
     connections: HashMap<SocketAddrV4, IcmpConnection>,
+    max_connections: usize,
 }
 
 impl Icmp {
-    pub fn new() -> Self {
+    pub fn new(max_connections: usize) -> Self {
         Self {
             connections: HashMap::new(),
+            max_connections: max_connections.max(1),
         }
     }
 }
@@ -62,6 +64,8 @@ impl Icmp {
 impl Inspect for Icmp {
     fn inspect(&self, req: inspect::Request<'_>) {
         let mut resp = req.respond();
+        resp.field("max_connections", self.max_connections)
+            .field("active_connections", self.connections.len());
         for (addr, conn) in &self.connections {
             resp.field(&format!("{}:{}", addr.ip(), addr.port()), conn);
         }
@@ -241,6 +245,17 @@ impl<T: Client> Access<'_, T> {
 
         let icmp_packet = Icmpv4Packet::new_unchecked(payload);
         let guest_addr = SocketAddrV4::new(addresses.src_addr, 0);
+
+        if !self.inner.icmp.connections.contains_key(&guest_addr)
+            && self.inner.icmp.connections.len() >= self.inner.icmp.max_connections
+        {
+            tracelimit::warn_ratelimited!(
+                max_connections = self.inner.icmp.max_connections,
+                guest = %guest_addr,
+                "rejecting ICMP flow before host socket creation because the active-flow limit was reached"
+            );
+            return Err(DropReason::IcmpConnectionLimit);
+        }
 
         let entry = self.inner.icmp.connections.entry(guest_addr);
         let conn = match entry {
