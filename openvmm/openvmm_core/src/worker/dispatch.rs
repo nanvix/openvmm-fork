@@ -2950,6 +2950,10 @@ impl InitializedVm {
                                     openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
                                     openvmm_defs::config::microvm_virtio_net_irq(None)?,
                                 ),
+                                "virtiofs" => (
+                                    openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                                    openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
+                                ),
                                 "virtio-console" => (
                                     openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
                                     openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,

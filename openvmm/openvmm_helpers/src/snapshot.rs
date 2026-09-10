@@ -646,6 +646,142 @@ pub fn add_microvm_network_contract(
     Ok(())
 }
 
+impl SnapshotMicrovmFilesystem {
+    fn new(
+        config: &openvmm_defs::config::MicrovmFilesystemConfig,
+        canonical_host_path: &str,
+    ) -> Self {
+        Self {
+            guest_mount_target: config.guest_mount_target.clone(),
+            access_mode: config.access.as_str().to_owned(),
+            restore_mode: "live-revalidate".to_owned(),
+            tag: "microvm".to_owned(),
+            high_priority_queue_count: 1,
+            request_queue_count: 1,
+            shared_memory_size: 0,
+            direct_io: true,
+            entry_cache_timeout_ns: 0,
+            attribute_cache_timeout_ns: 0,
+            canonical_host_path: canonical_host_path.to_owned(),
+        }
+    }
+}
+
+/// Adds a path-bound active filesystem identity without any network dependency.
+pub fn add_microvm_filesystem_contract(
+    contract: &mut SnapshotMachineContract,
+    config: &openvmm_defs::config::MicrovmFilesystemConfig,
+    root_path: &Path,
+    attachment: SnapshotAttachment,
+) -> anyhow::Result<()> {
+    let source_hypervisor = contract.source_hypervisor.as_str();
+    let effective_command_line = &contract.effective_command_line;
+    let filesystem = Some((config, root_path, attachment));
+    let filesystem_slot = true;
+    let mut devices = Vec::new();
+    let mut attachments = Vec::new();
+    let mmio = |start, length| SnapshotDeviceRange {
+        address_space: "mmio".to_owned(),
+        start,
+        length,
+    };
+    anyhow::ensure!(
+        filesystem.is_none() || filesystem_slot,
+        "microVM filesystem policy requires the reserved virtio-fs slot"
+    );
+    if filesystem_slot {
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+            openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
+        );
+        anyhow::ensure!(
+            effective_command_line
+                .split_ascii_whitespace()
+                .any(|token| token == discovery),
+            "microVM virtio-fs slot is missing from the effective command line"
+        );
+        devices.push(SnapshotDevice {
+            stable_id: "fs:microvm0".to_owned(),
+            state_unit_name: format!(
+                "virtiofs-{}",
+                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE
+            ),
+            kind: "virtio-fs".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![
+                openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES as u32,
+                (openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES >> 32) as u32,
+            ],
+            queue_count: 2,
+            queue_max_sizes: vec![256, 256],
+        });
+    }
+    let microvm_filesystem = if let Some((filesystem, canonical_host_path, attachment)) = filesystem
+    {
+        let canonical_host_path = canonical_host_path
+            .to_str()
+            .context("microVM filesystem canonical host path is not valid UTF-8")?;
+        anyhow::ensure!(
+            !canonical_host_path.is_empty(),
+            "microVM filesystem canonical host path is empty"
+        );
+        anyhow::ensure!(
+            attachment.stable_id == "fs:microvm0"
+                && attachment.kind == "virtio-fs"
+                && attachment.required
+                && attachment.reconnect_policy == "live-revalidate"
+                && match source_hypervisor {
+                    "kvm" | "mshv" => attachment.identity_kind == "unix-device-inode-v1",
+                    "whp" => attachment.identity_kind == "windows-volume-file-id-v1",
+                    _ => false,
+                }
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0
+                && attachment.reconnect_timeout_ms == 0,
+            "microVM filesystem attachment has an unsupported live-revalidation policy"
+        );
+        let tokens = effective_command_line
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            filesystem
+                .command_line_fragment()
+                .split_ascii_whitespace()
+                .all(|token| tokens.contains(token)),
+            "microVM filesystem command line does not match its saved policy"
+        );
+        attachments.push(attachment);
+        Some(SnapshotMicrovmFilesystem::new(
+            filesystem,
+            canonical_host_path,
+        ))
+    } else {
+        None
+    };
+
+    let index = contract
+        .devices
+        .iter()
+        .position(|device| matches!(device.kind.as_str(), "virtio-console" | "virtio-blk"))
+        .unwrap_or(contract.devices.len());
+    contract.devices.splice(index..index, devices);
+    for (index, device) in contract.devices.iter_mut().enumerate() {
+        device.order = index as u32;
+    }
+    contract.attachments.extend(attachments);
+    contract.microvm_filesystem = microvm_filesystem;
+    Ok(())
+}
+
 /// Builds the authoritative microVM machine contract.
 pub fn microvm_machine_contract(
     source_hypervisor: &str,
@@ -784,7 +920,10 @@ pub fn microvm_machine_contract(
         };
         anyhow::ensure!(
             attachment.stable_id == "console:microvm-virtio0"
-                && matches!(attachment.kind.as_str(), "virtio-console" | "virtio-net")
+                && matches!(
+                    attachment.kind.as_str(),
+                    "virtio-console" | "virtio-net" | "virtio-fs"
+                )
                 && policy_is_valid
                 && !attachment.identity.is_empty()
                 && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
@@ -3269,6 +3408,27 @@ fn validate_machine_contract_shape(
         validate_sha256(&network.egress_policy_sha256, "egress policy")?;
     }
 
+    if let Some(filesystem) = &contract.microvm_filesystem {
+        anyhow::ensure!(
+            !filesystem.canonical_host_path.is_empty(),
+            "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
+        );
+        let access = match filesystem.access_mode.as_str() {
+            "ro" => openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+            "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
+            mode => anyhow::bail!("snapshot filesystem access mode '{mode}' is unsupported"),
+        };
+        let parsed = openvmm_defs::config::MicrovmFilesystemConfig::new(
+            filesystem.guest_mount_target.clone(),
+            access,
+        )
+        .context("snapshot filesystem policy is invalid")?;
+        anyhow::ensure!(
+            *filesystem == SnapshotMicrovmFilesystem::new(&parsed, &filesystem.canonical_host_path),
+            "snapshot filesystem policy is not canonical"
+        );
+    }
+
     let topology = &contract.topology;
     let topology_vp_count = u64::from(topology.sockets)
         .checked_mul(u64::from(topology.dies_per_socket))
@@ -3286,12 +3446,11 @@ fn validate_machine_contract_shape(
     );
     anyhow::ensure!(
         contract.boot_online_vp_count == 0
-            && contract.microvm_filesystem.is_none()
             && contract.microvm_filesystem_slot_version == 0
             && contract.microvm_sandbox_blocks.is_empty()
             && contract.attachments.iter().all(|attachment| matches!(
                 attachment.kind.as_str(),
-                "virtio-console" | "virtio-net"
+                "virtio-console" | "virtio-net" | "virtio-fs"
             )),
         "base microVM snapshots cannot contain device attachments or expanded topology"
     );

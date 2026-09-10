@@ -49,6 +49,20 @@ pub mod fs {
     pub struct VirtioFsHandle {
         pub tag: String,
         pub fs: VirtioFsBackend,
+        pub profile: VirtioFsProfile,
+    }
+
+    #[derive(MeshPayload)]
+    pub enum VirtioFsProfile {
+        Standard,
+        Microvm {
+            stable_id: String,
+            root_identity: Vec<u8>,
+            read_only: bool,
+        },
+        MicrovmDormant {
+            stable_id: String,
+        },
     }
 
     #[derive(MeshPayload)]
@@ -66,6 +80,7 @@ pub mod fs {
         Aggregate {
             children: Vec<VirtioFsAggregateChild>,
         },
+        Dormant,
     }
 
     /// A single host folder exposed as a named child of a [`VirtioFsBackend::Aggregate`].

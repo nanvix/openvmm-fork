@@ -64,6 +64,8 @@ pub struct Config {
     pub machine_profile: MachineProfile,
     /// Static identity of the optional microVM NIC.
     pub microvm_network: Option<MicrovmNetworkConfig>,
+    /// Policy of the optional active filesystem attachment.
+    pub microvm_filesystem: Option<MicrovmFilesystemConfig>,
 }
 
 /// Static guest-visible network identity for the microVM NIC.
@@ -215,6 +217,92 @@ pub const MICROVM_VIRTIO_NET_WHP_IRQ: u32 = 5;
 /// Portable microVM network feature mask.
 pub const MICROVM_VIRTIO_NET_FEATURES: u64 = (1 << 5) | (1 << 32);
 
+/// Access policy for the microVM host filesystem.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmFilesystemAccess {
+    /// Reject guest mutations before invoking host filesystem operations.
+    ReadOnly,
+    /// Permit the common cross-platform mutation contract.
+    ReadWrite,
+}
+
+impl MicrovmFilesystemAccess {
+    /// Returns the command-line spelling of this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "ro",
+            Self::ReadWrite => "rw",
+        }
+    }
+
+    /// Returns whether host filesystem mutations are allowed.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
+/// Guest-visible configuration for the microVM virtio-fs device.
+#[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmFilesystemConfig {
+    /// Absolute guest path at which the initramfs mounts the filesystem.
+    pub guest_mount_target: String,
+    /// Snapshot-authoritative access policy.
+    pub access: MicrovmFilesystemAccess,
+}
+
+impl MicrovmFilesystemConfig {
+    /// Validates and constructs the microVM filesystem configuration.
+    pub fn new(
+        guest_mount_target: String,
+        access: MicrovmFilesystemAccess,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        if guest_mount_target.is_empty()
+            || !guest_mount_target.starts_with('/')
+            || guest_mount_target == "/"
+            || guest_mount_target.len() > 4096
+            || guest_mount_target.chars().any(|character| {
+                character.is_whitespace() || matches!(character, '\0' | '\\' | '=')
+            })
+            || guest_mount_target
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(InvalidMicrovmFilesystemConfig::InvalidGuestTarget(
+                guest_mount_target,
+            ));
+        }
+        Ok(Self {
+            guest_mount_target,
+            access,
+        })
+    }
+
+    /// Returns the pinned guest bootstrap command-line tokens.
+    pub fn command_line_fragment(&self) -> String {
+        format!(
+            "virtfs_dir={} virtfs_tag=microvm virtfs_mode={}",
+            self.guest_mount_target,
+            self.access.as_str()
+        )
+    }
+}
+
+/// Error returned for an invalid microVM filesystem specification.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidMicrovmFilesystemConfig {
+    /// The guest mount target is not a canonical absolute Linux path.
+    #[error(
+        "invalid guest mount target '{0}': expected an absolute non-root Linux path without empty, dot, parent, whitespace, backslash, or '=' components"
+    )]
+    InvalidGuestTarget(String),
+}
+
+/// Fixed microVM filesystem interrupt.
+pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
+/// Fixed microVM filesystem feature mask.
+pub const MICROVM_VIRTIO_FS_FEATURES: u64 = (1 << 28) | (1 << 29) | (1 << 32) | (1 << 33);
+
 /// The initial microVM guest ABI version.
 pub const MICROVM_ABI_VERSION_1: u32 = 1;
 /// ABI-v1 command line owned by the microVM profile.
@@ -347,6 +435,7 @@ fn validate_microvm_command_line(
                     MICROVM_VIRTIO_NET_MMIO_BASE,
                     microvm_virtio_net_irq(hypervisor_id)?,
                 ),
+                "virtiofs" => (MICROVM_VIRTIO_FS_MMIO_BASE, MICROVM_VIRTIO_FS_IRQ),
                 "virtio-console" => (MICROVM_VIRTIO_CONSOLE_MMIO_BASE, MICROVM_VIRTIO_CONSOLE_IRQ),
                 "virtio-blk" => (MICROVM_VIRTIO_BLK_MMIO_BASE, MICROVM_VIRTIO_BLK_IRQ),
                 id => anyhow::bail!("unsupported microVM virtio device '{id}'"),
@@ -414,6 +503,7 @@ pub fn append_microvm_device_discovery(
                 MICROVM_VIRTIO_NET_MMIO_BASE,
                 microvm_virtio_net_irq(hypervisor_id)?,
             ),
+            "virtiofs" => (MICROVM_VIRTIO_FS_MMIO_BASE, MICROVM_VIRTIO_FS_IRQ),
             "virtio-console" => (MICROVM_VIRTIO_CONSOLE_MMIO_BASE, MICROVM_VIRTIO_CONSOLE_IRQ),
             "virtio-blk" => (MICROVM_VIRTIO_BLK_MMIO_BASE, MICROVM_VIRTIO_BLK_IRQ),
             id => anyhow::bail!("unsupported microVM virtio device '{id}'"),
@@ -569,13 +659,16 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     );
 
     anyhow::ensure!(
-        config.virtio_devices.len() <= 3,
+        config.virtio_devices.len() <= 4,
         "microVM ABI version 1 permits at most one virtio-blk device"
     );
     for (bus, device) in &config.virtio_devices {
         anyhow::ensure!(
             *bus == VirtioBus::Mmio
-                && matches!(device.id(), "virtio-blk" | "virtio-console" | "virtio-net"),
+                && matches!(
+                    device.id(),
+                    "virtio-blk" | "virtio-console" | "virtio-net" | "virtiofs"
+                ),
             "microVM ABI version 1 permits only an MMIO virtio-blk device"
         );
     }
