@@ -13,12 +13,25 @@ criterion::criterion_main!(benches);
 
 criterion::criterion_group!(benches, bench_memcpy);
 
+unsafe extern "C" {
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        len: usize,
+    ) -> *mut core::ffi::c_void;
+}
+
+/// # Safety
+///
+/// The pointers must be valid for copying `len` bytes, and the regions must not overlap.
+unsafe extern "C" fn system_memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
+    // SAFETY: the caller upholds memcpy's pointer validity and overlap requirements.
+    unsafe { memcpy(dest.cast(), src.cast(), len).cast() }
+}
+
 fn bench_memcpy(c: &mut criterion::Criterion) {
-    unsafe extern "C" {
-        fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8;
-    }
     do_bench_memcpy(c.benchmark_group("fast_memcpy"), fast_memcpy::memcpy);
-    do_bench_memcpy(c.benchmark_group("system_memcpy"), memcpy);
+    do_bench_memcpy(c.benchmark_group("system_memcpy"), system_memcpy);
 }
 
 fn do_bench_memcpy(
