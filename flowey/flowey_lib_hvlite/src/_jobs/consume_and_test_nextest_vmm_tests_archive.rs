@@ -3,6 +3,7 @@
 
 //! Run a pre-built cargo-nextest based VMM tests archive.
 
+use crate::build_guest_test_pvh::GuestTestPvhOutput;
 use crate::build_guest_test_uefi::GuestTestUefiOutput;
 use crate::build_incubator::IncubatorOutput;
 use crate::build_nextest_vmm_tests::NextestVmmTestsArchive;
@@ -34,6 +35,7 @@ pub struct VmmTestsDepArtifacts {
     pub pipette_windows: Option<ReadVar<PipetteOutput>>,
     pub pipette_linux_musl: Option<ReadVar<PipetteOutput>>,
     pub guest_test_uefi: Option<ReadVar<GuestTestUefiOutput>>,
+    pub guest_test_pvh: Option<ReadVar<GuestTestPvhOutput>>,
     pub prep_steps: Option<ReadVar<PrepStepsOutput>>,
     pub openhcl_standard: Option<ReadVar<OpenhclIgvmOutput>>,
     pub openhcl_standard_dev: Option<ReadVar<OpenhclIgvmOutput>>,
@@ -178,6 +180,7 @@ impl SimpleFlowNode for Node {
             pipette_windows: register_pipette_windows,
             pipette_linux_musl: register_pipette_linux_musl,
             guest_test_uefi: register_guest_test_uefi,
+            guest_test_pvh: register_guest_test_pvh,
             prep_steps: register_prep_steps,
             openhcl_standard,
             openhcl_standard_dev,
@@ -249,6 +252,7 @@ impl SimpleFlowNode for Node {
             register_pipette_windows,
             register_pipette_linux_musl,
             register_guest_test_uefi,
+            register_guest_test_pvh,
             register_tmks,
             register_tmk_vmm,
             register_tmk_vmm_linux_musl,

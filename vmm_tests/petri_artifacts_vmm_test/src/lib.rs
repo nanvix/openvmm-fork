@@ -142,6 +142,8 @@ pub mod artifacts {
             LINUX_DIRECT_TEST_INITRD_AARCH64,
             /// Test linux direct bzImage kernel (from OpenVMM deps)
             LINUX_DIRECT_TEST_BZIMAGE_X64,
+            /// Source-built Xen PVH test guest for x86_64.
+            GUEST_TEST_PVH_X64,
             /// PCAT firmware DLL
             PCAT_FIRMWARE_X64,
             /// SVGA firmware DLL
@@ -169,6 +171,10 @@ pub mod artifacts {
         }
 
         impl IsLoadable for LINUX_DIRECT_TEST_BZIMAGE_X64 {
+            const ARCH: MachineArch = MachineArch::X86_64;
+        }
+
+        impl IsLoadable for GUEST_TEST_PVH_X64 {
             const ARCH: MachineArch = MachineArch::X86_64;
         }
 

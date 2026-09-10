@@ -174,6 +174,8 @@ pub struct Rtc {
     century_reg: CmosReg,
     initial_cmos: Option<[u8; 256]>,
     enlightened_interrupts: bool,
+    #[inspect(skip)]
+    mode: RtcMode,
 
     // Runtime deps
     real_time_source: Box<dyn InspectableLocalClock>,
@@ -196,8 +198,17 @@ struct RtcState {
     cmos: CmosData,
 }
 
+/// Guest-visible RTC behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtcMode {
+    /// Standard programmable MC146818-compatible behavior.
+    Standard,
+    /// microVM ABI version 1 binary, 24-hour, read-only clock behavior.
+    MicrovmV1,
+}
+
 impl RtcState {
-    fn new(initial_cmos: Option<[u8; 256]>) -> Self {
+    fn new(initial_cmos: Option<[u8; 256]>, mode: RtcMode) -> Self {
         let mut cmos = initial_cmos.map(CmosData).unwrap_or_else(CmosData::empty);
 
         cmos[CmosReg::STATUS_A] = {
@@ -208,7 +219,7 @@ impl RtcState {
         };
         cmos[CmosReg::STATUS_B] = {
             StatusRegB::new()
-                .with_disable_bcd(false)
+                .with_disable_bcd(mode == RtcMode::MicrovmV1)
                 .with_h24_mode(true)
                 .into()
         };
@@ -230,7 +241,7 @@ impl ChangeDeviceState for Rtc {
     async fn stop(&mut self) {}
 
     async fn reset(&mut self) {
-        self.state = RtcState::new(self.initial_cmos);
+        self.state = RtcState::new(self.initial_cmos, self.mode);
 
         self.update_timers();
         self.update_interrupt_line_level();
@@ -307,10 +318,32 @@ impl Rtc {
         initial_cmos: Option<[u8; 256]>,
         enlightened_interrupts: bool,
     ) -> Self {
+        Self::new_with_mode(
+            real_time_source,
+            interrupt,
+            vmtime_source,
+            century_reg_idx,
+            initial_cmos,
+            enlightened_interrupts,
+            RtcMode::Standard,
+        )
+    }
+
+    /// Creates a CMOS RTC with an explicit guest-visible behavior mode.
+    pub fn new_with_mode(
+        real_time_source: Box<dyn InspectableLocalClock>,
+        interrupt: LineInterrupt,
+        vmtime_source: &VmTimeSource,
+        century_reg_idx: u8,
+        initial_cmos: Option<[u8; 256]>,
+        enlightened_interrupts: bool,
+        mode: RtcMode,
+    ) -> Self {
         Rtc {
             century_reg: CmosReg(century_reg_idx),
             initial_cmos,
             enlightened_interrupts,
+            mode,
 
             real_time_source,
             interrupt,
@@ -320,7 +353,7 @@ impl Rtc {
 
             last_update_bit_blip: LocalClockTime::from_millis_since_unix_epoch(0),
 
-            state: RtcState::new(initial_cmos),
+            state: RtcState::new(initial_cmos, mode),
         }
     }
 
@@ -570,6 +603,10 @@ impl Rtc {
 
         tracing::trace!(?addr, ?data, "set_cmos_byte");
 
+        if self.mode == RtcMode::MicrovmV1 {
+            return;
+        }
+
         if (CmosReg::STATUS_A..=CmosReg::STATUS_D).contains(&addr) {
             self.set_status_byte(addr, data);
         } else {
@@ -663,6 +700,15 @@ impl Rtc {
     }
 
     fn get_status_byte(&mut self, addr: CmosReg) -> u8 {
+        if self.mode == RtcMode::MicrovmV1 {
+            return match addr {
+                CmosReg::STATUS_A => 0x26,
+                CmosReg::STATUS_B => 0x06,
+                CmosReg::STATUS_C => 0x00,
+                CmosReg::STATUS_D => 0x80,
+                _ => unreachable!("passed invalid status reg"),
+            };
+        }
         match addr {
             CmosReg::STATUS_A => {
                 let mut data = StatusRegA::from(self.state.cmos[CmosReg::STATUS_A]);
@@ -972,7 +1018,9 @@ mod tests {
     use local_clock::MockLocalClockAccessor;
     use test_with_tracing::test;
 
-    fn new_test_rtc() -> (
+    fn new_test_rtc_with_mode(
+        mode: RtcMode,
+    ) -> (
         pal_async::DefaultPool,
         vmcore::vmtime::VmTimeKeeper,
         MockLocalClockAccessor,
@@ -989,16 +1037,26 @@ mod tests {
         let time = MockLocalClock::new();
         let time_access = time.accessor();
 
-        let rtc = Rtc::new(
+        let rtc = Rtc::new_with_mode(
             Box::new(time),
             LineInterrupt::detached(),
             &vm_time_source,
             0x32,
             None,
             false,
+            mode,
         );
 
         (pool, vm_time_keeper, time_access, rtc)
+    }
+
+    fn new_test_rtc() -> (
+        pal_async::DefaultPool,
+        vmcore::vmtime::VmTimeKeeper,
+        MockLocalClockAccessor,
+        Rtc,
+    ) {
+        new_test_rtc_with_mode(RtcMode::Standard)
     }
 
     fn get_cmos_data(rtc: &mut Rtc, addr: CmosReg) -> u8 {
@@ -1121,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let default_state = RtcState::new(None);
+        let default_state = RtcState::new(None, RtcMode::Standard);
 
         let (_, _, _, mut rtc) = new_test_rtc();
 
@@ -1146,6 +1204,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn microvm_v1_is_binary_24_hour_and_read_only() {
+        let (_, _, _, mut rtc) = new_test_rtc_with_mode(RtcMode::MicrovmV1);
+
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0x26);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_B), 0x06);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0x00);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
+        set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0xff);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_B), 0x06);
+        set_cmos_data(&mut rtc, CmosReg(0x20), 0xff);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg(0x20)), 0x00);
+    }
+
     fn test_time_move(rtc: &mut Rtc, is_move: bool, time: MockLocalClockAccessor) {
         if let Ok(before) = rtc.get_cmos_date_time() {
             time.tick(Duration::from_secs(2));
@@ -1165,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_oscillator() {
-        let default_state = RtcState::new(None);
+        let default_state = RtcState::new(None, RtcMode::Standard);
 
         let (_, _, time, mut rtc) = new_test_rtc();
 
@@ -1228,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_readonly() {
-        let default_state = RtcState::new(None);
+        let default_state = RtcState::new(None, RtcMode::Standard);
 
         let (_, _, _, mut rtc) = new_test_rtc();
 

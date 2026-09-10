@@ -646,6 +646,28 @@ mod tests {
         resolve_memory_layout(input).unwrap().memory_layout
     }
 
+    #[test]
+    fn microvm_ram_ends_at_3gb_and_resumes_at_4gb() {
+        let mut config = input(&[4 * GB], None);
+        config.layout = vmm_core_defs::LayoutConfig {
+            chipset_low_mmio_size: GB as u32,
+            chipset_high_mmio_size: 0,
+            vtl2_chipset_mmio_size: 0,
+        };
+        let layout = resolve(config);
+        assert_eq!(
+            layout
+                .ram()
+                .iter()
+                .map(|range| range.range)
+                .collect::<Vec<_>>(),
+            [
+                MemoryRange::new(0..3 * GB),
+                MemoryRange::new(4 * GB..5 * GB),
+            ]
+        );
+    }
+
     fn vtl2_layout(size: u64) -> Vtl2MemoryLayoutRequest {
         Vtl2MemoryLayoutRequest {
             size,

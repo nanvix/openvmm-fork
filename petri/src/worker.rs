@@ -9,6 +9,7 @@ use mesh::rpc::RpcSend;
 use mesh_worker::WorkerHandle;
 use mesh_worker::WorkerHost;
 use openvmm_defs::config::Config;
+use openvmm_defs::config::MachineProfile;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
@@ -29,8 +30,13 @@ impl Worker {
         let (vm_rpc, rpc_recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
+        let hypervisor = if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+            openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
+        } else {
+            openvmm_helpers::hypervisor::choose_hypervisor()?
+        };
         let params = VmWorkerParameters {
-            hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
+            hypervisor,
             cfg,
             saved_state: None,
             shared_memory,

@@ -145,6 +145,46 @@ pub mod pit {
     }
 }
 
+pub mod microvm {
+    //! Resource definitions for microVM chipset devices.
+
+    use mesh::MeshPayload;
+    use vm_resource::Resource;
+    use vm_resource::ResourceId;
+    use vm_resource::kind::ChipsetDeviceHandleKind;
+    use vm_resource::kind::SerialBackendHandle;
+
+    /// The microVM bidirectional portb console at ports `0xe9` and `0xea`.
+    #[derive(MeshPayload)]
+    pub struct MicrovmPortbHandle {
+        /// Host serial endpoint used for raw input and output.
+        pub io: Resource<SerialBackendHandle>,
+    }
+
+    impl ResourceId<ChipsetDeviceHandleKind> for MicrovmPortbHandle {
+        const ID: &'static str = "microvm-portb";
+    }
+
+    /// microVM shutdown control port at `0x604`.
+    #[derive(MeshPayload)]
+    pub struct MicrovmShutdownHandle;
+
+    impl ResourceId<ChipsetDeviceHandleKind> for MicrovmShutdownHandle {
+        const ID: &'static str = "microvm-shutdown";
+    }
+
+    /// microVM snapshot-request port at `0x605`.
+    #[derive(MeshPayload)]
+    pub struct MicrovmSnapshotRequestHandle {
+        /// Optional asynchronous notification target. Phase 1 leaves this unbound.
+        pub notify: Option<mesh::Sender<()>>,
+    }
+
+    impl ResourceId<ChipsetDeviceHandleKind> for MicrovmSnapshotRequestHandle {
+        const ID: &'static str = "microvm-snapshot-request";
+    }
+}
+
 pub mod battery {
     //! Resource definitions for the battery device
 

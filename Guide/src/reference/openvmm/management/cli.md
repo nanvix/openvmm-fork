@@ -9,6 +9,29 @@ as well as the generated CLI help (via `cargo run -- --help`).
 
 * `--version`, `-V`: Print the OpenVMM build identity and exit. `-V` prints the concise identity. `--version` also prints the upstream product version, build kind, full Git revision when available, and build target. An ordinary checkout reports `MAJOR.MINOR.PATCH+g<SHORT_REVISION>`. This includes an exact checkout of an `openvmm-vMAJOR.MINOR.PATCH` release tag. A checkout detected with tracked changes appends `.dirty`; staged changes refresh this reliably, while an unstaged-only transition may remain cached until another build-script input changes. A Git-free source tree reports `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
+* `--machine <PROFILE>`: Select the guest-visible machine contract. The
+  default is `standard`. `microvm` selects microVM ABI version 1, an x86-64
+  Xen PVH machine that runs on KVM or WHP with exactly one vCPU:
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm \
+    --kernel vmlinux --initrd initramfs.cpio.gz
+  openvmm --machine microvm --hypervisor whp \
+    --kernel vmlinux --initrd initramfs.cpio.gz
+  ```
+
+  The kernel must be an uncompressed ELF64 image containing
+  `XEN_ELFNOTE_PHYS32_ENTRY`. The profile owns the base command line
+  (`earlycon=xe9 console=hvc0 reboot=t panic=-1`), reserves a 1-GiB MMIO gap
+  from 3 to 4 GiB, and exposes only PIC/IOAPIC, PIT, binary UTC RTC, the microVM
+  portb console, and lifecycle ports. User arguments cannot override
+  `earlycon=`, `console=`, or `virtio_mmio.device=`.
+
+  One optional `--virtio-blk <DISK>` is exposed at MMIO `0xd0003000`, IRQ 4,
+  using split rings. Firmware, ACPI, SMBIOS, PCI, VMBus, UARTs, graphics,
+  isolation, nested virtualization, and other devices are rejected. Snapshot
+  capture, restore, pulse-save/restore, and worker restart are unavailable in
+  ABI version 1 Phase 1.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:

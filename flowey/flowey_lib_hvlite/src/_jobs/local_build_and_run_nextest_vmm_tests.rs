@@ -48,6 +48,7 @@ pub struct BuildSelections {
     pub prep_steps_standard: bool,
     pub prep_steps_no_vmbus: bool,
     pub guest_test_uefi: bool,
+    pub guest_test_pvh: bool,
     pub tmks: bool,
     pub tmk_vmm_windows: bool,
     pub tmk_vmm_linux: bool,
@@ -108,6 +109,7 @@ impl SimpleFlowNode for Node {
     type Request = Params;
 
     fn imports(ctx: &mut ImportCtx<'_>) {
+        ctx.import::<crate::build_guest_test_pvh::Node>();
         ctx.import::<crate::build_guest_test_uefi::Node>();
         ctx.import::<crate::build_incubator::Node>();
         ctx.import::<crate::build_nextest_vmm_tests::Node>();
@@ -402,6 +404,13 @@ impl SimpleFlowNode for Node {
                 copy_to_dir.push((extras_dir.to_owned(), output.map(ctx, |x| Some(x.pdb))));
             }
             output
+        });
+
+        let register_guest_test_pvh = build.guest_test_pvh.then(|| {
+            ctx.reqv(|v| crate::build_guest_test_pvh::Request {
+                profile: CommonProfile::from_release(release),
+                guest_test_pvh: v,
+            })
         });
 
         let register_tmks = build.tmks.then(|| {
@@ -712,6 +721,7 @@ impl SimpleFlowNode for Node {
             register_pipette_windows,
             register_pipette_linux_musl,
             register_guest_test_uefi,
+            register_guest_test_pvh,
             register_tmks,
             register_tmk_vmm,
             register_tmk_vmm_linux_musl,

@@ -72,6 +72,7 @@ impl petri_artifacts_core::ResolveTestArtifact for OpenvmmKnownPathsTestArtifact
             _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_AARCH64 => linux_direct_arm_image_path(),
             _ if id == loadable::LINUX_DIRECT_TEST_INITRD_X64 => linux_direct_test_initrd_path(MachineArch::X86_64),
             _ if id == loadable::LINUX_DIRECT_TEST_INITRD_AARCH64 => linux_direct_test_initrd_path(MachineArch::Aarch64),
+            _ if id == loadable::GUEST_TEST_PVH_X64 => guest_test_pvh_path(),
 
             _ if id == petritools::PETRITOOLS_EROFS_X64 => petritools_erofs_path(MachineArch::X86_64),
             _ if id == petritools::PETRITOOLS_EROFS_AARCH64 => petritools_erofs_path(MachineArch::Aarch64),
@@ -232,6 +233,7 @@ pub fn resolve_bundle_name(id: ErasedArtifactHandle) -> Option<&'static str> {
         _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_AARCH64 => Some("aarch64/Image"),
         _ if id == loadable::LINUX_DIRECT_TEST_INITRD_X64 => Some("x64/initrd"),
         _ if id == loadable::LINUX_DIRECT_TEST_INITRD_AARCH64 => Some("aarch64/initrd"),
+        _ if id == loadable::GUEST_TEST_PVH_X64 => Some("guest_test_pvh"),
         _ if id == petritools::PETRITOOLS_EROFS_X64 => Some("x64/petritools.erofs"),
         _ if id == petritools::PETRITOOLS_EROFS_AARCH64 => Some("aarch64/petritools.erofs"),
         _ if id == loadable::UEFI_FIRMWARE_X64 => {
@@ -602,6 +604,33 @@ fn simple_tmk_path(arch: MachineArch) -> anyhow::Result<PathBuf> {
             cmd: &format!(
                 "RUSTC_BOOTSTRAP=1 cargo build -p simple_tmk --config openhcl/minimal_rt/{arch_str}-config.toml"
             ),
+        },
+    )
+}
+
+/// Path to the source-built x86_64 Xen PVH test guest.
+fn guest_test_pvh_path() -> anyhow::Result<PathBuf> {
+    let profile = cargo_build_profile();
+    if let Some(path) = try_get_path(
+        format!("target/x86_64-unknown-none/{profile}"),
+        "guest_test_pvh",
+    )? {
+        return Ok(path);
+    }
+
+    if let Some(path) = flowey_built_executable_path(
+        format!("target/guest_test_pvh/x86_64-unknown-none/{profile}/deps"),
+        "guest_test_pvh",
+    )? {
+        return Ok(path);
+    }
+
+    get_path(
+        format!("target/x86_64-unknown-none/{profile}"),
+        "guest_test_pvh",
+        MissingCommand::Custom {
+            description: "Xen PVH test guest",
+            cmd: "cargo build -p guest_test_pvh --target x86_64-unknown-none",
         },
     )
 }
