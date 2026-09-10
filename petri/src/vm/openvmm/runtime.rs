@@ -17,6 +17,7 @@ use crate::worker::Worker;
 use anyhow::Context;
 use async_trait::async_trait;
 use framebuffer::View;
+use futures::AsyncWriteExt;
 use futures::FutureExt;
 use futures_concurrency::future::Race;
 use get_resources::ged::FirmwareEvent;
@@ -355,6 +356,22 @@ impl PetriVmOpenVmm {
         pub async fn verify_save_restore(&mut self) -> anyhow::Result<()>
     );
     petri_vm_fn!(pub(crate) async fn launch_linux_direct_pipette(&mut self) -> anyhow::Result<()>);
+    petri_vm_fn!(
+        /// Wait for a microVM portb console marker.
+        pub async fn wait_for_microvm_portb_output(&mut self, marker: &str) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Wait for an exact byte sequence from the microVM portb console.
+        pub async fn wait_for_microvm_portb_bytes(&mut self, marker: &[u8]) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Write raw bytes to the microVM portb console input stream.
+        pub async fn write_microvm_portb_input(&mut self, input: &[u8]) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Perform one pulse save/restore operation.
+        pub async fn pulse_save_restore(&mut self) -> anyhow::Result<()>
+    );
 
     /// Wrap the provided future in a race with the worker process's halt
     /// notification channel. This is useful for preventing a future from
@@ -428,6 +445,51 @@ impl PetriVmOpenVmm {
 }
 
 impl PetriVmInner {
+    async fn wait_for_microvm_portb_output(&mut self, marker: &str) -> anyhow::Result<()> {
+        self.wait_for_microvm_portb_bytes(marker.as_bytes()).await
+    }
+
+    async fn wait_for_microvm_portb_bytes(&mut self, marker: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(!marker.is_empty(), "microVM portb marker cannot be empty");
+        let output = self
+            .resources
+            .microvm_portb_output
+            .as_mut()
+            .context("microVM portb output is not configured")?;
+        let mut buffered = Vec::new();
+        loop {
+            buffered.extend_from_slice(
+                &output
+                    .recv()
+                    .await
+                    .context("microVM portb output disconnected")?,
+            );
+            if buffered
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn write_microvm_portb_input(&mut self, input: &[u8]) -> anyhow::Result<()> {
+        self.resources
+            .microvm_portb_input
+            .as_mut()
+            .context("microVM portb input is not configured")?
+            .write_all(input)
+            .await
+            .context("writing microVM portb input")
+    }
+
+    async fn pulse_save_restore(&self) -> anyhow::Result<()> {
+        self.worker
+            .pulse_save_restore()
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     async fn wait_for_boot_event(&mut self) -> anyhow::Result<FirmwareEvent> {
         self.resources
             .firmware_event_recv

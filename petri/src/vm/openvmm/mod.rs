@@ -57,6 +57,7 @@ use openvmm_helpers::disk::OpenDiskOptions;
 use openvmm_helpers::disk::open_disk_type;
 use pal_async::DefaultDriver;
 use pal_async::socket::PolledSocket;
+use pal_async::socket::WriteHalf;
 use pal_async::task::Task;
 use petri_artifacts_common::tags::GuestQuirksInner;
 use petri_artifacts_common::tags::MachineArch;
@@ -68,6 +69,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempPath;
 use unix_socket::UnixListener;
+use unix_socket::UnixStream;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
@@ -196,6 +198,8 @@ struct PetriVmResourcesOpenVmm {
     pipette_listener: PolledSocket<UnixListener>,
     vtl2_pipette_listener: Option<PolledSocket<UnixListener>>,
     linux_direct_serial_agent: Option<LinuxDirectSerialAgent>,
+    microvm_portb_input: Option<WriteHalf<UnixStream>>,
+    microvm_portb_output: Option<Receiver<Vec<u8>>>,
 
     /// When set, the host connects to pipette via TCP through consomme
     /// port forwarding instead of accepting on the Unix socket listener.
