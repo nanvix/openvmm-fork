@@ -1395,9 +1395,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Select the microVM ABI version 1 machine profile.
     pub fn with_microvm_machine(mut self) -> Self {
-        self.config.machine_profile = MachineProfile::Microvm {
-            abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_1,
-        };
+        self.config.machine_profile = MachineProfile::Microvm;
         self.config.proc_topology.vp_count = 1;
         self.config.proc_topology.vps_per_socket = None;
         self.minimal_mode = true;

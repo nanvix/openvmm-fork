@@ -214,12 +214,12 @@ pub enum MachineProfile {
     #[default]
     Standard,
     /// The microVM machine.
-    Microvm { abi_version: u32 },
+    Microvm,
 }
 
 /// Validates the microVM machine contract. Standard-machine configurations are unchanged.
 pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> anyhow::Result<()> {
-    let MachineProfile::Microvm { abi_version } = config.machine_profile else {
+    let MachineProfile::Microvm = config.machine_profile else {
         anyhow::ensure!(
             !matches!(config.load_mode, LoadMode::Pvh { .. }),
             "PVH load mode requires the microVM profile"
@@ -227,10 +227,6 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         return Ok(());
     };
 
-    anyhow::ensure!(
-        abi_version == MICROVM_ABI_VERSION_1,
-        "unsupported microVM ABI version {abi_version}"
-    );
     validate_microvm_virtio_reservations()?;
     validate_microvm_command_line(config)?;
     anyhow::ensure!(

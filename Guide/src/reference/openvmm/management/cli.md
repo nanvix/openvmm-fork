@@ -19,6 +19,15 @@ describes the source definitions.
   `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the
   product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
+* `--snapshot-destination <DIR>`: Publish a base microVM snapshot when the
+  guest writes PMIO `0x605`. The directory must not exist. File-backed RAM
+  is allocated automatically when no memory file is supplied. Successful
+  capture terminates the source; rollback-safe failures resume it.
+* `--snapshot-quiesce-timeout-ms <MILLISECONDS>`: Bound host-input fencing and
+  device quiescence. Defaults to 5000 milliseconds.
+* `--restore-ready-path <PATH>`: With `--restore-snapshot`, emit
+  `OPENVMM_RESTORE_READY_V1` to a Unix socket or Windows named pipe after
+  restore startup succeeds and before guest execution.
 * `--machine <PROFILE>`: Select the guest-visible machine contract. The
   default is `standard`. `microvm` selects microVM ABI version 1, an x86-64
   Xen PVH machine that runs on KVM or WHP with exactly one vCPU:
@@ -33,7 +42,7 @@ describes the source definitions.
   The kernel must be an uncompressed ELF64 image containing
   `XEN_ELFNOTE_PHYS32_ENTRY`. The profile owns the base command line
   (`earlycon=xe9 console=hvc0 reboot=t panic=-1`), reserves a 1-GiB MMIO gap
-  from 3 to 4 GiB, and exposes only PIC/IOAPIC, PIT, binary UTC RTC, the microVM
+  from 3 to 4 GiB, and exposes only PIC/IOAPIC, PIT, UTC RTC, the microVM
   portb console, and lifecycle ports. User arguments cannot override
   `earlycon=`, `console=`, or `virtio_mmio.device=`.
 

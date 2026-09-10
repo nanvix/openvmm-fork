@@ -645,6 +645,7 @@ dependencies = [
 name = "chipset_device_resources"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset_device",
  "guestmem",
@@ -5857,6 +5858,7 @@ name = "openvmm_defs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chipset_resources",
  "floppy_resources",
  "framebuffer",
  "get_resources",
@@ -5870,12 +5872,14 @@ dependencies = [
  "net_backend_resources",
  "openvmm_pcat_locator",
  "smbios_defs",
+ "state_unit",
  "thiserror 2.0.16",
  "unix_socket",
  "virt",
  "virt_whp",
  "vm_resource",
  "vmbus_proxy",
+ "vmcore",
  "vmgs_resources",
  "vmm_core_defs",
  "vmotherboard",

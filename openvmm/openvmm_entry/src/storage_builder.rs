@@ -883,7 +883,7 @@ impl StorageBuilder {
         }
 
         let vtl0_virtio_blk_disks = std::mem::take(&mut self.vtl0_virtio_blk_disks);
-        if matches!(config.machine_profile, MachineProfile::Microvm { .. }) {
+        if matches!(config.machine_profile, MachineProfile::Microvm) {
             anyhow::ensure!(
                 vtl0_virtio_blk_disks.len() <= 1,
                 "microVM ABI version 1 permits at most one virtio-blk device"
