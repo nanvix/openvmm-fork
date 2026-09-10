@@ -3436,6 +3436,188 @@ async fn verify_device_packed_queue_simple(driver: DefaultDriver) {
     verify_device_queue_simple_inner(test_mem, guest, features).await;
 }
 
+#[async_test]
+async fn mmio_used_buffer_ack_doorbell_deasserts_interrupt(driver: DefaultDriver) {
+    for register_doorbells in [false, true] {
+        mmio_used_buffer_ack_inner(driver.clone(), register_doorbells).await;
+    }
+}
+
+async fn mmio_used_buffer_ack_inner(driver: DefaultDriver, register_doorbells: bool) {
+    const MMIO_BASE: u64 = 0x1000;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    let mut guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true);
+    let target = TestLineInterruptTarget::new_arc();
+    let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
+    let base_addr = guest.get_queue_descriptor_backing_memory_address(0);
+    let queue_work = Arc::new(
+        move |_: u16, queue: &mut VirtioQueue, work: VirtioQueueCallbackWork| {
+            assert_eq!(work.payload[0].address, base_addr);
+            queue.complete(work, 123);
+        },
+    );
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(
+            &driver_source,
+            DeviceTraits {
+                device_id: VirtioDeviceType::CONSOLE,
+                device_features: VirtioDeviceFeatures::new()
+                    .with_bank(0, VIRTIO_F_RING_EVENT_IDX | 2)
+                    .with_bank(1, VIRTIO_F_VERSION_1),
+                max_queues: 1,
+                device_register_length: 0,
+                ..Default::default()
+            },
+            Some(queue_work),
+        )),
+        &driver,
+        guest.mem(),
+        interrupt,
+        if register_doorbells {
+            Some(test_mem.clone())
+        } else {
+            None
+        },
+        MMIO_BASE,
+        0x1000,
+    )
+    .unwrap();
+
+    guest
+        .setup_chipset_device(&mut dev, guest.queue_features())
+        .await;
+    expect_mmio_interrupt(
+        &mut dev,
+        &target,
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE,
+        false,
+    )
+    .await;
+    guest.add_to_avail_queue(0);
+    dev.write_u32(80, 0);
+    poll_fn(|cx| target.poll_high(cx, 0)).await;
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+    );
+
+    let ack = DoorbellSpec {
+        address: MMIO_BASE + 100,
+        value: Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+        length: Some(4),
+    };
+    let accelerated = register_doorbells && cfg!(target_os = "linux");
+    assert_eq!(test_mem.installed_doorbells().contains(&ack), accelerated);
+    if accelerated {
+        assert!(test_mem.signal_doorbell(ack));
+    } else {
+        dev.write_u32(100, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+    }
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        0
+    );
+    assert!(!target.is_high(0));
+    dev.stop().await;
+}
+
+#[async_test]
+async fn mmio_ack_before_completion_keeps_new_interrupt_asserted(driver: DefaultDriver) {
+    for register_doorbells in [false, true] {
+        mmio_ack_before_completion_inner(driver.clone(), register_doorbells).await;
+    }
+}
+
+async fn mmio_ack_before_completion_inner(driver: DefaultDriver, register_doorbells: bool) {
+    const MMIO_BASE: u64 = 0x2000;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    let mut guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+    let target = TestLineInterruptTarget::new_arc();
+    let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let (completed, mut completions) = mesh::channel();
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(
+            &driver_source,
+            DeviceTraits {
+                device_id: VirtioDeviceType::CONSOLE,
+                device_features: VirtioDeviceFeatures::new()
+                    .with_bank(0, VIRTIO_F_RING_EVENT_IDX | 2)
+                    .with_bank(1, VIRTIO_F_VERSION_1),
+                max_queues: 1,
+                device_register_length: 0,
+                ..Default::default()
+            },
+            Some(Arc::new(
+                move |_: u16, queue: &mut VirtioQueue, work: VirtioQueueCallbackWork| {
+                    queue.complete(work, 123);
+                    completed.send(());
+                },
+            )),
+        )),
+        &driver,
+        guest.mem(),
+        interrupt,
+        if register_doorbells {
+            Some(test_mem.clone())
+        } else {
+            None
+        },
+        MMIO_BASE,
+        0x1000,
+    )
+    .unwrap();
+
+    guest
+        .setup_chipset_device(&mut dev, guest.queue_features())
+        .await;
+    expect_mmio_interrupt(
+        &mut dev,
+        &target,
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE,
+        false,
+    )
+    .await;
+    guest.add_to_avail_queue(0);
+    dev.write_u32(80, 0);
+    poll_fn(|cx| target.poll_high(cx, 0)).await;
+    must_recv_in_timeout(&mut completions, Duration::from_secs(5)).await;
+    assert_eq!(guest.get_next_completed(0), Some((0, 123)));
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+    );
+    let ack = DoorbellSpec {
+        address: MMIO_BASE + 100,
+        value: Some(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER.into()),
+        length: Some(4),
+    };
+    let accelerated = register_doorbells && cfg!(target_os = "linux");
+    assert_eq!(test_mem.installed_doorbells().contains(&ack), accelerated);
+    if !accelerated {
+        dev.write_u32(100, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+        assert!(!target.is_high(0));
+    }
+
+    guest.add_to_avail_queue(0);
+    dev.write_u32(80, 0);
+    must_recv_in_timeout(&mut completions, Duration::from_secs(5)).await;
+    assert_eq!(guest.get_next_completed(0), Some((0, 123)));
+    if accelerated {
+        // A deferred ACK must not clear a completion newer than the status read.
+        assert!(test_mem.signal_doorbell(ack));
+    }
+    assert_eq!(
+        dev.read_u32(96) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+    );
+    assert!(target.is_high(0));
+    dev.stop().await;
+}
+
 async fn verify_device_multi_queue_inner(
     test_mem: Arc<VirtioTestMemoryAccess>,
     mut guest: VirtioTestGuest,
