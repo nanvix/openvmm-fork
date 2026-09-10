@@ -19,6 +19,7 @@ pub use sys::SparseMapping;
 pub use sys::alloc_shared_memory;
 pub use sys::alloc_shared_memory_hugetlb;
 pub use sys::new_mappable_from_file;
+pub use sys::new_mappable_from_file_copy_on_write;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU8;
@@ -189,6 +190,9 @@ impl SparseMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::Write;
 
     static BUF: [u8; 65536] = [0xcc; 65536];
 
@@ -227,7 +231,6 @@ mod tests {
     #[test]
     fn test_sparse_mapping_minimum_alignment() {
         SparseMapping::new_with_minimum_alignment(SparseMapping::page_size(), 0).unwrap_err();
-
         let mapping =
             SparseMapping::new_with_minimum_alignment(SparseMapping::page_size(), 1).unwrap();
         assert_eq!(mapping.as_ptr() as usize % SparseMapping::page_size(), 0);
@@ -237,7 +240,6 @@ mod tests {
             SparseMapping::new_with_minimum_alignment(SparseMapping::page_size(), alignment)
                 .unwrap();
         assert_eq!(mapping.as_ptr() as usize % alignment, 0);
-
         // Alignments larger than the allocation granularity are honored on
         // both platforms.
         let alignment = 0x200000;
@@ -245,6 +247,63 @@ mod tests {
             SparseMapping::new_with_minimum_alignment(SparseMapping::page_size(), alignment)
                 .unwrap();
         assert_eq!(mapping.as_ptr() as usize % alignment, 0);
+    }
+
+    #[test]
+    fn test_flush_shared_file_mapping() {
+        let page_size = SparseMapping::page_size();
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(page_size as u64).unwrap();
+        let mappable = new_mappable_from_file(&file, true, false).unwrap();
+        let mapping = SparseMapping::new(page_size).unwrap();
+        mapping.map_file(0, page_size, &mappable, 0, true).unwrap();
+
+        mapping.write_at(0, b"flushed").unwrap();
+        mapping.flush(0, page_size).unwrap();
+
+        let mut bytes = [0_u8; 7];
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"flushed");
+    }
+
+    #[test]
+    fn copy_on_write_file_mapping_does_not_modify_file() {
+        let page_size = SparseMapping::page_size();
+        let mapping_size = page_size * 16;
+        let original = (0..mapping_size)
+            .map(|offset| (offset / page_size) as u8)
+            .collect::<Vec<_>>();
+        let mut artifact = tempfile::NamedTempFile::new().unwrap();
+        artifact.write_all(&original).unwrap();
+        artifact.as_file().sync_all().unwrap();
+        let mut file = std::fs::File::open(artifact.path()).unwrap();
+
+        let mappable = new_mappable_from_file_copy_on_write(&file, false).unwrap();
+        let mapping = SparseMapping::new(mapping_size).unwrap();
+        mapping
+            .map_file_copy_on_write(0, mapping_size, &mappable, 0, true)
+            .unwrap();
+        mapping.fill_at(0, 0xa5, mapping_size).unwrap();
+
+        let mut mapped_bytes = vec![0; mapping_size];
+        mapping.read_at(0, &mut mapped_bytes).unwrap();
+        assert_eq!(mapped_bytes, vec![0xa5; mapping_size]);
+        drop(mapping);
+
+        file.rewind().unwrap();
+        let mut file_bytes = Vec::new();
+        file.read_to_end(&mut file_bytes).unwrap();
+        assert_eq!(file_bytes, original);
+
+        let mappable = new_mappable_from_file_copy_on_write(&file, false).unwrap();
+        let mapping = SparseMapping::new(mapping_size).unwrap();
+        mapping
+            .map_file_copy_on_write(0, mapping_size, &mappable, 0, true)
+            .unwrap();
+        let mut remapped_bytes = vec![0; mapping_size];
+        mapping.read_at(0, &mut remapped_bytes).unwrap();
+        assert_eq!(remapped_bytes, original);
     }
 
     #[test]

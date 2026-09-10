@@ -9,12 +9,16 @@ use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::windows::prelude::*;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::ptr::null_mut;
 use std::str::FromStr;
 use widestring::U16CStr;
 use widestring::U16CString;
+use windows_sys::Win32::Foundation::GENERIC_READ;
+use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -28,8 +32,16 @@ use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Security::SACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
+use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 
 const MAX_SUBAUTHORITY_COUNT: usize = 15;
@@ -312,6 +324,58 @@ impl SecurityDescriptor {
     pub fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
         self.0.as_ptr() as _
     }
+}
+
+/// Creates a directory with `security_descriptor` applied atomically.
+pub fn create_directory_with_security(
+    path: &Path,
+    security_descriptor: &SecurityDescriptor,
+) -> std::io::Result<()> {
+    let path = U16CString::from_os_str(path.as_os_str())
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor.as_ptr(),
+        bInheritHandle: 0,
+    };
+    // SAFETY: the NUL-terminated path and security descriptor remain valid for
+    // the duration of the documented Win32 call.
+    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Exclusively creates a regular file with `security_descriptor` applied atomically.
+pub fn create_file_with_security(
+    path: &Path,
+    security_descriptor: &SecurityDescriptor,
+) -> std::io::Result<std::fs::File> {
+    let path = U16CString::from_os_str(path.as_os_str())
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor.as_ptr(),
+        bInheritHandle: 0,
+    };
+    // SAFETY: arguments satisfy CreateFileW's contracts. Ownership of a valid
+    // returned handle is transferred exactly once into `File`.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `handle` is valid and uniquely owned after successful CreateFileW.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 #[link(
