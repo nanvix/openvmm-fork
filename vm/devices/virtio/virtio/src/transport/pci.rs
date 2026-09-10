@@ -772,6 +772,18 @@ impl ChangeDeviceState for VirtioPciDevice {
         self.core.start(&mut self.pci);
     }
 
+    async fn start_fallible(&mut self) -> anyhow::Result<()> {
+        self.core.start_fallible(&mut self.pci).await
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.core.quiesce_input().await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.core.resume_input().await
+    }
+
     async fn stop(&mut self) {
         self.core.stop(&mut self.pci).await;
     }
@@ -813,6 +825,7 @@ mod saved_state {
         use mesh::payload::Protobuf;
         use pci_core::cfg_space_emu::ConfigSpaceType0Emulator;
         use vmcore::save_restore::SaveRestore;
+        use vmcore::save_restore::SavedStateBlob;
         use vmcore::save_restore::SavedStateRoot;
 
         #[derive(Protobuf)]
@@ -840,6 +853,8 @@ mod saved_state {
             /// the guest firmware runs) survive a save/restore cycle.
             #[mesh(5)]
             pub cfg_space: <ConfigSpaceType0Emulator as SaveRestore>::SavedState,
+            #[mesh(6)]
+            pub device_state: Option<SavedStateBlob>,
         }
 
         #[derive(Protobuf, SavedStateRoot)]
@@ -861,21 +876,26 @@ mod saved_state {
         type SavedState = state::SavedState;
 
         fn save(&mut self) -> Result<Self::SavedState, SaveError> {
+            let common = self.core.save_common()?;
+            let queues = self
+                .core
+                .queues
+                .iter()
+                .enumerate()
+                .map(|(i, qd)| state::SavedQueueState {
+                    common: self.core.save_queue_common(i),
+                    msix_vector: qd.msix_vector,
+                })
+                .collect();
+            let cfg_space = self.pci.config_space.save()?;
+            let device_state = self.core.take_device_state()?;
             Ok(state::SavedState {
-                common: self.core.save_common()?,
+                common,
                 msix_config_vector: self.pci.msix_config_vector,
-                queues: self
-                    .core
-                    .queues
-                    .iter()
-                    .enumerate()
-                    .map(|(i, qd)| state::SavedQueueState {
-                        common: self.core.save_queue_common(i),
-                        msix_vector: qd.msix_vector,
-                    })
-                    .collect(),
+                queues,
                 interrupt_status: *self.pci.interrupt_status.lock(),
-                cfg_space: self.pci.config_space.save()?,
+                cfg_space,
+                device_state,
             })
         }
 
@@ -900,6 +920,7 @@ mod saved_state {
             self.core.restore_common(
                 &mut self.pci,
                 &state.common,
+                state.device_state,
                 state
                     .queues
                     .into_iter()
