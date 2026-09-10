@@ -301,6 +301,18 @@ Examples:
     )]
     pub restore_snapshot: Option<PathBuf>,
 
+    /// Expose fresh entropy on the private microVM restore channel.
+    #[clap(long, requires = "restore_snapshot")]
+    pub restore_entropy: bool,
+
+    /// Bring a contiguous prefix of template processors online during restore.
+    #[clap(long, value_name = "COUNT", requires = "restore_snapshot")]
+    pub restore_processors: Option<u32>,
+
+    /// Maximum time allowed for guest post-restore repair.
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 60000)]
+    pub restore_gate_timeout_ms: u64,
+
     /// Write OPENVMM_RESTORE_READY_V1 to this Unix socket or Windows named pipe
     /// after restore startup completes and before guest execution begins.
     #[clap(long, value_name = "PATH", requires = "restore_snapshot")]

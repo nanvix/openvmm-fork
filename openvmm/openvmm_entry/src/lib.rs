@@ -1120,6 +1120,159 @@ fn effective_microvm_filesystem(
     }))
 }
 
+fn microvm_restore_packet(
+    entropy: &[u8; 64],
+    restore_online_vp_count: Option<u32>,
+    restore_memory_target_requested: bool,
+    restore_memory_ranges: &[openvmm_helpers::snapshot::SnapshotMemoryExpansionRange],
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        restore_memory_target_requested || restore_memory_ranges.is_empty(),
+        "restore memory ranges require an explicit memory target"
+    );
+    let mut packet = if restore_memory_target_requested {
+        // V3 is: 19-byte NUL-terminated header, u8 online-VP target (zero
+        // means absent), u8 range count, repeated little-endian (u64 GPA,
+        // u64 length) pairs, and 64 bytes of entropy. The exact GPA ranges
+        // keep guest repair independent of the host's layout implementation.
+        let range_count = u8::try_from(restore_memory_ranges.len())
+            .context("restore memory range count does not fit in u8")?;
+        let mut packet = b"OPENVMM_ENTROPY_V3\0".to_vec();
+        let online_vp_count = restore_online_vp_count
+            .map(u8::try_from)
+            .transpose()
+            .context("restore-online VP count does not fit in u8")?
+            .unwrap_or(0);
+        packet.push(online_vp_count);
+        packet.push(range_count);
+        for range in restore_memory_ranges {
+            anyhow::ensure!(range.length != 0, "restore memory range is empty");
+            range
+                .gpa_start
+                .checked_add(range.length)
+                .context("restore memory range overflows GPA space")?;
+            packet.extend_from_slice(&range.gpa_start.to_le_bytes());
+            packet.extend_from_slice(&range.length.to_le_bytes());
+        }
+        packet
+    } else if let Some(count) = restore_online_vp_count {
+        let count = u8::try_from(count).context("restore-online VP count does not fit in u8")?;
+        let mut packet = b"OPENVMM_ENTROPY_V2\0".to_vec();
+        packet.push(count);
+        packet
+    } else {
+        b"OPENVMM_ENTROPY_V1\0".to_vec()
+    };
+    packet.extend(entropy);
+    Ok(packet)
+}
+
+fn microvm_generation_id(entropy: &[u8; 64]) -> [u8; 16] {
+    let mut generation_id = [0; 16];
+    generation_id.copy_from_slice(&entropy[..16]);
+    generation_id
+}
+
+fn fresh_microvm_generation_id() -> anyhow::Result<[u8; 16]> {
+    let mut generation_id = [0; 16];
+    getrandom::fill(&mut generation_id).context("failed to generate microVM generation ID")?;
+    Ok(generation_id)
+}
+
+pub(crate) fn fresh_microvm_restore_packet(
+    restore_online_vp_count: Option<u32>,
+    restore_memory_target_requested: bool,
+    restore_memory_ranges: &[openvmm_helpers::snapshot::SnapshotMemoryExpansionRange],
+) -> anyhow::Result<([u8; 16], Vec<u8>)> {
+    let generation_id_create = openvmm_defs::profile::ProfileSpan::start();
+    let mut entropy = [0_u8; 64];
+    getrandom::fill(&mut entropy).context("failed to generate restore entropy")?;
+    let generation_id = microvm_generation_id(&entropy);
+    let packet = microvm_restore_packet(
+        &entropy,
+        restore_online_vp_count,
+        restore_memory_target_requested,
+        restore_memory_ranges,
+    )?;
+    generation_id_create.complete("restore", "generation_id_create", Default::default());
+    Ok((generation_id, packet))
+}
+
+#[cfg(test)]
+mod restore_packet_tests {
+    use super::microvm_generation_id;
+    use super::microvm_restore_packet;
+    use openvmm_helpers::snapshot::SnapshotMemoryExpansionRange;
+
+    #[test]
+    fn restore_packet_versions_preserve_entropy_and_online_target() {
+        let entropy = [0x5a; 64];
+        assert_eq!(microvm_generation_id(&entropy), [0x5a; 16]);
+        let v1 = microvm_restore_packet(&entropy, None, false, &[]).unwrap();
+        assert_eq!(&v1[..19], b"OPENVMM_ENTROPY_V1\0");
+        assert_eq!(&v1[19..], &entropy);
+
+        let v2 = microvm_restore_packet(&entropy, Some(8), false, &[]).unwrap();
+        assert_eq!(&v2[..19], b"OPENVMM_ENTROPY_V2\0");
+        assert_eq!(v2[19], 8);
+        assert_eq!(&v2[20..], &entropy);
+
+        let ranges = [
+            SnapshotMemoryExpansionRange {
+                gpa_start: 0x2000_0000,
+                length: 0x2000_0000,
+            },
+            SnapshotMemoryExpansionRange {
+                gpa_start: 0x1_0000_0000,
+                length: 0x4000_0000,
+            },
+        ];
+        let v3 = microvm_restore_packet(&entropy, Some(4), true, &ranges).unwrap();
+        assert_eq!(&v3[..19], b"OPENVMM_ENTROPY_V3\0");
+        assert_eq!(v3[19], 4);
+        assert_eq!(v3[20], 2);
+        assert_eq!(
+            &v3[21..37],
+            &[
+                ranges[0].gpa_start.to_le_bytes(),
+                ranges[0].length.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            &v3[37..53],
+            &[
+                ranges[1].gpa_start.to_le_bytes(),
+                ranges[1].length.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(&v3[53..], &entropy);
+
+        let v3_without_cpu = microvm_restore_packet(&entropy, None, true, &ranges[..1]).unwrap();
+        assert_eq!(&v3_without_cpu[..19], b"OPENVMM_ENTROPY_V3\0");
+        assert_eq!(v3_without_cpu[19], 0);
+        assert_eq!(v3_without_cpu[20], 1);
+        assert_eq!(
+            &v3_without_cpu[21..37],
+            &[
+                ranges[0].gpa_start.to_le_bytes(),
+                ranges[0].length.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(&v3_without_cpu[37..], &entropy);
+
+        let v3_explicit_base = microvm_restore_packet(&entropy, None, true, &[]).unwrap();
+        assert_eq!(&v3_explicit_base[..19], b"OPENVMM_ENTROPY_V3\0");
+        assert_eq!(v3_explicit_base[19], 0);
+        assert_eq!(v3_explicit_base[20], 0);
+        assert_eq!(&v3_explicit_base[21..], &entropy);
+
+        assert!(microvm_restore_packet(&entropy, None, false, &ranges[..1]).is_err());
+    }
+}
+
 /// Build a flat list of switches with their parent port assignments.
 ///
 /// This function converts hierarchical CLI switch definitions into a flat list
@@ -2339,9 +2492,20 @@ async fn vm_config_from_command_line(
         .context("failed to build chipset configuration")?;
 
     if let Some(io) = microvm_portb_cfg {
+        let (generation_id, restore_entropy) = if opt.restore_entropy {
+            fresh_microvm_restore_packet(opt.restore_processors, false, &[])?
+        } else {
+            (fresh_microvm_generation_id()?, Vec::new())
+        };
+
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmPortbHandle::ID.to_owned(),
-            resource: MicrovmPortbHandle { io }.into_resource(),
+            resource: MicrovmPortbHandle {
+                io,
+                generation_id,
+                restore_entropy,
+            }
+            .into_resource(),
         });
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmShutdownHandle::ID.to_owned(),
@@ -4081,6 +4245,10 @@ async fn run_control_inner(
             "snapshot machine profile does not match the requested microVM machine"
         );
         openvmm_helpers::snapshot::validate_supported_microvm_contract(contract)?;
+        if let Some(target) = opt.restore_processors {
+            openvmm_helpers::snapshot::validate_restore_online_vp_count(manifest, target)?;
+        }
+
         anyhow::ensure!(
             opt.cmdline.is_empty(),
             "restore-time command-line overrides are not allowed"
@@ -4098,6 +4266,9 @@ async fn run_control_inner(
     } else {
         None
     };
+    if opt.restore_processors.is_some() {
+        opt.restore_entropy = true;
+    }
     let (mut vm_config, mut resources) =
         vm_config_from_command_line(driver, mesh, &opt, restore_machine_contract).await?;
     if opt.snapshot_destination.is_some() || opt.restore_snapshot.is_some() {
@@ -4406,8 +4577,10 @@ async fn run_control_inner(
                 .and_then(|(_, _, frequency, _)| *frequency),
             restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
             restore_ready_sink,
-            restore_gate_timeout: None,
-            restore_vp_count: None,
+            restore_gate_timeout: opt
+                .restore_processors
+                .map(|_| Duration::from_millis(opt.restore_gate_timeout_ms)),
+            restore_vp_count: opt.restore_processors,
             rpc: rpc_recv,
             notify: notify_send,
         };

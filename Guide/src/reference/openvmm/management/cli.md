@@ -15,6 +15,14 @@ as well as the generated CLI help (via `cargo run -- --help`).
   capture terminates the source; rollback-safe failures resume it.
 * `--snapshot-quiesce-timeout-ms <MILLISECONDS>`: Bound host-input fencing and
   device quiescence. Defaults to 5000 milliseconds.
+* `--restore-entropy`: Supply a fresh private entropy packet during snapshot
+  restore. Generation IDs are fresh for every microVM instance independently
+  of serialized console input.
+* `--restore-processors <COUNT>`: Request an online VP prefix within an
+  opt-in `maxcpus=` template. The request supplies fresh entropy and holds
+  host input until the guest acknowledges post-restore repair.
+* `--restore-gate-timeout-ms <MILLISECONDS>`: Bound that repair gate.
+  Defaults to 60000 milliseconds.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>` on a microVM: Add the fixed
   virtio-fs attachment. Access defaults to `ro`. Restore requires the same
   canonical host path, guest target, access policy and live object identities.
