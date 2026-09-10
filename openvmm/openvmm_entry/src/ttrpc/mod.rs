@@ -781,25 +781,26 @@ impl VmService {
                 "the microVM profile requires pvh_boot"
             );
             anyhow::ensure!(
-                req_config
-                    .processor_config
-                    .as_ref()
-                    .map(|config| config.processor_count)
-                    .unwrap_or(1)
-                    == 1,
-                "microVM ABI version 1 requires exactly one vCPU"
+                openvmm_defs::config::microvm_processor_count_supported(
+                    req_config
+                        .processor_config
+                        .as_ref()
+                        .map(|config| config.processor_count)
+                        .unwrap_or(1)
+                ),
+                "microVM supports only 1, 2, 4, or 8 vCPUs"
             );
             anyhow::ensure!(
                 req_config.numa_config.is_none(),
-                "microVM ABI version 1 does not support custom NUMA topology"
+                "microVM ABI version 2 does not support custom NUMA topology"
             );
             anyhow::ensure!(
                 req_config.pcie.is_none(),
-                "microVM ABI version 1 does not support PCIe"
+                "microVM ABI version 2 does not support PCIe"
             );
             anyhow::ensure!(
                 req_config.hvsocket_config.is_none(),
-                "microVM ABI version 1 does not support hvsocket"
+                "microVM ABI version 2 does not support hvsocket"
             );
 
             let serial_ports = req_config
@@ -809,7 +810,7 @@ impl VmService {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 serial_ports.len() <= 1 && serial_ports.iter().all(|port| port.port == 0),
-                "microVM ABI version 1 accepts only serial port 0 as its portb endpoint"
+                "microVM ABI version 2 accepts only serial port 0 as its portb endpoint"
             );
             if let Some(devices) = &req_config.devices_config {
                 anyhow::ensure!(
@@ -819,7 +820,7 @@ impl VmService {
                         && devices.windows_device.is_empty()
                         && devices.virtiofs_config.is_empty()
                         && devices.virtio_console.is_none(),
-                    "microVM ABI version 1 supports only the optional virtio-blk device"
+                    "microVM ABI version 2 supports only the optional virtio-blk device"
                 );
             }
         }
@@ -978,7 +979,7 @@ impl VmService {
 
         let microvm_portb = if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
             if ports.iter().skip(1).any(Option::is_some) {
-                bail!("microVM ABI version 1 accepts only serial port 0 as its portb endpoint");
+                bail!("microVM ABI version 2 accepts only serial port 0 as its portb endpoint");
             }
             Some(
                 ports[0]
@@ -1101,10 +1102,13 @@ impl VmService {
             chipset: chipset.chipset,
             processor_topology: ProcessorTopologyConfig {
                 proc_count: config_proc_count,
-                vps_per_socket: None,
-                enable_smt: None,
+                vps_per_socket: is_microvm.then_some(config_proc_count),
+                enable_smt: is_microvm.then_some(false),
                 arch: if is_microvm {
-                    Some(ArchTopologyConfig::X86(X86TopologyConfig::default()))
+                    Some(ArchTopologyConfig::X86(X86TopologyConfig {
+                        apic_id_offset: 0,
+                        x2apic: openvmm_defs::config::X2ApicConfig::Unsupported,
+                    }))
                 } else {
                     arch
                 },
@@ -1275,7 +1279,7 @@ impl VmService {
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
             if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
-                bail!("microVM ABI version 1 does not support hvsocket");
+                bail!("microVM ABI version 2 does not support hvsocket");
             }
             let listener = UnixListener::bind(&hvsocket_config.path).with_context(|| {
                 format!("failed to bind hvsocket path: {}", hvsocket_config.path)

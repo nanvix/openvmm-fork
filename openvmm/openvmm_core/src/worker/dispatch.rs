@@ -117,6 +117,7 @@ use virt::ProtoPartition;
 use virt::VpIndex;
 use virtio::PciInterruptModel;
 use virtio::VirtioMmioDevice;
+use virtio::VirtioMmioInterruptMode;
 use virtio::VirtioPciDevice;
 use virtio::resolve::VirtioResolveInput;
 use vm_loader::InitialLoad;
@@ -571,7 +572,10 @@ struct X86TopologyResult {
 }
 
 #[cfg(guest_arch = "x86_64")]
-fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86TopologyResult> {
+fn build_x86_topology(
+    config: &ProcessorTopologyConfig,
+    machine_profile: MachineProfile,
+) -> anyhow::Result<X86TopologyResult> {
     use vm_topology::processor::x86::X2ApicState;
 
     let arch = match &config.arch {
@@ -579,7 +583,11 @@ fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86Top
         Some(ArchTopologyConfig::X86(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
-    let mut builder = TopologyBuilder::from_host_topology()?;
+    let mut builder = if machine_profile == MachineProfile::Microvm {
+        TopologyBuilder::new_x86()
+    } else {
+        TopologyBuilder::from_host_topology()?
+    };
     builder.apic_id_offset(arch.apic_id_offset);
     if let Some(smt) = config.enable_smt {
         builder.smt_enabled(smt);
@@ -1179,7 +1187,7 @@ impl InitializedVm {
         };
         #[cfg(not(guest_arch = "aarch64"))]
         let mut processor_topology = {
-            let result = build_x86_topology(&cfg.processor_topology)?;
+            let result = build_x86_topology(&cfg.processor_topology, cfg.machine_profile)?;
             result.processor_topology
         };
 
@@ -1810,6 +1818,7 @@ impl InitializedVm {
                                 with_psp: cfg.chipset.with_generic_psp,
                                 pm_base: PM_BASE,
                                 acpi_irq: SYSTEM_IRQ_ACPI,
+                                level_triggered_irqs: &[],
                                 iommu: None,
                             },
                         };
@@ -3127,8 +3136,16 @@ impl InitializedVm {
                         };
                     let id = format!("{id}-{mmio_start}");
                     let gm = gm.clone();
+                    let interrupt_mode = if cfg.machine_profile == MachineProfile::Microvm {
+                        VirtioMmioInterruptMode::SharedStatus {
+                            status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(mmio_start)
+                                .context("microVM device has no shared status slot")?,
+                        }
+                    } else {
+                        VirtioMmioInterruptMode::Legacy
+                    };
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
-                        VirtioMmioDevice::new_with_disabled_features(
+                        VirtioMmioDevice::new_with_disabled_features_and_interrupt_mode(
                             device.0,
                             &driver_source.simple(),
                             gm,
@@ -3137,6 +3154,7 @@ impl InitializedVm {
                             mmio_start,
                             mmio_len,
                             disabled_features,
+                            interrupt_mode,
                         )
                     })?;
                 }
@@ -3440,6 +3458,7 @@ impl LoadedVmInner {
                 with_pit: self.chipset_capabilities.with_pit,
                 pm_base: PM_BASE,
                 acpi_irq: SYSTEM_IRQ_ACPI,
+                level_triggered_irqs: &[],
                 iommu: match &self.iommu_devices {
                     IommuDevices::AmdVi(devices) => {
                         Some(vmm_core::acpi_builder::X86IommuAcpiConfig::AmdVi(
@@ -3493,15 +3512,54 @@ impl LoadedVmInner {
                 kernel,
                 initrd,
                 cmdline,
-            } => super::vm_loaders::pvh::load_pvh(
-                &super::vm_loaders::pvh::KernelConfig {
-                    kernel,
-                    initrd,
-                    cmdline,
-                    mem_layout: &self.mem_layout,
-                },
-                &self.gm,
-            )?,
+            } => {
+                anyhow::ensure!(
+                    self.machine_profile == MachineProfile::Microvm,
+                    "PVH load mode requires the microVM profile"
+                );
+                let pvh_reserved_memory_ranges = vec![MemoryRange::new(
+                    openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                        ..openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                            + openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+                )];
+                let apic_ids = self
+                    .processor_topology
+                    .vps_arch()
+                    .map(|vp| vp.apic_id)
+                    .collect::<Vec<_>>();
+                let tables = acpi_builder.build_acpi_tables(loader::pvh::ACPI_RSDP_ADDR, |dsdt| {
+                    add_devices_to_dsdt_x64(
+                        dsdt,
+                        &self.chipset_cfg,
+                        &self.chipset_capabilities,
+                        false,
+                        false,
+                        &self.chipset_mmio,
+                        self.virtio_mmio_region,
+                        self.virtio_mmio_irq,
+                        &self.pci_legacy_interrupts,
+                    )
+                });
+                super::vm_loaders::pvh::load_pvh(
+                    &super::vm_loaders::pvh::KernelConfig {
+                        kernel,
+                        initrd,
+                        cmdline,
+                        mem_layout: &self.mem_layout,
+                        acpi_tables: loader::pvh::AcpiTables {
+                            rsdp: tables.rsdp,
+                            tables: tables.tables,
+                        },
+                        boot_config: loader::pvh::BootConfig {
+                            apic_ids: &apic_ids,
+                            level_triggered_irqs:
+                                &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
+                            reserved_memory_ranges: &pvh_reserved_memory_ranges,
+                        },
+                    },
+                    &self.gm,
+                )?
+            }
             #[cfg(guest_arch = "x86_64")]
             &LoadMode::Linux {
                 ref kernel,

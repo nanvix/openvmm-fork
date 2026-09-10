@@ -151,7 +151,7 @@ pub struct NumaDistanceCli {
 pub enum MachineProfileCli {
     /// The standard OpenVMM machine.
     Standard,
-    /// The microVM ABI version 1 machine.
+    /// The microVM ABI version 2 machine.
     Microvm,
 }
 
@@ -1628,19 +1628,19 @@ impl Options {
             "the microVM machine requires an x86-64 guest"
         );
         anyhow::ensure!(
-            self.processors == 1,
-            "microVM ABI version 1 requires exactly one vCPU"
+            openvmm_defs::config::microvm_processor_count_supported(self.processors),
+            "microVM ABI version 2 requires exactly one vCPU"
         );
         anyhow::ensure!(
             self.numa.is_none() && self.numa_distance.is_none(),
-            "microVM ABI version 1 does not support custom NUMA topology"
+            "microVM ABI version 2 does not support custom NUMA topology"
         );
         anyhow::ensure!(
             self.vps_per_socket.is_none()
                 && self.smt == SmtConfigCli::Auto
                 && self.apic_id_offset == 0
                 && matches!(self.x2apic, X2ApicConfig::Auto),
-            "microVM ABI version 1 owns CPU topology and APIC configuration"
+            "microVM ABI version 2 owns CPU topology and APIC configuration"
         );
         anyhow::ensure!(
             self.restore_snapshot.is_none() || self.snapshot_destination.is_none(),
@@ -1648,7 +1648,7 @@ impl Options {
         );
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
-            "microVM ABI version 1 requires Xen PVH direct boot"
+            "microVM ABI version 2 requires Xen PVH direct boot"
         );
         anyhow::ensure!(
             !self.uefi_debug
@@ -1664,7 +1664,7 @@ impl Options {
                 && self.uefi_console_mode.is_none()
                 && self.efi_diagnostics_log_level.is_none()
                 && !self.default_boot_always_attempt,
-            "microVM ABI version 1 does not support firmware options"
+            "microVM ABI version 2 does not support firmware options"
         );
         anyhow::ensure!(
             !self.hv
@@ -1677,13 +1677,13 @@ impl Options {
                 && self.vmbus_vtl2_vsock_path.is_none()
                 && self.openhcl_dump_path.is_none()
                 && self.gdb.is_none(),
-            "microVM ABI version 1 does not support Hyper-V, VTL2, isolation, nested virtualization, GET, or VMBus"
+            "microVM ABI version 2 does not support Hyper-V, VTL2, isolation, nested virtualization, GET, or VMBus"
         );
         if let Some(hypervisor) = self.hypervisor.as_deref() {
             let name = hypervisor.split(':').next().unwrap_or(hypervisor);
             anyhow::ensure!(
                 matches!(name, "kvm" | "whp"),
-                "microVM ABI version 1 requires KVM or WHP"
+                "microVM ABI version 2 requires KVM or WHP"
             );
         }
 
@@ -1718,11 +1718,11 @@ impl Options {
                 && self.openhcl_controller.is_empty()
                 && self.ide.is_empty()
                 && self.floppy.is_empty(),
-            "microVM ABI version 1 supports only the optional virtio-blk extension"
+            "microVM ABI version 2 supports only the optional virtio-blk extension"
         );
         anyhow::ensure!(
             self.virtio_blk.len() <= 1,
-            "microVM ABI version 1 permits at most one virtio-blk device"
+            "microVM ABI version 2 permits at most one virtio-blk device"
         );
         anyhow::ensure!(
             self.virtio_blk.iter().all(|disk| disk.pcie_port.is_none()),
@@ -1736,17 +1736,17 @@ impl Options {
                 && !self.virtio_rng
                 && self.virtio_vsock_path.is_none()
                 && self.virtio_net.is_empty(),
-            "microVM ABI version 1 does not expose additional virtio devices"
+            "microVM ABI version 2 does not expose additional virtio devices"
         );
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
             self.vhost_user.is_empty(),
-            "microVM ABI version 1 does not support vhost-user devices"
+            "microVM ABI version 2 does not support vhost-user devices"
         );
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
             self.virtio_vsock_vhost_cid.is_none(),
-            "microVM ABI version 1 does not support vhost-vsock"
+            "microVM ABI version 2 does not support vhost-vsock"
         );
         anyhow::ensure!(
             !self.nic
@@ -1759,7 +1759,7 @@ impl Options {
                 && self.imc.is_none()
                 && !self.battery
                 && self.vmgs.is_none(),
-            "microVM ABI version 1 does not expose network, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
+            "microVM ABI version 2 does not expose network, graphics, TPM, watchdog, IMC, battery, or VMGS devices"
         );
         anyhow::ensure!(
             self.cxl_test.is_empty()
@@ -1770,17 +1770,17 @@ impl Options {
                 && self.pcie_remote.is_empty()
                 && self.amd_iommu.is_empty()
                 && self.intel_vtd.is_empty(),
-            "microVM ABI version 1 does not support PCIe or IOMMU devices"
+            "microVM ABI version 2 does not support PCIe or IOMMU devices"
         );
         #[cfg(windows)]
         anyhow::ensure!(
             self.device.is_empty() && self.kernel_vmnic.is_empty(),
-            "microVM ABI version 1 does not support assigned devices or kernel VM NICs"
+            "microVM ABI version 2 does not support assigned devices or kernel VM NICs"
         );
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
             self.vfio.is_empty() && self.iommu.is_empty(),
-            "microVM ABI version 1 does not support VFIO or IOMMU devices"
+            "microVM ABI version 2 does not support VFIO or IOMMU devices"
         );
 
         Ok(())
@@ -5751,7 +5751,7 @@ mod tests {
         valid.validate_microvm_options().unwrap();
 
         for args in [
-            vec!["openvmm", "--machine", "microvm", "--processors", "2"],
+            vec!["openvmm", "--machine", "microvm", "--processors", "3"],
             vec!["openvmm", "--machine", "microvm", "--uefi"],
             vec!["openvmm", "--machine", "microvm", "--hypervisor", "mshv"],
             vec!["openvmm", "--machine", "microvm", "--virtio-rng"],

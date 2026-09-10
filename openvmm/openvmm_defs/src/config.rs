@@ -309,8 +309,30 @@ pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
 pub const MICROVM_VIRTIO_FS_FEATURES: u64 = (1 << 28) | (1 << 29) | (1 << 32) | (1 << 33);
 
 /// The initial microVM guest ABI version.
-pub const MICROVM_ABI_VERSION_1: u32 = 1;
-/// ABI-v1 command line owned by the microVM profile.
+pub const MICROVM_ABI_VERSION_2: u32 = 2;
+
+/// Returns whether a processor count is supported by the fixed profile.
+pub const fn microvm_processor_count_supported(processor_count: u32) -> bool {
+    matches!(processor_count, 1 | 2 | 4 | 8)
+}
+/// Shared guest interrupt-status page.
+pub const MICROVM_SHARED_STATUS_PAGE_GPA: u64 = 0x3_0000;
+/// Size of the shared guest interrupt-status page.
+pub const MICROVM_SHARED_STATUS_PAGE_SIZE: u64 = 0x1000;
+/// Shared-status transports use edge interrupt delivery.
+pub const MICROVM_LEVEL_TRIGGERED_IRQS: [u32; 0] = [];
+/// Returns the shared status word for a fixed microVM device.
+pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
+    match mmio_base {
+        MICROVM_VIRTIO_NET_MMIO_BASE => Some(MICROVM_SHARED_STATUS_PAGE_GPA),
+        MICROVM_VIRTIO_FS_MMIO_BASE => Some(MICROVM_SHARED_STATUS_PAGE_GPA + 4),
+        MICROVM_VIRTIO_CONSOLE_MMIO_BASE => Some(MICROVM_SHARED_STATUS_PAGE_GPA + 8),
+        MICROVM_VIRTIO_BLK_MMIO_BASE => Some(MICROVM_SHARED_STATUS_PAGE_GPA + 12),
+        _ => None,
+    }
+}
+
+/// Command line owned by the microVM profile.
 pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
 
 /// Command line when the microVM virtio console is present.
@@ -383,7 +405,7 @@ fn validate_microvm_command_line(
     hypervisor_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let LoadMode::Pvh { cmdline, .. } = &config.load_mode else {
-        anyhow::bail!("microVM ABI version 1 requires PVH load mode");
+        anyhow::bail!("microVM ABI version 2 requires PVH load mode");
     };
     anyhow::ensure!(
         !cmdline.contains('\0'),
@@ -549,40 +571,40 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     validate_microvm_command_line(config, hypervisor_id)?;
     anyhow::ensure!(
         matches!(config.load_mode, LoadMode::Pvh { .. }),
-        "microVM ABI version 1 requires PVH load mode"
+        "microVM ABI version 2 requires PVH load mode"
     );
     if let Some(hypervisor_id) = hypervisor_id {
         anyhow::ensure!(
             matches!(hypervisor_id, "kvm" | "whp"),
-            "microVM ABI version 1 requires the KVM or WHP hypervisor"
+            "microVM ABI version 2 requires the KVM or WHP hypervisor"
         );
     }
     anyhow::ensure!(
-        config.processor_topology.proc_count == 1,
-        "microVM ABI version 1 requires exactly one vCPU"
+        microvm_processor_count_supported(config.processor_topology.proc_count),
+        "microVM ABI version 2 requires exactly one vCPU"
     );
     anyhow::ensure!(
-        config.processor_topology.vps_per_socket.is_none()
-            && config.processor_topology.enable_smt.is_none()
+        config.processor_topology.vps_per_socket == Some(config.processor_topology.proc_count)
+            && config.processor_topology.enable_smt == Some(false)
             && matches!(
                 &config.processor_topology.arch,
                 Some(ArchTopologyConfig::X86(X86TopologyConfig {
                     apic_id_offset: 0,
-                    x2apic: X2ApicConfig::Auto,
+                    x2apic: X2ApicConfig::Unsupported,
                 }))
             ),
-        "microVM ABI version 1 requires its fixed x86 APIC topology"
+        "microVM ABI version 2 requires its fixed x86 APIC topology"
     );
     anyhow::ensure!(
         config.numa.nodes.len() == 1 && config.numa.distances.is_empty(),
-        "microVM ABI version 1 requires a single NUMA node"
+        "microVM ABI version 2 requires a single NUMA node"
     );
     anyhow::ensure!(
         !config.hypervisor.with_hv
             && config.hypervisor.with_vtl2.is_none()
             && config.hypervisor.with_isolation.is_none()
             && !config.hypervisor.nested_virt,
-        "microVM ABI version 1 does not support Hyper-V enlightenments, VTL2, isolation, or nested virtualization"
+        "microVM ABI version 2 does not support Hyper-V enlightenments, VTL2, isolation, or nested virtualization"
     );
 
     let expected_chipset = BaseChipsetManifest {
@@ -591,7 +613,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     };
     anyhow::ensure!(
         config.chipset == expected_chipset,
-        "microVM ABI version 1 chipset is not the microVM allowlist"
+        "microVM ABI version 2 chipset is not the microVM allowlist"
     );
     anyhow::ensure!(
         config.chipset_capabilities.with_ioapic
@@ -601,7 +623,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             && !config.chipset_capabilities.with_psp
             && !config.chipset_capabilities.with_guest_watchdog
             && !config.chipset_capabilities.with_i440bx_host_pci_bridge,
-        "microVM ABI version 1 chipset capabilities do not match the fixed profile"
+        "microVM ABI version 2 chipset capabilities do not match the fixed profile"
     );
 
     let mut chipset_ids = config
@@ -620,12 +642,12 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
                 ("pic", "pic"),
                 ("pit", "pit"),
             ],
-        "microVM ABI version 1 chipset-device inventory is not exact"
+        "microVM ABI version 2 chipset-device inventory is not exact"
     );
 
     anyhow::ensure!(
         config.floppy_disks.is_empty() && config.ide_disks.is_empty(),
-        "microVM ABI version 1 does not support floppy or IDE devices"
+        "microVM ABI version 2 does not support floppy or IDE devices"
     );
     anyhow::ensure!(
         config.pcie_root_complexes.is_empty()
@@ -635,37 +657,37 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             && config.vpci_devices.is_empty()
             && config.pci_chipset_devices.is_empty()
             && config.isa_dma_controller.is_none(),
-        "microVM ABI version 1 does not support PCI, PCIe, VPCI, or ISA DMA"
+        "microVM ABI version 2 does not support PCI, PCIe, VPCI, or ISA DMA"
     );
     anyhow::ensure!(
         config.vmbus.is_none() && config.vtl2_vmbus.is_none() && config.vmbus_devices.is_empty(),
-        "microVM ABI version 1 does not support VMBus"
+        "microVM ABI version 2 does not support VMBus"
     );
     anyhow::ensure!(
         config.framebuffer.is_none() && config.vga_firmware.is_none() && !config.vtl2_gfx,
-        "microVM ABI version 1 does not support graphics or VGA firmware"
+        "microVM ABI version 2 does not support graphics or VGA firmware"
     );
     anyhow::ensure!(
         config.vmgs.is_none(),
-        "microVM ABI version 1 does not support VMGS"
+        "microVM ABI version 2 does not support VMGS"
     );
     anyhow::ensure!(
         config.firmware_event_send.is_none() && config.debugger_rpc.is_none(),
-        "microVM ABI version 1 does not support firmware or debugger resources"
+        "microVM ABI version 2 does not support firmware or debugger resources"
     );
     anyhow::ensure!(
         config.rtc_delta_milliseconds == 0,
-        "microVM ABI version 1 RTC must be anchored directly to UTC"
+        "microVM ABI version 2 RTC must be anchored directly to UTC"
     );
     #[cfg(windows)]
     anyhow::ensure!(
         config.kernel_vmnics.is_empty() && config.vpci_resources.is_empty(),
-        "microVM ABI version 1 does not support kernel NIC or VPCI resources"
+        "microVM ABI version 2 does not support kernel NIC or VPCI resources"
     );
 
     anyhow::ensure!(
         config.virtio_devices.len() <= 4,
-        "microVM ABI version 1 permits at most one virtio-blk device"
+        "microVM ABI version 2 permits at most one virtio-blk device"
     );
     for (bus, device) in &config.virtio_devices {
         anyhow::ensure!(
@@ -674,14 +696,14 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
                     device.id(),
                     "virtio-blk" | "virtio-console" | "virtio-net" | "virtiofs"
                 ),
-            "microVM ABI version 1 permits only an MMIO virtio-blk device"
+            "microVM ABI version 2 permits only an MMIO virtio-blk device"
         );
     }
     anyhow::ensure!(
         config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024
             && config.layout.chipset_high_mmio_size == 0
             && config.layout.vtl2_chipset_mmio_size == 0,
-        "microVM ABI version 1 requires the fixed 3-GiB/4-GiB RAM split"
+        "microVM ABI version 2 requires the fixed 3-GiB/4-GiB RAM split"
     );
     Ok(())
 }

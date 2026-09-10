@@ -20,7 +20,7 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     const COMMAND_STATE: u8 = 5;
     const COMMAND_SHUTDOWN: u8 = 6;
 
-    let mut vm = config.with_microvm_machine().run_without_agent().await?;
+    let mut vm = config.with_microvm_machine(1).run_without_agent().await?;
 
     CancelContext::new()
         .with_timeout(TIMEOUT)
