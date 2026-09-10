@@ -22,9 +22,9 @@ rules. It does not support snapshot and restore.
 
 ## microVM
 
-The microVM profile uses one fixed virtio-fs slot when an active attachment
-is configured. Without `--mount`, no filesystem device is present. Configure
-an attachment with:
+The microVM profile reserves one fixed virtio-fs slot. Without `--mount`, the
+slot is guest-discoverable but dormant and has no HostFs backend or filesystem
+policy. Configure an active attachment with:
 
 ```bash
 openvmm --machine microvm \
@@ -51,7 +51,7 @@ guest-visible configuration:
 
 For an active cold-boot attachment, the profile adds `virtfs_dir`,
 `virtfs_tag`, and `virtfs_mode` bootstrap tokens to the kernel command line.
-The configured transport is discoverable. Active attachment policy and the
+The fixed transport is always discoverable. Active attachment policy and the
 canonical absolute host path become snapshot-authoritative.
 
 `SectionFs`, aggregate roots, alternate tags, PCI transport, DAX, and extra
@@ -75,8 +75,18 @@ OpenVMM pins the supplied root and validates its saved root and object
 identities. Missing, moved, replaced, ambiguous, or no-longer-reopenable
 objects fail restore.
 
-A snapshot captured without a filesystem device cannot add `--mount` during
-restore. Reserving an empty slot for later attachment is a separate capability.
+A snapshot captured without `--mount` records the fixed slot as dormant. It
+may restore without an attachment, or bind a new `--mount` attachment. Because
+execution resumes after the cold-boot mount hook, the guest must mount the
+newly attached backend explicitly:
+
+```bash
+mkdir -p /mnt/share
+mount -t virtiofs microvm /mnt/share
+```
+
+Snapshots created before the dormant-slot capability cannot add a restore-time
+attachment and fail with a compatibility error.
 
 ```admonish warning
 An ordinary host directory is live external state. Host changes after capture

@@ -1276,6 +1276,7 @@ impl VmService {
         let controller = VmController {
             microvm_console_attachment: None,
             microvm_filesystem: None,
+            microvm_filesystem_slot: false,
             microvm_filesystem_root_path: None,
             microvm_filesystem_attachment: None,
             microvm_network: None,

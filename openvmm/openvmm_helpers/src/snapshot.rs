@@ -782,6 +782,50 @@ pub fn add_microvm_filesystem_contract(
     Ok(())
 }
 
+/// Reserves the stable dormant filesystem slot in a microVM contract.
+pub fn reserve_microvm_filesystem_slot(contract: &mut SnapshotMachineContract) {
+    if !contract
+        .devices
+        .iter()
+        .any(|device| device.stable_id == "fs:microvm0")
+    {
+        let index = contract
+            .devices
+            .iter()
+            .position(|device| matches!(device.kind.as_str(), "virtio-console" | "virtio-blk"))
+            .unwrap_or(contract.devices.len());
+        contract.devices.insert(
+            index,
+            SnapshotDevice {
+                stable_id: "fs:microvm0".to_owned(),
+                state_unit_name: format!(
+                    "virtiofs-{}",
+                    openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE
+                ),
+                kind: "virtio-fs".to_owned(),
+                order: index as u32,
+                ranges: vec![SnapshotDeviceRange {
+                    address_space: "mmio".to_owned(),
+                    start: openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                    length: openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+                }],
+                irq: Some(openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ),
+                transport: "virtio-mmio".to_owned(),
+                feature_banks: vec![
+                    openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES as u32,
+                    (openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES >> 32) as u32,
+                ],
+                queue_count: 2,
+                queue_max_sizes: vec![256, 256],
+            },
+        );
+        for (index, device) in contract.devices.iter_mut().enumerate() {
+            device.order = index as u32;
+        }
+    }
+    contract.microvm_filesystem_slot_version = MICROVM_FILESYSTEM_SLOT_VERSION;
+}
+
 /// Builds the authoritative microVM machine contract.
 pub fn microvm_machine_contract(
     source_hypervisor: &str,
@@ -3431,6 +3475,30 @@ fn validate_machine_contract_shape(
         );
     }
 
+    let has_filesystem_device = contract
+        .devices
+        .iter()
+        .any(|device| device.stable_id == "fs:microvm0");
+    let has_filesystem_attachment = contract
+        .attachments
+        .iter()
+        .any(|attachment| attachment.stable_id == "fs:microvm0");
+    match contract.microvm_filesystem_slot_version {
+        0 => anyhow::ensure!(
+            has_filesystem_device == contract.microvm_filesystem.is_some()
+                && has_filesystem_attachment == contract.microvm_filesystem.is_some(),
+            "legacy snapshot microVM filesystem device, policy, and attachment inventories disagree"
+        ),
+        MICROVM_FILESYSTEM_SLOT_VERSION => anyhow::ensure!(
+            has_filesystem_device
+                && has_filesystem_attachment == contract.microvm_filesystem.is_some(),
+            "snapshot reserved microVM filesystem slot, policy, and attachment inventories disagree"
+        ),
+        version => anyhow::bail!(
+            "snapshot microVM filesystem slot capability version {version} is unsupported"
+        ),
+    }
+
     let topology = &contract.topology;
     let topology_vp_count = u64::from(topology.sockets)
         .checked_mul(u64::from(topology.dies_per_socket))
@@ -3448,7 +3516,6 @@ fn validate_machine_contract_shape(
     );
     anyhow::ensure!(
         contract.boot_online_vp_count == 0
-            && contract.microvm_filesystem_slot_version == 0
             && contract.microvm_sandbox_blocks.is_empty()
             && contract.attachments.iter().all(|attachment| matches!(
                 attachment.kind.as_str(),
