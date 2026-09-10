@@ -51,6 +51,51 @@ use vmm_core_defs::debug_rpc::DebuggerVpState;
 
 const NUM_VTLS: usize = 3;
 
+#[cfg(guest_arch = "x86_64")]
+struct AdvancedTsc {
+    value: u64,
+    cycles: u64,
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn advance_tsc_state(
+    previous_tsc: u64,
+    duration: std::time::Duration,
+    frequency_hz: u64,
+) -> anyhow::Result<AdvancedTsc> {
+    let cycles = duration
+        .as_nanos()
+        .checked_mul(u128::from(frequency_hz))
+        .context("TSC downtime adjustment overflows")?
+        / 1_000_000_000;
+    let cycles = u64::try_from(cycles).context("TSC downtime adjustment exceeds u64")?;
+    let value = previous_tsc
+        .checked_add(cycles)
+        .context("TSC downtime adjustment exceeds the counter range")?;
+    Ok(AdvancedTsc { value, cycles })
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod snapshot_tsc_tests {
+    use super::*;
+    use std::time::Duration;
+    use test_with_tracing::test;
+
+    #[test]
+    fn downtime_advances_tsc_by_elapsed_cycles() {
+        let advanced = advance_tsc_state(1_000, Duration::from_secs(1), 1_000).unwrap();
+
+        assert_eq!(advanced.value, 2_000);
+        assert_eq!(advanced.cycles, 1_000);
+    }
+
+    #[test]
+    fn downtime_rejects_tsc_overflow() {
+        assert!(advance_tsc_state(u64::MAX, Duration::from_nanos(1), 1_000_000_000).is_err());
+        assert!(advance_tsc_state(0, Duration::MAX, u64::MAX).is_err());
+    }
+}
+
 /// Trait for controlling a VP on a bound partition.
 #[async_trait(?Send)]
 trait ControlVp: ProtobufSaveRestore {
@@ -77,6 +122,15 @@ trait ControlVp: ProtobufSaveRestore {
 
     /// Scrub per-VP state for a VTL.
     fn scrub(&mut self, vtl: Vtl) -> anyhow::Result<()>;
+
+    /// Advances the stopped vCPU TSC after snapshot downtime.
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()>;
 
     #[cfg(feature = "gdb")]
     fn debug(&mut self) -> &mut dyn DebugVp;
@@ -173,6 +227,69 @@ where
                 })
             }
         }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let mut access = self.vp.access_state(Vtl::Vtl0);
+        let mut tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
+        let mut tsc_deadline = access
+            .caps()
+            .tsc_deadline
+            .then(|| access.tsc_deadline())
+            .transpose()
+            .context("failed to read stopped vCPU TSC deadline")?;
+        let mut apic = apic_frequency_hz
+            .map(|frequency| {
+                let mut apic = access
+                    .apic()
+                    .context("failed to read stopped LAPIC timer")?;
+                apic.advance_timer(duration, frequency)?;
+                anyhow::Ok(apic)
+            })
+            .transpose()?;
+        let previous_tsc = tsc.value;
+        let advanced = advance_tsc_state(previous_tsc, duration, frequency_hz)?;
+        tsc.value = advanced.value;
+        if let (Some(apic), Some(tsc_deadline)) = (apic.as_mut(), tsc_deadline.as_mut()) {
+            tsc_deadline.value =
+                apic.advance_tsc_deadline(previous_tsc, advanced.value, tsc_deadline.value);
+        }
+        access
+            .set_tsc(&tsc)
+            .context("failed to adjust stopped vCPU TSC")?;
+        if let Some(apic) = apic.take() {
+            access
+                .set_apic(&apic)
+                .context("failed to reprogram stopped LAPIC timer")?;
+        }
+        if let Some(tsc_deadline) = tsc_deadline {
+            access
+                .set_tsc_deadline(&tsc_deadline)
+                .context("failed to reprogram stopped vCPU TSC deadline")?;
+        }
+        access
+            .commit()
+            .context("failed to commit adjusted vCPU TSC")?;
+        let observed_tsc = access
+            .tsc()
+            .context("failed to read back adjusted vCPU TSC")?
+            .value;
+        tracing::debug!(
+            previous_tsc,
+            requested_tsc = tsc.value,
+            observed_tsc,
+            cycles = advanced.cycles,
+            frequency_hz,
+            ?duration,
+            "adjusted restored vCPU TSC"
+        );
+        Ok(())
     }
 
     fn inspect_vp(
@@ -753,6 +870,7 @@ pub struct VpSet {
     inner: Arc<Inner>,
     #[inspect(rename = "vp", iter_by_index, safe)]
     vps: Vec<Vp>,
+    vp_capacity: usize,
     #[inspect(skip)]
     started: bool,
 }
@@ -767,8 +885,136 @@ struct Vp {
     vp_info: TargetVpInfo,
 }
 
+fn validate_restore_vp_indices(
+    vp_count: usize,
+    indices: impl IntoIterator<Item = VpIndex>,
+) -> Result<(), RestoreError> {
+    let mut present = vec![false; vp_count];
+    for vp_index in indices {
+        let index = vp_index.index() as usize;
+        let slot = present
+            .get_mut(index)
+            .ok_or_else(|| RestoreError::UnknownEntryId(format!("vp{}", vp_index.index())))?;
+        if std::mem::replace(slot, true) {
+            return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+                "snapshot contains duplicate state for vp{}",
+                vp_index.index()
+            )));
+        }
+    }
+    if let Some(index) = present.iter().position(|present| !present) {
+        return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+            "snapshot is missing state for vp{index}"
+        )));
+    }
+    Ok(())
+}
+
+fn select_instantiated_vp_states<T>(
+    vp_capacity: usize,
+    instantiated_vp_count: usize,
+    states: Vec<(VpIndex, T)>,
+) -> Result<Vec<(VpIndex, T)>, RestoreError> {
+    validate_restore_vp_indices(vp_capacity, states.iter().map(|(vp_index, _)| *vp_index))?;
+    Ok(states
+        .into_iter()
+        .filter(|(vp_index, _)| vp_index.index() < instantiated_vp_count as u32)
+        .collect())
+}
+
+fn validate_save_vp_count(
+    instantiated_vp_count: usize,
+    vp_capacity: usize,
+) -> Result<(), SaveError> {
+    if instantiated_vp_count != vp_capacity {
+        return Err(SaveError::NotSupported);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "dump", feature = "gdb"))]
+fn instantiated_vp_index(vp_count: usize, vp: VpIndex) -> anyhow::Result<usize> {
+    let index = vp.index() as usize;
+    (index < vp_count)
+        .then_some(index)
+        .with_context(|| format!("vp{} is not instantiated", vp.index()))
+}
+
+#[cfg(test)]
+mod restore_vp_index_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn requires_exactly_one_restore_entry_per_vp() {
+        validate_restore_vp_indices(4, (0..4).map(VpIndex::new)).unwrap();
+
+        let missing = validate_restore_vp_indices(4, [0, 1, 3].map(VpIndex::new)).unwrap_err();
+        let RestoreError::InvalidSavedState(missing) = missing else {
+            panic!("expected invalid saved state");
+        };
+        assert!(missing.to_string().contains("missing state for vp2"));
+
+        let duplicate = validate_restore_vp_indices(4, [0, 1, 1, 3].map(VpIndex::new)).unwrap_err();
+        let RestoreError::InvalidSavedState(duplicate) = duplicate else {
+            panic!("expected invalid saved state");
+        };
+        assert!(duplicate.to_string().contains("duplicate state for vp1"));
+
+        let unknown = validate_restore_vp_indices(4, [0, 1, 2, 4].map(VpIndex::new)).unwrap_err();
+        assert!(unknown.to_string().contains("unknown entry id: vp4"));
+    }
+
+    #[test]
+    fn validates_full_inventory_before_selecting_instantiated_prefix() {
+        let states = (0..4).map(|index| (VpIndex::new(index), index)).collect();
+        let selected = select_instantiated_vp_states(4, 2, states).unwrap();
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|(vp_index, state)| (vp_index.index(), state))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 1)]
+        );
+
+        let missing_dormant_vp = [0, 1, 2]
+            .map(|index| (VpIndex::new(index), index))
+            .into_iter()
+            .collect();
+        let error = select_instantiated_vp_states(4, 2, missing_dormant_vp).unwrap_err();
+        let RestoreError::InvalidSavedState(error) = error else {
+            panic!("expected invalid saved state");
+        };
+        assert!(error.to_string().contains("missing state for vp3"));
+    }
+
+    #[test]
+    fn rejects_saving_an_instantiated_prefix() {
+        assert!(validate_save_vp_count(4, 4).is_ok());
+        assert!(matches!(
+            validate_save_vp_count(2, 4),
+            Err(SaveError::NotSupported)
+        ));
+    }
+
+    #[test]
+    fn rejects_access_to_an_uninstantiated_vp() {
+        assert_eq!(instantiated_vp_index(2, VpIndex::new(1)).unwrap(), 1);
+        assert!(
+            instantiated_vp_index(2, VpIndex::new(2))
+                .unwrap_err()
+                .to_string()
+                .contains("vp2 is not instantiated")
+        );
+    }
+}
+
 impl VpSet {
-    pub fn new(vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS], halt: Arc<Halt>) -> Self {
+    pub fn new(
+        vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS],
+        halt: Arc<Halt>,
+        vp_capacity: usize,
+    ) -> Self {
         let inner = Inner {
             vtl_guest_memory,
             halt,
@@ -776,6 +1022,7 @@ impl VpSet {
         Self {
             inner: Arc::new(inner),
             vps: Vec::new(),
+            vp_capacity,
             started: false,
         }
     }
@@ -831,7 +1078,8 @@ impl VpSet {
     /// Stops all VPs.
     pub async fn stop(&mut self) {
         if self.started {
-            self.vps
+            let stops = self
+                .vps
                 .iter()
                 .map(|vp| {
                     let (send, recv) = mesh::oneshot();
@@ -839,10 +1087,42 @@ impl VpSet {
                     // Ignore VPs whose runners have been dropped.
                     async { recv.await.ok() }
                 })
-                .collect::<JoinAll<_>>()
-                .await;
+                .collect::<JoinAll<_>>();
             self.started = false;
+            stops.await;
         }
+    }
+
+    /// Stops all VPs at a deferred I/O completion boundary.
+    pub async fn stop_at_io_boundary(
+        &mut self,
+        release_io: mesh::OneshotSender<()>,
+        io_completed: mesh::OneshotReceiver<()>,
+    ) -> anyhow::Result<()> {
+        let stops = self.started.then(|| {
+            let stops = self
+                .vps
+                .iter()
+                .map(|vp| {
+                    let (send, recv) = mesh::oneshot();
+                    vp.send.send(VpEvent::Stop(send));
+                    async { recv.await.ok() }
+                })
+                .collect::<JoinAll<_>>();
+            self.started = false;
+            stops
+        });
+
+        // Every VP has observed a queued stop event before the deferred I/O is
+        // completed, so the originating VP cannot re-enter guest execution.
+        release_io.send(());
+        io_completed
+            .await
+            .context("deferred I/O completion channel closed")?;
+        if let Some(stops) = stops {
+            stops.await;
+        }
+        Ok(())
     }
 
     /// Resets per-VP state on all VPs concurrently.
@@ -881,6 +1161,7 @@ impl VpSet {
 
     pub async fn save(&mut self) -> Result<Vec<(VpIndex, SavedStateBlob)>, SaveError> {
         assert!(!self.started);
+        validate_save_vp_count(self.vps.len(), self.vp_capacity)?;
         self.vps
             .iter()
             .enumerate()
@@ -903,6 +1184,11 @@ impl VpSet {
         states: impl IntoIterator<Item = (VpIndex, SavedStateBlob)>,
     ) -> Result<(), RestoreError> {
         assert!(!self.started);
+        let states = select_instantiated_vp_states(
+            self.vp_capacity,
+            self.vps.len(),
+            states.into_iter().collect(),
+        )?;
         states
             .into_iter()
             .map(|(vp_index, data)| {
@@ -927,6 +1213,32 @@ impl VpSet {
             .collect::<TryJoinAll<_>>()
             .await?;
 
+        Ok(())
+    }
+
+    /// Advances TSC state on every stopped vCPU.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.started, "vCPUs must be stopped before adjusting TSC");
+        self.vps
+            .iter()
+            .enumerate()
+            .map(|(index, vp)| async move {
+                vp.send
+                    .call_failable(
+                        |rpc| VpEvent::State(StateEvent::AdvanceTsc(rpc)),
+                        (duration, frequency_hz, apic_frequency_hz),
+                    )
+                    .await
+                    .with_context(|| format!("vp{index} TSC adjustment"))
+            })
+            .collect::<TryJoinAll<_>>()
+            .await?;
         Ok(())
     }
 
@@ -966,6 +1278,11 @@ impl VpSet {
 
         Ok(())
     }
+
+    #[cfg(any(feature = "dump", feature = "gdb"))]
+    fn instantiated_vp(&self, vp: VpIndex) -> anyhow::Result<&Vp> {
+        Ok(&self.vps[instantiated_vp_index(self.vps.len(), vp)?])
+    }
 }
 
 /// Error returned when registers could not be set on a VP.
@@ -987,7 +1304,7 @@ impl VpSet {
         vp: VpIndex,
         vtl: Vtl,
     ) -> anyhow::Result<hyperv_dump::VpState> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(|x| VpEvent::State(StateEvent::GetDumpVpState(x)), vtl)
             .await
@@ -1003,7 +1320,7 @@ impl VpSet {
         vp: VpIndex,
         state: virt::x86::DebugState,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::SetDebugState(x))),
@@ -1032,7 +1349,7 @@ impl VpSet {
         vp: VpIndex,
         state: Box<DebuggerVpState>,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::SetVpState(x))),
@@ -1043,7 +1360,7 @@ impl VpSet {
     }
 
     pub async fn get_vp_state(&self, vp: VpIndex) -> anyhow::Result<Box<DebuggerVpState>> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::GetVpState(x))),
@@ -1059,7 +1376,7 @@ impl VpSet {
         gva: u64,
         len: usize,
     ) -> anyhow::Result<Vec<u8>> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::ReadVirtualMemory(x))),
@@ -1075,7 +1392,7 @@ impl VpSet {
         gva: u64,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::WriteVirtualMemory(x))),
@@ -1101,6 +1418,8 @@ enum StateEvent {
     Restore(Rpc<SavedStateBlob, Result<(), RestoreError>>),
     Reset(mesh::rpc::FailableRpc<(), ()>),
     Scrub(mesh::rpc::FailableRpc<Vtl, ()>),
+    #[cfg(guest_arch = "x86_64")]
+    AdvanceTsc(mesh::rpc::FailableRpc<(std::time::Duration, u64, Option<u64>), ()>),
     #[cfg(feature = "dump")]
     GetDumpVpState(Rpc<Vtl, anyhow::Result<hyperv_dump::VpState>>),
     #[cfg(feature = "gdb")]
@@ -1347,6 +1666,12 @@ impl RunnerInner {
             StateEvent::Restore(rpc) => rpc.handle_sync(|data| vp.restore(data)),
             StateEvent::Reset(rpc) => rpc.handle_failable_sync(|()| vp.reset()),
             StateEvent::Scrub(rpc) => rpc.handle_failable_sync(|vtl| vp.scrub(vtl)),
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::AdvanceTsc(rpc) => {
+                rpc.handle_failable_sync(|(duration, frequency_hz, apic_frequency_hz)| {
+                    vp.advance_tsc(duration, frequency_hz, apic_frequency_hz)
+                })
+            }
             #[cfg(feature = "dump")]
             StateEvent::GetDumpVpState(rpc) => rpc.handle_sync(|vtl| vp.get_dump_vp_state(vtl)),
             #[cfg(feature = "gdb")]

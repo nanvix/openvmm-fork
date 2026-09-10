@@ -1071,6 +1071,12 @@ impl InitializedVm {
                     .map(|typ| typ.into())
                     .unwrap_or(virt::IsolationType::None),
                 nested_virt: cfg.hypervisor.nested_virt,
+                user_mode_memory_faults: true,
+                lazy_memory_registration: false,
+                versioned_cpu_contract: matches!(
+                    cfg.machine_profile,
+                    MachineProfile::Microvm { .. }
+                ),
             })
             .context("failed to create the prototype partition")?;
 
@@ -1341,6 +1347,10 @@ impl InitializedVm {
                 .await
                 .context("failed to attach memory to VTL2")?;
         }
+
+        partition
+            .finalize_memory()
+            .context("failed to finalize partition memory")?;
 
         Ok(Self {
             partition,
@@ -1747,14 +1757,7 @@ impl InitializedVm {
                 .into_resource(),
                 century_reg_idx: 0x32, // TODO: automatically sync with FADT
                 initial_cmos: initial_rtc_cmos,
-                mode: if matches!(
-                    cfg.machine_profile,
-                    MachineProfile::Microvm { abi_version: 1 }
-                ) {
-                    dev::GenericCmosRtcMode::MicrovmV1
-                } else {
-                    dev::GenericCmosRtcMode::Standard
-                },
+                mode: dev::GenericCmosRtcMode::Standard,
             }
         });
 
@@ -2932,6 +2935,7 @@ impl InitializedVm {
             partition.clone().into_vm_partition(),
             PartitionUnitParams {
                 processor_topology: &processor_topology,
+                active_vp_count: None,
                 halt_vps,
                 halt_request_recv,
                 client_notify_send: halt_send,
