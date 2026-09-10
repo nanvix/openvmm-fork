@@ -28,10 +28,14 @@ use crate::cli_args::SecureBootTemplateCli;
 use anyhow::Context;
 use anyhow::bail;
 use chipset_resources::battery::HostBatteryUpdate;
+use chipset_resources::microvm::MicrovmPortbHandle;
+use chipset_resources::microvm::MicrovmShutdownHandle;
+use chipset_resources::microvm::MicrovmSnapshotRequestHandle;
 use cli_args::DiskCliKind;
 use cli_args::EfiDiagnosticsLogLevelCli;
 use cli_args::EndpointConfigCli;
 use cli_args::IgvmPersonalityCli;
+use cli_args::MachineProfileCli;
 use cli_args::NicConfigCli;
 use cli_args::ProvisionVmgs;
 use cli_args::SerialConfigCli;
@@ -91,6 +95,7 @@ use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
+use openvmm_defs::config::build_microvm_command_line;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -133,6 +138,7 @@ use vm_manifest_builder::VmChipsetResult;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
+use vm_resource::ResourceId;
 use vm_resource::kind::DiskHandleKind;
 use vm_resource::kind::DiskLayerHandleKind;
 use vm_resource::kind::NetEndpointHandleKind;
@@ -231,7 +237,9 @@ fn build_switch_list(all_switches: &[cli_args::GenericPcieSwitchCli]) -> Vec<Pci
 }
 
 fn base_chipset_type(opt: &Options) -> BaseChipsetType {
-    if opt.igvm.is_some() {
+    if opt.machine == MachineProfileCli::Microvm {
+        BaseChipsetType::Microvm
+    } else if opt.igvm.is_some() {
         match opt.igvm_personality {
             None => BaseChipsetType::HclHost,
             Some(IgvmPersonalityCli::Uefi) => BaseChipsetType::HypervGen2Uefi,
@@ -319,8 +327,10 @@ async fn vm_config_from_command_line(
     mesh: &VmmMesh,
     opt: &Options,
 ) -> anyhow::Result<(Config, VmResources)> {
+    let is_microvm = opt.machine == MachineProfileCli::Microvm;
     opt.validate_isolation_options()?;
     opt.validate_igvm_options()?;
+    opt.validate_microvm_options()?;
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
 
@@ -416,17 +426,42 @@ async fn vm_config_from_command_line(
         opt.com4.as_ref().is_some_and(|c| c.debugger_mode),
     ];
 
-    let serial0_cfg = setup_serial(
-        "com1",
-        opt.com1
-            .clone()
-            .map_or(SerialConfigCli::Console, |c| c.backend),
-        if cfg!(guest_arch = "x86_64") {
-            "ttyS0"
-        } else {
-            "ttyAMA0"
-        },
-    )?;
+    if is_microvm
+        && (opt.com1.is_some()
+            || opt.com2.is_some()
+            || opt.com3.is_some()
+            || opt.com4.is_some()
+            || opt.vmbus_com1_serial.is_some()
+            || opt.vmbus_com2_serial.is_some()
+            || opt.debugcon.is_some()
+            || opt.virtio_console.is_some())
+    {
+        bail!(
+            "microVM ABI version 1 does not expose UART, debugcon, VMBus serial, or virtio-console"
+        );
+    }
+
+    let microvm_portb_cfg = if is_microvm {
+        setup_serial("microvm-portb", SerialConfigCli::Console, "hvc0")?
+    } else {
+        None
+    };
+
+    let serial0_cfg = if is_microvm {
+        None
+    } else {
+        setup_serial(
+            "com1",
+            opt.com1
+                .clone()
+                .map_or(SerialConfigCli::Console, |c| c.backend),
+            if cfg!(guest_arch = "x86_64") {
+                "ttyS0"
+            } else {
+                "ttyAMA0"
+            },
+        )?
+    };
     let serial1_cfg = setup_serial(
         "com2",
         opt.com2
@@ -1329,7 +1364,51 @@ async fn vm_config_from_command_line(
         .build()
         .context("failed to build chipset configuration")?;
 
-    if opt.restore_snapshot.is_some() {
+    if let Some(io) = microvm_portb_cfg {
+        chipset_devices.push(ChipsetDeviceHandle {
+            name: MicrovmPortbHandle::ID.to_owned(),
+            resource: MicrovmPortbHandle { io }.into_resource(),
+        });
+        chipset_devices.push(ChipsetDeviceHandle {
+            name: MicrovmShutdownHandle::ID.to_owned(),
+            resource: MicrovmShutdownHandle.into_resource(),
+        });
+        chipset_devices.push(ChipsetDeviceHandle {
+            name: MicrovmSnapshotRequestHandle::ID.to_owned(),
+            resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+        });
+    }
+
+    if is_microvm {
+        if arch != MachineArch::X86_64 {
+            bail!("the microVM profile requires an x86-64 guest");
+        }
+        if opt.restore_snapshot.is_some() {
+            bail!("snapshot restore is unavailable for microVM ABI version 1");
+        }
+        if opt.igvm.is_some() || opt.pcat || opt.uefi {
+            bail!("the microVM profile requires Xen PVH direct boot");
+        }
+
+        let kernel = fs_err::File::open(
+            (opt.kernel.0)
+                .as_ref()
+                .context("must provide a PVH kernel when using --machine microvm")?,
+        )
+        .context("failed to open PVH kernel")?;
+        let initrd = (opt.initrd.0)
+            .as_ref()
+            .map(fs_err::File::open)
+            .transpose()
+            .context("failed to open PVH initrd")?;
+
+        load_mode = LoadMode::Pvh {
+            kernel: kernel.into(),
+            initrd: initrd.map(Into::into),
+            cmdline: build_microvm_command_line(&opt.cmdline)?,
+        };
+        with_hv = false;
+    } else if opt.restore_snapshot.is_some() {
         // Snapshot restore: skip firmware loading entirely. Device state and
         // memory come from the snapshot directory.
         load_mode = LoadMode::None;
@@ -1478,25 +1557,32 @@ async fn vm_config_from_command_line(
         };
     }
 
-    let mut vmgs = Some(if let Some(VmgsCli { kind, provision }) = &opt.vmgs {
-        let disk = VmgsDisk {
-            disk: disk_open(kind, false)
-                .await
-                .context("failed to open vmgs disk")?,
-            encryption_policy: if opt.test_gsp_by_id {
-                GuestStateEncryptionPolicy::GspById(true)
-            } else {
-                GuestStateEncryptionPolicy::None(true)
-            },
-        };
-        match provision {
-            ProvisionVmgs::OnEmpty => VmgsResource::Disk(disk),
-            ProvisionVmgs::OnFailure => VmgsResource::ReprovisionOnFailure(disk),
-            ProvisionVmgs::True => VmgsResource::Reprovision(disk),
+    let mut vmgs = if is_microvm {
+        if opt.vmgs.is_some() {
+            bail!("microVM ABI version 1 does not support VMGS");
         }
+        None
     } else {
-        VmgsResource::Ephemeral
-    });
+        Some(if let Some(VmgsCli { kind, provision }) = &opt.vmgs {
+            let disk = VmgsDisk {
+                disk: disk_open(kind, false)
+                    .await
+                    .context("failed to open vmgs disk")?,
+                encryption_policy: if opt.test_gsp_by_id {
+                    GuestStateEncryptionPolicy::GspById(true)
+                } else {
+                    GuestStateEncryptionPolicy::None(true)
+                },
+            };
+            match provision {
+                ProvisionVmgs::OnEmpty => VmgsResource::Disk(disk),
+                ProvisionVmgs::OnFailure => VmgsResource::ReprovisionOnFailure(disk),
+                ProvisionVmgs::True => VmgsResource::Reprovision(disk),
+            }
+        } else {
+            VmgsResource::Ephemeral
+        })
+    };
 
     if with_get && with_hv {
         let has_vtl0_nvme = storage.has_vtl0_nvme();
@@ -2023,7 +2109,7 @@ async fn vm_config_from_command_line(
     }
 
     let mut cfg = Config {
-        machine_profile: MachineProfile::Standard,
+        machine_profile: opt.machine.into(),
         chipset,
         load_mode,
         floppy_disks,
@@ -2168,6 +2254,19 @@ async fn vm_config_from_command_line(
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
+    if matches!(cfg.machine_profile, MachineProfile::Microvm { .. })
+        && !cfg.virtio_devices.is_empty()
+    {
+        let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode else {
+            unreachable!("microVM configuration was constructed with PVH load mode");
+        };
+        openvmm_defs::config::append_microvm_virtio_blk_discovery(cmdline)?;
+    }
+    let requested_hypervisor = opt
+        .hypervisor
+        .as_deref()
+        .and_then(|spec| spec.split(':').next());
+    openvmm_defs::config::validate_machine_config(&cfg, requested_hypervisor)?;
     resources.serial_driver = Some(serial_driver);
     validate_snp_config(&cfg)?;
     Ok((cfg, resources))
@@ -2901,6 +3000,9 @@ async fn run_control_inner(
         let params = VmWorkerParameters {
             hypervisor: match &opt.hypervisor {
                 Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
+                None if opt.machine == MachineProfileCli::Microvm => {
+                    openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
+                }
                 None => openvmm_helpers::hypervisor::choose_hypervisor()?,
             },
             cfg: vm_config,
@@ -2950,7 +3052,7 @@ async fn run_control_inner(
 
     // Build the VmController with exclusive resources.
     let controller = vm_controller::VmController {
-        machine_profile: MachineProfile::Standard,
+        machine_profile: opt.machine.into(),
         mesh: mesh_slot.take().unwrap(),
         vm_worker,
         vnc_worker,
