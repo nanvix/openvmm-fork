@@ -512,6 +512,16 @@ impl VmController {
             vp_count: self.processors,
             page_size: crate::system_page_size(),
             architecture: crate::GUEST_ARCH.to_string(),
+            state_size_bytes: 0,
+            state_sha256: Vec::new(),
+            memory_sha256: Vec::new(),
+            machine_contract: None,
+            format_magic: openvmm_helpers::snapshot::SNAPSHOT_FORMAT_MAGIC.to_vec(),
+            saved_state_schema_version: openvmm_helpers::snapshot::SAVED_STATE_SCHEMA_VERSION,
+            saved_state_root_type: openvmm_helpers::snapshot::SAVED_STATE_ROOT_TYPE.to_owned(),
+            snapshot_tier: String::new(),
+            restore_policy: String::new(),
+            consumed_config_sections: 0,
         };
 
         // Write snapshot directory.

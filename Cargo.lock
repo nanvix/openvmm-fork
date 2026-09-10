@@ -6037,11 +6037,16 @@ dependencies = [
  "hypervisor_resources",
  "libc",
  "mesh",
+ "nix 0.30.1",
  "openvmm_defs",
+ "pal",
+ "sha2",
  "sparse_mmap",
  "tempfile",
+ "thiserror 2.0.16",
  "tracing",
  "vm_resource",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
