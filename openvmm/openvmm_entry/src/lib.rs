@@ -896,7 +896,6 @@ fn microvm_control_broker_config(
         let inherited = opt
             .microvm_control_auth_handle
             .context("live microVM control console requires an inherited authentication handle")?;
-        #[cfg(unix)]
         {
             let capability = serial_io::read_control_capability(inherited)
                 .context("failed to read control-console authentication capability")?;
@@ -906,16 +905,15 @@ fn microvm_control_broker_config(
             );
             capability
         }
-        #[cfg(not(unix))]
-        {
-            let _ = inherited;
-            anyhow::bail!("secure live microVM control consoles are unavailable on this platform")
-        }
     };
     #[cfg(target_os = "linux")]
     let expected_peer_identity =
         serial_core::LocalPeerIdentity::UnixUid(pal::unix::effective_user_id());
+    #[cfg(target_os = "windows")]
+    let expected_peer_identity = serial_io::current_process_control_sid()
+        .context("failed to read current-process SID for control-console authentication")?;
     #[cfg(not(target_os = "linux"))]
+    #[cfg(not(target_os = "windows"))]
     let expected_peer_identity = serial_core::LocalPeerIdentity::Unsupported;
 
     Ok(
@@ -1580,8 +1578,97 @@ mod microvm_console_attachment_tests {
         assert_eq!(read_payload(&[0x5a; 32], false).unwrap(), [0x5a; 32]);
         assert!(read_payload(&[0x5a; 31], false).is_err());
         assert!(read_payload(&[0x5a; 33], false).is_err());
-        assert!(read_payload(&[0x5a; 32], true).is_err());
+        assert!(read_payload(&[0x5a; 31], true).is_err());
         assert!(serial_io::read_control_capability(u64::MAX).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_capability_handle_requires_exact_closed_pipe_payload() {
+        use std::io::Write as _;
+        use std::os::windows::io::IntoRawHandle as _;
+
+        fn read_payload(payload: &[u8], keep_writer_open: bool) -> io::Result<[u8; 32]> {
+            let (read, mut write) = pal::windows::pipe::pair()?;
+            write.write_all(payload)?;
+            if !keep_writer_open {
+                drop(write);
+            }
+            let raw = read.into_raw_handle() as usize as u64;
+            serial_io::read_control_capability(raw)
+        }
+
+        assert_eq!(read_payload(&[0x5a; 32], false).unwrap(), [0x5a; 32]);
+        assert!(read_payload(&[0x5a; 31], false).is_err());
+        assert!(read_payload(&[0x5a; 33], false).is_err());
+        assert!(read_payload(&[0x5a; 31], true).is_err());
+        assert!(serial_io::read_control_capability(0).is_err());
+        assert!(serial_io::read_control_capability(u64::MAX).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_control_console_requires_named_pipe_path() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "listen=control.sock",
+            "--microvm-control-auth-handle",
+            "42",
+        ])
+        .unwrap();
+        assert!(options.validate_microvm_options().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_control_auth_handle_parser_rejects_malformed_or_zero() {
+        for bad in ["0", "-1", "abc", "0x2a", "42 "] {
+            assert!(
+                Options::try_parse_from([
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--virtio-console",
+                    "none",
+                    "--microvm-control-console",
+                    "listen=//./pipe/openvmm-microvm-control0",
+                    "--microvm-control-auth-handle",
+                    bad,
+                ])
+                .is_err(),
+                "expected parse failure for {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_control_listener_uses_remote_rejection_and_current_sid_identity() {
+        use pal::windows::pipe::PipeExt;
+        use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
+
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let path = PathBuf::from(format!(
+            "//./pipe/openvmm-microvm-test-control-{:016x}",
+            u64::from_ne_bytes(nonce)
+        ));
+        let probe = serial_io::create_control_named_pipe(&path).unwrap();
+        assert_ne!(
+            probe.get_pipe_info_flags().unwrap() & PIPE_REJECT_REMOTE_CLIENTS,
+            0
+        );
+
+        let sid = serial_io::current_process_control_sid().unwrap();
+        let serial_core::LocalPeerIdentity::WindowsSid { length, .. } = sid else {
+            panic!("expected a Windows SID");
+        };
+        assert!(length > 0);
     }
 
     #[test]

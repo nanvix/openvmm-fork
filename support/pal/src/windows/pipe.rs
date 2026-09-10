@@ -4,6 +4,7 @@
 use super::UnicodeString;
 use super::chk_status;
 use super::dos_to_nt_path;
+use super::security::SecurityDescriptor;
 use super::status_to_error;
 // TODO: Revert this ntapi fallback once windows/windows-sys expose
 // NtCreateNamedPipeFile directly.
@@ -42,20 +43,30 @@ use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::OBJ_CASE_INSENSITIVE;
 use windows_sys::Win32::Foundation::STATUS_NAME_TOO_LONG;
 use windows_sys::Win32::Foundation::STATUS_NOT_SUPPORTED;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Ioctl::FILE_ANY_ACCESS;
 use windows_sys::Win32::System::Ioctl::FILE_DEVICE_NAMED_PIPE;
 use windows_sys::Win32::System::Ioctl::METHOD_BUFFERED;
+use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::Pipes::GetNamedPipeHandleStateW;
 use windows_sys::Win32::System::Pipes::GetNamedPipeInfo;
+use windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE;
+use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
 use windows_sys::Win32::System::Pipes::PIPE_SERVER_END;
+use windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE;
+use windows_sys::Win32::System::Pipes::PIPE_WAIT;
 use windows_sys::Win32::System::Pipes::SetNamedPipeHandleState;
 
 /// Creates a pair of pipe files, returning (read, write).
@@ -154,6 +165,38 @@ pub fn new_named_pipe(
     )
 }
 
+pub fn new_local_restricted_named_pipe(
+    path: impl AsRef<Path>,
+    security_descriptor: &SecurityDescriptor,
+) -> io::Result<File> {
+    let mut path_u16: Vec<u16> = path.as_ref().as_os_str().encode_wide().collect();
+    path_u16.push(0);
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor.as_ptr(),
+        bInheritHandle: 0,
+    };
+    // SAFETY: arguments satisfy CreateNamedPipeW contracts and the path/security
+    // buffers remain valid for the duration of the call.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            path_u16.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            4096,
+            4096,
+            0,
+            &security_attributes,
+        )
+    };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful CreateNamedPipeW returns a unique owned handle.
+    Ok(unsafe { File::from_raw_handle(handle.cast::<c_void>()) })
+}
+
 fn create_named_pipe(
     root: RawHandle,
     path: &Path,
@@ -250,7 +293,9 @@ pub fn bidirectional_pair(message_mode: bool) -> io::Result<(File, File)> {
 
 pub trait PipeExt {
     fn get_pipe_state(&self) -> io::Result<u32>;
+    fn get_pipe_info_flags(&self) -> io::Result<u32>;
     fn get_pipe_buffer_sizes(&self) -> io::Result<(u32, u32)>;
+    fn get_pipe_client_process_id(&self) -> io::Result<u32>;
     fn set_pipe_mode(&self, mode: u32) -> io::Result<()>;
     fn set_pipe_select_event(&self, event: &Event, event_types: u32) -> io::Result<()>;
     fn get_pipe_select_events(&self) -> io::Result<u32>;
@@ -279,13 +324,13 @@ impl PipeExt for File {
     }
 
     fn get_pipe_buffer_sizes(&self) -> io::Result<(u32, u32)> {
-        let mut flags = 0;
+        let flags = self.get_pipe_info_flags()?;
         let mut out_buffer_size = 0;
         let mut in_buffer_size = 0;
         unsafe {
             if GetNamedPipeInfo(
                 self.as_raw_handle(),
-                &mut flags,
+                null_mut(),
                 &mut out_buffer_size,
                 &mut in_buffer_size,
                 null_mut(),
@@ -299,6 +344,33 @@ impl PipeExt for File {
         } else {
             Ok((out_buffer_size, in_buffer_size))
         }
+    }
+
+    fn get_pipe_info_flags(&self) -> io::Result<u32> {
+        let mut flags = 0;
+        unsafe {
+            if GetNamedPipeInfo(
+                self.as_raw_handle(),
+                &mut flags,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(flags)
+    }
+
+    fn get_pipe_client_process_id(&self) -> io::Result<u32> {
+        let mut process_id = 0;
+        unsafe {
+            if GetNamedPipeClientProcessId(self.as_raw_handle(), &mut process_id) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(process_id)
     }
 
     fn set_pipe_mode(&self, mode: u32) -> io::Result<()> {

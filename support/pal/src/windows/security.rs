@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 use std::fmt::Debug;
+use std::io;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -15,6 +16,7 @@ use std::ptr::null_mut;
 use std::str::FromStr;
 use widestring::U16CStr;
 use widestring::U16CString;
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -35,6 +37,9 @@ use windows_sys::Win32::Security::SACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
+use windows_sys::Win32::Security::TOKEN_QUERY;
+use windows_sys::Win32::Security::TOKEN_USER;
+use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser};
 use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
@@ -43,8 +48,13 @@ use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::OpenProcess;
+use windows_sys::Win32::System::Threading::OpenProcessToken;
+use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
 const MAX_SUBAUTHORITY_COUNT: usize = 15;
+pub const MAX_SID_BYTE_LENGTH: usize = 68;
 
 /// A Windows SID.
 #[derive(Clone, Copy)]
@@ -376,6 +386,139 @@ pub fn create_file_with_security(
     }
     // SAFETY: `handle` is valid and uniquely owned after successful CreateFileW.
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+pub fn current_process_user_sid() -> io::Result<([u8; MAX_SID_BYTE_LENGTH], u8)> {
+    // SAFETY: called with a valid pseudo-handle and output pointer.
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful OpenProcessToken returns a uniquely owned handle.
+        let token = OwnedHandle::from_raw_handle(token);
+        sid_from_token_handle(token.as_raw_handle())
+    }
+}
+
+pub fn process_user_sid(process_id: u32) -> io::Result<Option<([u8; MAX_SID_BYTE_LENGTH], u8)>> {
+    // SAFETY: called with a concrete pid and checked return value.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if process.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32)
+            {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // SAFETY: successful OpenProcess returns a uniquely owned handle.
+        let process = OwnedHandle::from_raw_handle(process);
+
+        let mut token = null_mut();
+        if OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful OpenProcessToken returns a uniquely owned handle.
+        let token = OwnedHandle::from_raw_handle(token);
+        sid_from_token_handle(token.as_raw_handle()).map(Some)
+    }
+}
+
+pub fn sid_to_string(sid_bytes: &[u8], sid_length: u8) -> io::Result<String> {
+    let sid_length = sid_length as usize;
+    if sid_length == 0 || sid_length > sid_bytes.len() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "SID buffer has an invalid encoded length",
+        ));
+    }
+    let sid_ptr = sid_bytes.as_ptr().cast_mut().cast();
+    // SAFETY: `sid_ptr` points to `sid_length` bytes owned by this function,
+    // and `IsValidSid`/`ConvertSidToStringSidW` read according to SID layout.
+    unsafe {
+        if IsValidSid(sid_ptr) == 0 {
+            return Err(io::Error::new(ErrorKind::InvalidData, "invalid SID bytes"));
+        }
+        let sid_len = GetLengthSid(sid_ptr) as usize;
+        if sid_len != sid_length {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "SID length does not match encoded bytes",
+            ));
+        }
+        let mut value = null_mut();
+        if ConvertSidToStringSidW(sid_ptr, &mut value) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let string = U16CStr::from_ptr_str(value).to_string().map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("SID contains invalid UTF-16: {error}"),
+            )
+        })?;
+        LocalFree(value.cast());
+        Ok(string)
+    }
+}
+
+fn sid_from_token_handle(token: HANDLE) -> io::Result<([u8; MAX_SID_BYTE_LENGTH], u8)> {
+    // SAFETY: Token handle is valid. First call sizes the output buffer.
+    unsafe {
+        let mut required_len = 0;
+        if GetTokenInformation(token, TokenUser, null_mut(), 0, &mut required_len) != 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "unexpected token user buffer sizing result",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) || required_len == 0 {
+            return Err(error);
+        }
+
+        let mut buffer = vec![0u8; required_len as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            required_len,
+            &mut required_len,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let token_user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+        if IsValidSid(token_user.User.Sid) == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "token contains an invalid SID",
+            ));
+        }
+        let sid_length = GetLengthSid(token_user.User.Sid) as usize;
+        let sid_length_u8 = u8::try_from(sid_length).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "token SID length exceeds one-byte encoding",
+            )
+        })?;
+        if sid_length > MAX_SID_BYTE_LENGTH {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "token SID length exceeds LocalPeerIdentity capacity",
+            ));
+        }
+
+        let mut sid = [0u8; MAX_SID_BYTE_LENGTH];
+        std::ptr::copy_nonoverlapping(
+            token_user.User.Sid.cast::<u8>(),
+            sid.as_mut_ptr(),
+            sid_length,
+        );
+        Ok((sid, sid_length_u8))
+    }
 }
 
 #[link(

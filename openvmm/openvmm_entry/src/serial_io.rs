@@ -9,7 +9,6 @@ use pal_async::pipe::PolledPipe;
 use serial_socket::net::OpenSocketSerialConfig;
 use std::fs::File;
 use std::io;
-#[cfg(unix)]
 use std::io::Read;
 use std::net::SocketAddr;
 use std::net::TcpStream;
@@ -116,56 +115,155 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
 }
 
 #[cfg(not(unix))]
-pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "secure control-console named pipes are not implemented",
-    ))
+pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    #[cfg(windows)]
+    {
+        use serial_socket::windows::OpenWindowsPipeSerialConfig;
+
+        let pipe = create_control_named_pipe(path)?;
+        Ok(OpenWindowsPipeSerialConfig::from(pipe).into_resource())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure control-console listeners are unsupported on this platform",
+        ))
+    }
 }
 
-#[cfg(unix)]
-pub fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
-    use std::os::unix::fs::FileTypeExt;
+#[cfg(windows)]
+pub fn current_process_control_sid() -> io::Result<serial_core::LocalPeerIdentity> {
+    let (bytes, length) = pal::windows::security::current_process_user_sid()?;
+    Ok(serial_core::LocalPeerIdentity::WindowsSid { bytes, length })
+}
 
-    let mut file = pal::take_inherited_file(raw_handle)?;
-    if !file.metadata()?.file_type().is_fifo() {
+#[cfg(windows)]
+pub(crate) fn create_control_named_pipe(path: &Path) -> io::Result<File> {
+    if !is_windows_named_pipe_path(path) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "control authentication handle is not a one-way pipe",
+            "control endpoint must be a Windows \\\\.\\pipe\\... named pipe path",
         ));
     }
-    pal::unix::pipe::set_nonblocking(&file, true)?;
 
-    let mut bytes = [0u8; 33];
-    let mut count = 0;
-    loop {
-        match file.read(&mut bytes[count..]) {
-            Ok(0) => break,
-            Ok(read) => {
-                count += read;
-                if count == bytes.len() {
+    let (sid_bytes, sid_length) = pal::windows::security::current_process_user_sid()?;
+    let sid = pal::windows::security::sid_to_string(&sid_bytes, sid_length)?;
+    let security_descriptor: pal::windows::security::LocalSecurityDescriptor =
+        format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})").parse()?;
+    pal::windows::pipe::new_local_restricted_named_pipe(path, &security_descriptor)
+}
+
+#[cfg(windows)]
+fn is_windows_named_pipe_path(path: &Path) -> bool {
+    const NAMED_PIPE_PREFIX: &str = "//./pipe/";
+
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    normalized.starts_with(NAMED_PIPE_PREFIX) && normalized.len() > NAMED_PIPE_PREFIX.len()
+}
+
+pub fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        let mut file = pal::take_inherited_file(raw_handle)?;
+        if !file.metadata()?.file_type().is_fifo() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control authentication handle is not a one-way pipe",
+            ));
+        }
+        pal::unix::pipe::set_nonblocking(&file, true)?;
+
+        let mut bytes = [0u8; 33];
+        let mut count = 0;
+        loop {
+            match file.read(&mut bytes[count..]) {
+                Ok(0) => break,
+                Ok(read) => {
+                    count += read;
+                    if count == bytes.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "control authentication payload has an invalid length",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "control authentication payload has an invalid length",
+                        io::ErrorKind::TimedOut,
+                        "control authentication writer was not closed",
                     ));
                 }
+                Err(error) => return Err(error),
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "control authentication writer was not closed",
-                ));
-            }
-            Err(error) => return Err(error),
         }
+        bytes[..count].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control authentication payload has an invalid length",
+            )
+        })
     }
-    bytes[..count].try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "control authentication payload has an invalid length",
-        )
-    })
+
+    #[cfg(windows)]
+    {
+        use pal::windows::pipe::PipeExt;
+        use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
+
+        const HANDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let mut file = pal::take_inherited_file(raw_handle)?;
+        file.set_pipe_mode(PIPE_NOWAIT).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("control authentication handle is not a Windows pipe: {error}"),
+            )
+        })?;
+
+        let deadline = std::time::Instant::now() + HANDLE_READ_TIMEOUT;
+        let mut bytes = [0u8; 33];
+        let mut count = 0;
+        loop {
+            match file.read(&mut bytes[count..]) {
+                Ok(0) => break,
+                Ok(read) => {
+                    count += read;
+                    if count == bytes.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "control authentication payload has an invalid length",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "control authentication writer was not closed",
+                        ));
+                    }
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        bytes[..count].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control authentication payload has an invalid length",
+            )
+        })
+    }
 }
 
 fn bind_serial_inner(
@@ -176,7 +274,7 @@ fn bind_serial_inner(
     {
         use serial_socket::windows::OpenWindowsPipeSerialConfig;
 
-        if path.starts_with("//./pipe") {
+        if is_windows_named_pipe_path(path) {
             let pipe = pal::windows::pipe::new_named_pipe(
                 path,
                 windows_sys::Win32::Foundation::GENERIC_READ
@@ -203,7 +301,7 @@ pub fn connect_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> 
     {
         use serial_socket::windows::OpenWindowsPipeSerialConfig;
 
-        if path.starts_with("//./pipe") {
+        if is_windows_named_pipe_path(path) {
             let pipe = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)

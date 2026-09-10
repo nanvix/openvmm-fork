@@ -10,6 +10,7 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use mesh::MeshPayload;
 use pal::windows::pipe::PipeExt;
+use pal::windows::security;
 use pal_async::driver::Driver;
 use pal_async::pipe::PolledPipe;
 use pal_async::windows::pipe::ListeningPipe;
@@ -163,6 +164,31 @@ impl SerialIo for WindowsPipeSerialBackend {
 
     fn disconnect_current(&mut self) -> io::Result<()> {
         self.disconnect()
+    }
+
+    fn local_peer_identity(&self) -> io::Result<Option<serial_core::LocalPeerIdentity>> {
+        let PipeState::Connected(pipe) = &self.state else {
+            return Ok(None);
+        };
+        let client_pid = match pipe.as_file().get_pipe_client_process_id() {
+            Ok(pid) => pid,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((bytes, length)) = security::process_user_sid(client_pid)? else {
+            return Ok(None);
+        };
+        Ok(Some(serial_core::LocalPeerIdentity::WindowsSid {
+            bytes,
+            length,
+        }))
     }
 }
 

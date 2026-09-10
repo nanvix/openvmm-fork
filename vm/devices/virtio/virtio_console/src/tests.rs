@@ -73,6 +73,40 @@ const TX_USED_ADDR: u64 = 0x12000;
 const DATA_BASE: u64 = 0x20000;
 const TOTAL_MEM_SIZE: usize = 0x30000;
 
+fn expected_peer_identity() -> LocalPeerIdentity {
+    #[cfg(target_os = "linux")]
+    {
+        LocalPeerIdentity::UnixUid(1000)
+    }
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; 68];
+        bytes[..4].copy_from_slice(&[1, 2, 3, 4]);
+        LocalPeerIdentity::WindowsSid { bytes, length: 4 }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        LocalPeerIdentity::Unsupported
+    }
+}
+
+fn mismatched_peer_identity() -> LocalPeerIdentity {
+    #[cfg(target_os = "linux")]
+    {
+        LocalPeerIdentity::UnixUid(1001)
+    }
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; 68];
+        bytes[..4].copy_from_slice(&[9, 8, 7, 6]);
+        LocalPeerIdentity::WindowsSid { bytes, length: 4 }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        LocalPeerIdentity::Unsupported
+    }
+}
+
 // --- MockSerialIo ---
 
 /// Shared state for the mock serial backend.
@@ -350,7 +384,7 @@ fn new_mock_serial() -> (MockSerialIo, MockSerialHandle) {
         connect_error: false,
         disconnect_error: false,
         disconnect_poll_count: 0,
-        peer_identity: Some(LocalPeerIdentity::UnixUid(1000)),
+        peer_identity: Some(expected_peer_identity()),
     }));
     (
         MockSerialIo {
@@ -409,7 +443,7 @@ impl TestHarness {
                 VirtioControlConsoleBrokerConfig {
                     instance_id,
                     capability,
-                    expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
+                    expected_peer_identity: expected_peer_identity(),
                     auth_timeout_ms,
                 },
             )
@@ -528,7 +562,7 @@ impl TestHarness {
             VirtioControlConsoleBrokerConfig {
                 instance_id,
                 capability,
-                expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
+                expected_peer_identity: expected_peer_identity(),
                 auth_timeout_ms: 5000,
             },
         );
@@ -1451,7 +1485,7 @@ async fn broker_rejects_wrong_identity_before_reserving_host_slot(driver: Defaul
     let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
     harness
         .handle
-        .set_peer_identity(Some(LocalPeerIdentity::UnixUid(1001)));
+        .set_peer_identity(Some(mismatched_peer_identity()));
     harness.enable().await;
     yield_until(|| !harness.handle.is_connected()).await;
 
@@ -1466,7 +1500,37 @@ async fn broker_rejects_wrong_identity_before_reserving_host_slot(driver: Defaul
 
     harness
         .handle
-        .set_peer_identity(Some(LocalPeerIdentity::UnixUid(1000)));
+        .set_peer_identity(Some(expected_peer_identity()));
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!((wait.record_type, wait.epoch), (RecordType::Wait, 1));
+}
+
+#[async_test]
+async fn broker_rejects_missing_identity_before_reserving_host_slot(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.handle.set_peer_identity(None);
+    harness.enable().await;
+    yield_until(|| !harness.handle.is_connected()).await;
+
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 1));
+    assert!(harness.handle.tx_data().is_empty());
+
+    harness
+        .handle
+        .set_peer_identity(Some(expected_peer_identity()));
     harness.handle.reconnect();
     harness.handle.inject_rx_data(&encode(&Record::bootstrap(
         RecordType::HostAttach,

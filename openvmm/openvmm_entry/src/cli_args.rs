@@ -955,6 +955,7 @@ options:
     #[clap(
         long = "microvm-control-auth-handle",
         value_name = "FD_OR_HANDLE",
+        value_parser = parse_microvm_control_auth_handle,
         hide = true
     )]
     pub microvm_control_auth_handle: Option<u64>,
@@ -1761,10 +1762,13 @@ impl Options {
                     "--microvm-control-auth-handle is not used with a disconnected control console"
                 );
             } else {
+                #[cfg(windows)]
                 anyhow::ensure!(
-                    cfg!(target_os = "linux"),
-                    "live microVM control consoles require Linux SO_PEERCRED support; secure Windows named-pipe SID/ACL support is not implemented"
+                    matches!(control_console, SerialConfigCli::Pipe(path) if is_windows_named_pipe_path(path)),
+                    "live microVM control console on Windows requires listen=\\\\.\\pipe\\..."
                 );
+                #[cfg(not(any(target_os = "linux", windows)))]
+                anyhow::bail!("live microVM control consoles are unsupported on this platform");
                 anyhow::ensure!(
                     self.microvm_control_auth_handle.is_some(),
                     "live microVM control console requires --microvm-control-auth-handle"
@@ -2088,6 +2092,32 @@ fn parse_virtio_vsock_bus(value: &str) -> Result<VirtioBusCli, String> {
         Ok(bus @ (VirtioBusCli::Mmio | VirtioBusCli::Pci)) => Ok(bus),
         _ => Err("expected mmio or pci".to_string()),
     }
+}
+
+fn parse_microvm_control_auth_handle(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|ch| ch.is_ascii_digit()) {
+        return Err("expected a decimal nonzero inherited handle value".to_owned());
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid inherited handle '{value}': {error}"))?;
+    if parsed == 0 {
+        return Err("inherited handle must be nonzero".to_owned());
+    }
+    if cfg!(windows) && parsed > usize::MAX as u64 {
+        return Err("inherited handle is wider than the host pointer size".to_owned());
+    }
+    Ok(parsed)
+}
+
+#[cfg(windows)]
+fn is_windows_named_pipe_path(path: &std::path::Path) -> bool {
+    const NAMED_PIPE_PREFIX: &str = "//./pipe/";
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    normalized.starts_with(NAMED_PIPE_PREFIX) && normalized.len() > NAMED_PIPE_PREFIX.len()
 }
 
 #[cfg(target_os = "linux")]
@@ -6017,6 +6047,11 @@ mod tests {
         ])
         .unwrap();
         valid_control_console.validate_microvm_options().unwrap();
+        let control_path = if cfg!(windows) {
+            "listen=//./pipe/openvmm-microvm-control0"
+        } else {
+            "listen=control.sock"
+        };
         let valid_restore_control_console = Options::try_parse_from([
             "openvmm",
             "--machine",
@@ -6024,12 +6059,12 @@ mod tests {
             "--restore-snapshot",
             "snapshot",
             "--microvm-control-console",
-            "listen=control.sock",
+            control_path,
             "--microvm-control-auth-handle",
             "42",
         ])
         .unwrap();
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", windows)) {
             valid_restore_control_console
                 .validate_microvm_options()
                 .unwrap();

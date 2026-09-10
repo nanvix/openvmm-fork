@@ -89,6 +89,11 @@ impl PolledPipe {
         self.file
     }
 
+    /// Borrows the underlying pipe file handle.
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+
     fn new_internal(
         driver: &(impl ?Sized + Driver),
         file: File,
