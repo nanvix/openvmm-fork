@@ -486,6 +486,66 @@ fn microvm_snapshot_topology(processor_count: u32) -> anyhow::Result<SnapshotPro
     })
 }
 
+fn microvm_boot_online_vp_count(
+    vp_capacity: u32,
+    effective_command_line: &str,
+) -> anyhow::Result<u32> {
+    let mut boot_online_vp_count = None;
+    for token in effective_command_line.split_ascii_whitespace() {
+        let Some(value) = token.strip_prefix("maxcpus=") else {
+            continue;
+        };
+        anyhow::ensure!(
+            boot_online_vp_count.is_none(),
+            "microVM command line contains multiple maxcpus values"
+        );
+        let count = value
+            .parse::<u32>()
+            .context("microVM maxcpus value is invalid")?;
+        anyhow::ensure!(
+            openvmm_defs::config::microvm_processor_count_supported(count),
+            "microVM does not support a boot-online count of {count}"
+        );
+        anyhow::ensure!(
+            count <= vp_capacity,
+            "microVM boot-online count {count} exceeds VP capacity {vp_capacity}"
+        );
+        boot_online_vp_count = Some(count);
+    }
+    Ok(boot_online_vp_count.unwrap_or(0))
+}
+
+/// Validates a restore-time online VP target against an opt-in snapshot contract.
+pub fn validate_restore_online_vp_count(
+    manifest: &SnapshotManifest,
+    restore_online_vp_count: u32,
+) -> anyhow::Result<()> {
+    let contract = manifest
+        .machine_contract
+        .as_ref()
+        .context("snapshot is missing the authoritative machine contract")?;
+    validate_supported_microvm_contract(contract)?;
+    anyhow::ensure!(
+        contract.boot_online_vp_count != 0,
+        "snapshot does not declare restore-time VP activation support"
+    );
+    anyhow::ensure!(
+        openvmm_defs::config::microvm_processor_count_supported(restore_online_vp_count),
+        "restore-online VP count {restore_online_vp_count} is not supported"
+    );
+    anyhow::ensure!(
+        restore_online_vp_count >= contract.boot_online_vp_count,
+        "restore-online VP count {restore_online_vp_count} is below boot-online count {}",
+        contract.boot_online_vp_count
+    );
+    anyhow::ensure!(
+        restore_online_vp_count <= manifest.vp_count,
+        "restore-online VP count {restore_online_vp_count} exceeds VP capacity {}",
+        manifest.vp_count
+    );
+    Ok(())
+}
+
 fn canonical_microvm_memory_ranges(memory_size: u64) -> anyhow::Result<Vec<SnapshotMemoryRange>> {
     const LOW_RAM_END: u64 = 3 * 1024 * 1024 * 1024;
     const HIGH_RAM_START: u64 = 4 * 1024 * 1024 * 1024;
@@ -844,6 +904,8 @@ pub fn microvm_machine_contract(
         "microVM snapshots require the KVM or WHP hypervisor"
     );
     let topology = microvm_snapshot_topology(processor_count)?;
+    let boot_online_vp_count =
+        microvm_boot_online_vp_count(processor_count, &effective_command_line)?;
     let memory_ranges = canonical_microvm_memory_ranges(memory_size)?;
     let device = |stable_id: &str,
                   state_unit_name: &str,
@@ -1018,7 +1080,7 @@ pub fn microvm_machine_contract(
         apic_frequency_hz,
         microvm_sandbox_blocks: Vec::new(),
         microvm_filesystem_slot_version: 0,
-        boot_online_vp_count: 0,
+        boot_online_vp_count,
         virtio_interrupt_mode: MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned(),
         virtio_shared_status_page_gpa: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
         virtio_shared_status_page_size: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
@@ -3499,6 +3561,14 @@ fn validate_machine_contract_shape(
         ),
     }
 
+    if contract.boot_online_vp_count != 0 {
+        anyhow::ensure!(
+            contract.boot_online_vp_count
+                == microvm_boot_online_vp_count(vp_count, &contract.effective_command_line,)?,
+            "snapshot boot-online VP count does not match the effective command line"
+        );
+    }
+
     let topology = &contract.topology;
     let topology_vp_count = u64::from(topology.sockets)
         .checked_mul(u64::from(topology.dies_per_socket))
@@ -3515,8 +3585,7 @@ fn validate_machine_contract_shape(
         "snapshot processor topology is not canonical for the microVM"
     );
     anyhow::ensure!(
-        contract.boot_online_vp_count == 0
-            && contract.microvm_sandbox_blocks.is_empty()
+        contract.microvm_sandbox_blocks.is_empty()
             && contract.attachments.iter().all(|attachment| matches!(
                 attachment.kind.as_str(),
                 "virtio-console" | "virtio-net" | "virtio-fs"

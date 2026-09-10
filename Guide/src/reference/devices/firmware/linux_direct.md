@@ -22,6 +22,12 @@ the protected-mode code directly into guest memory and relies on the kernel's
 built-in decompressor to run at boot time. All standard bzImage compression
 formats are supported since decompression is handled by the kernel itself.
 
+The microVM profile uses the Xen PVH entry point instead of the standard Linux
+zero-page protocol. OpenVMM supplies the ACPI hardware description through the
+RSDP pointer in Xen start info and an Intel MP table in low memory for kernels
+built without ACPI support. These tables allow direct-boot kernels to discover
+and program the IOAPIC without firmware.
+
 On AArch64, pass the uncompressed `Image` file (not `Image.gz`).
 
 ## x86_64 Boot Flow
