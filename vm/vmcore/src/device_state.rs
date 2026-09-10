@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::future::Future;
+use std::time::Duration;
 
 /// Trait for transitioning device state.
 pub trait ChangeDeviceState {
@@ -27,6 +28,26 @@ pub trait ChangeDeviceState {
     // to finish, which may require a bunch of other changes.
     fn start(&mut self);
 
+    /// Starts a device and waits until startup has either completed or failed.
+    ///
+    /// The default preserves the notification-only behavior of [`Self::start`].
+    /// Devices that restore process-local workers should override this so a
+    /// restore failure is reported before dependent units start.
+    fn start_fallible(&mut self) -> impl Send + Future<Output = anyhow::Result<()>> {
+        self.start();
+        async { Ok(()) }
+    }
+
+    /// Stops accepting new host input before a snapshot vCPU boundary.
+    fn quiesce_input(&mut self) -> impl Send + Future<Output = anyhow::Result<()>> {
+        async { Ok(()) }
+    }
+
+    /// Resumes host input after a failed snapshot transaction.
+    fn resume_input(&mut self) -> impl Send + Future<Output = anyhow::Result<()>> {
+        async { Ok(()) }
+    }
+
     /// Stops a device's asynchronous work.
     ///
     /// After this returns, the device must not process any additional work. It
@@ -42,4 +63,12 @@ pub trait ChangeDeviceState {
     /// Callers must ensure that the device is in a stopped state before calling
     /// this method.
     fn reset(&mut self) -> impl Send + Future<Output = ()>;
+
+    /// Advances guest-visible device time after snapshot restore.
+    fn advance_time(
+        &mut self,
+        _duration: Duration,
+    ) -> impl Send + Future<Output = anyhow::Result<()>> {
+        async { Ok(()) }
+    }
 }
