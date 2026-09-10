@@ -1602,7 +1602,7 @@ impl Options {
                 "microVM snapshot quiesce timeout must be nonzero"
             );
             anyhow::ensure!(
-                self.snapshot_tier.is_some() == !self.microvm_sandbox_block.is_empty(),
+                self.snapshot_tier.is_some() != self.microvm_sandbox_block.is_empty(),
                 "--snapshot-tier is required exactly for microVM snapshot capture with sandbox blocks"
             );
             if let Some(memory_capacity) = self.memory_capacity {
