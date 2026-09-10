@@ -56,6 +56,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::IntoRawFd as _;
 use std::sync::Arc;
 use std::sync::Once;
+#[cfg(guest_arch = "x86_64")]
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -141,8 +143,9 @@ impl From<std::fs::File> for LinuxMshv {
 
 impl<'a> MshvProtoPartition<'a> {
     /// Performs the post-init partition setup common to both architectures:
-    /// creates VPs, BSP, installs intercepts, sets up the signal handler,
-    /// and checks for unsupported VTL2 configuration.
+    /// creates VP metadata, installs intercepts, sets up the signal handler,
+    /// and checks for unsupported VTL2 configuration. On aarch64, this also
+    /// preserves the existing eager BSP creation behavior.
     fn new(config: ProtoPartitionConfig<'a>, vmfd: VmFd) -> Result<Self, Error> {
         if config.processor_topology.vp_count() > u8::MAX as u32 {
             return Err(ErrorInner::TooManyVps(config.processor_topology.vp_count()).into());
@@ -157,10 +160,12 @@ impl<'a> MshvProtoPartition<'a> {
                 needs_yield: NeedsYield::new(),
                 message_queues: MessageQueues::new(),
                 message_queues_pending: AtomicBool::new(false),
+                extint_pending: AtomicBool::new(false),
                 waker: RwLock::new(None),
             })
             .collect();
 
+        #[cfg(guest_arch = "aarch64")]
         let bsp = vmfd
             .create_vcpu(0)
             .map_err(|e| ErrorInner::CreateVcpu(e.into()))?;
@@ -214,6 +219,7 @@ impl<'a> MshvProtoPartition<'a> {
             isolation: arch::MshvProtoPartitionIsolation::None,
             vmfd,
             vps,
+            #[cfg(guest_arch = "aarch64")]
             bsp,
         })
     }
@@ -235,6 +241,7 @@ pub struct MshvProtoPartition<'a> {
     isolation: arch::MshvProtoPartitionIsolation,
     vmfd: VmFd,
     vps: Vec<MshvVpInner>,
+    #[cfg(guest_arch = "aarch64")]
     bsp: VcpuFd,
 }
 
@@ -307,8 +314,12 @@ struct MshvPartitionInner {
     vmfd: VmFd,
     /// The BSP's VcpuFd, retained for partition-level register access
     /// (VM state get/set). Only used while VPs are stopped.
+    #[cfg(guest_arch = "aarch64")]
     #[inspect(skip)]
     bsp_vcpufd: VcpuFd,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(rename = "memory_finalized", with = "|x| x.get().is_some()")]
+    finalized: OnceLock<MshvFinalizedPartition>,
     #[inspect(skip)]
     memory: Mutex<MshvMemoryRangeState>,
     gm: GuestMemory,
@@ -319,8 +330,16 @@ struct MshvPartitionInner {
     irq_routes: virt::irqcon::IrqRoutes,
     #[inspect(skip)]
     gsi_states: Mutex<Box<[irqfd::GsiState; irqfd::NUM_GSIS]>>,
+    #[cfg(guest_arch = "aarch64")]
     caps: virt::PartitionCapabilities,
     synic_ports: virt::synic::SynicPortMap,
+    #[cfg(guest_arch = "x86_64")]
+    cpuid: virt::CpuidLeafSet,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    processor_topology: vm_topology::processor::ProcessorTopology,
+    #[cfg(guest_arch = "x86_64")]
+    hv_configured: bool,
     #[cfg(guest_arch = "x86_64")]
     software_devices: virt::x86::apic_software_device::ApicSoftwareDevices,
     #[inspect(skip)]
@@ -335,6 +354,37 @@ struct MshvPartitionInner {
     gic_msi: vm_topology::processor::aarch64::GicMsiController,
 }
 
+#[cfg(guest_arch = "x86_64")]
+struct MshvFinalizedPartition {
+    bsp_vcpufd: VcpuFd,
+    caps: virt::PartitionCapabilities,
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn finalized_partition<T>(finalized: &OnceLock<T>) -> Result<&T, Error> {
+    finalized
+        .get()
+        .ok_or_else(|| ErrorInner::PartitionNotFinalized.into())
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn finalize_memory_once<T>(
+    finalized: &OnceLock<T>,
+    memory_attached: bool,
+    initialize: impl FnOnce() -> Result<T, Error>,
+) -> Result<(), Error> {
+    if finalized.get().is_some() {
+        return Err(ErrorInner::PartitionAlreadyFinalized.into());
+    }
+    if !memory_attached {
+        return Err(ErrorInner::GuestMemoryNotAttached.into());
+    }
+
+    finalized
+        .set(initialize()?)
+        .map_err(|_| ErrorInner::PartitionAlreadyFinalized.into())
+}
+
 struct MshvVpInner {
     vp_info: vm_topology::processor::TargetVpInfo,
     thread: RwLock<Option<Pthread>>,
@@ -343,6 +393,9 @@ struct MshvVpInner {
     /// Set by device threads after enqueuing a message to signal the VP
     /// thread to flush its message queues.
     message_queues_pending: AtomicBool,
+    /// Set when the userspace PIC pulses LINT0 and cleared after ExtINT delivery.
+    #[cfg(guest_arch = "x86_64")]
+    extint_pending: AtomicBool,
     /// Waker for the VP run loop task. Set by the VP thread, used by device
     /// threads to re-poll the run loop when new messages are enqueued.
     waker: RwLock<Option<Waker>>,
@@ -665,6 +718,23 @@ impl virt::Processor for MshvProcessor<'_> {
                 }
             }
 
+            #[cfg(guest_arch = "x86_64")]
+            if vpinner.extint_pending.load(Ordering::Acquire)
+                && !self.deliverability_notifications.interrupt_notification()
+            {
+                let notifications = self
+                    .deliverability_notifications
+                    .with_interrupt_notification(true);
+                self.partition
+                    .vmfd
+                    .register_deliverabilty_notifications(
+                        self.vpindex.index(),
+                        u64::from(notifications),
+                    )
+                    .expect("requesting deliverability is not a fallible operation");
+                self.deliverability_notifications = notifications;
+            }
+
             match self.runner.run() {
                 Ok(exit) => {
                     self.handle_exit(&exit, dev).await?;
@@ -745,6 +815,15 @@ enum ErrorInner {
     #[cfg(guest_arch = "x86_64")]
     #[error(transparent)]
     Snp(#[from] arch::SnpError),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("guest memory is not attached")]
+    GuestMemoryNotAttached,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("partition memory has not been finalized")]
+    PartitionNotFinalized,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("partition memory was already finalized")]
+    PartitionAlreadyFinalized,
     #[error("vtl2 not supported")]
     Vtl2NotSupported,
     #[error("isolation not supported")]
@@ -819,6 +898,14 @@ enum ErrorInner {
     #[cfg(guest_arch = "x86_64")]
     #[error("unsupported processor vendor: {0:?}")]
     UnsupportedProcessorVendor(hvdef::HvProcessorVendor),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(
+        "TSC frequency mismatch between snapshot ({saved} Hz) and destination ({destination} Hz)"
+    )]
+    TscFrequencyMismatch { saved: u64, destination: u64 },
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    TscFrequencyCpuid(#[from] virt::x86::TscFrequencyCpuidError),
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to create virtual device")]
     NewDevice(#[source] virt::x86::apic_software_device::DeviceIdInUse),
@@ -1006,7 +1093,14 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             exec,
         )
         .entered();
-        let mapped = self.isolation.map_user_memory(&self.vmfd, mem_region)?;
+        let started = std::time::Instant::now();
+        let result = self.isolation.map_user_memory(&self.vmfd, mem_region);
+        tracing::info!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            success = result.is_ok(),
+            "MSHV_SET_GUEST_MEMORY completed"
+        );
+        let mapped = result?;
         state.ranges[slot_to_use] = Some(MshvMemoryRange {
             region: mem_region,
             mapped,
@@ -1058,6 +1152,68 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn finalization_requires_attached_memory_and_runs_once() {
+        let finalized = OnceLock::new();
+        let events = RefCell::new(Vec::new());
+
+        let result = finalize_memory_once(&finalized, false, || {
+            events.borrow_mut().push("backend initialized");
+            Ok(42)
+        });
+        assert!(matches!(
+            result,
+            Err(Error(ErrorInner::GuestMemoryNotAttached))
+        ));
+        assert!(events.borrow().is_empty());
+
+        events.borrow_mut().push("memory attached");
+        finalize_memory_once(&finalized, true, || {
+            events.borrow_mut().push("backend initialized");
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(
+            events.into_inner(),
+            ["memory attached", "backend initialized"]
+        );
+        assert_eq!(finalized_partition(&finalized).unwrap(), &42);
+
+        let result = finalize_memory_once(&finalized, true, || Ok(43));
+        assert!(matches!(
+            result,
+            Err(Error(ErrorInner::PartitionAlreadyFinalized))
+        ));
+        assert_eq!(finalized_partition(&finalized).unwrap(), &42);
+    }
+
+    #[test]
+    fn finalization_propagates_backend_failure() {
+        let finalized = OnceLock::<()>::new();
+
+        let result =
+            finalize_memory_once(&finalized, true, || Err(ErrorInner::CreateVMFailed.into()));
+
+        assert!(matches!(result, Err(Error(ErrorInner::CreateVMFailed))));
+        assert!(finalized.get().is_none());
+    }
+
+    #[test]
+    fn finalized_state_rejects_early_access() {
+        let finalized = OnceLock::<()>::new();
+
+        assert!(matches!(
+            finalized_partition(&finalized),
+            Err(Error(ErrorInner::PartitionNotFinalized))
+        ));
     }
 }
 

@@ -74,6 +74,10 @@ pub struct X86PartitionCapabilities {
     pub sgx: bool,
     /// TSC_AUX is supported
     pub tsc_aux: bool,
+    /// IA32_TSC_DEADLINE is supported.
+    pub tsc_deadline: bool,
+    /// KVM's paravirtual clock and its configuration MSRs are exposed.
+    pub kvm_clock: bool,
     /// The address of the virtual top of memory, for encrypted VMs.
     ///
     /// This is computed from the Hyper-V isolation leaf. It is guaranteed to be
@@ -133,6 +137,8 @@ impl X86PartitionCapabilities {
             cet_ss: false,
             sgx: false,
             tsc_aux: false,
+            tsc_deadline: false,
+            kvm_clock: false,
             vtom: None,
             physical_address_width: max_physical_address_size_from_cpuid(&mut *f),
             snp_c_bit: snp_c_bit_from_cpuid(&mut *f),
@@ -156,6 +162,7 @@ impl X86PartitionCapabilities {
             this.reset_rdx = result[0].into();
             let features = result[2] as u64 | ((result[3] as u64) << 32);
             this.x2apic = features & (1 << 21) != 0;
+            this.tsc_deadline = features & (1 << 24) != 0;
             xsave = features & (1 << 26) != 0;
             hypervisor = features & (1 << 31) != 0;
         }
@@ -217,6 +224,16 @@ impl X86PartitionCapabilities {
 
         // Hypervisor info.
         if hypervisor {
+            let [_, ebx, ecx, edx] = f(hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION, 0);
+            let mut vendor = [0_u8; 12];
+            vendor[0..4].copy_from_slice(&ebx.to_le_bytes());
+            vendor[4..8].copy_from_slice(&ecx.to_le_bytes());
+            vendor[8..12].copy_from_slice(&edx.to_le_bytes());
+            if vendor.starts_with(b"KVMKVMKVM") {
+                const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
+                this.kvm_clock =
+                    f(hvdef::HV_CPUID_FUNCTION_HV_INTERFACE, 0)[0] & KVM_FEATURE_CLOCKSOURCE2 != 0;
+            }
             let hv_max = f(hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION, 0)[0];
             if hv_max >= hvdef::HV_CPUID_FUNCTION_MS_HV_ENLIGHTENMENT_INFORMATION
                 && f(hvdef::HV_CPUID_FUNCTION_HV_INTERFACE, 0)[0] == u32::from_le_bytes(*b"Hv#1")
@@ -302,6 +319,207 @@ pub struct XsaveFeature {
     pub offset: u32,
     pub len: u32,
     pub align: bool,
+}
+
+/// Canonical CPUID leaf in a saved CPU compatibility contract.
+#[derive(Debug, Clone, PartialEq, Eq, mesh_protobuf::Protobuf)]
+#[mesh(package = "virt.x86")]
+pub struct CpuContractCpuidLeaf {
+    #[mesh(1)]
+    pub function: u32,
+    #[mesh(2)]
+    pub index: Option<u32>,
+    #[mesh(3)]
+    pub result: [u32; 4],
+    #[mesh(4)]
+    pub mask: [u32; 4],
+}
+
+/// XSAVE component layout in a saved CPU compatibility contract.
+#[derive(Debug, Clone, PartialEq, Eq, mesh_protobuf::Protobuf)]
+#[mesh(package = "virt.x86")]
+pub struct CpuContractXsaveComponent {
+    #[mesh(1)]
+    pub index: u32,
+    #[mesh(2)]
+    pub offset: u32,
+    #[mesh(3)]
+    pub length: u32,
+    #[mesh(4)]
+    pub align: bool,
+}
+
+/// The backend TSC frequency cannot be represented by CPUID leaf `0x15`.
+#[derive(Debug, Error)]
+pub enum TscFrequencyCpuidError {
+    #[error("TSC frequency must be nonzero")]
+    Zero,
+    #[error("TSC frequency {0} Hz cannot be represented by CPUID leaf 0x15")]
+    Unrepresentable(u64),
+}
+
+/// Returns CPUID overrides that expose an exact virtual TSC frequency.
+pub fn tsc_frequency_cpuid_leaves(
+    frequency_hz: u64,
+    current_max_basic_leaf: u32,
+) -> Result<[crate::CpuidLeaf; 2], TscFrequencyCpuidError> {
+    fn gcd(mut left: u64, mut right: u64) -> u64 {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    }
+
+    if frequency_hz == 0 {
+        return Err(TscFrequencyCpuidError::Zero);
+    }
+    const FALLBACK_CRYSTAL_FREQUENCY_HZ: u64 = 1_000_000_000;
+    let (denominator, numerator, crystal_frequency_hz) =
+        if let Ok(frequency_hz) = u32::try_from(frequency_hz) {
+            (1, 1, frequency_hz)
+        } else {
+            let divisor = gcd(frequency_hz, FALLBACK_CRYSTAL_FREQUENCY_HZ);
+            let numerator = u32::try_from(frequency_hz / divisor)
+                .map_err(|_| TscFrequencyCpuidError::Unrepresentable(frequency_hz))?;
+            let denominator = u32::try_from(FALLBACK_CRYSTAL_FREQUENCY_HZ / divisor)
+                .map_err(|_| TscFrequencyCpuidError::Unrepresentable(frequency_hz))?;
+            (denominator, numerator, FALLBACK_CRYSTAL_FREQUENCY_HZ as u32)
+        };
+
+    Ok([
+        crate::CpuidLeaf::new(
+            CpuidFunction::VendorAndMaxFunction.0,
+            [
+                current_max_basic_leaf.max(CpuidFunction::CoreCrystalClockInformation.0),
+                0,
+                0,
+                0,
+            ],
+        )
+        .masked([u32::MAX, 0, 0, 0]),
+        crate::CpuidLeaf::new(
+            CpuidFunction::CoreCrystalClockInformation.0,
+            [denominator, numerator, crystal_frequency_hz, 0],
+        ),
+    ])
+}
+
+#[cfg(test)]
+mod tsc_frequency_tests {
+    use super::tsc_frequency_cpuid_leaves;
+    use test_with_tracing::test;
+
+    #[test]
+    fn tsc_frequency_cpuid_avoids_kernel_overflow() {
+        let frequency_hz = 2_194_843_733;
+        let leaves = tsc_frequency_cpuid_leaves(frequency_hz, 0).unwrap();
+        let [denominator, numerator, crystal_frequency_hz, _] = leaves[1].result;
+
+        assert_eq!(
+            u64::from(crystal_frequency_hz) * u64::from(numerator) / u64::from(denominator),
+            frequency_hz
+        );
+        assert!(
+            (crystal_frequency_hz / 1000)
+                .checked_mul(numerator)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tsc_frequency_cpuid_supports_large_round_frequency() {
+        let frequency_hz = 5_000_000_000;
+        let leaves = tsc_frequency_cpuid_leaves(frequency_hz, 0).unwrap();
+        let [denominator, numerator, crystal_frequency_hz, _] = leaves[1].result;
+
+        assert_eq!(
+            u64::from(crystal_frequency_hz) * u64::from(numerator) / u64::from(denominator),
+            frequency_hz
+        );
+    }
+}
+
+/// Effective CPU contract that a destination must reproduce exactly.
+#[derive(Debug, Clone, PartialEq, Eq, mesh_protobuf::Protobuf)]
+#[mesh(package = "virt.x86")]
+pub struct CpuCompatibilityContract {
+    #[mesh(1)]
+    pub vendor: [u8; 12],
+    #[mesh(2)]
+    pub cpuid: Vec<CpuContractCpuidLeaf>,
+    #[mesh(3)]
+    pub xcr0_supported: u64,
+    #[mesh(4)]
+    pub xss_supported: u64,
+    #[mesh(5)]
+    pub xsave_standard_len: u32,
+    #[mesh(6)]
+    pub xsave_compact_len: u32,
+    #[mesh(7)]
+    pub xsave_components: Vec<CpuContractXsaveComponent>,
+    #[mesh(8)]
+    pub x2apic: bool,
+    #[mesh(9)]
+    pub x2apic_enabled: bool,
+    #[mesh(10)]
+    pub cet: bool,
+    #[mesh(11)]
+    pub cet_ss: bool,
+    #[mesh(12)]
+    pub sgx: bool,
+    #[mesh(13)]
+    pub tsc_aux: bool,
+    #[mesh(14)]
+    pub physical_address_width: u32,
+    #[mesh(15)]
+    pub tsc_deadline: bool,
+    #[mesh(16)]
+    pub kvm_clock: bool,
+}
+
+impl CpuCompatibilityContract {
+    /// Builds a canonical contract from effective partition state.
+    pub fn new(caps: &X86PartitionCapabilities, cpuid: &crate::CpuidLeafSet) -> Self {
+        Self {
+            vendor: caps.vendor.0,
+            cpuid: cpuid
+                .leaves()
+                .iter()
+                .map(|leaf| CpuContractCpuidLeaf {
+                    function: leaf.function,
+                    index: leaf.index,
+                    result: leaf.result,
+                    mask: leaf.mask,
+                })
+                .collect(),
+            xcr0_supported: caps.xsave.features,
+            xss_supported: caps.xsave.supervisor_features,
+            xsave_standard_len: caps.xsave.standard_len,
+            xsave_compact_len: caps.xsave.compact_len,
+            xsave_components: caps
+                .xsave
+                .feature_info
+                .iter()
+                .enumerate()
+                .filter(|(_, feature)| feature.len != 0)
+                .map(|(index, feature)| CpuContractXsaveComponent {
+                    index: index as u32,
+                    offset: feature.offset,
+                    length: feature.len,
+                    align: feature.align,
+                })
+                .collect(),
+            x2apic: caps.x2apic,
+            x2apic_enabled: caps.x2apic_enabled,
+            cet: caps.cet,
+            cet_ss: caps.cet_ss,
+            sgx: caps.sgx,
+            tsc_aux: caps.tsc_aux,
+            physical_address_width: u32::from(caps.physical_address_width),
+            tsc_deadline: caps.tsc_deadline,
+            kvm_clock: caps.kvm_clock,
+        }
+    }
 }
 
 impl XsaveCapabilities {

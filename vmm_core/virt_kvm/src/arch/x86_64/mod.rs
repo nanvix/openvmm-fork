@@ -166,6 +166,7 @@ impl virt::Hypervisor for Kvm {
         }
 
         let nested_virt = config.nested_virt;
+        let expose_kvm_clock = config.versioned_cpu_contract;
         let supported_cpuid = self.kvm.supported_cpuid()?;
 
         // KVM's in-kernel LAPIC only exposes the CMCI LVT register (APIC
@@ -189,7 +190,24 @@ impl virt::Hypervisor for Kvm {
             .filter_map(|entry| {
                 // Filter out KVM CPUID entries.
                 if entry.function & 0xf0000000 == 0x40000000 {
-                    return None;
+                    if !expose_kvm_clock {
+                        return None;
+                    }
+                    if entry.function == 0x4000_0001 {
+                        const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
+                        const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u32 = 1 << 24;
+                        return Some(CpuidLeaf::new(
+                            entry.function,
+                            [
+                                entry.eax
+                                    & (KVM_FEATURE_CLOCKSOURCE2
+                                        | KVM_FEATURE_CLOCKSOURCE_STABLE_BIT),
+                                0,
+                                0,
+                                0,
+                            ],
+                        ));
+                    }
                 }
                 let mut leaf =
                     CpuidLeaf::new(entry.function, [entry.eax, entry.ebx, entry.ecx, entry.edx]);
@@ -200,6 +218,17 @@ impl virt::Hypervisor for Kvm {
                 Some(leaf)
             })
             .collect::<Vec<_>>();
+
+        if expose_kvm_clock {
+            cpuid_entries.push(
+                CpuidLeaf::new(CpuidFunction::VersionAndFeatures.0, [0, 0, 1 << 31, 0]).masked([
+                    0,
+                    0,
+                    1 << 31,
+                    0,
+                ]),
+            );
+        }
 
         // When nested virt is disabled, strip the virtualization
         // CPUID bit for the host's vendor.
@@ -257,6 +286,18 @@ impl virt::Hypervisor for Kvm {
         // SGX is not supported on KVM.
         cpuid_entries.push(
             CpuidLeaf::new(CpuidFunction::SgxEnumeration.0, [0; 4]).indexed(2), // SGX enumeration is subleaf 2
+        );
+
+        // KVM does not expose an API to save or restore the shadow-stack
+        // pointer. Do not advertise CET-SS, or a snapshot could silently lose
+        // architecturally active state that the CPU contract claimed to cover.
+        let cet_ss_mask: u32 = x86defs::cpuid::ExtendedFeatureSubleaf0Ecx::new()
+            .with_cet_ss(true)
+            .into();
+        cpuid_entries.push(
+            CpuidLeaf::new(CpuidFunction::ExtendedFeatures.0, [0; 4])
+                .indexed(0)
+                .masked([0, 0, cet_ss_mask, 0]),
         );
 
         if let Some(hv_config) = &config.hv_config {
@@ -497,15 +538,6 @@ impl ProtoPartition for KvmProtoPartition<'_> {
             self.vm.set_bsp(bsp_apic_id)?;
         }
 
-        let mut caps = virt::PartitionCapabilities::from_cpuid(
-            self.config.processor_topology,
-            &mut |function, index| cpuid.result(function, index, &[0; 4]),
-        )
-        .map_err(KvmError::Capabilities)?;
-
-        caps.can_freeze_time = false;
-        caps.nested_virt = self.nested_virt;
-
         // Create all VCPUs now so that they are assigned dense, sequential
         // vcpu_idx values (KVM assigns vcpu_idx in creation order).  KVM's
         // Hyper-V enlightenment code has a fast O(1) VP-index-to-vcpu lookup
@@ -517,6 +549,25 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         for vp_info in self.config.processor_topology.vps_arch() {
             self.vm.add_vp(vp_info.apic_id)?;
         }
+
+        let tsc_frequency_hz = self.vm.vp(0).tsc_frequency_hz()?;
+        let current_max_basic_leaf =
+            cpuid.result(CpuidFunction::VendorAndMaxFunction.0, 0, &[0; 4])[0];
+        let mut cpuid = cpuid.into_leaves();
+        cpuid.extend(virt::x86::tsc_frequency_cpuid_leaves(
+            tsc_frequency_hz,
+            current_max_basic_leaf,
+        )?);
+        let cpuid = CpuidLeafSet::new(cpuid);
+
+        let mut caps = virt::PartitionCapabilities::from_cpuid(
+            self.config.processor_topology,
+            &mut |function, index| cpuid.result(function, index, &[0; 4]),
+        )
+        .map_err(KvmError::Capabilities)?;
+
+        caps.can_freeze_time = false;
+        caps.nested_virt = self.nested_virt;
 
         let mut gsi_routing = GsiRouting::new();
 
@@ -757,6 +808,41 @@ impl ResetPartition for KvmPartition {
 impl Partition for KvmPartition {
     fn initial_vp_state_source(&self) -> virt::InitialVpStateSource {
         virt::InitialVpStateSource::Registers
+    }
+
+    fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract {
+        virt::x86::CpuCompatibilityContract::new(&self.inner.caps, &self.inner.cpuid)
+    }
+
+    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(self.inner.kvm.vp(0).tsc_frequency_hz()?))
+    }
+
+    fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
+        for vp in &self.inner.vps {
+            self.inner
+                .kvm
+                .vp(vp.vp_info.base.vp_index.index())
+                .set_tsc_frequency_hz(frequency_hz)?;
+        }
+        Ok(())
+    }
+
+    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        // KVM's in-kernel local APIC uses a fixed one-nanosecond bus cycle.
+        Ok(Some(1_000_000_000))
+    }
+
+    fn advance_snapshot_time(&self, duration: Duration) -> Result<(), Self::Error> {
+        let clock = self.inner.kvm.get_clock_ns()?;
+        let delta =
+            u64::try_from(duration.as_nanos()).map_err(|_| KvmError::SnapshotClockOverflow)?;
+        let requested_clock = clock
+            .clock
+            .checked_add(delta)
+            .ok_or(KvmError::SnapshotClockOverflow)?;
+        self.inner.kvm.set_clock_ns(requested_clock)?;
+        Ok(())
     }
 
     fn supports_reset(&self) -> Option<&dyn ResetPartition<Error = Self::Error>> {

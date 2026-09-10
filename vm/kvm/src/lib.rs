@@ -97,6 +97,10 @@ mod ioctl {
     ioctl_read!(kvm_get_debugregs, KVMIO, 0xa1, kvm_debugregs);
     #[cfg(target_arch = "x86_64")]
     ioctl_write_ptr!(kvm_set_debugregs, KVMIO, 0xa2, kvm_debugregs);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_int_bad!(kvm_set_tsc_khz, request_code_none!(KVMIO, 0xa2));
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_int_bad!(kvm_get_tsc_khz, request_code_none!(KVMIO, 0xa3));
     ioctl_write_ptr!(kvm_enable_cap, KVMIO, 0xa3, kvm_enable_cap);
     #[cfg(target_arch = "x86_64")]
     ioctl_read!(kvm_get_xsave, KVMIO, 0xa4, kvm_xsave);
@@ -283,6 +287,12 @@ pub enum Error {
     SetRegs(#[source] nix::Error),
     #[error("SetSRegs")]
     SetSRegs(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetTscFrequency")]
+    GetTscFrequency(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("SetTscFrequency")]
+    SetTscFrequency(#[source] nix::Error),
     #[error("Run")]
     Run(#[source] nix::Error),
     #[error("RunMemoryFault(flags={flags:#x}, gpa={gpa:#x}, size={size:#x})")]
@@ -1276,6 +1286,29 @@ pub enum RoutingEntry {
 pub struct Processor<'a>(&'a Partition, u32);
 
 impl<'a> Processor<'a> {
+    #[cfg(target_arch = "x86_64")]
+    pub fn tsc_frequency_hz(&self) -> Result<u64> {
+        // SAFETY: Calling the documented vCPU ioctl with no pointer argument.
+        let khz = unsafe { ioctl::kvm_get_tsc_khz(self.get().vcpu.as_raw_fd(), 0) }
+            .map_err(Error::GetTscFrequency)?;
+        if khz <= 0 {
+            return Err(Error::GetTscFrequency(nix::errno::Errno::EINVAL));
+        }
+        Ok(khz as u64 * 1000)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<()> {
+        let khz = frequency_hz
+            .checked_div(1000)
+            .and_then(|khz| libc::c_int::try_from(khz).ok())
+            .ok_or(Error::SetTscFrequency(nix::errno::Errno::EINVAL))?;
+        // SAFETY: Calling the documented vCPU ioctl with its integer value.
+        unsafe { ioctl::kvm_set_tsc_khz(self.get().vcpu.as_raw_fd(), khz) }
+            .map_err(Error::SetTscFrequency)?;
+        Ok(())
+    }
+
     pub fn enable_synic(&self) -> Result<()> {
         // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
         // TODO: We are not calling KVM_CHECK_EXTENSION first.
@@ -1765,6 +1798,7 @@ impl<'a> Processor<'a> {
         VpRunner {
             partition: self.0,
             idx: self.1,
+            pending_extint: None,
             _not_send_sync: PhantomData,
         }
     }
@@ -1773,6 +1807,7 @@ impl<'a> Processor<'a> {
 pub struct VpRunner<'a> {
     partition: &'a Partition,
     idx: u32,
+    pending_extint: Option<u8>,
     // This type stores the current thread in `partition` and removes it in
     // `drop`, so don't allow sending or sharing this.
     _not_send_sync: PhantomData<*const u8>,
@@ -1878,6 +1913,9 @@ impl<'a> VpRunner<'a> {
         if !self.run_vp_once()? {
             return Ok(Exit::Interrupted);
         }
+        // KVM accepted the run, so an extint queued while the interrupt window
+        // was open has now been injected before guest execution.
+        self.pending_extint = None;
 
         let exit = match self.run_data().exit_reason {
             #[cfg(target_arch = "x86_64")]
@@ -2065,9 +2103,22 @@ impl<'a> VpRunner<'a> {
     /// [`Self::check_or_request_interrupt_window`] has returned `true`.
     pub fn inject_extint_interrupt(&mut self, vector: u8) -> Result<()> {
         self.partition.vp(self.idx).interrupt(vector.into())?;
+        self.pending_extint = Some(vector);
         // Remember that there is a pending extint interrupt. KVM will update
         // this field again after the VP runs.
         self.run_data().ready_for_interrupt_injection = 0;
+        Ok(())
+    }
+
+    /// Returns an extint queued in KVM but not yet consumed by a successful run.
+    pub fn pending_extint(&self) -> Option<u8> {
+        self.pending_extint
+    }
+
+    /// Restores an extint that was queued but not injected at capture time.
+    pub fn restore_pending_extint(&mut self, vector: u8) -> Result<()> {
+        self.partition.vp(self.idx).interrupt(vector.into())?;
+        self.pending_extint = Some(vector);
         Ok(())
     }
 }

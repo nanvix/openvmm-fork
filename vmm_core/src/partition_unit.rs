@@ -23,6 +23,7 @@ use guestmem::GuestMemory;
 use hvdef::Vtl;
 use inspect::InspectMut;
 use mesh::Receiver;
+use mesh::rpc::FailableRpc;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use pal_async::task::Spawn;
@@ -130,6 +131,9 @@ enum PartitionRequest {
     SetInitialRegs(Rpc<(Vtl, Arc<InitialRegs>), Result<(), InitialRegError>>),
     AcceptInitialPages(Rpc<Vec<InitialPageImport>, Result<(), AcceptInitialPagesError>>),
     StopVps(Rpc<(), ()>),
+    StopVpsAtIoBoundary(FailableRpc<(mesh::OneshotSender<()>, mesh::OneshotReceiver<()>), ()>),
+    #[cfg(guest_arch = "x86_64")]
+    AdvanceTsc(FailableRpc<(std::time::Duration, u64, Option<u64>), ()>),
     StartVps,
     /// Build the partition state blob for a dump file.
     #[cfg(feature = "dump")]
@@ -139,6 +143,8 @@ enum PartitionRequest {
 pub struct PartitionUnitParams<'a> {
     pub vtl_guest_memory: [Option<&'a GuestMemory>; 3],
     pub processor_topology: &'a ProcessorTopology,
+    /// VP prefix to instantiate. The full topology remains guest-visible.
+    pub active_vp_count: Option<u32>,
     /// Tracks the halt state of VPs.
     pub halt_vps: Arc<Halt>,
     /// The receiver returned from `Halt::new()`.
@@ -166,6 +172,8 @@ pub enum Error {
     NameInUse(NameInUse),
     #[error("missing guest memory required for gdb support")]
     MissingGuestMemory,
+    #[error("active VP count {active} is outside topology capacity 1..={capacity}")]
+    InvalidActiveVpCount { active: u32, capacity: u32 },
 }
 
 /// Error returned by [`PartitionUnit::set_initial_regs()`].
@@ -200,10 +208,23 @@ impl PartitionUnit {
             return Err(Error::DebuggingNotSupported);
         }
 
-        let mut vp_set = VpSet::new(params.vtl_guest_memory.map(|m| m.cloned()), params.halt_vps);
+        let vp_capacity = params.processor_topology.vp_count();
+        let active_vp_count = params.active_vp_count.unwrap_or(vp_capacity);
+        if !(1..=vp_capacity).contains(&active_vp_count) {
+            return Err(Error::InvalidActiveVpCount {
+                active: active_vp_count,
+                capacity: vp_capacity,
+            });
+        }
+        let mut vp_set = VpSet::new(
+            params.vtl_guest_memory.map(|m| m.cloned()),
+            params.halt_vps,
+            vp_capacity as usize,
+        );
         let vps = params
             .processor_topology
             .vps_arch()
+            .take(active_vp_count as usize)
             .map(|vp| vp_set.add(vp))
             .collect();
 
@@ -271,6 +292,38 @@ impl PartitionUnit {
             .unwrap();
 
         StopGuard(self.req_send.clone())
+    }
+
+    /// Stops VPs after queuing stop events but before completing deferred I/O.
+    pub async fn temporarily_stop_vps_at_io_boundary(
+        &mut self,
+        release_io: mesh::OneshotSender<()>,
+        io_completed: mesh::OneshotReceiver<()>,
+    ) -> anyhow::Result<StopGuard> {
+        self.req_send
+            .call_failable(
+                PartitionRequest::StopVpsAtIoBoundary,
+                (release_io, io_completed),
+            )
+            .await?;
+        Ok(StopGuard(self.req_send.clone()))
+    }
+
+    /// Advances TSC state on all stopped vCPUs.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn advance_tsc(
+        &mut self,
+        duration: std::time::Duration,
+        frequency_hz: u64,
+        apic_frequency_hz: Option<u64>,
+    ) -> anyhow::Result<()> {
+        self.req_send
+            .call_failable(
+                PartitionRequest::AdvanceTsc,
+                (duration, frequency_hz, apic_frequency_hz),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Sets the register state for the VPs for initial boot.
@@ -378,6 +431,25 @@ impl PartitionUnitRunner {
                     }
                     PartitionRequest::StopVps(rpc) => {
                         rpc.handle(async |()| self.stop_vps().await).await
+                    }
+                    PartitionRequest::StopVpsAtIoBoundary(rpc) => {
+                        rpc.handle_failable(async |(release_io, io_completed)| {
+                            self.vp_set
+                                .stop_at_io_boundary(release_io, io_completed)
+                                .await?;
+                            self.vp_stop_count += 1;
+                            anyhow::Ok(())
+                        })
+                        .await
+                    }
+                    #[cfg(guest_arch = "x86_64")]
+                    PartitionRequest::AdvanceTsc(rpc) => {
+                        rpc.handle_failable(async |(duration, frequency_hz, apic_frequency_hz)| {
+                            self.vp_set
+                                .advance_tsc(duration, frequency_hz, apic_frequency_hz)
+                                .await
+                        })
+                        .await
                     }
                     PartitionRequest::StartVps => {
                         self.resume_vps();
