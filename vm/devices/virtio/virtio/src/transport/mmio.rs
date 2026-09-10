@@ -23,13 +23,18 @@ use device_emulators::read_as_u32_chunks;
 use device_emulators::write_as_u32_chunks;
 use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
+use guestmem::GuestMemoryError;
 use inspect::Inspect;
 use inspect::InspectMut;
-use pal_async::task::Spawn;
+#[cfg(target_os = "linux")]
+use pal_async::driver::SpawnDriver as MmioDriver;
+#[cfg(not(target_os = "linux"))]
+use pal_async::task::Spawn as MmioDriver;
 use parking_lot::Mutex;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::task::Context;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
 use vmcore::line_interrupt::LineInterrupt;
@@ -50,17 +55,127 @@ struct MmioTransport {
 struct InterruptState {
     interrupt: LineInterrupt,
     status: u32,
+    used_buffer_generation: u64,
+    observed_used_buffer_generation: Option<u64>,
+    shared_status: Option<SharedInterruptStatus>,
+}
+
+#[derive(Inspect)]
+struct SharedInterruptStatus {
+    #[inspect(skip)]
+    guest_memory: GuestMemory,
+    #[inspect(hex)]
+    gpa: u64,
+}
+
+impl SharedInterruptStatus {
+    fn update(&self, operation: impl Fn(u32) -> u32) -> Result<u32, GuestMemoryError> {
+        let mut current = self.guest_memory.read_plain::<u32>(self.gpa)?;
+        loop {
+            let new = operation(current);
+            match self.guest_memory.compare_exchange(self.gpa, current, new)? {
+                Ok(_) => return Ok(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn load(&self) -> Result<u32, GuestMemoryError> {
+        self.update(|current| current)
+    }
+
+    fn store(&self, value: u32) -> Result<u32, GuestMemoryError> {
+        self.update(|_| value)
+    }
+
+    fn fetch_or(&self, bits: u32) -> Result<u32, GuestMemoryError> {
+        self.update(|current| current | bits)
+    }
 }
 
 impl InterruptState {
     fn update(&mut self, is_set: bool, bits: u32) {
+        if let Some(shared_status) = &self.shared_status {
+            if is_set {
+                let old_status = shared_status
+                    .fetch_or(bits)
+                    .expect("validated shared interrupt-status memory became inaccessible");
+                if old_status == 0 {
+                    self.interrupt.set_level(true);
+                    self.interrupt.set_level(false);
+                }
+            }
+            return;
+        }
+
         if is_set {
+            if bits & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0 {
+                self.used_buffer_generation = self.used_buffer_generation.wrapping_add(1);
+            }
             self.status |= bits;
         } else {
+            if bits & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0 {
+                self.observed_used_buffer_generation = None;
+            }
             self.status &= !bits;
         }
         self.interrupt.set_level(self.status != 0);
     }
+
+    fn read_status(&mut self) -> u32 {
+        if let Some(shared_status) = &self.shared_status {
+            return shared_status
+                .load()
+                .expect("validated shared interrupt-status memory became inaccessible");
+        }
+        if self.status & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0 {
+            self.observed_used_buffer_generation = Some(self.used_buffer_generation);
+        }
+        self.status
+    }
+}
+
+impl MmioTransport {
+    fn lock_interrupt_state(&self) -> parking_lot::MutexGuard<'_, InterruptState> {
+        self.interrupt_state.lock()
+    }
+
+    fn read_interrupt_status(&self) -> u32 {
+        self.lock_interrupt_state().read_status()
+    }
+
+    fn reset_interrupt_state(&self) {
+        let mut state = self.lock_interrupt_state();
+        if let Some(shared_status) = &state.shared_status {
+            shared_status
+                .store(0)
+                .expect("validated shared interrupt-status memory became inaccessible");
+        }
+        state.status = 0;
+        state.used_buffer_generation = 0;
+        state.observed_used_buffer_generation = None;
+        state.interrupt.set_level(false);
+    }
+}
+
+impl Drop for MmioTransport {
+    fn drop(&mut self) {
+        let state = self.interrupt_state.lock();
+        if let Some(shared_status) = &state.shared_status {
+            let _ = shared_status.store(0);
+        }
+        state.interrupt.set_level(false);
+    }
+}
+
+/// Interrupt-status delivery used by a virtio-mmio transport.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VirtioMmioInterruptMode {
+    /// Virtio MMIO status reads, acknowledgement writes, and a level interrupt.
+    #[default]
+    Legacy,
+    /// A shared atomic status word and a pulse on each zero-to-nonzero transition.
+    SharedStatus { status_gpa: u64 },
 }
 
 impl TransportOps for MmioTransport {
@@ -80,7 +195,7 @@ impl TransportOps for MmioTransport {
     }
 
     fn reset_interrupts(&mut self) {
-        self.interrupt_state.lock().update(false, !0);
+        self.reset_interrupt_state();
     }
 
     fn doorbell_region(&mut self) -> Option<(u64, u32)> {
@@ -108,7 +223,7 @@ impl fmt::Debug for VirtioMmioDevice {
 impl VirtioMmioDevice {
     pub fn new(
         device: Box<dyn DynVirtioDevice>,
-        driver: &impl Spawn,
+        driver: &impl MmioDriver,
         guest_memory: GuestMemory,
         interrupt: LineInterrupt,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
@@ -130,7 +245,7 @@ impl VirtioMmioDevice {
     /// Creates an MMIO transport after masking guest-visible device features.
     pub fn new_with_disabled_features(
         device: Box<dyn DynVirtioDevice>,
-        driver: &impl Spawn,
+        driver: &impl MmioDriver,
         guest_memory: GuestMemory,
         interrupt: LineInterrupt,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
@@ -138,12 +253,65 @@ impl VirtioMmioDevice {
         mmio_len: u64,
         disabled_features: u64,
     ) -> std::io::Result<Self> {
+        Self::new_with_disabled_features_and_interrupt_mode(
+            device,
+            driver,
+            guest_memory,
+            interrupt,
+            doorbell_registration,
+            mmio_gpa,
+            mmio_len,
+            disabled_features,
+            VirtioMmioInterruptMode::Legacy,
+        )
+    }
+
+    /// Creates an MMIO transport with explicit interrupt-status delivery.
+    pub fn new_with_disabled_features_and_interrupt_mode(
+        device: Box<dyn DynVirtioDevice>,
+        driver: &impl MmioDriver,
+        guest_memory: GuestMemory,
+        interrupt: LineInterrupt,
+        doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
+        mmio_gpa: u64,
+        mmio_len: u64,
+        disabled_features: u64,
+        interrupt_mode: VirtioMmioInterruptMode,
+    ) -> std::io::Result<Self> {
         let traits = device.traits();
+        let shared_status = match interrupt_mode {
+            VirtioMmioInterruptMode::Legacy => None,
+            VirtioMmioInterruptMode::SharedStatus { status_gpa } => {
+                if !status_gpa.is_multiple_of(size_of::<u32>() as u64) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "shared interrupt-status GPA {status_gpa:#x} is not naturally aligned"
+                        ),
+                    ));
+                }
+                let shared_status = SharedInterruptStatus {
+                    guest_memory: guest_memory.clone(),
+                    gpa: status_gpa,
+                };
+                shared_status.store(0).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "shared interrupt-status GPA {status_gpa:#x} is inaccessible: {error}"
+                        ),
+                    )
+                })?;
+                Some(shared_status)
+            }
+        };
         let interrupt_state = Arc::new(Mutex::new(InterruptState {
             interrupt,
             status: 0,
+            used_buffer_generation: 0,
+            observed_used_buffer_generation: None,
+            shared_status,
         }));
-
         let core = VirtioTransportCore::new_with_disabled_features(
             device,
             driver,
@@ -212,7 +380,7 @@ impl VirtioMmioDevice {
                     .is_some_and(|qd| qd.params.enable) as u32
             }
             VirtioMmioRegister::QUEUE_NOTIFY => 0,
-            VirtioMmioRegister::INTERRUPT_STATUS => self.mmio.interrupt_state.lock().status,
+            VirtioMmioRegister::INTERRUPT_STATUS => self.mmio.read_interrupt_status(),
             VirtioMmioRegister::INTERRUPT_ACK => 0,
             VirtioMmioRegister::STATUS => self.core.device_status.as_u32(),
             VirtioMmioRegister::QUEUE_DESC_LOW => self
@@ -388,6 +556,18 @@ impl ChangeDeviceState for VirtioMmioDevice {
         self.core.start(&mut self.mmio);
     }
 
+    async fn start_fallible(&mut self) -> anyhow::Result<()> {
+        self.core.start_fallible(&mut self.mmio).await
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.core.quiesce_input().await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.core.resume_input().await
+    }
+
     async fn stop(&mut self) {
         self.core.stop(&mut self.mmio).await;
     }
@@ -398,7 +578,7 @@ impl ChangeDeviceState for VirtioMmioDevice {
 }
 
 impl PollDevice for VirtioMmioDevice {
-    fn poll_device(&mut self, cx: &mut std::task::Context<'_>) {
+    fn poll_device(&mut self, cx: &mut Context<'_>) {
         self.core.poll_device(&mut self.mmio, cx);
         if !self.core.stalled_io.is_empty() && !self.core.state.is_busy() {
             self.replay_stalled_io();
@@ -421,6 +601,7 @@ mod saved_state {
         use crate::transport::saved_state::state::CommonQueueState;
         use crate::transport::saved_state::state::CommonSavedState;
         use mesh::payload::Protobuf;
+        use vmcore::save_restore::SavedStateBlob;
         use vmcore::save_restore::SavedStateRoot;
 
         #[derive(Protobuf)]
@@ -439,6 +620,8 @@ mod saved_state {
             pub queues: Vec<SavedQueueState>,
             #[mesh(3)]
             pub interrupt_status: u32,
+            #[mesh(4)]
+            pub device_state: Option<SavedStateBlob>,
         }
     }
 
@@ -449,14 +632,18 @@ mod saved_state {
         type SavedState = state::SavedState;
 
         fn save(&mut self) -> Result<Self::SavedState, vmcore::save_restore::SaveError> {
+            let common = self.core.save_common()?;
+            let queues = (0..self.core.queues.len())
+                .map(|i| state::SavedQueueState {
+                    common: self.core.save_queue_common(i),
+                })
+                .collect();
+            let device_state = self.core.take_device_state()?;
             Ok(state::SavedState {
-                common: self.core.save_common()?,
-                queues: (0..self.core.queues.len())
-                    .map(|i| state::SavedQueueState {
-                        common: self.core.save_queue_common(i),
-                    })
-                    .collect(),
-                interrupt_status: self.mmio.interrupt_state.lock().status,
+                common,
+                queues,
+                interrupt_status: self.mmio.read_interrupt_status(),
+                device_state,
             })
         }
 
@@ -464,10 +651,12 @@ mod saved_state {
             &mut self,
             state: Self::SavedState,
         ) -> Result<(), vmcore::save_restore::RestoreError> {
+            self.mmio.reset_interrupt_state();
             let saved_queue_count = state.queues.len();
             self.core.restore_common(
                 &mut self.mmio,
                 &state.common,
+                state.device_state,
                 state.queues.into_iter().map(|sq| (sq.common, 0)),
                 saved_queue_count,
             )?;
@@ -475,8 +664,20 @@ mod saved_state {
             // Restore MMIO-specific interrupt state.
             {
                 let mut is = self.mmio.interrupt_state.lock();
-                is.status = state.interrupt_status;
-                is.interrupt.set_level(is.status != 0);
+                if let Some(shared_status) = &is.shared_status {
+                    shared_status
+                        .store(state.interrupt_status)
+                        .map_err(|error| {
+                            vmcore::save_restore::RestoreError::InvalidSavedState(error.into())
+                        })?;
+                    is.interrupt.set_level(false);
+                } else {
+                    is.status = state.interrupt_status;
+                    is.used_buffer_generation = 0;
+                    is.observed_used_buffer_generation =
+                        (is.status & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER != 0).then_some(0);
+                    is.interrupt.set_level(is.status != 0);
+                }
             }
 
             Ok(())
@@ -540,5 +741,154 @@ impl MmioIntercept for VirtioMmioDevice {
 
     fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u64>)] {
         std::slice::from_ref(&self.mmio.fixed_mmio_region)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use vmcore::line_interrupt::LineSetTarget;
+
+    #[derive(Default)]
+    struct CountingInterruptTarget {
+        high: AtomicBool,
+        pulses: AtomicUsize,
+    }
+
+    impl LineSetTarget for CountingInterruptTarget {
+        fn set_irq(&self, _vector: u32, high: bool) {
+            self.high.store(high, Ordering::SeqCst);
+            if high {
+                self.pulses.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn shared_interrupt_state(
+        guest_memory: &GuestMemory,
+        target: Arc<CountingInterruptTarget>,
+    ) -> InterruptState {
+        InterruptState {
+            interrupt: LineInterrupt::new_with_target("shared-status-test", target, 0),
+            status: 0,
+            used_buffer_generation: 0,
+            observed_used_buffer_generation: None,
+            shared_status: Some(SharedInterruptStatus {
+                guest_memory: guest_memory.clone(),
+                gpa: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_status_coalesces_bits_and_pulses_on_zero_transition() {
+        let guest_memory = GuestMemory::allocate(0x1000);
+        let target = Arc::new(CountingInterruptTarget::default());
+        let mut state = shared_interrupt_state(&guest_memory, target.clone());
+
+        state.update(true, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+        state.update(true, VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE);
+        state.update(true, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+
+        assert_eq!(state.read_status(), 3);
+        assert_eq!(target.pulses.load(Ordering::SeqCst), 1);
+        assert!(!target.high.load(Ordering::SeqCst));
+
+        let consumed = state.shared_status.as_ref().unwrap().store(0).unwrap();
+        assert_eq!(consumed, 3);
+        state.update(true, VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE);
+        assert_eq!(target.pulses.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shared_status_completion_racing_exchange_is_not_lost() {
+        const ITERATIONS: usize = 1000;
+
+        let guest_memory = GuestMemory::allocate(0x1000);
+        let shared_status = Arc::new(SharedInterruptStatus {
+            guest_memory,
+            gpa: 0,
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let publisher = {
+            let shared_status = shared_status.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                for _ in 0..ITERATIONS {
+                    barrier.wait();
+                    shared_status
+                        .fetch_or(VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER)
+                        .unwrap();
+                    barrier.wait();
+                }
+            })
+        };
+
+        for _ in 0..ITERATIONS {
+            shared_status.store(0).unwrap();
+            barrier.wait();
+            let consumed = shared_status.store(0).unwrap();
+            barrier.wait();
+            let pending = shared_status.load().unwrap();
+            assert_eq!(
+                (consumed | pending) & VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+                VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER
+            );
+        }
+        publisher.join().unwrap();
+    }
+
+    #[test]
+    fn shared_status_reset_clears_pending_state_without_interrupt() {
+        let guest_memory = GuestMemory::allocate(0x1000);
+        let target = Arc::new(CountingInterruptTarget::default());
+        let state = MmioTransport {
+            fixed_mmio_region: ("test", 0..=0xfff),
+            device_id: 0,
+            vendor_id: 0,
+            interrupt_state: Arc::new(Mutex::new(shared_interrupt_state(
+                &guest_memory,
+                target.clone(),
+            ))),
+        };
+        state
+            .interrupt_state
+            .lock()
+            .update(true, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+        let pulses = target.pulses.load(Ordering::SeqCst);
+
+        state.reset_interrupt_state();
+
+        assert_eq!(state.read_interrupt_status(), 0);
+        assert_eq!(target.pulses.load(Ordering::SeqCst), pulses);
+        assert!(!target.high.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shared_status_teardown_clears_pending_state() {
+        let guest_memory = GuestMemory::allocate(0x1000);
+        let target = Arc::new(CountingInterruptTarget::default());
+        let transport = MmioTransport {
+            fixed_mmio_region: ("test", 0..=0xfff),
+            device_id: 0,
+            vendor_id: 0,
+            interrupt_state: Arc::new(Mutex::new(shared_interrupt_state(
+                &guest_memory,
+                target.clone(),
+            ))),
+        };
+        transport
+            .interrupt_state
+            .lock()
+            .update(true, VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER);
+
+        drop(transport);
+
+        assert_eq!(guest_memory.read_plain::<u32>(0).unwrap(), 0);
+        assert!(!target.high.load(Ordering::SeqCst));
     }
 }

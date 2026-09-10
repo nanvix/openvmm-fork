@@ -7,13 +7,38 @@
 use crate::DEFAULT_QUEUE_SIZE;
 use crate::DeviceTraits;
 use crate::QueueResources;
+use crate::queue::QueueParams;
 use crate::queue::QueueState;
 use crate::spec::VirtioDeviceFeatures;
+use guestmem::GuestMemory;
 use guestmem::MappedMemoryRegion;
 use inspect::InspectMut;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use vmcore::save_restore::RestoreError;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
+
+/// Restored queue metadata available to device-private state validation.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceQueueState {
+    pub params: QueueParams,
+    pub queue_state: Option<QueueState>,
+}
+
+/// Synchronous validation for opaque device-private saved state and its queue
+/// dependencies.
+pub type DeviceStateValidator = Box<
+    dyn Fn(
+            Option<&SavedStateBlob>,
+            &VirtioDeviceFeatures,
+            &[DeviceQueueState],
+            &GuestMemory,
+        ) -> Result<(), RestoreError>
+        + Send
+        + Sync,
+>;
 
 /// Per-queue virtio device trait. Ergonomic async fn — not object-safe.
 ///
@@ -22,6 +47,13 @@ use std::sync::Arc;
 pub trait VirtioDevice: InspectMut + Send {
     /// Device identity and capabilities.
     fn traits(&self) -> DeviceTraits;
+
+    /// Whether the transport should register accelerated queue doorbells.
+    /// Devices that opt out receive queue notifications through transport
+    /// emulation instead.
+    fn supports_accelerated_doorbells(&self) -> bool {
+        true
+    }
 
     /// The queue size for the given queue index.
     ///
@@ -105,6 +137,16 @@ pub trait VirtioDevice: InspectMut + Send {
         async {}
     }
 
+    /// Stops accepting new host input while preserving device and queue state.
+    fn quiesce_input(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Resumes host input after a failed save transaction.
+    fn resume_input(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Whether the device supports save/restore.
     ///
     /// Devices that return `false` will cause the transport's `save()` to
@@ -113,6 +155,48 @@ pub trait VirtioDevice: InspectMut + Send {
     /// leave this as `false`.
     fn supports_save_restore(&self) -> bool {
         false
+    }
+
+    /// Save device-private state after all queues have stopped.
+    ///
+    /// The transport saves queue and feature-negotiation state separately.
+    /// Devices with additional state should return a typed [`SavedStateBlob`].
+    fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        if self.supports_save_restore() {
+            Ok(None)
+        } else {
+            Err(SaveError::NotSupported)
+        }
+    }
+
+    /// Restore device-private state before any queues are restarted.
+    fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
+        if !self.supports_save_restore() {
+            return Err(RestoreError::SavedStateNotSupported);
+        }
+        if state.is_some() {
+            return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+                "device does not accept private saved state"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return an immutable validator that the transport can retain after the
+    /// device moves into its async task.
+    fn device_state_validator(&self) -> DeviceStateValidator {
+        let supports_save_restore = self.supports_save_restore();
+        Box::new(move |state, _features, _queues, _guest_memory| {
+            if !supports_save_restore {
+                return Err(RestoreError::SavedStateNotSupported);
+            }
+            if state.is_some() {
+                return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+                    "device does not accept private saved state"
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -125,6 +209,9 @@ pub trait VirtioDevice: InspectMut + Send {
 pub trait DynVirtioDevice: InspectMut + Send {
     /// Device identity and capabilities.
     fn traits(&self) -> DeviceTraits;
+
+    /// Whether the transport should register accelerated queue doorbells.
+    fn supports_accelerated_doorbells(&self) -> bool;
 
     /// The queue size for the given queue index.
     fn queue_size(&self, queue_index: u16) -> u16;
@@ -164,13 +251,32 @@ pub trait DynVirtioDevice: InspectMut + Send {
     /// Reset device-internal state.
     fn reset(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 
+    /// Stops accepting new host input while preserving device state.
+    fn quiesce_input(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
+
+    /// Resumes host input after a failed save transaction.
+    fn resume_input(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
+
     /// Whether the device supports save/restore.
     fn supports_save_restore(&self) -> bool;
+
+    /// Save device-private state after all queues have stopped.
+    fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError>;
+
+    /// Restore device-private state before any queues are restarted.
+    fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError>;
+
+    /// Return immutable validation for device-private saved state.
+    fn device_state_validator(&self) -> DeviceStateValidator;
 }
 
 impl<T: VirtioDevice> DynVirtioDevice for T {
     fn traits(&self) -> DeviceTraits {
         VirtioDevice::traits(self)
+    }
+
+    fn supports_accelerated_doorbells(&self) -> bool {
+        VirtioDevice::supports_accelerated_doorbells(self)
     }
 
     fn queue_size(&self, queue_index: u16) -> u16 {
@@ -226,7 +332,27 @@ impl<T: VirtioDevice> DynVirtioDevice for T {
         Box::pin(VirtioDevice::reset(self))
     }
 
+    fn quiesce_input(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(VirtioDevice::quiesce_input(self))
+    }
+
+    fn resume_input(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(VirtioDevice::resume_input(self))
+    }
+
     fn supports_save_restore(&self) -> bool {
         VirtioDevice::supports_save_restore(self)
+    }
+
+    fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        VirtioDevice::save_device(self)
+    }
+
+    fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
+        VirtioDevice::restore_device(self, state)
+    }
+
+    fn device_state_validator(&self) -> DeviceStateValidator {
+        VirtioDevice::device_state_validator(self)
     }
 }
