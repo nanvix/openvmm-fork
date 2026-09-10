@@ -81,6 +81,11 @@ impl VirtioWorkPool {
         n
     }
 
+    /// Returns the number of guest RX descriptors currently owned by the device.
+    pub fn pending_count(&self) -> usize {
+        self.rx_packets.iter().flatten().count()
+    }
+
     /// Add a virtio work instance to the buffers available for use.
     ///
     /// Returns `Err` with the work item if the buffer cannot be posted to the

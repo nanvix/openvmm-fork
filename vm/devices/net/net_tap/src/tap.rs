@@ -8,12 +8,14 @@
 
 use crate::VirtioNetHdr;
 use futures::AsyncRead;
+use futures::AsyncWrite;
 use linux_net_bindings::gen_if;
 use linux_net_bindings::gen_if_tun;
 use linux_net_bindings::tun_get_iff;
 use linux_net_bindings::tun_get_vnet_hdr_sz;
 use linux_net_bindings::tun_set_iff;
 use linux_net_bindings::tun_set_offload;
+use linux_net_bindings::tun_set_persist;
 use linux_net_bindings::tun_set_vnet_hdr_sz;
 use pal_async::driver::Driver;
 use pal_async::pipe::PolledPipe;
@@ -22,6 +24,7 @@ use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::os::raw::c_int;
 use std::os::raw::c_short;
 use std::os::unix::prelude::AsRawFd;
 use std::pin::Pin;
@@ -45,6 +48,8 @@ pub enum Error {
     SetVnetHdrSize(#[source] io::Error),
     #[error("TUNSETOFFLOAD ioctl failed")]
     SetOffload(#[source] io::Error),
+    #[error("TUNSETPERSIST ioctl failed")]
+    SetPersistent(#[source] io::Error),
     #[error("TAP name conversion to C string failed")]
     TapNameConversion(#[source] std::ffi::NulError),
     #[error("TAP interface does not have IFF_VNET_HDR set")]
@@ -93,6 +98,16 @@ pub fn open_tap(name: &str) -> Result<OwnedFd, Error> {
     Ok(fd)
 }
 
+/// Sets whether a TAP interface persists after its last fd is closed.
+pub fn set_persistent(fd: &OwnedFd, persistent: bool) -> Result<(), Error> {
+    // SAFETY: calling the ioctl according to implementation requirements.
+    unsafe {
+        tun_set_persist(fd.as_raw_fd(), c_int::from(persistent))
+            .map_err(|_e| Error::SetPersistent(io::Error::last_os_error()))?;
+    }
+    Ok(())
+}
+
 /// Structure corresponding to a TAP interface.
 ///
 /// Wraps a validated TAP fd with `IFF_VNET_HDR` and the correct vnet header
@@ -127,7 +142,7 @@ impl Tap {
         }
 
         // Set the vnet header size to the 12-byte v1 format.
-        let expected_sz = size_of::<VirtioNetHdr>() as std::os::raw::c_int;
+        let expected_sz = size_of::<VirtioNetHdr>() as c_int;
         // SAFETY: calling the ioctl with a valid fd and correct argument type.
         unsafe {
             tun_set_vnet_hdr_sz(tap.as_raw_fd(), &expected_sz)
@@ -135,7 +150,7 @@ impl Tap {
         };
 
         // Verify the header size was applied.
-        let mut actual_sz: std::os::raw::c_int = 0;
+        let mut actual_sz: c_int = 0;
         // SAFETY: calling the ioctl with a valid fd and correct argument type.
         unsafe {
             tun_get_vnet_hdr_sz(tap.as_raw_fd(), &mut actual_sz)
@@ -157,7 +172,7 @@ impl Tap {
     pub fn set_offloads(&self, flags: u32) -> Result<(), Error> {
         // SAFETY: calling the ioctl with a valid fd and correct argument type.
         unsafe {
-            tun_set_offload(self.tap.as_raw_fd(), flags as std::os::raw::c_int)
+            tun_set_offload(self.tap.as_raw_fd(), flags as c_int)
                 .map_err(|_e| Error::SetOffload(io::Error::last_os_error()))?;
         };
         Ok(())
@@ -190,6 +205,32 @@ impl AsyncRead for PolledTap {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.tap).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PolledTap {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.tap).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tap).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tap).poll_close(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.tap).poll_write_vectored(cx, bufs)
     }
 }
 

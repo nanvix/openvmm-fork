@@ -1156,6 +1156,7 @@ impl VmService {
                         root_path: virtiofs.root_path,
                         mount_options: String::new(),
                     },
+                    profile: virtio_resources::fs::VirtioFsProfile::Standard,
                 }
                 .into_resource();
                 // Use VPCI when possible (currently only on Windows and macOS due
@@ -1183,7 +1184,13 @@ impl VmService {
                             )
                         })?;
                     let resource: Resource<VirtioDeviceHandle> =
-                        virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
+                        virtio_resources::console::VirtioConsoleHandle {
+                            backend,
+                            disconnect_policy:
+                                virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                            attachment: None,
+                        }
+                        .into_resource();
                     if cfg!(windows) || cfg!(target_os = "macos") {
                         config.vpci_devices.push(VpciDeviceConfig {
                             vtl: DeviceVtl::Vtl0,
@@ -1366,7 +1373,7 @@ impl VmService {
     async fn resume_vm(&mut self) -> anyhow::Result<()> {
         let vm = self.vm.clone().context("VM not created yet")?;
         vm.worker_rpc
-            .call(VmRpc::Resume, ())
+            .call_failable(VmRpc::Resume, ())
             .await
             .map(drop)
             .context("resume failed")?;
@@ -1641,6 +1648,7 @@ fn parse_nic_config(
                 .map(parse_port_config)
                 .collect::<anyhow::Result<_>>()?,
             recv,
+            static_ipv4: None,
         }
         .into_resource(),
         _ => anyhow::bail!("unsupported backend"),
@@ -2082,6 +2090,10 @@ async fn build_virtio_device(
                     .parse::<MacAddress>()
                     .context("invalid mac address")?,
                 endpoint,
+                egress_policy: None,
+                save_restore: false,
+                static_ipv4: None,
+                effective_features: None,
             }
             .into_resource()
         }
@@ -2102,7 +2114,13 @@ async fn build_virtio_device(
         }
         Kind::Console(vmservice::VirtioConsole { backend }) => {
             let backend = build_serial_backend(backend.context("missing console backend")?)?;
-            virtio_resources::console::VirtioConsoleHandle { backend }.into_resource()
+            virtio_resources::console::VirtioConsoleHandle {
+                backend,
+                disconnect_policy:
+                    virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                attachment: None,
+            }
+            .into_resource()
         }
         Kind::VhostUser(vhost_user) => build_vhost_user_device(vhost_user)?,
     })
@@ -2141,6 +2159,7 @@ fn build_nic_backend(
                     .map(parse_port_config)
                     .collect::<anyhow::Result<_>>()?,
                 recv: None,
+                static_ipv4: None,
             }
             .into_resource()
         }

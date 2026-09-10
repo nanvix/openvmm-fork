@@ -2,12 +2,15 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
+use chipset_device::io::IoResult;
+use chipset_device::mmio::MmioIntercept;
 use guestmem::GuestMemory;
 use inspect::InspectMut;
 use net_backend::Endpoint;
 use net_backend::EndpointAction;
 use net_backend::MultiQueueSupport;
 use net_backend::QueueConfig;
+use net_backend::QueueQuiesceResult;
 use net_backend::RssConfig;
 use net_backend::RxChecksumState;
 use net_backend::RxId;
@@ -17,6 +20,10 @@ use net_backend::TxId;
 use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
+use net_backend::linearize;
+use net_backend::next_packet;
+use net_backend_resources::egress::EgressPolicy;
+use net_backend_resources::egress::EgressPolicyMode;
 use net_backend_resources::mac_address::MacAddress;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
@@ -30,6 +37,7 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 use test_with_tracing::test;
+use virtio::DeviceQueueState;
 use virtio::QueueResources;
 use virtio::VirtioDevice;
 use virtio::queue::QueueParams;
@@ -41,7 +49,11 @@ use virtio::test_helpers::make_available;
 use virtio::test_helpers::read_used;
 use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
+use virtio::transport::VirtioMmioDevice;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
+use vmcore::line_interrupt::LineInterrupt;
+use vmcore::save_restore::SaveRestore;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -118,6 +130,9 @@ struct MockQueue {
     ready_waker: Arc<Mutex<Option<Waker>>>,
     rx_avail_notify: mesh::Sender<()>,
     tx_avail_notify: mesh::Sender<()>,
+    egress_policy: Option<EgressPolicy>,
+    replace_next_tx: Arc<Mutex<Option<Vec<u8>>>>,
+    quiesce_notify: mesh::Sender<()>,
 }
 
 impl InspectMut for MockQueue {
@@ -169,11 +184,45 @@ impl net_backend::Queue for MockQueue {
         Ok(n)
     }
 
-    fn tx_avail(
+    async fn quiesce(
         &mut self,
         _pool: &mut dyn net_backend::BufferAccess,
+    ) -> anyhow::Result<QueueQuiesceResult> {
+        self.quiesce_notify.send(());
+        self.rx_pending.lock().clear();
+        Ok(QueueQuiesceResult {
+            rx_ready: self.rx_ready.lock().len(),
+            tx_ready: self.tx_completions.lock().iter().map(Vec::len).sum(),
+        })
+    }
+
+    fn tx_avail(
+        &mut self,
+        pool: &mut dyn net_backend::BufferAccess,
         segments: &[TxSegment],
     ) -> anyhow::Result<(bool, usize)> {
+        if let Some(replacement) = self.replace_next_tx.lock().take() {
+            let (metadata, packet_segments, _) = next_packet(segments);
+            anyhow::ensure!(replacement.len() == metadata.len as usize);
+            let mut offset = 0usize;
+            for segment in packet_segments {
+                let end = offset + segment.len as usize;
+                pool.guest_memory()
+                    .write_at(segment.gpa, &replacement[offset..end])?;
+                offset = end;
+            }
+            anyhow::ensure!(offset == replacement.len());
+        }
+        if let Some(policy) = &self.egress_policy {
+            let mut remaining = segments;
+            while !remaining.is_empty() {
+                let frame = linearize(pool, &mut remaining)?;
+                if policy.authorize_frame(&frame, frame.len()).is_err() {
+                    return Ok((true, segments.len()));
+                }
+            }
+        }
+
         // Log the segments
         let infos: Vec<TxSegmentInfo> = segments
             .iter()
@@ -232,6 +281,8 @@ struct MockQueueHandle {
     ready_waker: Arc<Mutex<Option<Waker>>>,
     rx_avail_notify: mesh::Receiver<()>,
     tx_avail_notify: mesh::Receiver<()>,
+    replace_next_tx: Arc<Mutex<Option<Vec<u8>>>>,
+    quiesce_notify: mesh::Receiver<()>,
 }
 
 impl MockQueueHandle {
@@ -244,6 +295,10 @@ impl MockQueueHandle {
 
     fn take_tx_avail_log(&self) -> Vec<Vec<TxSegmentInfo>> {
         std::mem::take(&mut *self.tx_avail_log.lock())
+    }
+
+    fn replace_next_tx(&self, frame: Vec<u8>) {
+        *self.replace_next_tx.lock() = Some(frame);
     }
 
     /// Inject an RX packet into a pending RX buffer.
@@ -322,9 +377,18 @@ impl MockQueueHandle {
             .expect("timed out waiting for tx_avail")
             .expect("channel closed");
     }
+
+    async fn wait_for_quiesce(&mut self) {
+        mesh::CancelContext::new()
+            .with_timeout(Duration::from_secs(5))
+            .until_cancelled(self.quiesce_notify.next())
+            .await
+            .expect("timed out waiting for queue quiesce")
+            .expect("channel closed");
+    }
 }
 
-fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
+fn new_mock_queue(egress_policy: Option<EgressPolicy>) -> (MockQueue, MockQueueHandle) {
     let tx_avail_behavior = Arc::new(Mutex::new(TxAvailBehavior::default()));
     let tx_avail_log = Arc::new(Mutex::new(Vec::new()));
     let tx_completions = Arc::new(Mutex::new(VecDeque::new()));
@@ -333,6 +397,8 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
     let ready_waker = Arc::new(Mutex::new(None));
     let (rx_avail_tx, rx_avail_rx) = mesh::channel();
     let (tx_avail_tx, tx_avail_rx) = mesh::channel();
+    let replace_next_tx = Arc::new(Mutex::new(None));
+    let (quiesce_tx, quiesce_rx) = mesh::channel();
 
     let queue = MockQueue {
         tx_avail_behavior: tx_avail_behavior.clone(),
@@ -343,6 +409,9 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
         ready_waker: ready_waker.clone(),
         rx_avail_notify: rx_avail_tx,
         tx_avail_notify: tx_avail_tx,
+        egress_policy,
+        replace_next_tx: replace_next_tx.clone(),
+        quiesce_notify: quiesce_tx,
     };
     let handle = MockQueueHandle {
         tx_avail_behavior,
@@ -353,6 +422,8 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
         ready_waker,
         rx_avail_notify: rx_avail_rx,
         tx_avail_notify: tx_avail_rx,
+        replace_next_tx,
+        quiesce_notify: quiesce_rx,
     };
     (queue, handle)
 }
@@ -362,6 +433,7 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
 struct MockEndpoint {
     queue_tx: mesh::Sender<MockQueueHandle>,
     is_ordered: bool,
+    egress_policy: Option<EgressPolicy>,
 }
 
 impl InspectMut for MockEndpoint {
@@ -382,9 +454,14 @@ impl Endpoint for MockEndpoint {
         _rss: Option<&RssConfig<'_>>,
         queues: &mut Vec<Box<dyn net_backend::Queue>>,
     ) -> anyhow::Result<()> {
-        let (queue, handle) = new_mock_queue();
+        let (queue, handle) = new_mock_queue(self.egress_policy.clone());
         self.queue_tx.send(handle);
         queues.push(Box::new(queue));
+        Ok(())
+    }
+
+    fn set_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        self.egress_policy = Some(policy);
         Ok(())
     }
 
@@ -471,6 +548,10 @@ struct TestHarness {
 
 impl TestHarness {
     fn new(driver: &DefaultDriver) -> Self {
+        Self::new_with_egress_policy(driver, None)
+    }
+
+    fn new_with_egress_policy(driver: &DefaultDriver, egress_policy: Option<EgressPolicy>) -> Self {
         let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
 
         // Initialize RX queue rings
@@ -486,11 +567,16 @@ impl TestHarness {
         let endpoint = MockEndpoint {
             queue_tx,
             is_ordered: true,
+            egress_policy: None,
         };
 
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
         let mac = MacAddress::new([0x00, 0x15, 0x5d, 0xaa, 0xbb, 0xcc]);
-        let device = Device::builder()
+        let mut builder = Device::builder();
+        if let Some(egress_policy) = egress_policy {
+            builder = builder.egress_policy(egress_policy);
+        }
+        let device = builder
             .build(&driver_source, Box::new(endpoint), mac)
             .unwrap();
 
@@ -516,6 +602,32 @@ impl TestHarness {
         }
     }
 
+    fn new_save_restore(driver: &DefaultDriver) -> Self {
+        let mut harness = Self::new(driver);
+        let (queue_tx, queue_handle_rx) = mesh::channel();
+        let endpoint = MockEndpoint {
+            queue_tx,
+            is_ordered: true,
+            egress_policy: None,
+        };
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+        let mac = MacAddress::new([0x52, 0x54, 0, 0, 0, 2]);
+        harness.device = Device::builder()
+            .save_restore(
+                net_backend_resources::consomme::StaticIpv4Config {
+                    guest_ipv4: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                    prefix_length: 24,
+                    gateway_ipv4: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                    gateway_mac: MacAddress::new([0x52, 0x54, 0, 0, 0, 1]),
+                },
+                (1 << 5) | (1 << 32),
+            )
+            .build(&driver_source, Box::new(endpoint), mac)
+            .unwrap();
+        harness.queue_handle_rx = queue_handle_rx;
+        harness
+    }
+
     /// Enable the device and retrieve the MockQueueHandle.
     async fn enable_and_get_handle(&mut self) -> MockQueueHandle {
         self.enable_and_get_handle_with_features(VirtioDeviceFeatures::new())
@@ -527,30 +639,7 @@ impl TestHarness {
         &mut self,
         features: VirtioDeviceFeatures,
     ) -> MockQueueHandle {
-        let rx_interrupt = Interrupt::from_event(self.rx_interrupt_event.clone());
-        let tx_interrupt = Interrupt::from_event(self.tx_interrupt_event.clone());
-
-        // Queue 0: RX
-        self.device
-            .start_queue(
-                0,
-                QueueResources {
-                    params: QueueParams {
-                        size: QUEUE_SIZE,
-                        enable: true,
-                        desc_addr: RX_DESC_ADDR,
-                        avail_addr: RX_AVAIL_ADDR,
-                        used_addr: RX_USED_ADDR,
-                    },
-                    notify: rx_interrupt,
-                    event: self.rx_event.clone(),
-                    guest_memory: self.mem.clone(),
-                },
-                &features,
-                None,
-            )
-            .await
-            .unwrap();
+        self.start_rx_queue(&features).await;
 
         // Queue 1: TX
         self.device
@@ -564,7 +653,7 @@ impl TestHarness {
                         avail_addr: TX_AVAIL_ADDR,
                         used_addr: TX_USED_ADDR,
                     },
-                    notify: tx_interrupt,
+                    notify: Interrupt::from_event(self.tx_interrupt_event.clone()),
                     event: self.tx_event.clone(),
                     guest_memory: self.mem.clone(),
                 },
@@ -583,6 +672,32 @@ impl TestHarness {
             .expect("channel closed")
     }
 
+    async fn start_rx_queue(&mut self, features: &VirtioDeviceFeatures) {
+        let rx_interrupt = Interrupt::from_event(self.rx_interrupt_event.clone());
+
+        // Queue 0: RX
+        self.device
+            .start_queue(
+                0,
+                QueueResources {
+                    params: QueueParams {
+                        size: QUEUE_SIZE,
+                        enable: true,
+                        desc_addr: RX_DESC_ADDR,
+                        avail_addr: RX_AVAIL_ADDR,
+                        used_addr: RX_USED_ADDR,
+                    },
+                    notify: rx_interrupt,
+                    event: self.rx_event.clone(),
+                    guest_memory: self.mem.clone(),
+                },
+                features,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
     /// Allocate a data region in guest memory and return its GPA.
     fn alloc_data(&mut self, size: u32) -> u64 {
         let gpa = self.next_data_offset;
@@ -596,16 +711,19 @@ impl TestHarness {
 
     /// Post a TX packet with a header + one data segment, make it available, and signal.
     fn post_tx_and_signal(&mut self, desc_index: u16, data_len: u32) {
+        self.post_tx_frame_and_signal(desc_index, &vec![0xAB; data_len as usize]);
+    }
+
+    fn post_tx_frame_and_signal(&mut self, desc_index: u16, frame: &[u8]) {
         let header_gpa = self.alloc_data(NET_HEADER_SIZE);
+        let data_len = u32::try_from(frame.len()).unwrap();
         let data_gpa = self.alloc_data(data_len);
 
         // Write a zero virtio-net header
         let header_bytes = vec![0u8; NET_HEADER_SIZE as usize];
         self.mem.write_at(header_gpa, &header_bytes).unwrap();
 
-        // Write some data
-        let data_bytes = vec![0xABu8; data_len as usize];
-        self.mem.write_at(data_gpa, &data_bytes).unwrap();
+        self.mem.write_at(data_gpa, frame).unwrap();
 
         post_tx_packet(
             &self.mem,
@@ -726,6 +844,339 @@ impl TestHarness {
 // --- Tests ---
 
 use futures::StreamExt;
+
+#[async_test]
+async fn denied_tx_completes_without_backend_ownership(driver: DefaultDriver) {
+    let policy = EgressPolicy::bind(
+        std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
+        std::net::Ipv4Addr::new(10, 0, 0, 1),
+        EgressPolicyMode::TcpEndpoints(vec!["192.0.2.7:443".parse().unwrap()]),
+    )
+    .unwrap();
+    let mut harness = TestHarness::new_with_egress_policy(&driver, Some(policy));
+    let handle = harness.enable_and_get_handle().await;
+
+    harness.post_tx_and_signal(0, 64);
+    assert_eq!(harness.wait_for_used().await, (0, 0));
+    assert!(handle.take_tx_avail_log().is_empty());
+}
+
+fn policy_tcp_frame(destination_port: u16) -> Vec<u8> {
+    let mut frame = vec![0u8; 14 + 20 + 20];
+    frame[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    let ip = &mut frame[14..];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&40u16.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 6;
+    ip[12..16].copy_from_slice(&[10, 0, 0, 2]);
+    ip[16..20].copy_from_slice(&[192, 0, 2, 7]);
+    ip[20..22].copy_from_slice(&12345u16.to_be_bytes());
+    ip[22..24].copy_from_slice(&destination_port.to_be_bytes());
+    ip[32] = 5 << 4;
+    let mut sum = ip[..20].chunks_exact(2).fold(0u32, |sum, word| {
+        sum + u32::from(u16::from_be_bytes([word[0], word[1]]))
+    });
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    ip[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    frame
+}
+
+fn policy_arp_frame(target: std::net::Ipv4Addr) -> Vec<u8> {
+    let guest_mac = [0x52, 0x54, 0, 0, 0, 2];
+    let mut frame = vec![0u8; 42];
+    frame[..6].fill(0xff);
+    frame[6..12].copy_from_slice(&guest_mac);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&1u16.to_be_bytes());
+    frame[22..28].copy_from_slice(&guest_mac);
+    frame[28..32].copy_from_slice(&[10, 0, 0, 2]);
+    frame[38..42].copy_from_slice(&target.octets());
+    frame
+}
+
+fn endpoint_policy() -> EgressPolicy {
+    EgressPolicy::bind(
+        std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
+        std::net::Ipv4Addr::new(10, 0, 0, 1),
+        EgressPolicyMode::TcpEndpoints(vec![
+            "10.0.0.9:443".parse().unwrap(),
+            "192.0.2.7:443".parse().unwrap(),
+        ]),
+    )
+    .unwrap()
+}
+
+#[async_test]
+async fn endpoint_policy_forwards_only_bound_arp_targets(driver: DefaultDriver) {
+    let mut allowed_harness = TestHarness::new_with_egress_policy(&driver, Some(endpoint_policy()));
+    let allowed_handle = allowed_harness.enable_and_get_handle().await;
+    allowed_harness
+        .post_tx_frame_and_signal(0, &policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 9)));
+    assert_eq!(allowed_harness.wait_for_used().await, (0, 0));
+    assert!(!allowed_handle.take_tx_avail_log().is_empty());
+
+    let mut denied_harness = TestHarness::new_with_egress_policy(&driver, Some(endpoint_policy()));
+    let denied_handle = denied_harness.enable_and_get_handle().await;
+    denied_harness
+        .post_tx_frame_and_signal(0, &policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 10)));
+    assert_eq!(denied_harness.wait_for_used().await, (0, 0));
+    assert!(denied_handle.take_tx_avail_log().is_empty());
+}
+
+#[async_test]
+async fn endpoint_policy_checks_transmitted_bytes_after_guest_mutation(driver: DefaultDriver) {
+    let policy = EgressPolicy::bind(
+        std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
+        std::net::Ipv4Addr::new(10, 0, 0, 1),
+        EgressPolicyMode::TcpEndpoints(vec!["192.0.2.7:443".parse().unwrap()]),
+    )
+    .unwrap();
+    let mut harness = TestHarness::new_with_egress_policy(&driver, Some(policy));
+    let handle = harness.enable_and_get_handle().await;
+    handle.replace_next_tx(policy_tcp_frame(80));
+
+    harness.post_tx_frame_and_signal(0, &policy_tcp_frame(443));
+    assert_eq!(harness.wait_for_used().await, (0, 0));
+    assert!(handle.take_tx_avail_log().is_empty());
+}
+
+#[async_test]
+async fn endpoint_policy_rechecks_mutated_arp_target_at_backend(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_with_egress_policy(&driver, Some(endpoint_policy()));
+    let handle = harness.enable_and_get_handle().await;
+    handle.replace_next_tx(policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 10)));
+
+    harness.post_tx_frame_and_signal(0, &policy_arp_frame(std::net::Ipv4Addr::new(10, 0, 0, 9)));
+    assert_eq!(harness.wait_for_used().await, (0, 0));
+    assert!(handle.take_tx_avail_log().is_empty());
+}
+
+#[async_test]
+async fn save_restore_rewinds_unused_rx_and_validates_private_state(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_save_restore(&driver);
+    let mut handle = harness.enable_and_get_handle().await;
+    harness.post_rx_buffer_and_signal(0, 1500);
+    handle.wait_for_rx_pending().await;
+
+    harness.device.quiesce_input().await.unwrap();
+    let rx_state = harness.device.stop_queue(0).await.unwrap();
+    let tx_state = harness.device.stop_queue(1).await.unwrap();
+    assert_eq!(rx_state.avail_index, rx_state.used_index);
+    assert_eq!(tx_state.avail_index, tx_state.used_index);
+    let saved = harness.device.save_device().unwrap().unwrap();
+
+    let queues = [
+        DeviceQueueState {
+            params: QueueParams {
+                size: QUEUE_SIZE,
+                enable: true,
+                desc_addr: RX_DESC_ADDR,
+                avail_addr: RX_AVAIL_ADDR,
+                used_addr: RX_USED_ADDR,
+            },
+            queue_state: Some(rx_state),
+        },
+        DeviceQueueState {
+            params: QueueParams {
+                size: QUEUE_SIZE,
+                enable: true,
+                desc_addr: TX_DESC_ADDR,
+                avail_addr: TX_AVAIL_ADDR,
+                used_addr: TX_USED_ADDR,
+            },
+            queue_state: Some(tx_state),
+        },
+    ];
+    let restored = TestHarness::new_save_restore(&driver);
+    restored.device.device_state_validator()(
+        Some(&saved),
+        &VirtioDeviceFeatures::new(),
+        &queues,
+        &harness.mem,
+    )
+    .unwrap();
+    let mut restored_device = restored.device;
+    restored_device.restore_device(Some(saved)).unwrap();
+    assert_eq!(restored_device.endpoint_generation, 1);
+}
+
+#[async_test]
+async fn input_quiesce_latches_before_queue_start(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_save_restore(&driver);
+    harness.device.quiesce_input().await.unwrap();
+
+    let mut handle = harness.enable_and_get_handle().await;
+    handle.wait_for_quiesce().await;
+
+    harness.device.resume_input().await.unwrap();
+}
+
+#[async_test]
+async fn save_restore_preserves_partial_queue_lifecycle(driver: DefaultDriver) {
+    let features = VirtioDeviceFeatures::new().with_bank(0, 1 << 5);
+    let disabled_queues = [
+        DeviceQueueState {
+            params: QueueParams {
+                size: QUEUE_SIZE,
+                enable: false,
+                desc_addr: RX_DESC_ADDR,
+                avail_addr: RX_AVAIL_ADDR,
+                used_addr: RX_USED_ADDR,
+            },
+            queue_state: None,
+        },
+        DeviceQueueState {
+            params: QueueParams {
+                size: QUEUE_SIZE,
+                enable: false,
+                desc_addr: TX_DESC_ADDR,
+                avail_addr: TX_AVAIL_ADDR,
+                used_addr: TX_USED_ADDR,
+            },
+            queue_state: None,
+        },
+    ];
+
+    let mut unstarted = TestHarness::new_save_restore(&driver);
+    let unstarted_state = unstarted.device.save_device().unwrap().unwrap();
+    unstarted.device.device_state_validator()(
+        Some(&unstarted_state),
+        &features,
+        &disabled_queues,
+        &unstarted.mem,
+    )
+    .unwrap();
+    let mut configured_queues = disabled_queues;
+    configured_queues[0].params.enable = true;
+    configured_queues[1].params.enable = true;
+    unstarted.device.device_state_validator()(
+        Some(&unstarted_state),
+        &features,
+        &configured_queues,
+        &unstarted.mem,
+    )
+    .unwrap();
+
+    let mut half_open = TestHarness::new_save_restore(&driver);
+    half_open.start_rx_queue(&features).await;
+    let rx_state = half_open.device.stop_queue(0).await.unwrap();
+    let half_open_state = half_open.device.save_device().unwrap().unwrap();
+    let mut partial_queues = disabled_queues;
+    partial_queues[0].params.enable = true;
+    partial_queues[0].queue_state = Some(rx_state);
+    half_open.device.device_state_validator()(
+        Some(&half_open_state),
+        &features,
+        &partial_queues,
+        &half_open.mem,
+    )
+    .unwrap();
+}
+
+#[async_test]
+async fn inactive_transport_restore_defers_net_private_state(driver: DefaultDriver) {
+    let source_harness = TestHarness::new_save_restore(&driver);
+    let mut source = VirtioMmioDevice::new(
+        Box::new(source_harness.device),
+        &driver,
+        source_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    source.stop().await;
+    let saved = source.save().unwrap();
+    assert_eq!(
+        saved
+            .device_state
+            .as_ref()
+            .unwrap()
+            .parse::<crate::saved_state::SavedState>()
+            .unwrap()
+            .endpoint_generation,
+        0
+    );
+
+    let destination_harness = TestHarness::new_save_restore(&driver);
+    let mut destination = VirtioMmioDevice::new(
+        Box::new(destination_harness.device),
+        &driver,
+        destination_harness.mem,
+        LineInterrupt::detached(),
+        None,
+        0,
+        0x1000,
+    )
+    .unwrap();
+    destination.restore(saved).unwrap();
+    destination.start_fallible().await.unwrap();
+    destination.stop().await;
+    let staged = destination.save().unwrap();
+    assert_eq!(
+        staged
+            .device_state
+            .as_ref()
+            .unwrap()
+            .parse::<crate::saved_state::SavedState>()
+            .unwrap()
+            .endpoint_generation,
+        0
+    );
+
+    destination.start_fallible().await.unwrap();
+    let mut config = [0; 4];
+    match destination.mmio_read(0x100, &mut config) {
+        IoResult::Defer(token) => token.read_future(&mut config).await.unwrap(),
+        other => panic!("expected deferred config read, got {other:?}"),
+    }
+    destination.stop().await;
+    let activated = destination.save().unwrap();
+    assert_eq!(
+        activated
+            .device_state
+            .unwrap()
+            .parse::<crate::saved_state::SavedState>()
+            .unwrap()
+            .endpoint_generation,
+        1
+    );
+}
+
+#[async_test]
+async fn snapshot_drains_accepted_pending_tx_exactly_once(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_save_restore(&driver);
+    let mut handle = harness.enable_and_get_handle().await;
+    handle.tx_avail_behavior.lock().sync = false;
+
+    harness.post_tx_and_signal(0, 64);
+    handle.wait_for_tx_avail().await;
+    handle.tx_completions.lock().push_back(vec![TxId(0)]);
+
+    harness.device.quiesce_input().await.unwrap();
+    let rx_state = harness.device.stop_queue(0).await.unwrap();
+    let tx_state = harness.device.stop_queue(1).await.unwrap();
+    assert_eq!(rx_state.avail_index, rx_state.used_index);
+    assert_eq!(tx_state.avail_index, tx_state.used_index);
+    harness.device.save_device().unwrap().unwrap();
+    assert!(handle.tx_completions.lock().is_empty());
+}
 
 /// Post 1 TX packet. tx_avail returns (sync: true, all segments consumed).
 /// Verify segments logged and used ring updated.
@@ -870,6 +1321,7 @@ async fn unordered_backend_rejected(driver: DefaultDriver) {
     let endpoint = MockEndpoint {
         queue_tx,
         is_ordered: false,
+        egress_policy: None,
     };
 
     let err = Device::builder()

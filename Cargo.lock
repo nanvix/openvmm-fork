@@ -632,6 +632,7 @@ dependencies = [
 name = "chipset_device_resources"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset_device",
  "guestmem",
@@ -2449,6 +2450,7 @@ dependencies = [
  "tempfile",
  "test_with_tracing",
  "thiserror 2.0.16",
+ "tracelimit",
  "tracing",
  "zerocopy",
 ]
@@ -4952,6 +4954,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "consomme",
+ "guestmem",
  "inspect",
  "inspect_counters",
  "mesh",
@@ -9783,6 +9786,7 @@ dependencies = [
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
+ "tracing",
  "virtio_resources",
  "virtio_spec",
  "vm_resource",
@@ -9795,6 +9799,7 @@ name = "virtio_blk"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "disk_backend",
  "disklayer_ram",
@@ -9823,10 +9828,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chipset_device",
  "futures",
  "futures-concurrency",
  "guestmem",
  "inspect",
+ "mesh",
  "pal_async",
  "pal_event",
  "parking_lot",
@@ -9835,7 +9842,6 @@ dependencies = [
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
- "tracing",
  "virtio",
  "virtio_resources",
  "vm_resource",
@@ -9849,6 +9855,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitfield-struct 0.11.0",
+ "chipset_device",
  "futures",
  "guestmem",
  "inspect",
@@ -9992,12 +9999,14 @@ name = "virtiofs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chipset_device",
  "fuse",
  "futures",
  "guestmem",
  "inspect",
  "lx",
  "lxutil",
+ "mesh",
  "ntapi",
  "pal",
  "pal_async",
@@ -10006,6 +10015,8 @@ dependencies = [
  "task_control",
  "tempfile",
  "test_with_tracing",
+ "thiserror 2.0.16",
+ "tracelimit",
  "tracing",
  "virtio",
  "virtio_resources",

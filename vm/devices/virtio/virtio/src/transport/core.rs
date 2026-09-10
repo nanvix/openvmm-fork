@@ -5,13 +5,19 @@
 
 use super::StalledIo;
 use super::task::DeviceCommand;
+use super::task::DeviceRestoreState;
 use super::task::StartParams;
+use super::task::StopResult;
 use super::task::TransportState;
 use super::task::TransportStateResult;
 use super::task::run_device_task;
+use crate::DeviceQueueState;
+use crate::DeviceStateValidator;
 use crate::DynVirtioDevice;
 use crate::QueueResources;
 use crate::VirtioDoorbells;
+use crate::queue::QueueCoreCompleteWork;
+use crate::queue::QueueCoreGetWork;
 use crate::queue::QueueParams;
 use crate::queue::QueueState;
 use crate::spec::VirtioDeviceFeatures;
@@ -29,6 +35,7 @@ use std::task::Poll;
 use vmcore::interrupt::Interrupt;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 
 /// Per-queue transport data shared between PCI and MMIO.
 #[derive(Inspect)]
@@ -88,6 +95,12 @@ pub(crate) struct VirtioTransportCore {
     pub doorbells: VirtioDoorbells,
     pub supports_save_restore: bool,
     #[inspect(skip)]
+    pub device_state_validator: DeviceStateValidator,
+    #[inspect(skip)]
+    pub captured_device_state: Option<Result<Option<SavedStateBlob>, SaveError>>,
+    #[inspect(skip)]
+    pub restored_device_state: DeviceRestoreState,
+    #[inspect(skip)]
     pub guest_memory: GuestMemory,
     #[inspect(with = "Option::is_some")]
     pub pending_status_deferred: Option<DeferredWrite>,
@@ -115,6 +128,11 @@ impl VirtioTransportCore {
         disabled_features: u64,
     ) -> std::io::Result<Self> {
         let traits = device.traits();
+        let doorbell_registration = if device.supports_accelerated_doorbells() {
+            doorbell_registration
+        } else {
+            None
+        };
         let queues: Vec<QueueData> = (0..traits.max_queues)
             .map(|i| {
                 let size = device.queue_size(i);
@@ -141,6 +159,7 @@ impl VirtioTransportCore {
             .with_access_platform(true)
             .without_bits(disabled_features);
         let supports_save_restore = device.supports_save_restore();
+        let device_state_validator = device.device_state_validator();
 
         let (sender, receiver) = mesh::channel();
         let _device_task = driver.spawn("virtio-device-task", async move {
@@ -162,6 +181,9 @@ impl VirtioTransportCore {
             config_generation: 0,
             doorbells: VirtioDoorbells::new(doorbell_registration),
             supports_save_restore,
+            device_state_validator,
+            captured_device_state: None,
+            restored_device_state: DeviceRestoreState::NotRestored,
             guest_memory,
             pending_status_deferred: None,
             stalled_io: Vec::new(),
@@ -201,6 +223,9 @@ impl VirtioTransportCore {
             _device_task: _,
             device_feature: _,
             supports_save_restore: _,
+            device_state_validator: _,
+            captured_device_state,
+            restored_device_state,
             guest_memory: _,
 
             // Async state machine — not owned by reset_status.
@@ -224,6 +249,8 @@ impl VirtioTransportCore {
 
         drop(pending_status_deferred.take());
         stalled_io.clear();
+        *captured_device_state = None;
+        *restored_device_state = DeviceRestoreState::NotRestored;
 
         doorbells.clear();
         *device_status = VirtioDeviceStatus::new();
@@ -291,9 +318,13 @@ impl VirtioTransportCore {
 
         if val == 0 {
             if self.device_status.as_u32() == 0 {
+                self.device_sender
+                    .send(DeviceCommand::Reset(Rpc::detached(())));
                 return;
             }
             if !self.device_status.driver_ok() {
+                self.device_sender
+                    .send(DeviceCommand::Reset(Rpc::detached(())));
                 self.reset_status(ops);
             } else {
                 self.doorbells.clear();
@@ -327,7 +358,7 @@ impl VirtioTransportCore {
             let features = self.driver_feature;
             let queues: Vec<_> = self
                 .queues
-                .iter()
+                .iter_mut()
                 .enumerate()
                 .filter(|(_, qd)| qd.params.enable)
                 .map(|(i, qd)| {
@@ -340,6 +371,7 @@ impl VirtioTransportCore {
                             event: qd.event.clone(),
                             guest_memory: self.guest_memory.clone(),
                         },
+                        qd.saved_state,
                     )
                 })
                 .collect();
@@ -371,14 +403,41 @@ impl VirtioTransportCore {
 
     /// `ChangeDeviceState::start()` implementation.
     pub fn start(&mut self, ops: &mut dyn TransportOps) {
+        if let Some(params) = self.start_params(ops) {
+            self.device_sender
+                .send(DeviceCommand::Start(Rpc::detached(params)));
+        }
+    }
+
+    /// Starts the device and waits for private-state restore and queue startup.
+    pub async fn start_fallible(&mut self, ops: &mut dyn TransportOps) -> anyhow::Result<()> {
+        if let Some(params) = self.start_params(ops) {
+            self.device_sender
+                .call_failable(DeviceCommand::Start, params)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn start_params(&mut self, ops: &mut dyn TransportOps) -> Option<StartParams> {
+        self.captured_device_state = None;
+        let device_state = std::mem::replace(
+            &mut self.restored_device_state,
+            DeviceRestoreState::NotRestored,
+        );
+        let active = self.device_status.driver_ok();
+        let should_start = active || device_state.is_restored();
+        if !should_start {
+            return None;
+        }
+        let features = self.driver_feature;
+        let mut queues = Vec::new();
         if self.device_status.driver_ok() {
-            let features = self.driver_feature;
-            let mut queues = Vec::new();
             for (i, qd) in self.queues.iter_mut().enumerate() {
                 if !qd.params.enable {
                     continue;
                 }
-                let initial_state = qd.saved_state.take();
+                let initial_state = qd.saved_state;
                 queues.push((
                     i,
                     qd.params,
@@ -387,29 +446,30 @@ impl VirtioTransportCore {
                     initial_state,
                 ));
             }
-            let queues: Vec<_> = queues
-                .into_iter()
-                .map(|(i, params, msix_vector, event, initial_state)| {
-                    let notify = ops.create_queue_interrupt(i, msix_vector);
-                    (
-                        i as u16,
-                        QueueResources {
-                            params,
-                            notify,
-                            event,
-                            guest_memory: self.guest_memory.clone(),
-                        },
-                        initial_state,
-                    )
-                })
-                .collect();
-
-            let params = StartParams { queues, features };
-
-            // Fire and forget — start() is sync, can't await.
-            self.device_sender
-                .send(DeviceCommand::Start(Rpc::detached(params)));
         }
+        let queues = queues
+            .into_iter()
+            .map(|(i, params, msix_vector, event, initial_state)| {
+                let notify = ops.create_queue_interrupt(i, msix_vector);
+                (
+                    i as u16,
+                    QueueResources {
+                        params,
+                        notify,
+                        event,
+                        guest_memory: self.guest_memory.clone(),
+                    },
+                    initial_state,
+                )
+            })
+            .collect();
+
+        Some(StartParams {
+            queues,
+            features,
+            device_state,
+            active,
+        })
     }
 
     /// `ChangeDeviceState::stop()` implementation.
@@ -420,14 +480,20 @@ impl VirtioTransportCore {
         drop(self.pending_status_deferred.take());
         self.stalled_io.clear();
 
-        let states = self
+        let StopResult {
+            queues,
+            device_state,
+        } = self
             .device_sender
             .call(DeviceCommand::Stop, ())
             .await
             .expect("device task is gone");
-        for (i, state) in states.into_iter().enumerate() {
-            self.queues[i].saved_state = state;
+        for (i, (was_started, state)) in queues.into_iter().enumerate() {
+            if was_started {
+                self.queues[i].saved_state = state;
+            }
         }
+        self.captured_device_state = Some(device_state);
     }
 
     /// `ChangeDeviceState::reset()` implementation.
@@ -437,10 +503,29 @@ impl VirtioTransportCore {
         self.reset_status(ops);
     }
 
+    /// Stops device-specific host input before a snapshot boundary.
+    pub async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.device_sender
+            .call_failable(DeviceCommand::QuiesceInput, ())
+            .await?;
+        Ok(())
+    }
+
+    /// Resumes device-specific host input after a failed snapshot.
+    pub async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.device_sender
+            .call_failable(DeviceCommand::ResumeInput, ())
+            .await?;
+        Ok(())
+    }
+
     /// Signal a queue notification by index.
     pub fn notify_queue(&self, queue_index: u32) {
         if let Some(qd) = self.queues.get(queue_index as usize) {
-            qd.event.signal();
+            self.device_sender.send(DeviceCommand::Kick {
+                idx: queue_index as u16,
+                event: qd.event.clone(),
+            });
         }
     }
 
@@ -472,6 +557,13 @@ impl VirtioTransportCore {
         }
     }
 
+    /// Take the device-private state captured when the queues stopped.
+    pub fn take_device_state(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        self.captured_device_state
+            .take()
+            .ok_or_else(|| SaveError::Other(anyhow::anyhow!("device state was not captured")))?
+    }
+
     /// Restore the transport-agnostic portion of the common configuration.
     ///
     /// Validates the saved state, then restores feature negotiation, queue
@@ -482,13 +574,13 @@ impl VirtioTransportCore {
         &mut self,
         ops: &mut dyn TransportOps,
         common: &super::saved_state::state::CommonSavedState,
+        device_state: Option<SavedStateBlob>,
         queue_states: impl Iterator<Item = (super::saved_state::state::CommonQueueState, u16)>,
         saved_queue_count: usize,
     ) -> Result<(), RestoreError> {
         if !self.supports_save_restore {
             return Err(RestoreError::SavedStateNotSupported);
         }
-
         let queue_items: Vec<_> = queue_states.collect();
 
         super::saved_state::validate_restore(
@@ -497,17 +589,57 @@ impl VirtioTransportCore {
             queue_items
                 .iter()
                 .enumerate()
-                .map(|(i, (q, _))| (i, q.size)),
+                .map(|(i, (q, _))| (i, q.size, self.queues[i].initial_size)),
             self.queues.len(),
             saved_queue_count,
-            crate::MAX_QUEUE_SIZE,
+        )?;
+
+        let mut restored_features = VirtioDeviceFeatures::new();
+        for (index, &bank) in common.driver_feature_banks.iter().enumerate() {
+            restored_features.set_bank(index, bank);
+        }
+        let mut ring_ranges = Vec::new();
+        for (index, (queue, _)) in queue_items.iter().enumerate() {
+            if !queue.enable {
+                continue;
+            }
+            if VirtioDeviceStatus::from(common.device_status).driver_ok()
+                && queue.queue_state.is_none()
+            {
+                return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+                    "queue {index}: enabled DRIVER_OK queue is missing progress state"
+                )));
+            }
+            validate_restored_queue(
+                index,
+                queue,
+                restored_features,
+                &self.guest_memory,
+                &mut ring_ranges,
+            )?;
+        }
+        let device_queues = queue_items
+            .iter()
+            .map(|(queue, _)| DeviceQueueState {
+                params: QueueParams {
+                    size: queue.size,
+                    enable: queue.enable,
+                    desc_addr: queue.desc_addr,
+                    avail_addr: queue.avail_addr,
+                    used_addr: queue.used_addr,
+                },
+                queue_state: queue.queue_state,
+            })
+            .collect::<Vec<_>>();
+        (self.device_state_validator)(
+            device_state.as_ref(),
+            &restored_features,
+            &device_queues,
+            &self.guest_memory,
         )?;
 
         // Restore feature negotiation.
-        self.driver_feature = VirtioDeviceFeatures::new();
-        for (i, &bank) in common.driver_feature_banks.iter().enumerate() {
-            self.driver_feature.set_bank(i, bank);
-        }
+        self.driver_feature = restored_features;
         self.device_feature_select = common.device_feature_select;
         self.driver_feature_select = common.driver_feature_select;
         self.queue_select = common.queue_select;
@@ -528,6 +660,7 @@ impl VirtioTransportCore {
         }
 
         self.device_status = VirtioDeviceStatus::from(common.device_status);
+        self.restored_device_state = DeviceRestoreState::Restored(device_state);
 
         // Verify ephemeral runtime state.
         assert!(!self.state.is_busy());
@@ -541,4 +674,89 @@ impl VirtioTransportCore {
 
         Ok(())
     }
+}
+
+pub(crate) fn validate_restored_queue(
+    index: usize,
+    queue: &super::saved_state::state::CommonQueueState,
+    features: VirtioDeviceFeatures,
+    guest_memory: &GuestMemory,
+    previous_ranges: &mut Vec<(usize, &'static str, std::ops::Range<u64>)>,
+) -> Result<(), RestoreError> {
+    let invalid = |message: String| {
+        RestoreError::InvalidSavedState(anyhow::anyhow!("queue {index}: {message}"))
+    };
+    if queue.size == 0 || (!features.ring_packed() && !queue.size.is_power_of_two()) {
+        return Err(invalid(format!(
+            "invalid {} ring size {}",
+            if features.ring_packed() {
+                "packed"
+            } else {
+                "split"
+            },
+            queue.size
+        )));
+    }
+
+    let descriptor_length = u64::from(queue.size)
+        .checked_mul(16)
+        .ok_or_else(|| invalid("descriptor length overflow".to_owned()))?;
+    let (available_length, used_length) = if features.ring_packed() {
+        (4, 4)
+    } else {
+        (
+            u64::from(queue.size)
+                .checked_mul(2)
+                .and_then(|length| length.checked_add(6))
+                .ok_or_else(|| invalid("available ring length overflow".to_owned()))?,
+            u64::from(queue.size)
+                .checked_mul(8)
+                .and_then(|length| length.checked_add(6))
+                .ok_or_else(|| invalid("used ring length overflow".to_owned()))?,
+        )
+    };
+    let specifications = [
+        ("descriptor", queue.desc_addr, descriptor_length, 16),
+        ("available", queue.avail_addr, available_length, 2),
+        ("used", queue.used_addr, used_length, 4),
+    ];
+    let mut queue_ranges = Vec::new();
+    for (name, address, length, alignment) in specifications {
+        if address % alignment != 0 {
+            return Err(invalid(format!(
+                "{name} ring address {address:#x} is not {alignment}-byte aligned"
+            )));
+        }
+        let end = address
+            .checked_add(length)
+            .ok_or_else(|| invalid(format!("{name} ring range overflows")))?;
+        guest_memory
+            .subrange(address, length, true)
+            .map_err(|error| invalid(format!("{name} ring is outside guest RAM: {error}")))?;
+        let range = address..end;
+        for (other_index, other_name, other_range) in
+            previous_ranges.iter().chain(queue_ranges.iter())
+        {
+            if range.start < other_range.end && other_range.start < range.end {
+                return Err(invalid(format!(
+                    "{name} ring overlaps queue {other_index} {other_name} ring"
+                )));
+            }
+        }
+        queue_ranges.push((index, name, range));
+    }
+
+    let params = QueueParams {
+        size: queue.size,
+        enable: true,
+        desc_addr: queue.desc_addr,
+        avail_addr: queue.avail_addr,
+        used_addr: queue.used_addr,
+    };
+    QueueCoreGetWork::new(features, guest_memory.clone(), params, queue.queue_state)
+        .map_err(|error| invalid(format!("invalid available progress: {error}")))?;
+    QueueCoreCompleteWork::new(features, guest_memory.clone(), params, queue.queue_state)
+        .map_err(|error| invalid(format!("invalid used progress: {error}")))?;
+    previous_ranges.extend(queue_ranges);
+    Ok(())
 }

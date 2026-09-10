@@ -1784,6 +1784,10 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
+            egress_policy: None,
+            save_restore: false,
+            static_ipv4: None,
+            effective_features: None,
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -1803,6 +1807,7 @@ async fn vm_config_from_command_line(
                 root_path: args.path.clone(),
                 mount_options: args.options.clone(),
             },
+            profile: virtio_resources::fs::VirtioFsProfile::Standard,
         }
         .into_resource();
         if let Some(pcie_port) = &args.pcie_port {
@@ -1821,6 +1826,7 @@ async fn vm_config_from_command_line(
             fs: virtio_resources::fs::VirtioFsBackend::SectionFs {
                 root_path: args.path.clone(),
             },
+            profile: virtio_resources::fs::VirtioFsProfile::Standard,
         }
         .into_resource();
         if let Some(pcie_port) = &args.pcie_port {
@@ -1880,7 +1886,13 @@ async fn vm_config_from_command_line(
 
     if let Some(backend) = virtio_console_backend {
         let resource: Resource<VirtioDeviceHandle> =
-            virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
+            virtio_resources::console::VirtioConsoleHandle {
+                backend,
+                disconnect_policy:
+                    virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                attachment: None,
+            }
+            .into_resource();
         if let Some(pcie_port) = &opt.virtio_console_pcie_port {
             pcie_devices.push(PcieDeviceConfig {
                 port_name: pcie_port.clone(),
@@ -2223,6 +2235,7 @@ fn parse_endpoint(
                 cidr: cidr.clone(),
                 ports,
                 recv,
+                static_ipv4: None,
             }
             .into_resource()
         }
@@ -2834,7 +2847,7 @@ async fn run_control_inner(
     }
 
     if !opt.paused {
-        vm_rpc.call(VmRpc::Resume, ()).await?;
+        vm_rpc.call_failable(VmRpc::Resume, ()).await?;
     }
 
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(

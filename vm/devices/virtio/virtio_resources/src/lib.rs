@@ -49,6 +49,20 @@ pub mod fs {
     pub struct VirtioFsHandle {
         pub tag: String,
         pub fs: VirtioFsBackend,
+        pub profile: VirtioFsProfile,
+    }
+
+    #[derive(MeshPayload)]
+    pub enum VirtioFsProfile {
+        Standard,
+        Microvm {
+            stable_id: String,
+            root_identity: Vec<u8>,
+            read_only: bool,
+        },
+        MicrovmDormant {
+            stable_id: String,
+        },
     }
 
     #[derive(MeshPayload)]
@@ -66,6 +80,7 @@ pub mod fs {
         Aggregate {
             children: Vec<VirtioFsAggregateChild>,
         },
+        Dormant,
     }
 
     /// A single host folder exposed as a named child of a [`VirtioFsBackend::Aggregate`].
@@ -143,6 +158,10 @@ pub mod net {
         pub max_queues: Option<u16>,
         pub mac_address: MacAddress,
         pub endpoint: Resource<NetEndpointHandleKind>,
+        pub egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+        pub save_restore: bool,
+        pub static_ipv4: Option<net_backend_resources::consomme::StaticIpv4Config>,
+        pub effective_features: Option<u64>,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioNetHandle {
@@ -157,9 +176,54 @@ pub mod console {
     use vm_resource::kind::SerialBackendHandle;
     use vm_resource::kind::VirtioDeviceHandle;
 
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, MeshPayload)]
+    pub enum VirtioConsoleDisconnectPolicy {
+        /// Complete and discard guest transmit descriptors while disconnected.
+        Discard,
+        /// Retain guest transmit descriptors until the backend reconnects.
+        Retain,
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, MeshPayload)]
+    pub enum VirtioConsoleBackendKind {
+        UnixSocket,
+        NamedPipe,
+        Tcp,
+        Inherited,
+        Disconnected,
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, MeshPayload)]
+    pub enum VirtioConsoleAttachmentMode {
+        Listen,
+        Connect,
+        Inherited,
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, MeshPayload)]
+    pub enum VirtioConsoleReconnectPolicy {
+        RecreateListener,
+        ReconnectClient,
+        RequireInheritedAttachment,
+        DiscardWhileDisconnected,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, MeshPayload)]
+    pub struct VirtioConsoleAttachment {
+        pub stable_id: String,
+        pub backend_kind: VirtioConsoleBackendKind,
+        pub mode: VirtioConsoleAttachmentMode,
+        pub endpoint_identity: String,
+        pub reconnect_policy: VirtioConsoleReconnectPolicy,
+        pub required: bool,
+        pub reconnect_timeout_ms: u64,
+    }
+
     #[derive(MeshPayload)]
     pub struct VirtioConsoleHandle {
         pub backend: Resource<SerialBackendHandle>,
+        pub disconnect_policy: VirtioConsoleDisconnectPolicy,
+        pub attachment: Option<VirtioConsoleAttachment>,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioConsoleHandle {

@@ -37,6 +37,19 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioNetHandle> for VirtioNetReso
         if let Some(max_queues) = resource.max_queues {
             builder = builder.max_queues(max_queues);
         }
+        if let Some(egress_policy) = resource.egress_policy {
+            builder = builder.egress_policy(egress_policy);
+        }
+        if resource.save_restore {
+            builder = builder.save_restore(
+                resource.static_ipv4.ok_or_else(|| {
+                    anyhow::anyhow!("saved virtio-net requires static IPv4 identity")
+                })?,
+                resource.effective_features.ok_or_else(|| {
+                    anyhow::anyhow!("saved virtio-net requires an effective feature contract")
+                })?,
+            );
+        }
 
         let endpoint = resolver
             .resolve(

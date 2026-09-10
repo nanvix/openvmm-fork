@@ -17,8 +17,9 @@ use vmcore::vmtime::VmTimeKeeper;
 struct KeeperUnit<'a>(#[inspect(mut)] &'a mut VmTimeKeeper);
 
 impl StateUnit for KeeperUnit<'_> {
-    async fn start(&mut self) {
+    async fn start(&mut self) -> anyhow::Result<()> {
         self.0.start().await;
+        Ok(())
     }
 
     async fn stop(&mut self) {
@@ -36,6 +37,11 @@ impl StateUnit for KeeperUnit<'_> {
 
     async fn restore(&mut self, state: SavedStateBlob) -> Result<(), RestoreError> {
         self.0.restore(state.parse()?).await;
+        Ok(())
+    }
+
+    async fn advance_time(&mut self, duration: std::time::Duration) -> anyhow::Result<()> {
+        self.0.advance(duration).await;
         Ok(())
     }
 }
