@@ -56,8 +56,8 @@ use membacking::SharedMemoryBacking;
 use memory_range::MemoryRange;
 use mesh::MeshPayload;
 use mesh::error::RemoteError;
-use mesh::payload::Protobuf;
 use mesh::payload::message::ProtobufMessage;
+use mesh::rpc::Rpc;
 use mesh_worker::Worker;
 use mesh_worker::WorkerId;
 use mesh_worker::WorkerRpc;
@@ -86,27 +86,32 @@ use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::X86TopologyConfig;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::RESTORE_READY_EVENT_V1;
+use openvmm_defs::worker::SavedState;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_pcat_locator::RomFileLocation;
 use pal_async::DefaultDriver;
 use pal_async::DefaultPool;
+use pal_async::driver::SpawnDriver;
 use pal_async::local::block_with_io;
-use pal_async::task::Spawn;
 use pal_async::task::Task;
+use pal_async::timer::Instant;
+use pal_async::timer::PolledTimer;
 use pci_core::PciInterruptPin;
 use pcie::root::GenericPcieRootComplex;
 use pcie::switch::GenericPcieSwitch;
 use scsi_core::ResolveScsiDeviceHandleParams;
 use scsidisk::atapi_scsi::AtapiScsiDisk;
 use serial_16550_resources::ComPort;
-use state_unit::SavedStateUnit;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::fs::File;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use virt::ProtoPartition;
 use virt::VpIndex;
 use virtio::PciInterruptModel;
@@ -136,7 +141,6 @@ use vmbus_channel::channel::VmbusDevice;
 use vmbus_server::HvsockRelayChannel;
 use vmbus_server::VmbusServer;
 use vmbus_server::hvsock::HvsockRelay;
-use vmcore::save_restore::SavedStateRoot;
 use vmcore::vm_task::VmTaskDriverSource;
 use vmcore::vm_task::thread::ThreadDriverBackend;
 use vmcore::vmtime::VmTime;
@@ -266,13 +270,6 @@ pub struct Manifest {
     machine_profile: MachineProfile,
 }
 
-#[derive(Protobuf, SavedStateRoot)]
-#[mesh(package = "openvmm")]
-pub struct SavedState {
-    #[mesh(1)]
-    pub units: Vec<SavedStateUnit>,
-}
-
 async fn open_simple_disk(
     resolver: &ResourceResolver,
     disk_type: Resource<DiskHandleKind>,
@@ -311,6 +308,7 @@ pub struct VmWorker {
     vm: LoadedVm,
     rpc: mesh::Receiver<VmRpc>,
     device_thread: JoinHandle<()>,
+    snapshot_restore_guards: Option<openvmm_defs::worker::SnapshotRestoreGuards>,
 }
 
 impl Worker for VmWorker {
@@ -319,18 +317,29 @@ impl Worker for VmWorker {
     const ID: WorkerId<Self::Parameters> = VM_WORKER;
 
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+        let worker_construct = openvmm_defs::profile::ProfileSpan::start();
+        let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
+        let snapshot_ready = parameters.snapshot_ready;
+        let snapshot_restore_guards = parameters.snapshot_restore_guards;
+        let restore_ready_sink = parameters.restore_ready_sink;
+        let restore_gate_timeout = parameters.restore_gate_timeout;
+        let restore_time = match (
+            parameters.restore_downtime,
+            parameters.restore_tsc_frequency_hz,
+            parameters.restore_apic_frequency_hz,
+        ) {
+            (Some(downtime), Some(tsc_frequency), apic_frequency) => {
+                Some((downtime, tsc_frequency, apic_frequency))
+            }
+            (None, None, None) => None,
+            _ => anyhow::bail!("restore downtime and TSC frequency must be provided together"),
+        };
+        tracing::debug!(?restore_time, "received snapshot restore time contract");
+        let restore_cpu_contract = parameters.restore_cpu_contract;
         openvmm_defs::config::validate_machine_config(
             &parameters.cfg,
             Some(parameters.hypervisor.id()),
         )?;
-        if matches!(
-            parameters.cfg.machine_profile,
-            MachineProfile::Microvm { .. }
-        ) && parameters.saved_state.is_some()
-        {
-            anyhow::bail!("saved-state restore is unavailable for microVM ABI version 1");
-        }
-
         let (device_thread, device_driver) = new_device_thread();
 
         let manifest = Manifest::from_config(parameters.cfg);
@@ -338,9 +347,14 @@ impl Worker for VmWorker {
         let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
             .context("failed to resolve hypervisor backend")?;
 
+        let file_mapping_mode = if parameters.shared_memory_copy_on_write {
+            membacking::FileMappingMode::CopyOnWrite
+        } else {
+            membacking::FileMappingMode::Shared
+        };
         let shared_memory = parameters
             .shared_memory
-            .map(|fd| SharedMemoryBacking::from_mappable(fd.into()));
+            .map(|fd| SharedMemoryBacking::from_mappable_with_mode(fd.into(), file_mapping_mode));
 
         let vm = block_on(InitializedVm::new(
             VmTaskDriverSource::new(ThreadDriverBackend::new(device_driver)),
@@ -348,21 +362,50 @@ impl Worker for VmWorker {
             manifest,
             shared_memory,
         ))?;
+        if let Some(expected_cpu_contract) = restore_cpu_contract {
+            #[cfg(guest_arch = "x86_64")]
+            {
+                let destination_contract = vm.partition.cpu_compatibility_contract();
+                let destination_cpu_contract = mesh::payload::encode(destination_contract.clone());
+                if destination_cpu_contract != expected_cpu_contract {
+                    let expected_contract: virt::x86::CpuCompatibilityContract =
+                        mesh::payload::decode(&expected_cpu_contract)
+                            .context("failed to decode snapshot CPU contract")?;
+                    let first_cpuid_difference = expected_contract
+                        .cpuid
+                        .iter()
+                        .zip(&destination_contract.cpuid)
+                        .find(|(expected, destination)| expected != destination);
+                    anyhow::bail!(
+                        "destination CPU contract does not match the snapshot; first CPUID difference: {first_cpuid_difference:?}"
+                    );
+                }
+            }
+            #[cfg(not(guest_arch = "x86_64"))]
+            anyhow::bail!("snapshot CPU contracts are only supported for x86-64 guests");
+        }
         let saved_state = parameters
             .saved_state
             .map(|m| m.parse())
             .transpose()
             .context("failed to decode saved state")?;
 
-        let vm = block_with_io(|_| vm.load(saved_state, parameters.notify))?;
+        let mut vm = block_with_io(|_| vm.load(saved_state, parameters.notify, restore_time))?;
+        vm.snapshot_boundary_requests = snapshot_boundary_requests;
+        vm.snapshot_ready = snapshot_ready;
+        vm.restore_ready_sink = restore_ready_sink;
+        vm.restore_gate_timeout = restore_gate_timeout;
 
         LOADED_VM.store(&vm);
 
-        Ok(Self {
+        let worker = Self {
             vm,
             rpc: parameters.rpc,
             device_thread,
-        })
+            snapshot_restore_guards,
+        };
+        worker_construct.complete_milestone("startup", "worker_construct", Default::default());
+        Ok(worker)
     }
 
     fn restart(state: Self::State) -> anyhow::Result<Self> {
@@ -387,7 +430,7 @@ impl Worker for VmWorker {
             shared_memory,
         ))?;
         pal_async::local::block_on(async {
-            let mut vm = vm.load(Some(saved_state), notify).await?;
+            let mut vm = vm.load(Some(saved_state), notify, None).await?;
 
             LOADED_VM.store(&vm);
 
@@ -398,16 +441,24 @@ impl Worker for VmWorker {
                 vm,
                 rpc,
                 device_thread,
+                snapshot_restore_guards: None,
             })
         })
     }
 
     fn run(self, worker_rpc: mesh::Receiver<WorkerRpc<Self::State>>) -> anyhow::Result<()> {
+        let Self {
+            vm,
+            rpc,
+            device_thread,
+            snapshot_restore_guards,
+        } = self;
         DefaultPool::run_with(async |driver| {
             let driver = driver;
-            self.vm.run(&driver, self.rpc, worker_rpc).await
+            vm.run(&driver, rpc, worker_rpc).await
         });
-        self.device_thread.join().unwrap();
+        device_thread.join().unwrap();
+        drop(snapshot_restore_guards);
         Ok(())
     }
 }
@@ -729,6 +780,20 @@ pub(crate) struct LoadedVm {
     state_units: StateUnits,
     inner: LoadedVmInner,
     running: bool,
+    restore_start_guard: Option<vmm_core::partition_unit::StopGuard>,
+    restore_ready_sink: Option<File>,
+    restore_gate_timeout: Option<Duration>,
+    restore_gate_deadline: Option<Instant>,
+    restore_gate_profile: Option<openvmm_defs::profile::ProfileSpan>,
+    restore_input_gated: bool,
+    restored_from_snapshot: bool,
+    snapshot_boundary_requests:
+        Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
+    snapshot_ready: Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
+    snapshot_stop_guard: Option<vmm_core::partition_unit::StopGuard>,
+    snapshot_transaction_complete: Option<Rpc<(), ()>>,
+    snapshot_capture_wall_clock: Option<mesh::payload::Timestamp>,
+    snapshot_input_gate_timeout: Option<Duration>,
 }
 
 /// Most of the VM state for [`LoadedVm`], excluding things that are necessary
@@ -1060,6 +1125,7 @@ impl InitializedVm {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
 
+        let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
@@ -1073,12 +1139,10 @@ impl InitializedVm {
                 nested_virt: cfg.hypervisor.nested_virt,
                 user_mode_memory_faults: true,
                 lazy_memory_registration: false,
-                versioned_cpu_contract: matches!(
-                    cfg.machine_profile,
-                    MachineProfile::Microvm { .. }
-                ),
+                versioned_cpu_contract: cfg.machine_profile == MachineProfile::Microvm,
             })
             .context("failed to create the prototype partition")?;
+        partition_prototype.complete("startup", "partition_prototype", Default::default());
 
         let physical_address_size = proto.max_physical_address_size();
 
@@ -1113,7 +1177,7 @@ impl InitializedVm {
             None
         };
 
-        let virtio_mmio_count = if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+        let virtio_mmio_count = if cfg.machine_profile == MachineProfile::Microvm {
             0
         } else {
             cfg.virtio_devices
@@ -1161,6 +1225,7 @@ impl InitializedVm {
         })
         .context("invalid memory configuration")?;
         let mem_layout = resolved_layout.memory_layout;
+        let guest_memory_bytes = mem_layout.ram().iter().map(|range| range.range.len()).sum();
         let resolved_pcie_root_complex_ranges = resolved_layout.pcie_root_complex_ranges;
         let virtio_mmio_region = resolved_layout.virtio_mmio_region;
         let chipset_mmio = resolved_layout.chipset_mmio;
@@ -1226,7 +1291,7 @@ impl InitializedVm {
                     "shared memory restore not supported with {nodes_with_ranges} memory nodes"
                 );
             }
-            Some(smb.into_mappable())
+            Some(smb.into_parts())
         } else {
             None
         };
@@ -1235,6 +1300,7 @@ impl InitializedVm {
         memory_builder = memory_builder
             .vtl0_alias_map(vtl0_alias_map)
             .supports_memory_fault_resolution(supports_memory_fault_resolution)
+            .track_memory_faults(openvmm_defs::profile::enabled())
             .x86_legacy_support(
                 matches!(cfg.load_mode, LoadMode::Pcat { .. }) || cfg.chipset.with_hyperv_vga,
             );
@@ -1263,13 +1329,14 @@ impl InitializedVm {
             if mem.hugepages {
                 backing = backing.hugepages(mem.hugepage_size);
             }
-            if let Some(mappable) = existing_mappable.take() {
-                backing = backing.existing_mappable(mappable);
+            if let Some((mappable, file_mapping_mode)) = existing_mappable.take() {
+                backing = backing
+                    .existing_mappable(mappable)
+                    .file_mapping_mode(file_mapping_mode);
             }
 
             memory_builder = memory_builder.add_backing(backing);
         }
-
         #[cfg(all(windows, feature = "virt_whp"))]
         if !cfg.vpci_resources.is_empty() {
             memory_builder = memory_builder.pin_mappings(true);
@@ -1294,10 +1361,19 @@ impl InitializedVm {
             .end_of_layout()
             .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
 
+        let cow_map_view = openvmm_defs::profile::ProfileSpan::start();
         let mut memory_manager = memory_builder
             .build(max_addr)
             .await
             .context("failed to build guest memory")?;
+        cow_map_view.complete(
+            "startup",
+            "cow_map_view",
+            openvmm_defs::profile::ProfileCounters {
+                logical_bytes: Some(guest_memory_bytes),
+                ..Default::default()
+            },
+        );
 
         let gm = memory_manager
             .client()
@@ -1317,6 +1393,7 @@ impl InitializedVm {
             ));
         }
 
+        let partition_build = openvmm_defs::profile::ProfileSpan::start();
         let (partition, vps) = proto
             .build(virt::PartitionConfig {
                 mem_layout: &mem_layout,
@@ -1327,11 +1404,13 @@ impl InitializedVm {
                     .then(|| memory_manager.memory_fault_resolver()),
             })
             .context("failed to create the partition")?;
+        partition_build.complete("startup", "partition_build", Default::default());
 
         let vps = vps.into_iter().map(|vp| Box::new(vp) as _).collect();
 
         let partition = Arc::new(partition);
 
+        let gpa_registration = openvmm_defs::profile::ProfileSpan::start();
         memory_manager
             .attach_partition(Vtl::Vtl0, &partition.memory_mapper(Vtl::Vtl0), None)
             .await
@@ -1347,10 +1426,29 @@ impl InitializedVm {
                 .await
                 .context("failed to attach memory to VTL2")?;
         }
+        gpa_registration.complete(
+            "startup",
+            "gpa_registration",
+            openvmm_defs::profile::ProfileCounters {
+                logical_bytes: Some(guest_memory_bytes),
+                ..Default::default()
+            },
+        );
 
-        partition
-            .finalize_memory()
-            .context("failed to finalize partition memory")?;
+        let partition_finalize = openvmm_defs::profile::ProfileSpan::start();
+        let finalize_result = {
+            let _span = tracing::info_span!("post-memory partition finalization").entered();
+            let started = std::time::Instant::now();
+            let result = partition.finalize_memory();
+            tracing::info!(
+                elapsed_us = started.elapsed().as_micros() as u64,
+                success = result.is_ok(),
+                "post-memory partition finalization completed"
+            );
+            result
+        };
+        finalize_result.context("failed to finalize partition memory")?;
+        partition_finalize.complete("startup", "partition_finalize", Default::default());
 
         Ok(Self {
             partition,
@@ -1380,8 +1478,11 @@ impl InitializedVm {
         self,
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
+        restore_time: Option<(Duration, u64, Option<u64>)>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
+
+        let restored_from_snapshot = saved_state.is_some();
 
         let Self {
             partition,
@@ -2842,7 +2943,7 @@ impl InitializedVm {
             match bus {
                 VirtioBus::Mmio => {
                     let (mmio_start, mmio_len, irq, disabled_features) =
-                        if matches!(cfg.machine_profile, MachineProfile::Microvm { .. }) {
+                        if matches!(cfg.machine_profile, MachineProfile::Microvm) {
                             const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
                             let start = openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE;
                             let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
@@ -2984,6 +3085,19 @@ impl InitializedVm {
         let mut this = LoadedVm {
             state_units,
             running: false,
+            restore_start_guard: None,
+            restore_ready_sink: None,
+            restore_gate_timeout: None,
+            restore_gate_deadline: None,
+            restore_gate_profile: None,
+            restore_input_gated: false,
+            restored_from_snapshot,
+            snapshot_boundary_requests: None,
+            snapshot_ready: None,
+            snapshot_stop_guard: None,
+            snapshot_transaction_complete: None,
+            snapshot_capture_wall_clock: None,
+            snapshot_input_gate_timeout: None,
             inner: LoadedVmInner {
                 driver_source,
                 resolver,
@@ -3040,9 +3154,59 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
+            if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
+                let destination_frequency = this
+                    .inner
+                    .partition
+                    .tsc_frequency_hz()?
+                    .context("destination backend does not expose a guest TSC frequency")?;
+                anyhow::ensure!(
+                    destination_frequency == saved_frequency,
+                    "destination TSC frequency {destination_frequency} Hz does not match saved frequency {saved_frequency} Hz"
+                );
+                this.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
+                let destination_apic_frequency = this
+                    .inner
+                    .partition
+                    .apic_frequency_hz()?
+                    .context("destination backend does not expose a local APIC frequency")?;
+                if let Some(saved_apic_frequency) = saved_apic_frequency {
+                    anyhow::ensure!(
+                        destination_apic_frequency == saved_apic_frequency,
+                        "destination APIC frequency {destination_apic_frequency} Hz does not match saved frequency {saved_apic_frequency} Hz"
+                    );
+                }
+            }
+            let saved_state_restore = openvmm_defs::profile::ProfileSpan::start();
             this.restore(saved_state)
                 .await
                 .context("loadedvm restore failed")?;
+            saved_state_restore.complete("restore", "saved_state_restore", Default::default());
+            if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
+                this.state_units
+                    .advance_time(downtime)
+                    .await
+                    .context("failed to advance restored VM time")?;
+                #[cfg(guest_arch = "x86_64")]
+                {
+                    let apic_frequency = match saved_apic_frequency {
+                        Some(frequency) => frequency,
+                        None => this.inner.partition.apic_frequency_hz()?.context(
+                            "destination backend does not expose a local APIC frequency",
+                        )?,
+                    };
+                    this.inner
+                        .partition_unit
+                        .advance_tsc(downtime, frequency, Some(apic_frequency))
+                        .await
+                        .context("failed to advance restored vCPU TSC")?;
+                }
+                this.inner
+                    .partition
+                    .advance_snapshot_time(downtime)
+                    .context("failed to advance backend snapshot clock")?;
+            }
+            this.restore_start_guard = Some(this.inner.partition_unit.temporarily_stop_vps().await);
         } else {
             // Assign PCI bus numbers/BARs before building firmware so that the
             // ACPI tables (specifically the SRAT generic-initiator entries) can
@@ -3446,7 +3610,51 @@ impl LoadedVm {
         if self.running {
             return Ok(false);
         }
-        self.state_units.start().await?;
+        if let Some(timeout) = self.restore_gate_timeout {
+            self.state_units
+                .quiesce_input_for_save(timeout)
+                .await
+                .context("failed to establish post-restore input gate")?;
+            self.restore_input_gated = true;
+        }
+        let device_start = openvmm_defs::profile::ProfileSpan::start();
+        self.state_units
+            .start()
+            .await
+            .context("VM state units failed to start")?;
+        if self.restored_from_snapshot && openvmm_defs::profile::enabled() {
+            let faults = self.inner.memory_manager.fault_counters();
+            device_start.complete(
+                "restore",
+                "device_start",
+                openvmm_defs::profile::ProfileCounters {
+                    gpa_faults: Some(faults.guest_faults),
+                    populated_bytes: Some(faults.populated_bytes),
+                    ..Default::default()
+                },
+            );
+        }
+        if let Some(mut sink) = self.restore_ready_sink.take() {
+            let signal_result = sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
+                #[cfg(windows)]
+                {
+                    sink.sync_all()
+                }
+                #[cfg(not(windows))]
+                {
+                    sink.flush()
+                }
+            });
+            if let Err(error) = signal_result {
+                self.state_units.stop().await;
+                return Err(error).context("failed to publish restore readiness event");
+            }
+        }
+        if let Some(timeout) = self.restore_gate_timeout {
+            self.restore_gate_deadline = Some(Instant::now().saturating_add(timeout));
+            self.restore_gate_profile = Some(openvmm_defs::profile::ProfileSpan::start());
+        }
+        self.restore_start_guard.take();
         self.running = true;
         Ok(true)
     }
@@ -3458,6 +3666,131 @@ impl LoadedVm {
         self.state_units.stop().await;
         self.running = false;
         true
+    }
+
+    async fn establish_snapshot_boundary(
+        &mut self,
+        request: chipset_resources::microvm::MicrovmSnapshotBoundaryRequest,
+    ) -> bool {
+        if self.snapshot_stop_guard.is_some() {
+            tracelimit::warn_ratelimited!("dropping duplicate microVM snapshot boundary request");
+            request.release_write.send(());
+            request.transaction_complete.complete(());
+            return true;
+        }
+        let Some(snapshot_ready) = self.snapshot_ready.clone() else {
+            request.release_write.send(());
+            request.transaction_complete.complete(());
+            return true;
+        };
+
+        if !self.restore_input_gated {
+            let input_gate = openvmm_defs::profile::ProfileSpan::start();
+            if let Err(error) = self
+                .state_units
+                .quiesce_input_for_save(request.input_gate_timeout)
+                .await
+            {
+                tracelimit::error_ratelimited!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "failed to gate host input before snapshot boundary"
+                );
+                if let Err(resume_error) = self
+                    .state_units
+                    .resume_input_after_save(request.input_gate_timeout)
+                    .await
+                {
+                    tracelimit::error_ratelimited!(
+                        error = resume_error.as_ref() as &dyn std::error::Error,
+                        "host-input gate rollback is uncertain; terminating VM worker"
+                    );
+                    request.transaction_complete.complete(());
+                    return false;
+                }
+                request.release_write.send(());
+                request.transaction_complete.complete(());
+                return true;
+            }
+            input_gate.complete("capture", "input_gate", Default::default());
+        }
+
+        let vp_stop_at_io_boundary = openvmm_defs::profile::ProfileSpan::start();
+        match self
+            .inner
+            .partition_unit
+            .temporarily_stop_vps_at_io_boundary(request.release_write, request.write_completed)
+            .await
+        {
+            Ok(stop_guard) => {
+                vp_stop_at_io_boundary.complete(
+                    "capture",
+                    "vp_stop_at_io_boundary",
+                    Default::default(),
+                );
+                self.snapshot_stop_guard = Some(stop_guard);
+                self.snapshot_transaction_complete = Some(request.transaction_complete);
+                self.snapshot_capture_wall_clock = Some(std::time::SystemTime::now().into());
+                self.snapshot_input_gate_timeout = Some(request.input_gate_timeout);
+                snapshot_ready.send(request.scratch_policy);
+                true
+            }
+            Err(error) => {
+                tracelimit::error_ratelimited!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "failed to establish snapshot PMIO boundary"
+                );
+                if self.restore_input_gated {
+                    tracelimit::error_ratelimited!(
+                        "failed to establish post-restore acknowledgement boundary; terminating VM worker"
+                    );
+                    request.transaction_complete.complete(());
+                    return false;
+                }
+                if let Err(resume_error) = self
+                    .state_units
+                    .resume_input_after_save(request.input_gate_timeout)
+                    .await
+                {
+                    tracelimit::error_ratelimited!(
+                        error = resume_error.as_ref() as &dyn std::error::Error,
+                        "host input is uncertain after boundary failure; terminating VM worker"
+                    );
+                    request.transaction_complete.complete(());
+                    return false;
+                }
+                request.transaction_complete.complete(());
+                true
+            }
+        }
+    }
+
+    async fn release_snapshot_boundary(&mut self) -> anyhow::Result<()> {
+        let input_gate_timeout = self
+            .snapshot_input_gate_timeout
+            .context("snapshot boundary is missing its input-gate timeout")?;
+        self.state_units
+            .resume_input_after_save(input_gate_timeout)
+            .await?;
+        let transaction_complete = self
+            .snapshot_transaction_complete
+            .take()
+            .context("no active microVM snapshot boundary")?;
+        let stop_guard = self
+            .snapshot_stop_guard
+            .take()
+            .context("snapshot boundary is missing its vCPU stop guard")?;
+        let restore_gate_profile = self.restore_gate_profile.take();
+        self.snapshot_capture_wall_clock = None;
+        self.snapshot_input_gate_timeout = None;
+        self.restore_gate_timeout = None;
+        self.restore_gate_deadline = None;
+        self.restore_input_gated = false;
+        transaction_complete.complete(());
+        drop(stop_guard);
+        if let Some(profile) = restore_gate_profile {
+            profile.complete_milestone("restore", "guest_repair_gate", Default::default());
+        }
+        Ok(())
     }
 
     /// Assign PCI bus numbers and BAR addresses for all boot modes.
@@ -3487,7 +3820,10 @@ impl LoadedVm {
         let stop_guard = self.inner.partition_unit.temporarily_stop_vps().await;
 
         // Start state units so device config space is accessible.
-        self.state_units.start().await?;
+        self.state_units
+            .start()
+            .await
+            .context("failed to start devices for PCI resource assignment")?;
 
         let result = ecam_config_access::assign_pci_resources_for_root_complexes(
             &self.inner.chipset,
@@ -3505,7 +3841,7 @@ impl LoadedVm {
 
     pub async fn run(
         mut self,
-        driver: &impl Spawn,
+        driver: &impl SpawnDriver,
         mut rpc_recv: mesh::Receiver<VmRpc>,
         mut worker_rpc: mesh::Receiver<WorkerRpc<RestartState>>,
     ) {
@@ -3513,6 +3849,10 @@ impl LoadedVm {
             WorkerRpc(Result<WorkerRpc<RestartState>, mesh::RecvError>),
             VmRpc(Result<VmRpc, mesh::RecvError>),
             Halt(Result<HaltReason, mesh::RecvError>),
+            SnapshotBoundary(
+                Result<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest, mesh::RecvError>,
+            ),
+            RestoreGateTimeout,
         }
 
         // Start a task to handle state unit inspections by filtering the worker
@@ -3540,17 +3880,53 @@ impl LoadedVm {
                 let a = rpc_recv.recv().map(Event::VmRpc);
                 let b = worker_rpc.recv().map(Event::WorkerRpc);
                 let c = self.inner.halt_recv.recv().map(Event::Halt);
-                (a, b, c).race().await
+                let d = async {
+                    match self.snapshot_boundary_requests.as_mut() {
+                        Some(requests) => Event::SnapshotBoundary(requests.recv().await),
+                        None => std::future::pending().await,
+                    }
+                };
+                let restore_gate_deadline = self.restore_gate_deadline;
+                let e = async {
+                    match restore_gate_deadline {
+                        Some(deadline) => {
+                            PolledTimer::new(driver).sleep_until(deadline).await;
+                            Event::RestoreGateTimeout
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                (a, b, c, d, e).race().await
             };
 
             match event {
                 Event::WorkerRpc(Err(_)) => break,
+                Event::SnapshotBoundary(Ok(request)) => {
+                    if !self.establish_snapshot_boundary(request).await {
+                        if self.running {
+                            self.state_units.stop().await;
+                            self.running = false;
+                        }
+                        break;
+                    }
+                }
+                Event::SnapshotBoundary(Err(_)) => {
+                    self.snapshot_boundary_requests = None;
+                }
+                Event::RestoreGateTimeout => {
+                    tracing::error!("post-restore input gate acknowledgement timed out");
+                    if self.running {
+                        self.state_units.stop().await;
+                        self.running = false;
+                    }
+                    break;
+                }
                 Event::WorkerRpc(Ok(message)) => match message {
                     WorkerRpc::Stop => break,
                     WorkerRpc::Restart(rpc) => {
-                        if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                        if self.inner.machine_profile == MachineProfile::Microvm {
                             rpc.complete(Err(RemoteError::new(anyhow::anyhow!(
-                                "worker restart is unavailable for microVM ABI version 1"
+                                "worker restart is unavailable for microVM"
                             ))));
                             continue;
                         }
@@ -3614,9 +3990,9 @@ impl LoadedVm {
                     }
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
                     VmRpc::Save(rpc) => {
-                        if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                        if self.inner.machine_profile == MachineProfile::Microvm {
                             rpc.handle_failable_sync(|()| {
-                                anyhow::bail!("save is unavailable for microVM ABI version 1")
+                                anyhow::bail!("save is unavailable for microVM")
                             });
                         } else {
                             rpc.handle_failable(async |()| {
@@ -3624,6 +4000,126 @@ impl LoadedVm {
                             })
                             .await;
                         }
+                    }
+                    VmRpc::QuiesceForSnapshot(rpc) => {
+                        rpc.handle(async |timeout| {
+                            if self.inner.machine_profile != MachineProfile::Microvm {
+                                return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                                    RemoteError::new(anyhow::anyhow!(
+                                        "guest-requested snapshot quiesce requires the microVM profile"
+                                    )),
+                                ));
+                            }
+                            if !self.running {
+                                return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                                    RemoteError::new(anyhow::anyhow!("VM is already stopped")),
+                                ));
+                            }
+
+                            let quiesce = openvmm_defs::profile::ProfileSpan::start();
+                            if let Err(error) = self.state_units.quiesce_for_save(timeout).await {
+                                return Err(if error.has_uncertain_state() {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::Uncertain(
+                                        RemoteError::new(error),
+                                    )
+                                } else {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                });
+                            }
+                            quiesce.complete("capture", "quiesce", Default::default());
+                            self.running = false;
+
+                            let save_state = openvmm_defs::profile::ProfileSpan::start();
+                            let saved_state = self.save().await.map_err(|error| {
+                                openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                    RemoteError::new(error),
+                                )
+                            })?;
+                            save_state.complete("capture", "save_state", Default::default());
+                            let mapped_memory_flush =
+                                openvmm_defs::profile::ProfileSpan::start();
+                            self.inner
+                                .memory_manager
+                                .flush_shared_file_backing()
+                                .context("failed to flush mapped guest RAM")
+                                .map_err(|error| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                })?;
+                            mapped_memory_flush.complete(
+                                "capture",
+                                "mapped_memory_flush",
+                                Default::default(),
+                            );
+                            let tsc_frequency_hz = self
+                                .inner
+                                .partition
+                                .tsc_frequency_hz()
+                                .map_err(|error| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(anyhow::anyhow!(
+                                            "backend does not expose a guest TSC frequency"
+                                        )),
+                                    )
+                                })?;
+                            let apic_frequency_hz = self
+                                .inner
+                                .partition
+                                .apic_frequency_hz()
+                                .map_err(|error| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(error),
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(anyhow::anyhow!(
+                                            "backend does not expose a local APIC frequency"
+                                        )),
+                                    )
+                                })?;
+                            let capture_wall_clock = self
+                                .snapshot_capture_wall_clock
+                                .ok_or_else(|| {
+                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
+                                        RemoteError::new(anyhow::anyhow!(
+                                            "snapshot boundary has no wall-clock timestamp"
+                                        )),
+                                    )
+                                })?;
+                            Ok(openvmm_defs::rpc::SnapshotSaveResponse {
+                                state_unit_names: saved_state.inventory.clone(),
+                                saved_state: ProtobufMessage::new(saved_state),
+                                tsc_frequency_hz,
+                                apic_frequency_hz,
+                                capture_wall_clock,
+                                cpu_contract: mesh::payload::encode(
+                                    self.inner.partition.cpu_compatibility_contract(),
+                                ),
+                            })
+                        })
+                        .await;
+                    }
+                    VmRpc::ResumeAfterFailedSnapshot(rpc) => {
+                        rpc.handle_failable(async |timeout| {
+                            self.state_units.resume_after_failed_save(timeout).await?;
+                            self.running = true;
+                            self.release_snapshot_boundary().await?;
+                            anyhow::Ok(())
+                        })
+                        .await;
+                    }
+                    VmRpc::ReleaseSnapshotBoundary(rpc) => {
+                        rpc.handle_failable(async |()| self.release_snapshot_boundary().await)
+                            .await
                     }
                     VmRpc::Nmi(rpc) => rpc.handle_sync(|vpindex| {
                         if vpindex < self.inner.processor_topology.vp_count() {
@@ -3689,7 +4185,7 @@ impl LoadedVm {
                     }
                     VmRpc::PulseSaveRestore(rpc) => {
                         rpc.handle(async |()| {
-                            if matches!(self.inner.machine_profile, MachineProfile::Microvm { .. }) {
+                            if self.inner.machine_profile == MachineProfile::Microvm {
                                 return Err(PulseSaveRestoreError::UnsupportedMachineProfile);
                             }
                             if !self.inner.partition.supports_reset() {
@@ -3961,11 +4457,15 @@ impl LoadedVm {
     async fn save(&mut self) -> anyhow::Result<SavedState> {
         Ok(SavedState {
             units: self.state_units.save().await?,
+            inventory: self.state_units.inventory(),
         })
     }
 
     /// Restore state on the VM.
     async fn restore(&mut self, state: SavedState) -> anyhow::Result<()> {
+        if !state.inventory.is_empty() {
+            self.state_units.validate_inventory(&state.inventory)?;
+        }
         self.state_units.restore(state.units).await?;
         Ok(())
     }

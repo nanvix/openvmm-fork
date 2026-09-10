@@ -136,7 +136,7 @@ impl PetriVmConfigOpenVmm {
             physical_nvme_devices,
         } = petri_vm_config;
 
-        let is_microvm = matches!(machine_profile, MachineProfile::Microvm { .. });
+        let is_microvm = matches!(machine_profile, MachineProfile::Microvm);
         if is_microvm {
             anyhow::ensure!(
                 matches!(arch, MachineArch::X86_64),
@@ -650,7 +650,11 @@ impl PetriVmConfigOpenVmm {
                 },
                 ChipsetDeviceHandle {
                     name: MicrovmSnapshotRequestHandle::ID.to_owned(),
-                    resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+                    resource: MicrovmSnapshotRequestHandle {
+                        notify: None,
+                        input_gate_timeout: std::time::Duration::from_secs(5),
+                    }
+                    .into_resource(),
                 },
             ]);
         }

@@ -112,6 +112,6 @@ impl ResolveResource<ChipsetDeviceHandleKind, MicrovmSnapshotRequestHandle>
         resource: MicrovmSnapshotRequestHandle,
         _input: ResolveChipsetDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        Ok(MicrovmSnapshotRequest::new(resource.notify).into())
+        Ok(MicrovmSnapshotRequest::new(resource.notify, resource.input_gate_timeout).into())
     }
 }

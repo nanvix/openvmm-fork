@@ -53,7 +53,6 @@ use scsidisk_resources::SimpleScsiDiskHandle;
 use scsidisk_resources::SimpleScsiDvdHandle;
 use std::future::pending;
 use std::io;
-#[cfg(unix)]
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
@@ -431,6 +430,7 @@ pub(crate) struct ReplResources {
     pub vm_rpc: mesh::Sender<VmRpc>,
     pub vm_controller: mesh::Sender<VmControllerRpc>,
     pub vm_controller_events: mesh::Receiver<VmControllerEvent>,
+    pub restore_ready_pending: bool,
     pub scsi_rpc: Option<mesh::Sender<ScsiControllerRequest>>,
     pub nvme_vtl2_rpc: Option<mesh::Sender<NvmeControllerRequest>>,
     pub consomme_rpc: Option<mesh::Sender<ConsommeRequest>>,
@@ -449,6 +449,7 @@ pub(crate) async fn run_repl(
         vm_rpc,
         vm_controller,
         mut vm_controller_events,
+        mut restore_ready_pending,
         mut scsi_rpc,
         mut nvme_vtl2_rpc,
         consomme_rpc,
@@ -526,7 +527,11 @@ pub(crate) async fn run_repl(
             let mut stdin = io::stdin();
             loop {
                 // Raw console text until Ctrl-Q.
-                crossterm::terminal::enable_raw_mode().expect("failed to enable raw console mode");
+                let terminal = stdin.is_terminal();
+                if terminal {
+                    crossterm::terminal::enable_raw_mode()
+                        .expect("failed to enable raw console mode");
+                }
 
                 if let Some(input) = console_in.as_mut() {
                     let mut buf = [0; 32];
@@ -546,8 +551,10 @@ pub(crate) async fn run_repl(
                     }
                 }
 
-                crossterm::terminal::disable_raw_mode()
-                    .expect("failed to disable raw console mode");
+                if terminal {
+                    crossterm::terminal::disable_raw_mode()
+                        .expect("failed to disable raw console mode");
+                }
 
                 loop {
                     let line = rl.readline("openvmm> ");
@@ -707,12 +714,21 @@ pub(crate) async fn run_repl(
                             }
                         }
                         StateChange::Resume(result) => match result {
-                            Ok(true) => tracing::info!("resumed complete"),
+                            Ok(true) => {
+                                restore_ready_pending = false;
+                                tracing::info!("resumed complete");
+                            }
                             Ok(false) => tracing::warn!("already running"),
-                            Err(err) => tracing::error!(
-                                error = &err as &dyn std::error::Error,
-                                "resume failed"
-                            ),
+                            Err(err) => {
+                                tracing::error!(
+                                    error = &err as &dyn std::error::Error,
+                                    "resume failed"
+                                );
+                                if restore_ready_pending {
+                                    return Err(anyhow::Error::new(err)
+                                        .context("restore readiness resume failed"));
+                                }
+                            }
                         },
                         StateChange::Reset(r) => match r {
                             Ok(()) => tracing::info!("reset complete"),

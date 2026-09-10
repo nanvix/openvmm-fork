@@ -62,7 +62,6 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
-use openvmm_defs::config::MICROVM_ABI_VERSION_1;
 use openvmm_defs::config::MachineProfile as OpenvmmMachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
@@ -711,11 +710,9 @@ impl VmService {
                 })?;
         let machine_profile = match requested_profile {
             vmservice::vm_config::MachineProfile::Standard => OpenvmmMachineProfile::Standard,
-            vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm {
-                abi_version: MICROVM_ABI_VERSION_1,
-            },
+            vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm,
         };
-        let is_microvm = matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. });
+        let is_microvm = matches!(machine_profile, OpenvmmMachineProfile::Microvm);
         if is_microvm {
             anyhow::ensure!(
                 cfg!(guest_arch = "x86_64"),
@@ -804,7 +801,7 @@ impl VmService {
             .context("missing boot configuration")?
         {
             vmservice::vm_config::BootConfig::DirectBoot(boot) => {
-                if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
                     bail!("the microVM profile requires pvh_boot");
                 }
                 let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
@@ -826,7 +823,7 @@ impl VmService {
                 )
             }
             vmservice::vm_config::BootConfig::PvhBoot(boot) => {
-                if !matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                if !matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
                     bail!("pvh_boot requires the microVM profile");
                 }
                 let kernel = File::open(boot.kernel_path).context("failed to open PVH kernel")?;
@@ -846,7 +843,7 @@ impl VmService {
                 )
             }
             vmservice::vm_config::BootConfig::Uefi(uefi) => {
-                if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+                if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
                     bail!("the microVM profile requires pvh_boot");
                 }
                 let firmware = File::open(&uefi.firmware_path).with_context(|| {
@@ -917,7 +914,7 @@ impl VmService {
             }
         };
 
-        let microvm_portb = if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+        let microvm_portb = if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
             if ports.iter().skip(1).any(Option::is_some) {
                 bail!("microVM ABI version 1 accepts only serial port 0 as its portb endpoint");
             }
@@ -965,7 +962,11 @@ impl VmService {
                 },
                 ChipsetDeviceHandle {
                     name: MicrovmSnapshotRequestHandle::ID.to_owned(),
-                    resource: MicrovmSnapshotRequestHandle { notify: None }.into_resource(),
+                    resource: MicrovmSnapshotRequestHandle {
+                        notify: None,
+                        input_gate_timeout: Duration::from_secs(5),
+                    }
+                    .into_resource(),
                 },
             ]);
         }
@@ -1199,7 +1200,7 @@ impl VmService {
         }
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
-            if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. }) {
+            if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
                 bail!("microVM ABI version 1 does not support hvsocket");
             }
             let listener = UnixListener::bind(&hvsocket_config.path).with_context(|| {
@@ -1225,8 +1226,7 @@ impl VmService {
             .launch_worker(
                 VM_WORKER,
                 VmWorkerParameters {
-                    hypervisor: if matches!(machine_profile, OpenvmmMachineProfile::Microvm { .. })
-                    {
+                    hypervisor: if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
                         openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
                     } else {
                         openvmm_helpers::hypervisor::choose_hypervisor()?
@@ -1234,6 +1234,17 @@ impl VmService {
                     cfg: config,
                     saved_state: None,
                     shared_memory: None,
+                    shared_memory_copy_on_write: false,
+                    snapshot_restore_guards: None,
+                    snapshot_boundary_requests: None,
+                    snapshot_ready: None,
+                    restore_downtime: None,
+                    restore_tsc_frequency_hz: None,
+                    restore_apic_frequency_hz: None,
+                    restore_cpu_contract: None,
+                    restore_ready_sink: None,
+                    restore_gate_timeout: None,
+                    restore_vp_count: None,
                     rpc: recv,
                     notify: notify_send,
                 },
@@ -1249,6 +1260,13 @@ impl VmService {
 
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
+            snapshot_memory_handle: None,
+            snapshot_requests: None,
+            snapshot_destination: None,
+            snapshot_quiesce_timeout: Duration::from_secs(5),
+            source_hypervisor: String::new(),
+            effective_command_line: None,
+            snapshot_memory_file: None,
             machine_profile,
             mesh,
             vm_worker: worker,

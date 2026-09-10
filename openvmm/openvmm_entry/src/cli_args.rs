@@ -25,7 +25,6 @@ use cxl_spec::spec::CfmwsWindowRestrictions;
 use guid::Guid;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
-use openvmm_defs::config::MICROVM_ABI_VERSION_1;
 #[cfg(test)]
 use openvmm_defs::config::MICROVM_BASE_COMMAND_LINE;
 #[cfg(test)]
@@ -159,9 +158,7 @@ impl From<MachineProfileCli> for MachineProfile {
     fn from(value: MachineProfileCli) -> Self {
         match value {
             MachineProfileCli::Standard => Self::Standard,
-            MachineProfileCli::Microvm => Self::Microvm {
-                abi_version: MICROVM_ABI_VERSION_1,
-            },
+            MachineProfileCli::Microvm => Self::Microvm,
         }
     }
 }
@@ -287,6 +284,19 @@ Examples:
         conflicts_with_all = ["deprecated_memory_backing_file", "numa"]
     )]
     pub restore_snapshot: Option<PathBuf>,
+
+    /// Write OPENVMM_RESTORE_READY_V1 to this Unix socket or Windows named pipe
+    /// after restore startup completes and before guest execution begins.
+    #[clap(long, value_name = "PATH", requires = "restore_snapshot")]
+    pub restore_ready_path: Option<PathBuf>,
+
+    /// Capture a microVM snapshot here when the guest writes PMIO 0x605.
+    #[clap(long, value_name = "DIR", conflicts_with = "restore_snapshot")]
+    pub snapshot_destination: Option<PathBuf>,
+
+    /// Maximum time in milliseconds to quiesce a guest-requested snapshot.
+    #[clap(long, value_name = "MILLISECONDS", default_value_t = 5000)]
+    pub snapshot_quiesce_timeout_ms: u64,
 
     /// use private anonymous memory for guest RAM
     #[clap(long = "private-memory", hide = true, conflicts_with_all = ["deprecated_memory_backing_file", "restore_snapshot", "numa"])]
@@ -1436,8 +1446,8 @@ impl Options {
             "microVM ABI version 1 owns CPU topology and APIC configuration"
         );
         anyhow::ensure!(
-            self.restore_snapshot.is_none(),
-            "snapshot restore is unavailable for microVM ABI version 1"
+            self.restore_snapshot.is_none() || self.snapshot_destination.is_none(),
+            "snapshot capture and restore cannot be requested together"
         );
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
@@ -5035,12 +5045,7 @@ mod tests {
 
         let opt = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
         assert_eq!(opt.machine, MachineProfileCli::Microvm);
-        assert_eq!(
-            MachineProfile::from(opt.machine),
-            MachineProfile::Microvm {
-                abi_version: MICROVM_ABI_VERSION_1
-            }
-        );
+        assert_eq!(MachineProfile::from(opt.machine), MachineProfile::Microvm);
 
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
