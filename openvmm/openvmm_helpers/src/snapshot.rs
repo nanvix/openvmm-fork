@@ -38,7 +38,8 @@ pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 2;
 /// Contract version for one-shot restore-time microVM memory expansion.
 pub const MICROVM_MEMORY_EXPANSION_VERSION: u32 = 1;
 /// Linux memory-block granularity used by the x86-64 microVM guest.
-pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 = 128 * 1024 * 1024;
+pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 =
+    openvmm_defs::config::MICROVM_MEMORY_BLOCK_SIZE_BYTES;
 /// Snapshot contract name for shared-status edge interrupts.
 pub const MICROVM_SHARED_STATUS_INTERRUPT_MODE: &str = "edge-shared-status";
 /// Clock policy applied when a snapshot is restored.
@@ -362,6 +363,72 @@ pub struct SnapshotMicrovmSandboxBlock {
     pub physical_block_size: u32,
 }
 
+impl SnapshotMicrovmFilesystem {
+    fn new(
+        config: &openvmm_defs::config::MicrovmFilesystemConfig,
+        canonical_host_path: &str,
+    ) -> Self {
+        Self {
+            guest_mount_target: config.guest_mount_target.clone(),
+            access_mode: config.access.as_str().to_owned(),
+            restore_mode: "live-revalidate".to_owned(),
+            tag: "microvm".to_owned(),
+            high_priority_queue_count: 1,
+            request_queue_count: 1,
+            shared_memory_size: 0,
+            direct_io: true,
+            entry_cache_timeout_ns: 0,
+            attribute_cache_timeout_ns: 0,
+            canonical_host_path: canonical_host_path.to_owned(),
+        }
+    }
+}
+
+impl SnapshotMicrovmNetwork {
+    fn new(
+        config: &openvmm_defs::config::MicrovmNetworkConfig,
+        egress_policy: &net_backend_resources::egress::EgressPolicy,
+    ) -> Self {
+        Self {
+            profile: config.profile.as_str().to_owned(),
+            guest_ipv4: u32::from(config.guest_ipv4),
+            prefix_length: u32::from(config.prefix_length),
+            gateway_ipv4: u32::from(config.derived_gateway_ipv4),
+            guest_mac: config.guest_mac.to_bytes().to_vec(),
+            gateway_mac: config.gateway_mac.to_bytes().to_vec(),
+            egress_policy_mode: egress_policy.mode_name().to_owned(),
+            egress_policy_sha256: sha2::Sha256::digest(egress_policy.canonical_bytes()).to_vec(),
+            egress_policy_required: egress_policy.is_active(),
+            egress_policy_encoding_version:
+                net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION,
+        }
+    }
+}
+
+/// Validates a restore-time policy against the snapshot's canonical contract.
+pub fn validate_microvm_network_policy(
+    saved: &SnapshotMicrovmNetwork,
+    policy: &net_backend_resources::egress::EgressPolicy,
+) -> anyhow::Result<()> {
+    let encoding_version = match saved.egress_policy_encoding_version {
+        0 => 1,
+        version => version,
+    };
+    let canonical = policy
+        .canonical_bytes_for_version(encoding_version)
+        .with_context(|| {
+            format!("snapshot egress policy encoding version {encoding_version} is unsupported")
+        })?;
+    let digest = sha2::Sha256::digest(canonical);
+    anyhow::ensure!(
+        saved.egress_policy_mode == policy.mode_name()
+            && saved.egress_policy_sha256 == digest.as_slice()
+            && saved.egress_policy_required == policy.is_active(),
+        "restore-time egress policy does not match the snapshot contract"
+    );
+    Ok(())
+}
+
 /// Machine composition that becomes authoritative after capture.
 #[derive(Clone, Debug, PartialEq, Eq, Protobuf)]
 #[mesh(package = "openvmm.snapshot")]
@@ -546,6 +613,41 @@ pub fn validate_restore_online_vp_count(
     Ok(())
 }
 
+/// Validates and selects the expansion ranges for a restore-time RAM target.
+pub fn validate_restore_memory_target(
+    manifest: &SnapshotManifest,
+    restore_memory_size: u64,
+) -> anyhow::Result<Vec<SnapshotMemoryExpansionRange>> {
+    let contract = manifest
+        .machine_contract
+        .as_ref()
+        .context("snapshot is missing the authoritative machine contract")?;
+    validate_machine_contract_shape(contract, manifest.memory_size_bytes, manifest.vp_count)?;
+    anyhow::ensure!(
+        contract.memory_expansion_version == MICROVM_MEMORY_EXPANSION_VERSION,
+        "snapshot does not declare restore-time memory expansion support"
+    );
+    anyhow::ensure!(
+        restore_memory_size >= manifest.memory_size_bytes,
+        "restore memory target {restore_memory_size} is below snapshot RAM {}",
+        manifest.memory_size_bytes
+    );
+    anyhow::ensure!(
+        restore_memory_size <= contract.memory_capacity_bytes,
+        "restore memory target {restore_memory_size} exceeds RAM capacity {}",
+        contract.memory_capacity_bytes
+    );
+    anyhow::ensure!(
+        restore_memory_size.is_multiple_of(contract.memory_block_size_bytes),
+        "restore memory target {restore_memory_size} is not aligned to the {}-byte memory block size",
+        contract.memory_block_size_bytes
+    );
+    memory_expansion_prefix(
+        &contract.memory_expansion_ranges,
+        restore_memory_size - manifest.memory_size_bytes,
+    )
+}
+
 fn canonical_microvm_memory_ranges(memory_size: u64) -> anyhow::Result<Vec<SnapshotMemoryRange>> {
     const LOW_RAM_END: u64 = 3 * 1024 * 1024 * 1024;
     const HIGH_RAM_START: u64 = 4 * 1024 * 1024 * 1024;
@@ -570,329 +672,76 @@ fn canonical_microvm_memory_ranges(memory_size: u64) -> anyhow::Result<Vec<Snaps
     Ok(ranges)
 }
 
-impl SnapshotMicrovmNetwork {
-    fn new(
-        config: &openvmm_defs::config::MicrovmNetworkConfig,
-        egress_policy: &net_backend_resources::egress::EgressPolicy,
-    ) -> Self {
-        Self {
-            profile: config.profile.as_str().to_owned(),
-            guest_ipv4: u32::from(config.guest_ipv4),
-            prefix_length: u32::from(config.prefix_length),
-            gateway_ipv4: u32::from(config.derived_gateway_ipv4),
-            guest_mac: config.guest_mac.to_bytes().to_vec(),
-            gateway_mac: config.gateway_mac.to_bytes().to_vec(),
-            egress_policy_mode: egress_policy.mode_name().to_owned(),
-            egress_policy_sha256: sha2::Sha256::digest(egress_policy.canonical_bytes()).to_vec(),
-            egress_policy_required: egress_policy.is_active(),
-            egress_policy_encoding_version:
-                net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION,
-        }
-    }
-}
-
-/// Validates a restore-time policy against the snapshot's canonical contract.
-pub fn validate_microvm_network_policy(
-    saved: &SnapshotMicrovmNetwork,
-    policy: &net_backend_resources::egress::EgressPolicy,
-) -> anyhow::Result<()> {
-    let encoding_version = match saved.egress_policy_encoding_version {
-        0 => 1,
-        version => version,
-    };
-    let canonical = policy
-        .canonical_bytes_for_version(encoding_version)
-        .with_context(|| {
-            format!("snapshot egress policy encoding version {encoding_version} is unsupported")
-        })?;
-    let digest = sha2::Sha256::digest(canonical);
+fn canonical_memory_expansion_ranges(
+    memory_size: u64,
+    memory_capacity: u64,
+) -> anyhow::Result<Vec<SnapshotMemoryExpansionRange>> {
     anyhow::ensure!(
-        saved.egress_policy_mode == policy.mode_name()
-            && saved.egress_policy_sha256 == digest.as_slice()
-            && saved.egress_policy_required == policy.is_active(),
-        "restore-time egress policy does not match the snapshot contract"
+        memory_capacity >= memory_size,
+        "RAM capacity {memory_capacity} is below snapshot RAM {memory_size}"
     );
-    Ok(())
-}
-
-/// Adds a portable network identity to a base microVM snapshot contract.
-pub fn add_microvm_network_contract(
-    contract: &mut SnapshotMachineContract,
-    config: &openvmm_defs::config::MicrovmNetworkConfig,
-    policy: &net_backend_resources::egress::EgressPolicy,
-    attachment: SnapshotAttachment,
-) -> anyhow::Result<()> {
-    let source_hypervisor = contract.source_hypervisor.as_str();
-    let effective_command_line = &contract.effective_command_line;
-    let network = Some((config, policy, attachment));
-    let mut devices = Vec::new();
-    let mut attachments = Vec::new();
-    let mmio = |start, length| SnapshotDeviceRange {
-        address_space: "mmio".to_owned(),
-        start,
-        length,
-    };
-    let microvm_network = if let Some((network, egress_policy, attachment)) = network {
-        let policy_is_valid = matches!(source_hypervisor, "kvm" | "mshv" | "whp")
-            && attachment.reconnect_policy == "recreate-endpoint"
-            && !attachment.required
-            && attachment.identity_kind == "user-mode-nat"
-            && attachment.identity == b"consomme";
-        anyhow::ensure!(
-            attachment.stable_id == "net:microvm0"
-                && attachment.kind == "virtio-net"
-                && policy_is_valid
-                && !attachment.identity.is_empty()
-                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
-                && attachment.length == 0
-                && attachment.reconnect_timeout_ms == 0,
-            "microVM network attachment has an unsupported endpoint policy"
-        );
-        let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor))?;
-        let discovery = format!(
-            "virtio_mmio.device={:#x}@{:#x}:{irq}",
-            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
-        );
-        let tokens = effective_command_line
-            .split_ascii_whitespace()
-            .collect::<HashSet<_>>();
-        anyhow::ensure!(
-            tokens.contains(discovery.as_str())
-                && network
-                    .command_line_fragment()
-                    .split_ascii_whitespace()
-                    .all(|token| tokens.contains(token)),
-            "microVM network command line does not match its saved identity"
-        );
-        devices.push(SnapshotDevice {
-            stable_id: "net:microvm0".to_owned(),
-            state_unit_name: format!(
-                "virtio-net-{}",
-                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE
-            ),
-            kind: "virtio-net".to_owned(),
-            order: devices.len() as u32,
-            ranges: vec![mmio(
-                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
-                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            )],
-            irq: Some(irq),
-            transport: "virtio-mmio".to_owned(),
-            feature_banks: vec![
-                openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES as u32,
-                (openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES >> 32) as u32,
-            ],
-            queue_count: 2,
-            queue_max_sizes: vec![256, 256],
-        });
-        attachments.push(attachment);
-        Some(SnapshotMicrovmNetwork::new(network, egress_policy))
-    } else {
-        None
-    };
-
-    let index = contract
-        .devices
-        .iter()
-        .position(|device| device.transport == "virtio-mmio")
-        .unwrap_or(contract.devices.len());
-    contract.devices.splice(index..index, devices);
-    for (index, device) in contract.devices.iter_mut().enumerate() {
-        device.order = index as u32;
-    }
-    contract.attachments.extend(attachments);
-    contract.microvm_network = microvm_network;
-    Ok(())
-}
-
-impl SnapshotMicrovmFilesystem {
-    fn new(
-        config: &openvmm_defs::config::MicrovmFilesystemConfig,
-        canonical_host_path: &str,
-    ) -> Self {
-        Self {
-            guest_mount_target: config.guest_mount_target.clone(),
-            access_mode: config.access.as_str().to_owned(),
-            restore_mode: "live-revalidate".to_owned(),
-            tag: "microvm".to_owned(),
-            high_priority_queue_count: 1,
-            request_queue_count: 1,
-            shared_memory_size: 0,
-            direct_io: true,
-            entry_cache_timeout_ns: 0,
-            attribute_cache_timeout_ns: 0,
-            canonical_host_path: canonical_host_path.to_owned(),
+    let mut ranges = Vec::new();
+    for capacity_range in canonical_microvm_memory_ranges(memory_capacity)? {
+        let logical_start = capacity_range.file_offset.max(memory_size);
+        let logical_end = capacity_range
+            .file_offset
+            .checked_add(capacity_range.length)
+            .context("microVM capacity range overflows")?;
+        if logical_start >= logical_end {
+            continue;
         }
-    }
-}
-
-/// Adds a path-bound active filesystem identity without any network dependency.
-pub fn add_microvm_filesystem_contract(
-    contract: &mut SnapshotMachineContract,
-    config: &openvmm_defs::config::MicrovmFilesystemConfig,
-    root_path: &Path,
-    attachment: SnapshotAttachment,
-) -> anyhow::Result<()> {
-    let source_hypervisor = contract.source_hypervisor.as_str();
-    let effective_command_line = &contract.effective_command_line;
-    let filesystem = Some((config, root_path, attachment));
-    let filesystem_slot = true;
-    let mut devices = Vec::new();
-    let mut attachments = Vec::new();
-    let mmio = |start, length| SnapshotDeviceRange {
-        address_space: "mmio".to_owned(),
-        start,
-        length,
-    };
-    anyhow::ensure!(
-        filesystem.is_none() || filesystem_slot,
-        "microVM filesystem policy requires the reserved virtio-fs slot"
-    );
-    if filesystem_slot {
-        let discovery = format!(
-            "virtio_mmio.device={:#x}@{:#x}:{}",
-            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
-            openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
-        );
-        anyhow::ensure!(
-            effective_command_line
-                .split_ascii_whitespace()
-                .any(|token| token == discovery),
-            "microVM virtio-fs slot is missing from the effective command line"
-        );
-        devices.push(SnapshotDevice {
-            stable_id: "fs:microvm0".to_owned(),
-            state_unit_name: format!(
-                "virtiofs-{}",
-                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE
-            ),
-            kind: "virtio-fs".to_owned(),
-            order: devices.len() as u32,
-            ranges: vec![mmio(
-                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
-                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            )],
-            irq: Some(openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ),
-            transport: "virtio-mmio".to_owned(),
-            feature_banks: vec![
-                openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES as u32,
-                (openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES >> 32) as u32,
-            ],
-            queue_count: 2,
-            queue_max_sizes: vec![256, 256],
+        ranges.push(SnapshotMemoryExpansionRange {
+            gpa_start: capacity_range.gpa_start + logical_start - capacity_range.file_offset,
+            length: logical_end - logical_start,
         });
     }
-    let microvm_filesystem = if let Some((filesystem, canonical_host_path, attachment)) = filesystem
-    {
-        let canonical_host_path = canonical_host_path
-            .to_str()
-            .context("microVM filesystem canonical host path is not valid UTF-8")?;
-        anyhow::ensure!(
-            !canonical_host_path.is_empty(),
-            "microVM filesystem canonical host path is empty"
-        );
-        anyhow::ensure!(
-            attachment.stable_id == "fs:microvm0"
-                && attachment.kind == "virtio-fs"
-                && attachment.required
-                && attachment.reconnect_policy == "live-revalidate"
-                && match source_hypervisor {
-                    "kvm" | "mshv" => attachment.identity_kind == "unix-device-inode-v1",
-                    "whp" => attachment.identity_kind == "windows-volume-file-id-v1",
-                    _ => false,
-                }
-                && !attachment.identity.is_empty()
-                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
-                && attachment.length == 0
-                && attachment.reconnect_timeout_ms == 0,
-            "microVM filesystem attachment has an unsupported live-revalidation policy"
-        );
-        let tokens = effective_command_line
-            .split_ascii_whitespace()
-            .collect::<HashSet<_>>();
-        anyhow::ensure!(
-            filesystem
-                .command_line_fragment()
-                .split_ascii_whitespace()
-                .all(|token| tokens.contains(token)),
-            "microVM filesystem command line does not match its saved policy"
-        );
-        attachments.push(attachment);
-        Some(SnapshotMicrovmFilesystem::new(
-            filesystem,
-            canonical_host_path,
-        ))
-    } else {
-        None
-    };
-
-    let index = contract
-        .devices
-        .iter()
-        .position(|device| matches!(device.kind.as_str(), "virtio-console" | "virtio-blk"))
-        .unwrap_or(contract.devices.len());
-    contract.devices.splice(index..index, devices);
-    for (index, device) in contract.devices.iter_mut().enumerate() {
-        device.order = index as u32;
-    }
-    contract.attachments.extend(attachments);
-    contract.microvm_filesystem = microvm_filesystem;
-    Ok(())
+    Ok(ranges)
 }
 
-/// Reserves the stable dormant filesystem slot in a microVM contract.
-pub fn reserve_microvm_filesystem_slot(contract: &mut SnapshotMachineContract) {
-    if !contract
-        .devices
-        .iter()
-        .any(|device| device.stable_id == "fs:microvm0")
-    {
-        let index = contract
-            .devices
-            .iter()
-            .position(|device| matches!(device.kind.as_str(), "virtio-console" | "virtio-blk"))
-            .unwrap_or(contract.devices.len());
-        contract.devices.insert(
-            index,
-            SnapshotDevice {
-                stable_id: "fs:microvm0".to_owned(),
-                state_unit_name: format!(
-                    "virtiofs-{}",
-                    openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE
-                ),
-                kind: "virtio-fs".to_owned(),
-                order: index as u32,
-                ranges: vec![SnapshotDeviceRange {
-                    address_space: "mmio".to_owned(),
-                    start: openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
-                    length: openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-                }],
-                irq: Some(openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ),
-                transport: "virtio-mmio".to_owned(),
-                feature_banks: vec![
-                    openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES as u32,
-                    (openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES >> 32) as u32,
-                ],
-                queue_count: 2,
-                queue_max_sizes: vec![256, 256],
-            },
-        );
-        for (index, device) in contract.devices.iter_mut().enumerate() {
-            device.order = index as u32;
+fn memory_expansion_prefix(
+    ranges: &[SnapshotMemoryExpansionRange],
+    size: u64,
+) -> anyhow::Result<Vec<SnapshotMemoryExpansionRange>> {
+    let mut remaining = size;
+    let mut prefix = Vec::new();
+    for range in ranges {
+        if remaining == 0 {
+            break;
         }
+        let length = range.length.min(remaining);
+        prefix.push(SnapshotMemoryExpansionRange {
+            gpa_start: range.gpa_start,
+            length,
+        });
+        remaining -= length;
     }
-    contract.microvm_filesystem_slot_version = MICROVM_FILESYSTEM_SLOT_VERSION;
+    anyhow::ensure!(
+        remaining == 0,
+        "memory expansion ranges do not cover target"
+    );
+    Ok(prefix)
 }
 
 /// Builds the authoritative microVM machine contract.
 pub fn microvm_machine_contract(
     source_hypervisor: &str,
     effective_command_line: String,
+    network: Option<(
+        &openvmm_defs::config::MicrovmNetworkConfig,
+        &net_backend_resources::egress::EgressPolicy,
+        SnapshotAttachment,
+    )>,
+    filesystem_slot: bool,
+    filesystem: Option<(
+        &openvmm_defs::config::MicrovmFilesystemConfig,
+        &Path,
+        SnapshotAttachment,
+    )>,
     console_attachment: Option<SnapshotAttachment>,
+    sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
     processor_count: u32,
     memory_size: u64,
+    memory_capacity: Option<u64>,
     state_unit_names: Vec<String>,
     capture_wall_clock: Timestamp,
     tsc_frequency_hz: u64,
@@ -900,13 +749,38 @@ pub fn microvm_machine_contract(
     cpu_contract: Vec<u8>,
 ) -> anyhow::Result<SnapshotMachineContract> {
     anyhow::ensure!(
-        matches!(source_hypervisor, "kvm" | "whp"),
-        "microVM snapshots require the KVM or WHP hypervisor"
+        matches!(source_hypervisor, "kvm" | "mshv" | "whp"),
+        "microVM snapshots require the KVM, MSHV, or WHP hypervisor"
     );
     let topology = microvm_snapshot_topology(processor_count)?;
     let boot_online_vp_count =
         microvm_boot_online_vp_count(processor_count, &effective_command_line)?;
+
     let memory_ranges = canonical_microvm_memory_ranges(memory_size)?;
+    let (
+        memory_expansion_version,
+        memory_capacity_bytes,
+        memory_block_size_bytes,
+        memory_expansion_ranges,
+    ) = if let Some(memory_capacity) = memory_capacity {
+        anyhow::ensure!(
+            memory_size.is_multiple_of(MICROVM_MEMORY_BLOCK_SIZE_BYTES),
+            "snapshot RAM {memory_size} is not aligned to the {MICROVM_MEMORY_BLOCK_SIZE_BYTES}-byte memory block size"
+        );
+        anyhow::ensure!(
+            memory_capacity.is_multiple_of(MICROVM_MEMORY_BLOCK_SIZE_BYTES),
+            "RAM capacity {memory_capacity} is not aligned to the {MICROVM_MEMORY_BLOCK_SIZE_BYTES}-byte memory block size"
+        );
+        (
+            MICROVM_MEMORY_EXPANSION_VERSION,
+            memory_capacity,
+            MICROVM_MEMORY_BLOCK_SIZE_BYTES,
+            canonical_memory_expansion_ranges(memory_size, memory_capacity)?,
+        )
+    } else {
+        (0, 0, 0, Vec::new())
+    };
+
     let device = |stable_id: &str,
                   state_unit_name: &str,
                   kind: &str,
@@ -991,6 +865,147 @@ pub fn microvm_machine_contract(
         ),
     ];
     let mut attachments = Vec::new();
+    let microvm_network = if let Some((network, egress_policy, attachment)) = network {
+        let policy_is_valid = matches!(source_hypervisor, "kvm" | "mshv" | "whp")
+            && attachment.reconnect_policy == "recreate-endpoint"
+            && !attachment.required
+            && attachment.identity_kind == "user-mode-nat"
+            && attachment.identity == b"consomme";
+        anyhow::ensure!(
+            attachment.stable_id == "net:microvm0"
+                && attachment.kind == "virtio-net"
+                && policy_is_valid
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0
+                && attachment.reconnect_timeout_ms == 0,
+            "microVM network attachment has an unsupported endpoint policy"
+        );
+        let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor))?;
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{irq}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+        );
+        let tokens = effective_command_line
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            tokens.contains(discovery.as_str())
+                && network
+                    .command_line_fragment()
+                    .split_ascii_whitespace()
+                    .all(|token| tokens.contains(token)),
+            "microVM network command line does not match its saved identity"
+        );
+        devices.push(SnapshotDevice {
+            stable_id: "net:microvm0".to_owned(),
+            state_unit_name: format!(
+                "virtio-net-{}",
+                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE
+            ),
+            kind: "virtio-net".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(irq),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![
+                openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES as u32,
+                (openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES >> 32) as u32,
+            ],
+            queue_count: 2,
+            queue_max_sizes: vec![256, 256],
+        });
+        attachments.push(attachment);
+        Some(SnapshotMicrovmNetwork::new(network, egress_policy))
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        filesystem.is_none() || filesystem_slot,
+        "microVM filesystem policy requires the reserved virtio-fs slot"
+    );
+    if filesystem_slot {
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+            openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
+        );
+        anyhow::ensure!(
+            effective_command_line
+                .split_ascii_whitespace()
+                .any(|token| token == discovery),
+            "microVM virtio-fs slot is missing from the effective command line"
+        );
+        devices.push(SnapshotDevice {
+            stable_id: "fs:microvm0".to_owned(),
+            state_unit_name: format!(
+                "virtiofs-{}",
+                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE
+            ),
+            kind: "virtio-fs".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![
+                openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES as u32,
+                (openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES >> 32) as u32,
+            ],
+            queue_count: 2,
+            queue_max_sizes: vec![256, 256],
+        });
+    }
+    let microvm_filesystem = if let Some((filesystem, canonical_host_path, attachment)) = filesystem
+    {
+        let canonical_host_path = canonical_host_path
+            .to_str()
+            .context("microVM filesystem canonical host path is not valid UTF-8")?;
+        anyhow::ensure!(
+            !canonical_host_path.is_empty(),
+            "microVM filesystem canonical host path is empty"
+        );
+        anyhow::ensure!(
+            attachment.stable_id == "fs:microvm0"
+                && attachment.kind == "virtio-fs"
+                && attachment.required
+                && attachment.reconnect_policy == "live-revalidate"
+                && match source_hypervisor {
+                    "kvm" | "mshv" => attachment.identity_kind == "unix-device-inode-v1",
+                    "whp" => attachment.identity_kind == "windows-volume-file-id-v1",
+                    _ => false,
+                }
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0
+                && attachment.reconnect_timeout_ms == 0,
+            "microVM filesystem attachment has an unsupported live-revalidation policy"
+        );
+        let tokens = effective_command_line
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            filesystem
+                .command_line_fragment()
+                .split_ascii_whitespace()
+                .all(|token| tokens.contains(token)),
+            "microVM filesystem command line does not match its saved policy"
+        );
+        attachments.push(attachment);
+        Some(SnapshotMicrovmFilesystem::new(
+            filesystem,
+            canonical_host_path,
+        ))
+    } else {
+        None
+    };
     if let Some(attachment) = console_attachment {
         let policy_is_valid = match attachment.reconnect_policy.as_str() {
             "recreate-listener" => {
@@ -1026,10 +1041,7 @@ pub fn microvm_machine_contract(
         };
         anyhow::ensure!(
             attachment.stable_id == "console:microvm-virtio0"
-                && matches!(
-                    attachment.kind.as_str(),
-                    "virtio-console" | "virtio-net" | "virtio-fs"
-                )
+                && attachment.kind == "virtio-console"
                 && policy_is_valid
                 && !attachment.identity.is_empty()
                 && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
@@ -1057,6 +1069,45 @@ pub fn microvm_machine_contract(
         attachments.push(attachment);
     }
 
+    for block in &sandbox_blocks {
+        let role = match block.role.as_str() {
+            "distro" => openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
+            "runtime" => openvmm_defs::config::MicrovmSandboxBlockRole::Runtime,
+            "custom" => openvmm_defs::config::MicrovmSandboxBlockRole::Custom,
+            "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+            role => anyhow::bail!("snapshot sandbox block role '{role}' is unsupported"),
+        };
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            role.mmio_base(),
+            role.irq(),
+        );
+        anyhow::ensure!(
+            effective_command_line
+                .split_ascii_whitespace()
+                .any(|token| token == discovery),
+            "microVM sandbox block '{}' is missing from the effective command line",
+            block.role
+        );
+        let features = openvmm_defs::config::microvm_sandbox_block_features(role);
+        devices.push(SnapshotDevice {
+            stable_id: format!("blk:sandbox:{}", role.as_str()),
+            state_unit_name: format!("virtio-blk-{}", role.mmio_base()),
+            kind: "virtio-blk".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                role.mmio_base(),
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(role.irq()),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![features as u32, (features >> 32) as u32],
+            queue_count: 1,
+            queue_max_sizes: vec![256],
+        });
+    }
+
     let mut contract = SnapshotMachineContract {
         machine_profile: "microvm".to_owned(),
         microvm_abi_version: openvmm_defs::config::MICROVM_ABI_VERSION_2,
@@ -1075,19 +1126,23 @@ pub fn microvm_machine_contract(
         cpu_contract_sha256: Vec::new(),
         pvh_layout_version: MICROVM_PVH_LAYOUT_VERSION,
         clock_policy: ADVANCE_BY_HOST_DOWNTIME.to_owned(),
-        microvm_network: None,
-        microvm_filesystem: None,
+        microvm_network,
+        microvm_filesystem,
         apic_frequency_hz,
-        microvm_sandbox_blocks: Vec::new(),
-        microvm_filesystem_slot_version: 0,
+        microvm_sandbox_blocks: sandbox_blocks,
+        microvm_filesystem_slot_version: if filesystem_slot {
+            MICROVM_FILESYSTEM_SLOT_VERSION
+        } else {
+            0
+        },
         boot_online_vp_count,
         virtio_interrupt_mode: MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned(),
         virtio_shared_status_page_gpa: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
         virtio_shared_status_page_size: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
-        memory_expansion_version: 0,
-        memory_capacity_bytes: 0,
-        memory_block_size_bytes: 0,
-        memory_expansion_ranges: Vec::new(),
+        memory_expansion_version,
+        memory_capacity_bytes,
+        memory_block_size_bytes,
+        memory_expansion_ranges,
     };
     contract.set_effective_command_line(effective_command_line);
     contract.set_cpu_compatibility_contract(cpu_contract);
@@ -3469,13 +3524,70 @@ fn validate_machine_contract_shape(
         total_memory == memory_size,
         "snapshot RAM ranges cover {total_memory} bytes, expected {memory_size}"
     );
+    match contract.memory_expansion_version {
+        0 => anyhow::ensure!(
+            contract.memory_capacity_bytes == 0
+                && contract.memory_block_size_bytes == 0
+                && contract.memory_expansion_ranges.is_empty(),
+            "legacy snapshot has an unexpected RAM capacity contract"
+        ),
+        MICROVM_MEMORY_EXPANSION_VERSION => {
+            anyhow::ensure!(
+                memory_size.is_multiple_of(MICROVM_MEMORY_BLOCK_SIZE_BYTES),
+                "snapshot RAM is not memory-block aligned"
+            );
+            anyhow::ensure!(
+                contract.memory_block_size_bytes == MICROVM_MEMORY_BLOCK_SIZE_BYTES,
+                "snapshot memory block size {} is unsupported",
+                contract.memory_block_size_bytes
+            );
+            anyhow::ensure!(
+                contract.memory_capacity_bytes >= memory_size
+                    && contract
+                        .memory_capacity_bytes
+                        .is_multiple_of(MICROVM_MEMORY_BLOCK_SIZE_BYTES),
+                "snapshot RAM capacity is invalid"
+            );
+            anyhow::ensure!(
+                contract.memory_ranges == canonical_microvm_memory_ranges(memory_size)?,
+                "snapshot base RAM ranges are not canonical"
+            );
+            anyhow::ensure!(
+                contract.memory_expansion_ranges
+                    == canonical_memory_expansion_ranges(
+                        memory_size,
+                        contract.memory_capacity_bytes,
+                    )?,
+                "snapshot memory expansion ranges are not canonical"
+            );
+        }
+        version => {
+            anyhow::bail!("snapshot memory expansion contract version {version} is unsupported")
+        }
+    }
+
+    let topology = &contract.topology;
+    let topology_vp_count = u64::from(topology.sockets)
+        .checked_mul(u64::from(topology.dies_per_socket))
+        .and_then(|count| count.checked_mul(u64::from(topology.cores_per_die)))
+        .and_then(|count| count.checked_mul(u64::from(topology.threads_per_core)))
+        .context("snapshot processor topology overflows")?;
     anyhow::ensure!(
-        contract.memory_expansion_version == 0
-            && contract.memory_capacity_bytes == 0
-            && contract.memory_block_size_bytes == 0
-            && contract.memory_expansion_ranges.is_empty(),
-        "base microVM snapshots do not support memory expansion"
+        topology_vp_count == u64::from(vp_count) && topology.apic_ids.len() == vp_count as usize,
+        "snapshot processor topology doesn't describe {vp_count} virtual processors"
     );
+    ensure_unique(&topology.apic_ids, "APIC ID")?;
+    anyhow::ensure!(
+        *topology == microvm_snapshot_topology(vp_count)?,
+        "snapshot processor topology is not canonical for the microVM"
+    );
+    if contract.boot_online_vp_count != 0 {
+        anyhow::ensure!(
+            contract.boot_online_vp_count
+                == microvm_boot_online_vp_count(vp_count, &contract.effective_command_line,)?,
+            "snapshot boot-online VP count does not match the effective command line"
+        );
+    }
 
     if let Some(network) = &contract.microvm_network {
         anyhow::ensure!(
@@ -3515,7 +3627,6 @@ fn validate_machine_contract_shape(
         );
         validate_sha256(&network.egress_policy_sha256, "egress policy")?;
     }
-
     if let Some(filesystem) = &contract.microvm_filesystem {
         anyhow::ensure!(
             !filesystem.canonical_host_path.is_empty(),
@@ -3561,37 +3672,85 @@ fn validate_machine_contract_shape(
         ),
     }
 
-    if contract.boot_online_vp_count != 0 {
+    if !contract.microvm_sandbox_blocks.is_empty() {
         anyhow::ensure!(
-            contract.boot_online_vp_count
-                == microvm_boot_online_vp_count(vp_count, &contract.effective_command_line,)?,
-            "snapshot boot-online VP count does not match the effective command line"
+            contract.microvm_sandbox_blocks.len() >= 2
+                && contract.microvm_sandbox_blocks.len() <= 4,
+            "microVM snapshot must contain one to three layers and scratch"
+        );
+        let mut previous_role = None;
+        for block in &contract.microvm_sandbox_blocks {
+            let role = match block.role.as_str() {
+                "distro" => openvmm_defs::config::MicrovmSandboxBlockRole::Distro,
+                "runtime" => openvmm_defs::config::MicrovmSandboxBlockRole::Runtime,
+                "custom" => openvmm_defs::config::MicrovmSandboxBlockRole::Custom,
+                "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
+                role => anyhow::bail!("snapshot sandbox block role '{role}' is unsupported"),
+            };
+            anyhow::ensure!(
+                previous_role.is_none_or(|previous| previous < role),
+                "snapshot sandbox block roles are duplicated or out of order"
+            );
+            previous_role = Some(role);
+            anyhow::ensure!(
+                block.read_only == role.is_read_only(),
+                "snapshot sandbox block '{}' has an invalid access mode",
+                block.role
+            );
+            anyhow::ensure!(
+                block.length != 0 && block.length % 512 == 0,
+                "snapshot sandbox block '{}' has invalid geometry",
+                block.role
+            );
+            anyhow::ensure!(
+                block.logical_block_size >= 512
+                    && block.logical_block_size.is_power_of_two()
+                    && block.physical_block_size >= block.logical_block_size
+                    && block.physical_block_size.is_power_of_two()
+                    && block.length % u64::from(block.logical_block_size) == 0,
+                "snapshot sandbox block '{}' has invalid block geometry",
+                block.role
+            );
+            if role == openvmm_defs::config::MicrovmSandboxBlockRole::Scratch {
+                anyhow::ensure!(
+                    block.artifact.is_empty() || block.artifact == SCRATCH_FILE_NAME,
+                    "snapshot scratch artifact name is invalid"
+                );
+                if block.artifact.is_empty() {
+                    anyhow::ensure!(
+                        block.identity_kind == "fresh" && block.identity.is_empty(),
+                        "snapshot fresh scratch policy is invalid"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        block.identity_kind == "sha256",
+                        "snapshot paired scratch has an unsupported identity kind"
+                    );
+                    validate_sha256(&block.identity, "scratch block")?;
+                }
+            } else {
+                anyhow::ensure!(
+                    block.artifact.is_empty()
+                        && matches!(block.identity_kind.as_str(), "sha256" | "unbound"),
+                    "snapshot read-only layer '{}' has an invalid identity policy",
+                    block.role
+                );
+                if block.identity_kind == "sha256" {
+                    validate_sha256(&block.identity, &format!("{} block", block.role))?;
+                } else {
+                    anyhow::ensure!(
+                        block.identity.is_empty(),
+                        "snapshot unbound layer '{}' carries an identity",
+                        block.role
+                    );
+                }
+            }
+        }
+        anyhow::ensure!(
+            previous_role == Some(openvmm_defs::config::MicrovmSandboxBlockRole::Scratch),
+            "microVM snapshot is missing its scratch role"
         );
     }
-
-    let topology = &contract.topology;
-    let topology_vp_count = u64::from(topology.sockets)
-        .checked_mul(u64::from(topology.dies_per_socket))
-        .and_then(|count| count.checked_mul(u64::from(topology.cores_per_die)))
-        .and_then(|count| count.checked_mul(u64::from(topology.threads_per_core)))
-        .context("snapshot processor topology overflows")?;
-    anyhow::ensure!(
-        topology_vp_count == u64::from(vp_count) && topology.apic_ids.len() == vp_count as usize,
-        "snapshot processor topology doesn't describe {vp_count} virtual processors"
-    );
-    ensure_unique(&topology.apic_ids, "APIC ID")?;
-    anyhow::ensure!(
-        *topology == microvm_snapshot_topology(vp_count)?,
-        "snapshot processor topology is not canonical for the microVM"
-    );
-    anyhow::ensure!(
-        contract.microvm_sandbox_blocks.is_empty()
-            && contract.attachments.iter().all(|attachment| matches!(
-                attachment.kind.as_str(),
-                "virtio-console" | "virtio-net" | "virtio-fs"
-            )),
-        "base microVM snapshots cannot contain device attachments or expanded topology"
-    );
 
     anyhow::ensure!(
         contract.devices.len() <= MAX_DEVICES,
@@ -3918,7 +4077,7 @@ mod tests {
             },
             openvmm_version: "test-0.1.0".to_string(),
             memory_size_bytes: 1024,
-            vp_count: 1,
+            vp_count: 2,
             page_size: 4096,
             architecture: "x86_64".to_string(),
             state_size_bytes: 0,
@@ -3949,9 +4108,9 @@ mod tests {
             topology: SnapshotProcessorTopology {
                 sockets: 1,
                 dies_per_socket: 1,
-                cores_per_die: 1,
+                cores_per_die: 2,
                 threads_per_core: 1,
-                apic_ids: vec![0],
+                apic_ids: vec![0, 1],
             },
             devices: vec![
                 SnapshotDevice {
@@ -4015,6 +4174,696 @@ mod tests {
         contract
     }
 
+    fn paired_scratch_manifest(scratch: &[u8]) -> SnapshotManifest {
+        let mut manifest = test_manifest();
+        let mut contract = test_machine_contract();
+        contract.microvm_sandbox_blocks = vec![
+            SnapshotMicrovmSandboxBlock {
+                role: "distro".to_owned(),
+                read_only: true,
+                length: 512,
+                identity_kind: "sha256".to_owned(),
+                identity: vec![0x11; SHA256_SIZE],
+                artifact: String::new(),
+                logical_block_size: 512,
+                physical_block_size: 4096,
+            },
+            SnapshotMicrovmSandboxBlock {
+                role: "scratch".to_owned(),
+                read_only: false,
+                length: scratch.len() as u64,
+                identity_kind: "sha256".to_owned(),
+                identity: sha2::Sha256::digest(scratch).to_vec(),
+                artifact: SCRATCH_FILE_NAME.to_owned(),
+                logical_block_size: 512,
+                physical_block_size: 4096,
+            },
+        ];
+        contract
+            .set_effective_command_line("console=hvc0 nvx_snapshot_tier=workload-start".to_owned());
+        manifest.machine_contract = Some(contract);
+        manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_ALL;
+        manifest
+    }
+
+    #[test]
+    fn abi_v2_snapshot_tier_contract_is_canonical() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_INSTANCE_CHECKPOINT.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_RESUME.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_ALL;
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=instance-checkpoint".to_owned(),
+            );
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        assert!(validate_manifest_version(&manifest).is_err());
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+        assert!(validate_manifest_version(&manifest).is_err());
+
+        let scratch = manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks
+            .last_mut()
+            .unwrap();
+        scratch.identity_kind = "fresh".to_owned();
+        scratch.identity.clear();
+        scratch.artifact.clear();
+        for block in manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks
+            .iter_mut()
+            .filter(|block| block.read_only)
+        {
+            block.identity_kind = "unbound".to_owned();
+            block.identity.clear();
+        }
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line("console=hvc0 nvx_snapshot_tier=platform".to_owned());
+        validate_manifest_version(&manifest).unwrap();
+    }
+
+    #[test]
+    fn restore_online_vp_count_is_bounded_by_template() {
+        assert_eq!(
+            microvm_boot_online_vp_count(8, "console=hvc0 maxcpus=1").unwrap(),
+            1
+        );
+        assert_eq!(microvm_boot_online_vp_count(8, "console=hvc0").unwrap(), 0);
+        assert!(microvm_boot_online_vp_count(8, "maxcpus=3").is_err());
+
+        let mut manifest = test_manifest();
+        manifest.vp_count = 8;
+        let mut contract = test_machine_contract();
+        contract.boot_online_vp_count = 2;
+        manifest.machine_contract = Some(contract);
+
+        for target in [2, 4, 8] {
+            validate_restore_online_vp_count(&manifest, target).unwrap();
+        }
+        for target in [1, 3, 16] {
+            assert!(validate_restore_online_vp_count(&manifest, target).is_err());
+        }
+
+        manifest.vp_count = 4;
+        let error = validate_restore_online_vp_count(&manifest, 8).unwrap_err();
+        assert!(error.to_string().contains("exceeds VP capacity 4"));
+        manifest.vp_count = 8;
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .boot_online_vp_count = 0;
+        let error = validate_restore_online_vp_count(&manifest, 8).unwrap_err();
+        assert!(error.to_string().contains("does not declare"));
+    }
+
+    #[test]
+    fn platform_snapshot_rejects_tenant_command_line() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+        manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+        {
+            let contract = manifest.machine_contract.as_mut().unwrap();
+            for block in contract
+                .microvm_sandbox_blocks
+                .iter_mut()
+                .filter(|block| block.read_only)
+            {
+                block.identity_kind = "unbound".to_owned();
+                block.identity.clear();
+            }
+            let scratch = contract.microvm_sandbox_blocks.last_mut().unwrap();
+            scratch.identity_kind = "fresh".to_owned();
+            scratch.identity.clear();
+            scratch.artifact.clear();
+            contract.set_effective_command_line(
+                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_entrypoint=/tenant".to_owned(),
+            );
+        }
+
+        assert!(
+            validate_manifest_version(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("contains tenant or unsupported configuration")
+        );
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform"
+                .to_owned(),
+        );
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_config=tenant-data".to_owned(),
+            );
+        assert!(
+            validate_manifest_version(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("contains tenant or unsupported configuration")
+        );
+    }
+
+    #[test]
+    fn version_4_manifest_has_no_snapshot_tier_metadata() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.version = VERSION_4_MANIFEST_VERSION;
+        manifest.format_magic = VERSION_4_SNAPSHOT_FORMAT_MAGIC.to_vec();
+        manifest.snapshot_tier.clear();
+        manifest.restore_policy.clear();
+        manifest.consumed_config_sections = 0;
+        validate_manifest_header(&manifest).unwrap();
+        validate_manifest_version(&manifest).unwrap();
+
+        manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+        assert!(validate_manifest_version(&manifest).is_err());
+    }
+
+    #[test]
+    fn resume_snapshot_claim_is_single_use() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.snapshot_tier = SNAPSHOT_TIER_INSTANCE_CHECKPOINT.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_RESUME.to_owned();
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=instance-checkpoint".to_owned(),
+            );
+        let dir = tempfile::tempdir().unwrap();
+
+        claim_snapshot_for_restore(dir.path(), &manifest).unwrap();
+        let error = claim_snapshot_for_restore(dir.path(), &manifest).unwrap_err();
+        assert!(error.to_string().contains("already been claimed"));
+    }
+
+    #[test]
+    fn clone_snapshot_claim_is_a_noop() {
+        let scratch = vec![0x5a; 512];
+        let manifest = paired_scratch_manifest(&scratch);
+        let dir = tempfile::tempdir().unwrap();
+
+        claim_snapshot_for_restore(dir.path(), &manifest).unwrap();
+        claim_snapshot_for_restore(dir.path(), &manifest).unwrap();
+        assert!(!dir.path().join(RESUME_CLAIM_FILE_NAME).exists());
+    }
+
+    fn microvm_console_attachment() -> SnapshotAttachment {
+        SnapshotAttachment {
+            stable_id: "console:microvm-virtio0".to_owned(),
+            kind: "virtio-console".to_owned(),
+            required: false,
+            reconnect_policy: "recreate-listener".to_owned(),
+            identity_kind: "tcp".to_owned(),
+            identity: b"127.0.0.1:5555".to_vec(),
+            length: 0,
+            reconnect_timeout_ms: 0,
+        }
+    }
+
+    fn microvm_network_attachment(source_hypervisor: &str) -> SnapshotAttachment {
+        assert!(matches!(source_hypervisor, "kvm" | "mshv" | "whp"));
+        SnapshotAttachment {
+            stable_id: "net:microvm0".to_owned(),
+            kind: "virtio-net".to_owned(),
+            required: false,
+            reconnect_policy: "recreate-endpoint".to_owned(),
+            identity_kind: "user-mode-nat".to_owned(),
+            identity: b"consomme".to_vec(),
+            length: 0,
+            reconnect_timeout_ms: 0,
+        }
+    }
+
+    fn microvm_filesystem_attachment(source_hypervisor: &str) -> SnapshotAttachment {
+        SnapshotAttachment {
+            stable_id: "fs:microvm0".to_owned(),
+            kind: "virtio-fs".to_owned(),
+            required: true,
+            reconnect_policy: "live-revalidate".to_owned(),
+            identity_kind: match source_hypervisor {
+                "kvm" | "mshv" => "unix-device-inode-v1",
+                "whp" => "windows-volume-file-id-v1",
+                _ => unreachable!(),
+            }
+            .to_owned(),
+            identity: b"root-object-v1".to_vec(),
+            length: 0,
+            reconnect_timeout_ms: 0,
+        }
+    }
+
+    fn generated_network_contract(source_hypervisor: &str) -> SnapshotMachineContract {
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let egress_policy = net_backend_resources::egress::EgressPolicy::bind(
+            network.guest_ipv4,
+            network.prefix_length,
+            network.guest_mac,
+            network.derived_gateway_ipv4,
+            net_backend_resources::egress::EgressPolicyMode::AllowList(vec![
+                "192.0.2.0/24".parse().unwrap(),
+            ]),
+        )
+        .unwrap();
+        let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
+        let command_line = format!(
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {}",
+            network.command_line_fragment_with_dns(true)
+        );
+        microvm_machine_contract(
+            source_hypervisor,
+            command_line,
+            Some((
+                &network,
+                &egress_policy,
+                microvm_network_attachment(source_hypervisor),
+            )),
+            false,
+            None,
+            None,
+            Vec::new(),
+            1,
+            1024,
+            None,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtio-net-3489660928",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    fn generated_console_contract() -> SnapshotMachineContract {
+        microvm_machine_contract(
+            "whp",
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0002000:7"
+                .to_owned(),
+            None,
+            false,
+            None,
+            Some(microvm_console_attachment()),
+            Vec::new(),
+            1,
+            1024,
+            None,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtio-console-3489669120",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    fn generated_filesystem_contract(source_hypervisor: &str) -> SnapshotMachineContract {
+        let filesystem = openvmm_defs::config::MicrovmFilesystemConfig::new(
+            "/mnt/share".to_owned(),
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+        )
+        .unwrap();
+        let command_line = format!(
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0001000:6 {}",
+            filesystem.command_line_fragment()
+        );
+        microvm_machine_contract(
+            source_hypervisor,
+            command_line,
+            None,
+            true,
+            Some((
+                &filesystem,
+                Path::new(if cfg!(windows) {
+                    r"C:\microvm-share"
+                } else {
+                    "/microvm-share"
+                }),
+                microvm_filesystem_attachment(source_hypervisor),
+            )),
+            None,
+            Vec::new(),
+            1,
+            1024,
+            None,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtiofs-3489665024",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    fn generated_dormant_filesystem_contract() -> SnapshotMachineContract {
+        microvm_machine_contract(
+            "whp",
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0001000:6"
+                .to_owned(),
+            None,
+            true,
+            None,
+            None,
+            Vec::new(),
+            1,
+            1024,
+            None,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtiofs-3489665024",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generated_microvm_console_contract_has_fixed_abi() {
+        let contract = generated_console_contract();
+        let console = contract.devices.last().unwrap();
+        assert_eq!(console.stable_id, "console:microvm-virtio0");
+        assert_eq!(console.state_unit_name, "virtio-console-3489669120");
+        assert_eq!(console.ranges[0].start, 0xd000_2000);
+        assert_eq!(console.ranges[0].length, 0x1000);
+        assert_eq!(console.irq, Some(7));
+        assert_eq!(console.transport, "virtio-mmio");
+        assert_eq!(console.feature_banks, [0x3000_0001, 0x0000_0003]);
+        assert_eq!(console.queue_max_sizes, [256, 256]);
+        assert_eq!(contract.attachments, [microvm_console_attachment()]);
+    }
+
+    #[test]
+    fn generated_microvm_network_contract_has_backend_specific_fixed_abi() {
+        for (source_hypervisor, irq) in [("kvm", 10), ("mshv", 10), ("whp", 5)] {
+            let contract = generated_network_contract(source_hypervisor);
+            let network_device = contract.devices.last().unwrap();
+            assert_eq!(network_device.stable_id, "net:microvm0");
+            assert_eq!(network_device.state_unit_name, "virtio-net-3489660928");
+            assert_eq!(network_device.ranges[0].start, 0xd000_0000);
+            assert_eq!(network_device.ranges[0].length, 0x1000);
+            assert_eq!(network_device.irq, Some(irq));
+            assert_eq!(network_device.transport, "virtio-mmio");
+            assert_eq!(network_device.feature_banks, [0x20, 0x1]);
+            assert_eq!(network_device.queue_count, 2);
+            assert_eq!(network_device.queue_max_sizes, [256, 256]);
+            assert_eq!(
+                contract.attachments,
+                [microvm_network_attachment(source_hypervisor)]
+            );
+
+            let network = contract.microvm_network.unwrap();
+            assert_eq!(network.profile, "portable");
+            assert_eq!(
+                network.guest_ipv4,
+                u32::from(std::net::Ipv4Addr::new(10, 0, 0, 2))
+            );
+            assert_eq!(network.prefix_length, 24);
+            assert_eq!(
+                network.gateway_ipv4,
+                u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1))
+            );
+            assert_eq!(network.guest_mac, [0x52, 0x54, 0, 0, 0, 2]);
+            assert_eq!(network.gateway_mac, [0x52, 0x54, 0, 0, 0, 1]);
+            assert_eq!(network.egress_policy_mode, "allow-list");
+            assert_eq!(network.egress_policy_sha256.len(), 32);
+            assert!(network.egress_policy_required);
+            assert_eq!(
+                network.egress_policy_encoding_version,
+                net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_network_policy_digest_remains_valid() {
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = net_backend_resources::egress::EgressPolicy::bind(
+            network.guest_ipv4,
+            network.prefix_length,
+            network.guest_mac,
+            network.derived_gateway_ipv4,
+            net_backend_resources::egress::EgressPolicyMode::TcpEndpoints(vec![
+                "10.0.0.9:443".parse().unwrap(),
+                "192.0.2.7:443".parse().unwrap(),
+            ]),
+        )
+        .unwrap();
+        let mut saved = SnapshotMicrovmNetwork::new(&network, &policy);
+        saved.egress_policy_encoding_version = 0;
+        saved.egress_policy_sha256 =
+            sha2::Sha256::digest(policy.canonical_bytes_for_version(1).unwrap()).to_vec();
+
+        validate_microvm_network_policy(&saved, &policy).unwrap();
+        saved.egress_policy_encoding_version = u32::MAX;
+        assert!(validate_microvm_network_policy(&saved, &policy).is_err());
+    }
+
+    #[test]
+    fn generated_microvm_filesystem_contract_has_fixed_abi() {
+        for source_hypervisor in ["kvm", "mshv", "whp"] {
+            let contract = generated_filesystem_contract(source_hypervisor);
+            let filesystem_device = contract.devices.last().unwrap();
+            assert_eq!(filesystem_device.stable_id, "fs:microvm0");
+            assert_eq!(filesystem_device.state_unit_name, "virtiofs-3489665024");
+            assert_eq!(filesystem_device.ranges[0].start, 0xd000_1000);
+            assert_eq!(filesystem_device.ranges[0].length, 0x1000);
+            assert_eq!(filesystem_device.irq, Some(6));
+            assert_eq!(filesystem_device.transport, "virtio-mmio");
+            assert_eq!(filesystem_device.feature_banks, [0x3000_0000, 0x0000_0003]);
+            assert_eq!(filesystem_device.queue_count, 2);
+            assert_eq!(filesystem_device.queue_max_sizes, [256, 256]);
+            assert_eq!(
+                contract.attachments,
+                [microvm_filesystem_attachment(source_hypervisor)]
+            );
+
+            let filesystem = contract.microvm_filesystem.unwrap();
+            assert_eq!(filesystem.guest_mount_target, "/mnt/share");
+            assert_eq!(filesystem.access_mode, "ro");
+            assert_eq!(
+                filesystem.canonical_host_path,
+                if cfg!(windows) {
+                    r"C:\microvm-share"
+                } else {
+                    "/microvm-share"
+                }
+            );
+            assert_eq!(filesystem.restore_mode, "live-revalidate");
+            assert_eq!(filesystem.tag, "microvm");
+            assert_eq!(filesystem.high_priority_queue_count, 1);
+            assert_eq!(filesystem.request_queue_count, 1);
+            assert_eq!(filesystem.shared_memory_size, 0);
+            assert!(filesystem.direct_io);
+            assert_eq!(filesystem.entry_cache_timeout_ns, 0);
+            assert_eq!(filesystem.attribute_cache_timeout_ns, 0);
+        }
+    }
+
+    #[test]
+    fn generated_dormant_microvm_filesystem_contract_reserves_fixed_slot() {
+        let contract = generated_dormant_filesystem_contract();
+        assert_eq!(
+            contract.microvm_filesystem_slot_version,
+            MICROVM_FILESYSTEM_SLOT_VERSION
+        );
+        assert!(contract.microvm_filesystem.is_none());
+        assert!(contract.attachments.is_empty());
+        let filesystem = contract.devices.last().unwrap();
+        assert_eq!(filesystem.stable_id, "fs:microvm0");
+        assert_eq!(filesystem.state_unit_name, "virtiofs-3489665024");
+        assert_eq!(filesystem.ranges[0].start, 0xd000_1000);
+        assert_eq!(filesystem.irq, Some(6));
+    }
+
+    #[test]
+    fn dormant_microvm_filesystem_capability_requires_fixed_device() {
+        let mut contract = generated_dormant_filesystem_contract();
+        contract.devices.pop();
+        assert!(validate_machine_contract_shape(&contract, 1024, 1).is_err());
+    }
+
+    #[test]
+    fn validate_microvm_filesystem_contract_rejects_policy_change() {
+        let contract = generated_filesystem_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_filesystem
+            .as_mut()
+            .unwrap()
+            .request_queue_count = 2;
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("not canonical"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_noncanonical_identity() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .guest_mac[5] = 3;
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("not canonical"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_unsupported_profile() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .profile = "other".to_owned();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("profile"));
+    }
+
+    #[test]
+    fn validate_microvm_network_contract_rejects_legacy_missing_profile() {
+        let contract = generated_network_contract("whp");
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .profile
+            .clear();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("profile '' is unsupported"));
+    }
+
+    #[test]
+    fn validate_microvm_console_contract_rejects_attachment_change() {
+        let contract = generated_console_contract();
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        let mut expected = contract;
+        expected.attachments[0].identity = b"127.0.0.1:6666".to_vec();
+        let error = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
+        assert!(error.to_string().contains("attachment inventory"));
+    }
+
     #[test]
     fn validate_microvm_machine_contract_ok() {
         let mut manifest = test_manifest();
@@ -4028,10 +4877,10 @@ mod tests {
         let mut manifest = test_manifest();
         let expected = test_machine_contract();
         let mut contract = expected.clone();
-        contract.microvm_abi_version = 0;
+        contract.microvm_abi_version = 1;
         manifest.machine_contract = Some(contract);
         let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
-        assert!(err.to_string().contains("ABI version 0 is unsupported"));
+        assert!(err.to_string().contains("ABI version 1 is unsupported"));
     }
 
     #[test]
@@ -4104,13 +4953,62 @@ mod tests {
         let mut manifest = test_manifest();
         let expected = test_machine_contract();
         let mut contract = expected.clone();
-        contract.pvh_layout_version = 0;
+        contract.pvh_layout_version = 1;
         manifest.machine_contract = Some(contract);
         let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
         assert!(
             err.to_string()
-                .contains("PVH layout version 0 is unsupported")
+                .contains("PVH layout version 1 is unsupported")
         );
+    }
+
+    #[test]
+    fn microvm_snapshot_topology_is_canonical() {
+        for processor_count in [1, 2, 4, 8] {
+            let topology = microvm_snapshot_topology(processor_count).unwrap();
+            assert_eq!(topology.sockets, 1);
+            assert_eq!(topology.dies_per_socket, 1);
+            assert_eq!(topology.cores_per_die, processor_count);
+            assert_eq!(topology.threads_per_core, 1);
+            assert_eq!(topology.apic_ids, (0..processor_count).collect::<Vec<_>>());
+            assert_eq!(MICROVM_PVH_LAYOUT_VERSION, 2);
+        }
+
+        for processor_count in [0, 3, 5, 16] {
+            assert!(microvm_snapshot_topology(processor_count).is_err());
+        }
+    }
+
+    #[test]
+    fn microvm_snapshot_identifies_shared_status_page() {
+        let contract = test_machine_contract();
+        let mut manifest = test_manifest();
+        manifest.machine_contract = Some(contract.clone());
+
+        validate_microvm_machine_contract(&manifest, &contract).unwrap();
+
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .virtio_shared_status_page_gpa += 0x1000;
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shared-status interrupt contract")
+        );
+    }
+
+    #[test]
+    fn validate_microvm_snapshot_rejects_noncanonical_apic_ids() {
+        let mut manifest = test_manifest();
+        let mut contract = test_machine_contract();
+        contract.topology.apic_ids = vec![0, 2];
+        manifest.machine_contract = Some(contract.clone());
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(error.to_string().contains("not canonical"));
     }
 
     #[test]
@@ -4130,7 +5028,7 @@ mod tests {
         let contract = test_machine_contract();
         manifest.machine_contract = Some(contract.clone());
         let mut expected = contract;
-        expected.topology.apic_ids[0] = 1;
+        expected.topology.apic_ids.swap(0, 1);
         let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
         assert!(err.to_string().contains("processor topology"));
     }
@@ -4199,6 +5097,141 @@ mod tests {
         assert!(err.to_string().contains("overlap in GPA space"));
     }
 
+    fn expandable_memory_manifest(base_memory: u64, capacity: u64) -> SnapshotManifest {
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = base_memory;
+        let mut contract = test_machine_contract();
+        contract.memory_ranges = canonical_microvm_memory_ranges(base_memory).unwrap();
+        contract.memory_expansion_version = MICROVM_MEMORY_EXPANSION_VERSION;
+        contract.memory_capacity_bytes = capacity;
+        contract.memory_block_size_bytes = MICROVM_MEMORY_BLOCK_SIZE_BYTES;
+        contract.memory_expansion_ranges =
+            canonical_memory_expansion_ranges(base_memory, capacity).unwrap();
+        manifest.machine_contract = Some(contract);
+        manifest
+    }
+
+    #[test]
+    fn restore_memory_targets_select_canonical_prefixes() {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+        let manifest = expandable_memory_manifest(512 * MB, 2 * GB);
+
+        assert_eq!(
+            validate_restore_memory_target(&manifest, 512 * MB).unwrap(),
+            []
+        );
+        assert_eq!(
+            validate_restore_memory_target(&manifest, GB).unwrap(),
+            [SnapshotMemoryExpansionRange {
+                gpa_start: 512 * MB,
+                length: 512 * MB,
+            }]
+        );
+        assert_eq!(
+            validate_restore_memory_target(&manifest, 2 * GB).unwrap(),
+            [SnapshotMemoryExpansionRange {
+                gpa_start: 512 * MB,
+                length: 1536 * MB,
+            }]
+        );
+    }
+
+    #[test]
+    fn restore_memory_target_validation_rejects_invalid_requests() {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+        let manifest = expandable_memory_manifest(512 * MB, 2 * GB);
+
+        assert!(
+            validate_restore_memory_target(&manifest, 384 * MB)
+                .unwrap_err()
+                .to_string()
+                .contains("below snapshot RAM")
+        );
+        assert!(
+            validate_restore_memory_target(&manifest, 640 * MB + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("not aligned")
+        );
+        assert!(
+            validate_restore_memory_target(&manifest, 2 * GB + 128 * MB)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds RAM capacity")
+        );
+    }
+
+    #[test]
+    fn restore_memory_contract_rejects_malformed_and_legacy_snapshots() {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+
+        let mut overlap = expandable_memory_manifest(512 * MB, 2 * GB);
+        overlap
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .memory_expansion_ranges[0]
+            .gpa_start = 256 * MB;
+        assert!(
+            validate_restore_memory_target(&overlap, GB)
+                .unwrap_err()
+                .to_string()
+                .contains("not canonical")
+        );
+
+        let mut version = expandable_memory_manifest(512 * MB, 2 * GB);
+        version
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .memory_expansion_version += 1;
+        assert!(
+            validate_restore_memory_target(&version, GB)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+
+        let mut legacy = test_manifest();
+        legacy.machine_contract = Some(test_machine_contract());
+        assert!(
+            validate_restore_memory_target(&legacy, 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("does not declare")
+        );
+    }
+
+    #[test]
+    fn memory_capacity_contract_rejects_alignment_and_overflow() {
+        const MB: u64 = 1024 * 1024;
+        assert!(canonical_memory_expansion_ranges(512 * MB, 512 * MB - 1).is_err());
+        assert!(
+            microvm_machine_contract(
+                "whp",
+                "console=hvc0".to_owned(),
+                None,
+                false,
+                None,
+                None,
+                Vec::new(),
+                1,
+                512 * MB,
+                Some(512 * MB + 1),
+                Vec::new(),
+                std::time::SystemTime::now().into(),
+                1_000_000_000,
+                Some(1_000_000_000),
+                vec![1],
+            )
+            .is_err()
+        );
+        assert!(canonical_microvm_memory_ranges(u64::MAX).is_err());
+    }
+
     #[test]
     fn write_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -4225,6 +5258,94 @@ mod tests {
 
         // memory.bin should exist in the snapshot directory.
         assert!(snap_dir.join("memory.bin").exists());
+    }
+
+    #[test]
+    fn paired_scratch_is_published_and_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("memory.bin");
+        let scratch_path = dir.path().join("scratch.img");
+        let scratch = vec![0x5a_u8; 1024];
+        std::fs::write(&memory_path, vec![0_u8; 1024]).unwrap();
+        std::fs::write(&scratch_path, &scratch).unwrap();
+        let memory_file = std::fs::File::open(memory_path).unwrap();
+        let scratch_file = std::fs::File::open(scratch_path).unwrap();
+        let manifest = paired_scratch_manifest(&scratch);
+
+        write_snapshot_from_memory_and_scratch_files(
+            &snap_dir,
+            &manifest,
+            b"state",
+            &memory_file,
+            Some(&scratch_file),
+        )
+        .unwrap();
+
+        let read_manifest = read_snapshot_manifest(&snap_dir).unwrap();
+        let verified = open_paired_scratch_file(&snap_dir, &read_manifest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file_sha256(&verified, 1024, SCRATCH_FILE_NAME).unwrap(),
+            manifest.machine_contract.unwrap().microvm_sandbox_blocks[1].identity
+        );
+        drop(verified);
+
+        let published = snap_dir.join(SCRATCH_FILE_NAME);
+        std::fs::write(&published, vec![0xa5_u8; 1024]).unwrap();
+        assert!(
+            open_paired_scratch_file(&snap_dir, &read_manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("digest mismatch")
+        );
+
+        std::fs::write(&published, vec![0_u8; 512]).unwrap();
+        assert!(
+            open_paired_scratch_file(&snap_dir, &read_manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("doesn't match manifest")
+        );
+
+        std::fs::remove_file(&published).unwrap();
+        let error = match read_snapshot_manifest(&snap_dir) {
+            Ok(_) => panic!("snapshot without scratch.img unexpectedly validated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn paired_scratch_digest_mismatch_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let memory_path = dir.path().join("memory.bin");
+        let scratch_path = dir.path().join("scratch.img");
+        let scratch = vec![0x5a_u8; 1024];
+        std::fs::write(&memory_path, vec![0_u8; 1024]).unwrap();
+        std::fs::write(&scratch_path, &scratch).unwrap();
+        let memory_file = std::fs::File::open(memory_path).unwrap();
+        let scratch_file = std::fs::File::open(scratch_path).unwrap();
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks[1]
+            .identity = vec![0xff; SHA256_SIZE];
+
+        let error = write_snapshot_from_memory_and_scratch_files(
+            &snap_dir,
+            &manifest,
+            b"state",
+            &memory_file,
+            Some(&scratch_file),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"));
+        assert!(!snap_dir.exists());
     }
 
     #[test]
@@ -4744,7 +5865,53 @@ mod tests {
         manifest.version = PREVIOUS_MANIFEST_VERSION;
         manifest.format_magic = PREVIOUS_SNAPSHOT_FORMAT_MAGIC.to_vec();
 
-        validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap();
+        validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap();
+    }
+
+    #[test]
+    fn legacy_formats_reject_abi_v2_blocks() {
+        let scratch = vec![0x5a_u8; 1024];
+        for (version, magic) in [
+            (LEGACY_MANIFEST_VERSION, LEGACY_SNAPSHOT_FORMAT_MAGIC),
+            (PREVIOUS_MANIFEST_VERSION, PREVIOUS_SNAPSHOT_FORMAT_MAGIC),
+        ] {
+            let mut manifest = paired_scratch_manifest(&scratch);
+            manifest.version = version;
+            manifest.format_magic = magic.to_vec();
+            manifest.snapshot_tier.clear();
+            manifest.restore_policy.clear();
+            manifest.consumed_config_sections = 0;
+            if version == LEGACY_MANIFEST_VERSION {
+                manifest.state_sha256 = vec![0; SHA256_SIZE];
+                manifest.memory_sha256 = vec![0; SHA256_SIZE];
+            }
+            let error = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot contain microVM sandbox blocks")
+            );
+        }
+    }
+
+    #[test]
+    fn abi_v2_contract_rejects_scratch_without_a_lower_layer() {
+        let scratch = vec![0x5a_u8; 1024];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .microvm_sandbox_blocks
+            .remove(0);
+        let contract = manifest.machine_contract.clone().unwrap();
+
+        let error = validate_microvm_machine_contract(&manifest, &contract).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("one to three layers and scratch")
+        );
     }
 
     #[test]
@@ -4892,6 +6059,47 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn resume_claim_targets_opened_directory_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().join("snap");
+        let moved_dir = dir.path().join("opened-snapshot");
+        let memory_source = dir.path().join("memory-source.bin");
+        let scratch_source = dir.path().join("scratch-source.bin");
+        let scratch = vec![0x5a_u8; 512];
+        std::fs::write(&memory_source, vec![0_u8; 1024]).unwrap();
+        std::fs::write(&scratch_source, &scratch).unwrap();
+        let memory_file = std::fs::File::open(&memory_source).unwrap();
+        let scratch_file = std::fs::File::open(&scratch_source).unwrap();
+        let mut manifest = paired_scratch_manifest(&scratch);
+        manifest.snapshot_tier = SNAPSHOT_TIER_INSTANCE_CHECKPOINT.to_owned();
+        manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_RESUME.to_owned();
+        manifest
+            .machine_contract
+            .as_mut()
+            .unwrap()
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=instance-checkpoint".to_owned(),
+            );
+        write_snapshot_from_memory_and_scratch_files(
+            &snap_dir,
+            &manifest,
+            b"state",
+            &memory_file,
+            Some(&scratch_file),
+        )
+        .unwrap();
+
+        let snapshot = OpenedSnapshot::open(&snap_dir).unwrap();
+        std::fs::rename(&snap_dir, &moved_dir).unwrap();
+        std::fs::create_dir(&snap_dir).unwrap();
+        snapshot.claim_for_restore().unwrap();
+
+        assert!(moved_dir.join(RESUME_CLAIM_FILE_NAME).exists());
+        assert!(!snap_dir.join(RESUME_CLAIM_FILE_NAME).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn opened_snapshot_detects_same_length_memory_write_before_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let snap_dir = dir.path().join("snap");
@@ -4991,13 +6199,13 @@ mod tests {
     #[test]
     fn validate_manifest_ok() {
         let manifest = test_manifest();
-        validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap();
+        validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap();
     }
 
     #[test]
     fn validate_manifest_wrong_arch() {
         let manifest = test_manifest();
-        let err = validate_manifest(&manifest, "aarch64", 1024, 1, 4096).unwrap_err();
+        let err = validate_manifest(&manifest, "aarch64", 1024, 2, 4096).unwrap_err();
         assert!(
             err.to_string().contains("architecture"),
             "unexpected error: {err}"
@@ -5007,7 +6215,7 @@ mod tests {
     #[test]
     fn validate_manifest_wrong_memory_size() {
         let manifest = test_manifest();
-        let err = validate_manifest(&manifest, "x86_64", 9999, 1, 4096).unwrap_err();
+        let err = validate_manifest(&manifest, "x86_64", 9999, 2, 4096).unwrap_err();
         assert!(
             err.to_string().contains("memory size"),
             "unexpected error: {err}"
@@ -5027,7 +6235,7 @@ mod tests {
     #[test]
     fn validate_manifest_wrong_page_size() {
         let manifest = test_manifest();
-        let err = validate_manifest(&manifest, "x86_64", 1024, 1, 65536).unwrap_err();
+        let err = validate_manifest(&manifest, "x86_64", 1024, 2, 65536).unwrap_err();
         assert!(
             err.to_string().contains("page size"),
             "unexpected error: {err}"
@@ -5038,7 +6246,7 @@ mod tests {
     fn validate_manifest_wrong_version() {
         let mut manifest = test_manifest();
         manifest.version = 999;
-        let err = validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap_err();
+        let err = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
         assert!(
             err.to_string().contains("version"),
             "unexpected error: {err}"
@@ -5049,7 +6257,7 @@ mod tests {
     fn validate_manifest_wrong_magic() {
         let mut manifest = test_manifest();
         manifest.format_magic = b"NOT_OPENVMM".to_vec();
-        let err = validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap_err();
+        let err = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
         assert!(err.to_string().contains("format magic"));
     }
 
@@ -5057,7 +6265,7 @@ mod tests {
     fn validate_manifest_wrong_saved_state_schema() {
         let mut manifest = test_manifest();
         manifest.saved_state_schema_version += 1;
-        let err = validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap_err();
+        let err = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
         assert!(err.to_string().contains("schema version"));
     }
 
@@ -5065,23 +6273,7 @@ mod tests {
     fn validate_manifest_wrong_saved_state_root() {
         let mut manifest = test_manifest();
         manifest.saved_state_root_type = "other.SavedState".to_owned();
-        let err = validate_manifest(&manifest, "x86_64", 1024, 1, 4096).unwrap_err();
+        let err = validate_manifest(&manifest, "x86_64", 1024, 2, 4096).unwrap_err();
         assert!(err.to_string().contains("root type"));
-    }
-    #[test]
-    fn microvm_snapshot_topology_is_canonical() {
-        for processor_count in [1, 2, 4, 8] {
-            let topology = microvm_snapshot_topology(processor_count).unwrap();
-            assert_eq!(topology.sockets, 1);
-            assert_eq!(topology.dies_per_socket, 1);
-            assert_eq!(topology.cores_per_die, processor_count);
-            assert_eq!(topology.threads_per_core, 1);
-            assert_eq!(topology.apic_ids, (0..processor_count).collect::<Vec<_>>());
-            assert_eq!(MICROVM_PVH_LAYOUT_VERSION, 2);
-        }
-
-        for processor_count in [0, 3, 5, 16] {
-            assert!(microvm_snapshot_topology(processor_count).is_err());
-        }
     }
 }

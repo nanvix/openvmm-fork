@@ -25,6 +25,12 @@ describes the source definitions.
   capture terminates the source; rollback-safe failures resume it.
 * `--snapshot-quiesce-timeout-ms <MILLISECONDS>`: Bound host-input fencing and
   device quiescence. Defaults to 5000 milliseconds.
+* `--microvm-sandbox-block <ROLE:DISK>`: Attach fixed `distro`, `runtime`,
+  `custom`, or `scratch` roles. Lower layers are read-only; scratch is writable.
+* `--snapshot-tier <platform|workload-start|instance-checkpoint>`: Select
+  configuration-consumption and scratch policy for sandbox capture. Platform
+  snapshots are reusable with fresh scratch; workload-start snapshots clone
+  paired scratch; instance checkpoints use a single-use resume claim.
 * `--restore-entropy`: Supply a fresh private entropy packet during snapshot
   restore. Generation IDs are fresh for every microVM instance independently
   of serialized console input.

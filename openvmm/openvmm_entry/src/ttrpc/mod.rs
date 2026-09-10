@@ -898,7 +898,7 @@ impl VmService {
                     LoadMode::Pvh {
                         kernel,
                         initrd,
-                        cmdline: build_microvm_command_line(&[boot.kernel_cmdline])?,
+                        cmdline: build_microvm_command_line(&[boot.kernel_cmdline], false)?,
                     },
                     vm_manifest_builder::BaseChipsetType::Microvm,
                     None,
@@ -1090,6 +1090,11 @@ impl VmService {
         };
 
         let mut config = Config {
+            microvm_sandbox_blocks: Vec::new(),
+            microvm_filesystem_bootstrap: false,
+            microvm_memory_capacity: None,
+            microvm_snapshot_memory_ranges: Vec::new(),
+            microvm_restore_memory_ranges: Vec::new(),
             microvm_filesystem: None,
             microvm_network: None,
             // TODO: devices, other stuff
@@ -1182,7 +1187,18 @@ impl VmService {
                 let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
                     unreachable!("microVM was validated with pvh_boot");
                 };
-                openvmm_defs::config::append_microvm_virtio_blk_discovery(cmdline)?;
+                anyhow::ensure!(
+                    config.virtio_devices.is_empty(),
+                    "microVM block devices require the fixed-role sandbox configuration"
+                );
+                openvmm_defs::config::append_microvm_virtio_discovery(
+                    cmdline,
+                    None,
+                    false,
+                    None,
+                    false,
+                    &[],
+                )?;
             }
             if !devices_config.scsi_disks.is_empty() {
                 let mut devices = Vec::new();
@@ -1343,6 +1359,10 @@ impl VmService {
 
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
+            snapshot_tier: None,
+            memory_capacity: None,
+            microvm_sandbox_block_sources: Vec::new(),
+            _private_scratch_dir: None,
             microvm_console_attachment: None,
             microvm_filesystem: None,
             microvm_filesystem_slot: false,
