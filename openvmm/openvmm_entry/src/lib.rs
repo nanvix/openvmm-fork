@@ -1244,6 +1244,14 @@ async fn vm_config_from_command_line(
     opt.validate_isolation_options()?;
     opt.validate_igvm_options()?;
     opt.validate_microvm_options()?;
+    let microvm_filesystem_slot = if is_microvm {
+        restore_machine_contract
+            .map(microvm_filesystem_slot_from_snapshot)
+            .transpose()?
+            .unwrap_or(true)
+    } else {
+        false
+    };
     let effective_microvm_filesystem = if is_microvm {
         effective_microvm_filesystem(opt.microvm_mount.as_ref(), restore_machine_contract)?
     } else {
@@ -3016,20 +3024,33 @@ async fn vm_config_from_command_line(
         );
     }
 
-    if let Some(filesystem) = &effective_microvm_filesystem {
-        add_virtio_device(
-            VirtioBusCli::Mmio,
-            virtio_resources::fs::VirtioFsHandle {
-                tag: "microvm".to_owned(),
-                fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+    if microvm_filesystem_slot {
+        let (fs, profile) = if let Some(filesystem) = &effective_microvm_filesystem {
+            (
+                virtio_resources::fs::VirtioFsBackend::HostFs {
                     root_path: filesystem.root_path.clone(),
                     mount_options: String::new(),
                 },
-                profile: virtio_resources::fs::VirtioFsProfile::Microvm {
+                virtio_resources::fs::VirtioFsProfile::Microvm {
                     stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
                     root_identity: filesystem.attachment.identity.clone(),
                     read_only: filesystem.config.access.is_read_only(),
                 },
+            )
+        } else {
+            (
+                virtio_resources::fs::VirtioFsBackend::Dormant,
+                virtio_resources::fs::VirtioFsProfile::MicrovmDormant {
+                    stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
+                },
+            )
+        };
+        add_virtio_device(
+            VirtioBusCli::Mmio,
+            virtio_resources::fs::VirtioFsHandle {
+                tag: "microvm".to_owned(),
+                fs,
+                profile,
             }
             .into_resource(),
         );
@@ -4282,6 +4303,10 @@ async fn run_control_inner(
         _ => None,
     };
     let microvm_console_attachment = resources.microvm_console_attachment.clone();
+    let microvm_filesystem_slot = vm_config
+        .virtio_devices
+        .iter()
+        .any(|(_, device)| device.id() == "virtiofs");
     let microvm_filesystem = vm_config.microvm_filesystem.clone();
     let microvm_filesystem_root_path = resources.microvm_filesystem_root_path.clone();
     let microvm_filesystem_attachment = resources.microvm_filesystem_attachment.clone();
@@ -4639,6 +4664,7 @@ async fn run_control_inner(
         }),
         microvm_console_attachment,
         microvm_filesystem,
+        microvm_filesystem_slot,
         microvm_filesystem_root_path,
         microvm_filesystem_attachment,
         microvm_network,
@@ -5344,5 +5370,85 @@ mod microvm_console_attachment_tests {
             None,
         )
         .unwrap();
+    }
+    fn dormant_filesystem_contract() -> openvmm_helpers::snapshot::SnapshotMachineContract {
+        let command_line =
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0001000:6"
+                .to_owned();
+        let mut contract = openvmm_helpers::snapshot::microvm_machine_contract(
+            if cfg!(windows) { "whp" } else { "kvm" },
+            command_line,
+            None,
+            1,
+            1024,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtiofs-3489665024",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap();
+        openvmm_helpers::snapshot::reserve_microvm_filesystem_slot(&mut contract);
+        contract
+    }
+
+    #[test]
+    fn filesystem_restore_without_mount_preserves_dormant_slot() {
+        let contract = dormant_filesystem_contract();
+        assert!(
+            effective_microvm_filesystem(None, Some(&contract))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filesystem_restore_attaches_mount_to_dormant_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let contract = dormant_filesystem_contract();
+        let options = restore_mount_options(root.path(), "rw");
+        let filesystem =
+            effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract))
+                .unwrap()
+                .unwrap();
+        assert_eq!(filesystem.config.guest_mount_target, "/mnt/share");
+        assert_eq!(
+            filesystem.config.access,
+            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+        );
+        assert_eq!(
+            filesystem.root_path,
+            fs_err::canonicalize(root.path()).unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn filesystem_restore_rejects_mount_for_legacy_snapshot_without_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let contract = network_contract();
+        let options = restore_mount_options(root.path(), "ro");
+        let error =
+            match effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract)) {
+                Err(error) => error,
+                Ok(_) => panic!("legacy snapshot unexpectedly accepted a restore-time mount"),
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("does not support restore-time microVM filesystem attachment")
+        );
     }
 }
