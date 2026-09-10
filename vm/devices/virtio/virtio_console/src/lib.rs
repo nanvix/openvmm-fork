@@ -279,10 +279,22 @@ impl VirtioDevice for VirtioConsoleDevice {
         state.input_gated = false;
         state.mem = GuestMemory::empty();
         if let ConsoleWorkerMode::Broker(mode) = &mut worker.mode {
+            // Linux resets a newly discovered virtio device before starting its
+            // queues. Preserve a host connection that the broker has not yet
+            // observed; established sessions still require a fresh attachment.
+            let preserve_unstarted_host = mode.broker.state()
+                == control_session_broker::BrokerState::AwaitGuestAttach
+                && !mode.broker.host_is_connected();
             mode.broker.reset_for_device();
             mode.host_input.clear();
             mode.auth_deadline = None;
-            mode.transport_state = if mode.host_io.disconnect_current().is_ok() {
+            mode.transport_state = if preserve_unstarted_host {
+                if mode.host_io.is_connected() {
+                    HostTransportState::Connected
+                } else {
+                    HostTransportState::WaitingForDisconnect
+                }
+            } else if mode.host_io.disconnect_current().is_ok() {
                 HostTransportState::WaitingForConnect
             } else {
                 HostTransportState::WaitingForDisconnect
@@ -1596,6 +1608,10 @@ impl BrokerWorker {
         };
         match Pin::new(&mut *self.host_io).poll_write(cx, &bytes[..count]) {
             Poll::Ready(Ok(0)) => {
+                tracelimit::warn_ratelimited!(
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport returned a zero-length write"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1605,7 +1621,12 @@ impl BrokerWorker {
                     .map_err(WorkerError::Broker)?;
                 Ok(true)
             }
-            Poll::Ready(Err(_)) => {
+            Poll::Ready(Err(error)) => {
+                tracelimit::warn_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport write failed"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1641,6 +1662,10 @@ impl BrokerWorker {
         let mut bytes = [0; BUF_SIZE];
         match Pin::new(&mut *self.host_io).poll_read(cx, &mut bytes) {
             Poll::Ready(Ok(0)) => {
+                tracelimit::warn_ratelimited!(
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport reached EOF"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1648,7 +1673,12 @@ impl BrokerWorker {
                 self.host_input.extend(&bytes[..read]);
                 Ok(true)
             }
-            Poll::Ready(Err(_)) => {
+            Poll::Ready(Err(error)) => {
+                tracelimit::warn_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport read failed"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1677,6 +1707,12 @@ impl BrokerWorker {
             Ok(Some(ref identity)) if identity == &self.config.expected_peer_identity
         ) {
             tracelimit::warn_ratelimited!(
+                identity_status = match &identity {
+                    Ok(Some(_)) => "unexpected",
+                    Ok(None) => "unavailable",
+                    Err(_) => "error",
+                },
+                identity_error = identity.as_ref().err().map(|error| error.to_string()),
                 "control-console host rejected because its local peer identity is unavailable or unexpected"
             );
             self.detach_host()?;

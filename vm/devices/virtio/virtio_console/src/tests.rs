@@ -1629,6 +1629,25 @@ async fn broker_disconnect_emits_reset_without_guest_eof(driver: DefaultDriver) 
 }
 
 #[async_test]
+async fn broker_initial_device_reset_preserves_connected_host(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+
+    harness.device.reset().await;
+    harness.enable().await;
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Wait
+    );
+    assert!(harness.handle.is_connected());
+}
+
+#[async_test]
 async fn broker_device_reset_requires_a_fresh_host_attachment(driver: DefaultDriver) {
     let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
     harness.enable().await;
