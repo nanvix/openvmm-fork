@@ -20,8 +20,10 @@ use fd_passing::FdRegistry;
 struct FdRegistry {}
 
 use crate::cli_args::GuestPowerAction;
+use crate::cli_args::SerialConfigCli;
 use crate::meshworker::VmmMesh;
 use crate::serial_io::bind_serial;
+use crate::serial_io::bind_serial_without_cleanup;
 use crate::serial_io::connect_serial;
 use crate::vm_controller::GuestPowerActions;
 use crate::vm_controller::InspectTarget;
@@ -62,6 +64,7 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MICROVM_ABI_VERSION_2;
 use openvmm_defs::config::MachineProfile as OpenvmmMachineProfile;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
@@ -95,6 +98,9 @@ use scsidisk_resources::SimpleScsiDiskHandle;
 use serial_core::resources::DisconnectedSerialBackendHandle;
 use std::fs::File;
 use std::future::Future;
+use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use storvsp_resources::ScsiControllerHandle;
@@ -379,6 +385,7 @@ impl Worker for TtrpcWorker {
                 controller_task: None,
                 wait_vm_response: None,
                 lifecycle: VmLifecycle::Uninitialized,
+                restore_ready_pending: false,
                 rpc_tasks: Vec::new(),
                 transport: self.transport,
                 registry: FdRegistry::default(),
@@ -496,7 +503,9 @@ impl VmService {
                     break false;
                 }
                 Action::ControllerEvent(Some(event)) => {
-                    self.handle_controller_event(event);
+                    if self.handle_controller_event(event) {
+                        break true;
+                    }
                 }
                 Action::ControllerEvent(None) => {} // handled above
                 Action::WaitVmCancelled(reason) => {
@@ -558,6 +567,32 @@ struct Vm {
     consomme_rpc: Option<mesh::Sender<ConsommeRequest>>,
 }
 
+struct AuthoritativeMicrovmRestore {
+    path: PathBuf,
+    snapshot: Option<openvmm_helpers::snapshot::OpenedSnapshot>,
+    base_memory_size: u64,
+    selected_memory_size: u64,
+    restore_memory_target_requested: bool,
+    restore_memory_ranges: Vec<openvmm_helpers::snapshot::SnapshotMemoryExpansionRange>,
+    vp_count: u32,
+    machine_contract: openvmm_helpers::snapshot::SnapshotMachineContract,
+}
+
+fn openvmm_machine_profile(profile: vmservice::vm_config::MachineProfile) -> OpenvmmMachineProfile {
+    match profile {
+        vmservice::vm_config::MachineProfile::Standard => OpenvmmMachineProfile::Standard,
+        vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm,
+    }
+}
+
+fn ttrpc_machine_profile(abi_version: u32) -> anyhow::Result<vmservice::vm_config::MachineProfile> {
+    anyhow::ensure!(
+        abi_version == MICROVM_ABI_VERSION_2,
+        "unsupported microVM ABI version {abi_version}; this OpenVMM supports version {MICROVM_ABI_VERSION_2}"
+    );
+    Ok(vmservice::vm_config::MachineProfile::Microvm)
+}
+
 enum VmLifecycle {
     Uninitialized,
     Running,
@@ -584,6 +619,7 @@ struct VmService {
     controller_task: Option<Task<()>>,
     wait_vm_response: Option<(mesh::CancelContext, mesh::OneshotSender<Result<(), Status>>)>,
     lifecycle: VmLifecycle,
+    restore_ready_pending: bool,
     rpc_tasks: Vec<Task<()>>,
     transport: ResolvedTransport,
     /// Registry of file descriptors passed in over the fd-passing protocol,
@@ -752,55 +788,413 @@ impl VmService {
     }
 
     async fn create_vm(&mut self, request: vmservice::CreateVmRequest) -> anyhow::Result<()> {
-        let mut req_config = request.config.context("missing configuration")?;
-
         if self.vm.is_some() {
             bail!("VM already created");
         }
+
+        let vmservice::CreateVmRequest {
+            config: requested_config,
+            microvm_snapshot,
+            ..
+        } = request;
+        let vmservice::MicrovmSnapshotConfig {
+            destination_path,
+            restore_path,
+            restore_entropy,
+            quiesce_timeout_ms,
+            restore_ready_path,
+            restore_processor_count,
+            restore_gate_timeout_ms,
+            memory_capacity_bytes,
+            restore_memory_bytes,
+        } = microvm_snapshot.unwrap_or_default();
+        let restore_online_vp_count =
+            (restore_processor_count != 0).then_some(restore_processor_count);
+        let restore_gate_timeout = Duration::from_millis(if restore_gate_timeout_ms == 0 {
+            60_000
+        } else {
+            restore_gate_timeout_ms
+        });
+        let resolve_path = |value: String| -> anyhow::Result<Option<PathBuf>> {
+            if value.is_empty() {
+                return Ok(None);
+            }
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                Ok(Some(path))
+            } else {
+                Ok(Some(
+                    std::env::current_dir()
+                        .context("failed to resolve current directory")?
+                        .join(path),
+                ))
+            }
+        };
+        let snapshot_destination = resolve_path(destination_path)?;
+        let restore_path = resolve_path(restore_path)?;
+        anyhow::ensure!(
+            snapshot_destination.is_none() || restore_path.is_none(),
+            "snapshot capture and restore paths are mutually exclusive"
+        );
+        anyhow::ensure!(
+            !restore_entropy || restore_path.is_some(),
+            "restore_entropy requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_online_vp_count.is_none() || restore_path.is_some(),
+            "restore_processor_count requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_gate_timeout_ms == 0 || restore_path.is_some(),
+            "restore_gate_timeout_ms requires restore_path"
+        );
+        anyhow::ensure!(
+            memory_capacity_bytes == 0 || snapshot_destination.is_some(),
+            "memory_capacity_bytes requires destination_path"
+        );
+        anyhow::ensure!(
+            restore_memory_bytes == 0 || restore_path.is_some(),
+            "restore_memory_bytes requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_ready_path.is_empty() || restore_path.is_some(),
+            "restore_ready_path requires restore_path"
+        );
+        anyhow::ensure!(
+            quiesce_timeout_ms == 0 || snapshot_destination.is_some(),
+            "quiesce_timeout_ms requires destination_path"
+        );
+        let snapshot_quiesce_timeout = Duration::from_millis(if quiesce_timeout_ms == 0 {
+            5_000
+        } else {
+            quiesce_timeout_ms
+        });
+
+        let mut authoritative_restore = if let Some(path) = restore_path {
+            let snapshot = openvmm_helpers::snapshot::OpenedSnapshot::open(&path)?;
+            let manifest = snapshot.manifest();
+            openvmm_helpers::snapshot::validate_manifest(
+                manifest,
+                crate::GUEST_ARCH,
+                manifest.memory_size_bytes,
+                manifest.vp_count,
+                crate::system_page_size(),
+            )?;
+            let machine_contract = manifest
+                .machine_contract
+                .as_ref()
+                .context("microVM snapshot is missing its authoritative machine contract")?;
+            anyhow::ensure!(
+                machine_contract.machine_profile == "microvm",
+                "snapshot machine profile is not microvm"
+            );
+            openvmm_helpers::snapshot::validate_supported_microvm_contract(machine_contract)?;
+            anyhow::ensure!(
+                machine_contract.microvm_sandbox_blocks.is_empty(),
+                "TTRPC restore does not support microVM sandbox-block snapshots"
+            );
+            let base_memory_size = manifest.memory_size_bytes;
+            let restore_memory_target_requested = restore_memory_bytes != 0;
+            let selected_memory_size = if !restore_memory_target_requested {
+                base_memory_size
+            } else {
+                restore_memory_bytes
+            };
+            let restore_memory_ranges = if !restore_memory_target_requested {
+                Vec::new()
+            } else {
+                openvmm_helpers::snapshot::validate_restore_memory_target(
+                    manifest,
+                    selected_memory_size,
+                )?
+            };
+            let vp_count = manifest.vp_count;
+            if let Some(restore_online_vp_count) = restore_online_vp_count {
+                openvmm_helpers::snapshot::validate_restore_online_vp_count(
+                    manifest,
+                    restore_online_vp_count,
+                )?;
+            }
+            let machine_contract = machine_contract.clone();
+            Some(AuthoritativeMicrovmRestore {
+                path,
+                snapshot: Some(snapshot),
+                base_memory_size,
+                selected_memory_size,
+                restore_memory_target_requested,
+                restore_memory_ranges,
+                vp_count,
+                machine_contract,
+            })
+        } else {
+            None
+        };
+
+        let mut restore_console_config = None;
+        let mut restore_filesystem_config = None;
+        let mut req_config = if let Some(restore) = &authoritative_restore {
+            let restore_profile =
+                ttrpc_machine_profile(restore.machine_contract.microvm_abi_version)?;
+            let requested = requested_config.unwrap_or_else(|| vmservice::VmConfig {
+                machine_profile: restore_profile as i32,
+                ..Default::default()
+            });
+            anyhow::ensure!(
+                requested.machine_profile == restore_profile as i32,
+                "microVM snapshot restore requires the matching microVM ABI profile"
+            );
+            anyhow::ensure!(
+                requested.memory_config.is_none()
+                    && requested.boot_config.is_none()
+                    && requested.windows_options.is_none()
+                    && requested.hvsocket_config.is_none()
+                    && requested.numa_config.is_none()
+                    && requested.pcie.is_none(),
+                "restore configuration may contain only processor identity, serial attachments, and guest power actions"
+            );
+            if let Some(processors) = &requested.processor_config {
+                anyhow::ensure!(
+                    processors.processor_count == restore.vp_count
+                        && processors.processor_weight == 0
+                        && processors.processor_limit == 0,
+                    "restore processor count does not match the snapshot"
+                );
+            }
+            if let Some(devices) = &requested.devices_config {
+                anyhow::ensure!(
+                    devices.scsi_disks.is_empty()
+                        && devices.vpmem_disks.is_empty()
+                        && devices.nic_config.is_empty()
+                        && devices.windows_device.is_empty()
+                        && devices.virtiofs_config.len() <= 1,
+                    "restore devices_config may contain only one virtio-fs and one virtio-console attachment"
+                );
+                restore_console_config = devices.virtio_console.clone();
+                restore_filesystem_config = devices.virtiofs_config.first().cloned();
+            }
+            vmservice::VmConfig {
+                serial_config: requested.serial_config,
+                guest_power_actions: requested.guest_power_actions,
+                machine_profile: restore_profile as i32,
+                ..Default::default()
+            }
+        } else {
+            requested_config.context("missing configuration")?
+        };
 
         let requested_profile =
             vmservice::vm_config::MachineProfile::from_i32(req_config.machine_profile)
                 .with_context(|| {
                     format!("unknown machine profile {}", req_config.machine_profile)
                 })?;
-        let machine_profile = match requested_profile {
-            vmservice::vm_config::MachineProfile::Standard => OpenvmmMachineProfile::Standard,
-            vmservice::vm_config::MachineProfile::Microvm => OpenvmmMachineProfile::Microvm,
+        let machine_profile = openvmm_machine_profile(requested_profile);
+        let is_microvm = machine_profile == OpenvmmMachineProfile::Microvm;
+        let effective_processor_count = authoritative_restore
+            .as_ref()
+            .map(|restore| restore.vp_count)
+            .or_else(|| {
+                req_config
+                    .processor_config
+                    .as_ref()
+                    .map(|config| config.processor_count)
+            })
+            .unwrap_or(1);
+        anyhow::ensure!(
+            is_microvm || (snapshot_destination.is_none() && authoritative_restore.is_none()),
+            "microVM snapshot options require the microVM machine profile"
+        );
+        let hypervisor = if is_microvm {
+            openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
+        } else {
+            openvmm_helpers::hypervisor::choose_hypervisor()?
         };
-        let is_microvm = matches!(machine_profile, OpenvmmMachineProfile::Microvm);
+        let source_hypervisor = hypervisor.id().to_owned();
+        if let Some(restore) = &authoritative_restore {
+            anyhow::ensure!(
+                restore.machine_contract.source_hypervisor == source_hypervisor,
+                "snapshot source hypervisor '{}' does not match destination '{}'",
+                restore.machine_contract.source_hypervisor,
+                source_hypervisor
+            );
+        }
+        let microvm_filesystem_slot = if let Some(restore) = &authoritative_restore {
+            crate::microvm_filesystem_slot_from_snapshot(&restore.machine_contract)?
+        } else {
+            is_microvm
+        };
+        let restored_microvm_filesystem = if let Some(restore) = &authoritative_restore {
+            let saved_policy = restore.machine_contract.microvm_filesystem.as_ref();
+            let saved_attachment = restore
+                .machine_contract
+                .attachments
+                .iter()
+                .find(|attachment| attachment.stable_id == "fs:microvm0");
+            anyhow::ensure!(
+                saved_policy.is_some() == saved_attachment.is_some()
+                    && (restore.machine_contract.microvm_filesystem_slot_version
+                        == openvmm_helpers::snapshot::MICROVM_FILESYSTEM_SLOT_VERSION
+                        || microvm_filesystem_slot == saved_policy.is_some()),
+                "snapshot microVM filesystem slot, policy, and attachment inventories disagree"
+            );
+            match (saved_policy, saved_attachment) {
+                (Some(saved_policy), Some(saved_attachment)) => {
+                    let requested = restore_filesystem_config.as_ref().context(
+                        "snapshot restore requires a fresh virtiofs_config attachment for fs:microvm0",
+                    )?;
+                    let config = crate::microvm_filesystem_from_snapshot(saved_policy)?;
+                    anyhow::ensure!(
+                        requested.tag == "microvm"
+                            && requested.guest_mount_target == config.guest_mount_target
+                            && requested.read_write != config.access.is_read_only()
+                            && !requested.root_path.is_empty(),
+                        "restore-time virtiofs_config does not match the snapshot policy"
+                    );
+                    let (root_path, attachment) =
+                        crate::microvm_filesystem_attachment(Path::new(&requested.root_path))?;
+                    anyhow::ensure!(
+                        !saved_policy.canonical_host_path.is_empty(),
+                        "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
+                    );
+                    anyhow::ensure!(
+                        root_path == saved_policy.canonical_host_path,
+                        "restore-time filesystem canonical host path does not match the snapshot contract"
+                    );
+                    anyhow::ensure!(
+                        &attachment == saved_attachment,
+                        "restore-time filesystem root identity does not match the snapshot attachment"
+                    );
+                    Some((config, root_path, attachment))
+                }
+                (None, None) => {
+                    if let Some(requested) = restore_filesystem_config.as_ref() {
+                        anyhow::ensure!(
+                            restore.machine_contract.microvm_filesystem_slot_version
+                                == openvmm_helpers::snapshot::MICROVM_FILESYSTEM_SLOT_VERSION,
+                            "snapshot does not support restore-time microVM filesystem attachment"
+                        );
+                        anyhow::ensure!(
+                            requested.tag == "microvm" && !requested.root_path.is_empty(),
+                            "restore-time virtiofs_config does not match the fixed microVM slot"
+                        );
+                        let config = openvmm_defs::config::MicrovmFilesystemConfig::new(
+                            requested.guest_mount_target.clone(),
+                            if requested.read_write {
+                                openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+                            } else {
+                                openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+                            },
+                        )?;
+                        let (root_path, attachment) =
+                            crate::microvm_filesystem_attachment(Path::new(&requested.root_path))?;
+                        Some((config, root_path, attachment))
+                    } else {
+                        None
+                    }
+                }
+                _ => anyhow::bail!(
+                    "snapshot microVM filesystem policy and attachment inventories disagree"
+                ),
+            }
+        } else {
+            None
+        };
+        let prepared_restore = if let Some(restore) = &mut authoritative_restore {
+            anyhow::ensure!(
+                restore.machine_contract.microvm_network.is_none(),
+                "ttrpc restore does not yet expose microVM network attachments"
+            );
+            let prepared = crate::prepare_snapshot_restore_for_config(
+                restore
+                    .snapshot
+                    .take()
+                    .context("snapshot restore is missing its opened generation")?,
+                restore.base_memory_size,
+                restore.selected_memory_size,
+                restore.vp_count,
+                Some((
+                    &source_hypervisor,
+                    &restore.machine_contract.effective_command_line,
+                    None,
+                    restored_microvm_filesystem
+                        .as_ref()
+                        .map(|(config, root_path, attachment)| {
+                            (config, Path::new(root_path), attachment)
+                        }),
+                    restore
+                        .machine_contract
+                        .attachments
+                        .iter()
+                        .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
+                    restore.machine_contract.microvm_sandbox_blocks.clone(),
+                )),
+            )?;
+            let restore_time = prepared
+                .restore_time
+                .context("microVM snapshot is missing its restore-time contract")?;
+            if !restore_entropy
+                && restore_online_vp_count.is_none()
+                && !restore.restore_memory_target_requested
+            {
+                tracing::warn!(
+                    "restoring cloned guest RNG state without fresh entropy injection; cryptographic workloads are unsafe"
+                );
+            }
+            Some((
+                prepared.shared_memory,
+                prepared.guards,
+                prepared.saved_state,
+                restore_time,
+            ))
+        } else {
+            None
+        };
+        let restore_ready_sink = if restore_ready_path.is_empty() {
+            None
+        } else {
+            Some(
+                crate::serial_io::connect_restore_ready_sink(Path::new(&restore_ready_path))
+                    .context("failed to connect restore readiness endpoint")?,
+            )
+        };
+        let restore_ready_required = restore_ready_sink.is_some();
+        let (microvm_snapshot_notify, microvm_snapshot_requests) = if is_microvm {
+            let (notify, requests) = mesh::channel();
+            (Some(notify), Some(requests))
+        } else {
+            (None, None)
+        };
+        let (snapshot_ready, snapshot_requests) = if is_microvm {
+            let (ready, requests) = mesh::channel();
+            (Some(ready), Some(requests))
+        } else {
+            (None, None)
+        };
         if is_microvm {
             anyhow::ensure!(
                 cfg!(guest_arch = "x86_64"),
                 "microVM requires an x86-64 guest"
             );
+            if authoritative_restore.is_none() {
+                anyhow::ensure!(
+                    matches!(
+                        req_config.boot_config.as_ref(),
+                        Some(vmservice::vm_config::BootConfig::PvhBoot(_))
+                    ),
+                    "the microVM profile requires pvh_boot"
+                );
+            }
             anyhow::ensure!(
-                matches!(
-                    req_config.boot_config.as_ref(),
-                    Some(vmservice::vm_config::BootConfig::PvhBoot(_))
-                ),
-                "the microVM profile requires pvh_boot"
-            );
-            anyhow::ensure!(
-                openvmm_defs::config::microvm_processor_count_supported(
-                    req_config
-                        .processor_config
-                        .as_ref()
-                        .map(|config| config.processor_count)
-                        .unwrap_or(1)
-                ),
-                "microVM supports only 1, 2, 4, or 8 vCPUs"
+                openvmm_defs::config::microvm_processor_count_supported(effective_processor_count),
+                "microVM does not support {effective_processor_count} vCPUs"
             );
             anyhow::ensure!(
                 req_config.numa_config.is_none(),
-                "microVM ABI version 2 does not support custom NUMA topology"
+                "microVM does not support custom NUMA topology"
             );
-            anyhow::ensure!(
-                req_config.pcie.is_none(),
-                "microVM ABI version 2 does not support PCIe"
-            );
+            anyhow::ensure!(req_config.pcie.is_none(), "microVM does not support PCIe");
             anyhow::ensure!(
                 req_config.hvsocket_config.is_none(),
-                "microVM ABI version 2 does not support hvsocket"
+                "microVM does not support hvsocket"
             );
 
             let serial_ports = req_config
@@ -810,7 +1204,7 @@ impl VmService {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 serial_ports.len() <= 1 && serial_ports.iter().all(|port| port.port == 0),
-                "microVM ABI version 2 accepts only serial port 0 as its portb endpoint"
+                "microVM accepts only serial port 0 as its portb endpoint"
             );
             if let Some(devices) = &req_config.devices_config {
                 anyhow::ensure!(
@@ -818,10 +1212,29 @@ impl VmService {
                         && devices.vpmem_disks.is_empty()
                         && devices.nic_config.is_empty()
                         && devices.windows_device.is_empty()
-                        && devices.virtiofs_config.is_empty()
-                        && devices.virtio_console.is_none(),
-                    "microVM ABI version 2 supports only the optional virtio-blk device"
+                        && devices.virtiofs_config.len() <= 1,
+                    "microVM supports only one fixed virtio-fs and one fixed virtio-console device"
                 );
+                if let Some(filesystem) = devices.virtiofs_config.first() {
+                    anyhow::ensure!(
+                        filesystem.tag == "microvm" && !filesystem.root_path.is_empty(),
+                        "microVM virtio-fs requires tag 'microvm' and a host root path"
+                    );
+                    openvmm_defs::config::MicrovmFilesystemConfig::new(
+                        filesystem.guest_mount_target.clone(),
+                        if filesystem.read_write {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+                        } else {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+                        },
+                    )?;
+                }
+                if let Some(console) = &devices.virtio_console {
+                    anyhow::ensure!(
+                        !console.socket_path.is_empty(),
+                        "microVM virtio-console requires a socket path"
+                    );
+                }
             }
         }
         // Snapshot the fd registry so tap NIC backends can resolve descriptors
@@ -843,6 +1256,13 @@ impl VmService {
         }
         let any_serial_configured = ports.iter().any(|port| port.is_some());
         let com1_configured = ports[0].is_some();
+        let has_requested_microvm_console = is_microvm
+            && authoritative_restore.is_none()
+            && req_config
+                .devices_config
+                .as_ref()
+                .and_then(|devices| devices.virtio_console.as_ref())
+                .is_some();
 
         #[cfg(guest_arch = "aarch64")]
         let arch = vm_manifest_builder::MachineArch::Aarch64;
@@ -855,64 +1275,82 @@ impl VmService {
 
         // The boot configuration also determines the base chipset, since the
         // firmware and the device model have to agree on the platform.
-        let (load_mode, base_chipset_type, uefi_config) = match req_config
-            .boot_config
-            .take()
-            .context("missing boot configuration")?
+        let (load_mode, base_chipset_type, uefi_config) = if let Some(restore) =
+            &authoritative_restore
         {
-            vmservice::vm_config::BootConfig::DirectBoot(boot) => {
-                if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
-                    bail!("the microVM profile requires pvh_boot");
+            (
+                LoadMode::Pvh {
+                    kernel: tempfile::tempfile()
+                        .context("failed to create inert restore kernel handle")?,
+                    initrd: None,
+                    cmdline: restore.machine_contract.effective_command_line.clone(),
+                },
+                vm_manifest_builder::BaseChipsetType::Microvm,
+                None,
+            )
+        } else {
+            match req_config
+                .boot_config
+                .take()
+                .context("missing boot configuration")?
+            {
+                vmservice::vm_config::BootConfig::DirectBoot(boot) => {
+                    if machine_profile == OpenvmmMachineProfile::Microvm {
+                        bail!("the microVM profile requires pvh_boot");
+                    }
+                    let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
+                    let initrd = if boot.initrd_path.is_empty() {
+                        None
+                    } else {
+                        Some(File::open(boot.initrd_path).context("failed to open initrd")?)
+                    };
+                    (
+                        LoadMode::Linux {
+                            kernel,
+                            initrd,
+                            cmdline: boot.kernel_cmdline,
+                            enable_serial: true,
+                            isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                            boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
+                            smbios,
+                        },
+                        vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
+                        None,
+                    )
                 }
-                let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
-                let initrd = if boot.initrd_path.is_empty() {
-                    None
-                } else {
-                    Some(File::open(boot.initrd_path).context("failed to open initrd")?)
-                };
-                (
-                    LoadMode::Linux {
-                        kernel,
-                        initrd,
-                        cmdline: boot.kernel_cmdline,
-                        enable_serial: true,
-                        isolation: openvmm_defs::config::LinuxIsolationConfig::None,
-                        boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
-                        smbios,
-                    },
-                    vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
-                    None,
-                )
-            }
-            vmservice::vm_config::BootConfig::PvhBoot(boot) => {
-                if !matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
-                    bail!("pvh_boot requires the microVM profile");
+                vmservice::vm_config::BootConfig::PvhBoot(boot) => {
+                    if machine_profile != OpenvmmMachineProfile::Microvm {
+                        bail!("pvh_boot requires the microVM profile");
+                    }
+                    let kernel =
+                        File::open(boot.kernel_path).context("failed to open PVH kernel")?;
+                    let initrd = if boot.initrd_path.is_empty() {
+                        None
+                    } else {
+                        Some(File::open(boot.initrd_path).context("failed to open PVH initrd")?)
+                    };
+                    (
+                        LoadMode::Pvh {
+                            kernel,
+                            initrd,
+                            cmdline: build_microvm_command_line(
+                                &[boot.kernel_cmdline],
+                                has_requested_microvm_console,
+                            )?,
+                        },
+                        vm_manifest_builder::BaseChipsetType::Microvm,
+                        None,
+                    )
                 }
-                let kernel = File::open(boot.kernel_path).context("failed to open PVH kernel")?;
-                let initrd = if boot.initrd_path.is_empty() {
-                    None
-                } else {
-                    Some(File::open(boot.initrd_path).context("failed to open PVH initrd")?)
-                };
-                (
-                    LoadMode::Pvh {
-                        kernel,
-                        initrd,
-                        cmdline: build_microvm_command_line(&[boot.kernel_cmdline], false)?,
-                    },
-                    vm_manifest_builder::BaseChipsetType::Microvm,
-                    None,
-                )
-            }
-            vmservice::vm_config::BootConfig::Uefi(uefi) => {
-                if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
-                    bail!("the microVM profile requires pvh_boot");
-                }
-                let firmware = File::open(&uefi.firmware_path).with_context(|| {
-                    format!("failed to open uefi firmware {}", uefi.firmware_path)
-                })?;
-                let initial_variables = uefi.initial_variables.unwrap_or_default();
-                let base_template = match (arch, initial_variables.secure_boot_template()) {
+                vmservice::vm_config::BootConfig::Uefi(uefi) => {
+                    if machine_profile == OpenvmmMachineProfile::Microvm {
+                        bail!("the microVM profile requires pvh_boot");
+                    }
+                    let firmware = File::open(&uefi.firmware_path).with_context(|| {
+                        format!("failed to open uefi firmware {}", uefi.firmware_path)
+                    })?;
+                    let initial_variables = uefi.initial_variables.unwrap_or_default();
+                    let base_template = match (arch, initial_variables.secure_boot_template()) {
                     (_, vmservice::uefi::initial_variables::SecureBootTemplate::None) => {
                         None
                     }
@@ -941,45 +1379,46 @@ impl VmService {
                         firmware_uefi_resources::aarch64_secure_boot_templates::microsoft_uefi_ca(),
                     ),
                 };
-                (
-                    LoadMode::Uefi {
-                        firmware,
-                        enable_serial: any_serial_configured,
-                        // Route the firmware console to COM1 when it is
-                        // available. The firmware's default console is the
-                        // video device, so without this the firmware and
-                        // anything it launches would have nowhere to write on a
-                        // VM with no graphics adapter.
-                        uefi_console_mode: com1_configured.then_some(UefiConsoleMode::Com1),
-                        smbios,
-                        enable_vmbus: true,
-                        // Everything below is fixed for now. The proto has no
-                        // way to express these yet; fields will be added as
-                        // callers need them.
-                        //
-                        // Note that memory protections match the CLI in
-                        // defaulting to off, since Linux currently fails to
-                        // boot with them enabled.
-                        enable_memory_protections: false,
-                        enable_debugging: false,
-                        disable_frontpage: false,
-                        enable_tpm: false,
-                        enable_battery: false,
-                        enable_vpci_boot: false,
-                        default_boot_always_attempt: false,
-                        force_dma_bounce: false,
-                        enable_hv: true,
-                        hibernation_enabled: true,
-                    },
-                    vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
-                    Some((base_template, uefi.secure_boot_enabled)),
-                )
+                    (
+                        LoadMode::Uefi {
+                            firmware,
+                            enable_serial: any_serial_configured,
+                            // Route the firmware console to COM1 when it is
+                            // available. The firmware's default console is the
+                            // video device, so without this the firmware and
+                            // anything it launches would have nowhere to write on a
+                            // VM with no graphics adapter.
+                            uefi_console_mode: com1_configured.then_some(UefiConsoleMode::Com1),
+                            smbios,
+                            enable_vmbus: true,
+                            // Everything below is fixed for now. The proto has no
+                            // way to express these yet; fields will be added as
+                            // callers need them.
+                            //
+                            // Note that memory protections match the CLI in
+                            // defaulting to off, since Linux currently fails to
+                            // boot with them enabled.
+                            enable_memory_protections: false,
+                            enable_debugging: false,
+                            disable_frontpage: false,
+                            enable_tpm: false,
+                            enable_battery: false,
+                            enable_vpci_boot: false,
+                            default_boot_always_attempt: false,
+                            force_dma_bounce: false,
+                            enable_hv: true,
+                            hibernation_enabled: true,
+                        },
+                        vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
+                        Some((base_template, uefi.secure_boot_enabled)),
+                    )
+                }
             }
         };
 
-        let microvm_portb = if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
+        let microvm_portb = if machine_profile == OpenvmmMachineProfile::Microvm {
             if ports.iter().skip(1).any(Option::is_some) {
-                bail!("microVM ABI version 2 accepts only serial port 0 as its portb endpoint");
+                bail!("microVM accepts only serial port 0 as its portb endpoint");
             }
             Some(
                 ports[0]
@@ -1014,13 +1453,32 @@ impl VmService {
             .build()
             .context("failed to build vm configuration")?;
         if let Some(io) = microvm_portb {
+            let restore_memory_ranges = authoritative_restore
+                .as_ref()
+                .map(|restore| restore.restore_memory_ranges.as_slice())
+                .unwrap_or_default();
+            let restore_memory_target_requested = authoritative_restore
+                .as_ref()
+                .is_some_and(|restore| restore.restore_memory_target_requested);
+            let (generation_id, restore_entropy) = if restore_entropy
+                || restore_online_vp_count.is_some()
+                || restore_memory_target_requested
+            {
+                crate::fresh_microvm_restore_packet(
+                    restore_online_vp_count,
+                    restore_memory_target_requested,
+                    restore_memory_ranges,
+                )?
+            } else {
+                (crate::fresh_microvm_generation_id()?, Vec::new())
+            };
             chipset.chipset_devices.extend([
                 ChipsetDeviceHandle {
                     name: MicrovmPortbHandle::ID.to_owned(),
                     resource: MicrovmPortbHandle {
                         io,
-                        generation_id: crate::fresh_microvm_generation_id()?,
-                        restore_entropy: Vec::new(),
+                        generation_id,
+                        restore_entropy,
                     }
                     .into_resource(),
                 },
@@ -1031,8 +1489,8 @@ impl VmService {
                 ChipsetDeviceHandle {
                     name: MicrovmSnapshotRequestHandle::ID.to_owned(),
                     resource: MicrovmSnapshotRequestHandle {
-                        notify: None,
-                        input_gate_timeout: Duration::from_secs(5),
+                        notify: microvm_snapshot_notify,
+                        input_gate_timeout: snapshot_quiesce_timeout,
                     }
                     .into_resource(),
                 },
@@ -1043,7 +1501,25 @@ impl VmService {
         // `NumaConfig` are mutually exclusive (mirrors the CLI `--memory` vs
         // `--numa` conflict). `config_mem_size` is the total guest memory
         // reported to the `VmController`.
-        let (numa, config_mem_size) = if let Some(numa_config) = req_config.numa_config.take() {
+        let (numa, config_mem_size) = if let Some(restore) = &authoritative_restore {
+            let mem_size = restore.selected_memory_size;
+            let numa = NumaTopology {
+                nodes: vec![NumaNode {
+                    mem: Some(MemoryConfig {
+                        mem_size,
+                        prefetch_memory: false,
+                        private_memory: false,
+                        transparent_hugepages: true,
+                        hugepages: false,
+                        hugepage_size: None,
+                        host_numa_node: None,
+                    }),
+                    vps: VpAssignment::FromTopology,
+                }],
+                distances: vec![],
+            };
+            (numa, mem_size)
+        } else if let Some(numa_config) = req_config.numa_config.take() {
             if req_config.memory_config.is_some() {
                 bail!("memory_config and numa_config are mutually exclusive");
             }
@@ -1074,11 +1550,7 @@ impl VmService {
             (numa, mem_size)
         };
 
-        let config_proc_count = req_config
-            .processor_config
-            .as_ref()
-            .map(|c| c.processor_count)
-            .unwrap_or(1);
+        let config_proc_count = effective_processor_count;
         let arch = parse_arch_topology_overrides(req_config.processor_config.as_ref())?;
 
         // Build the PCIe topology (root complexes, switches, and the devices
@@ -1090,13 +1562,6 @@ impl VmService {
         };
 
         let mut config = Config {
-            microvm_sandbox_blocks: Vec::new(),
-            microvm_filesystem_bootstrap: false,
-            microvm_memory_capacity: None,
-            microvm_snapshot_memory_ranges: Vec::new(),
-            microvm_restore_memory_ranges: Vec::new(),
-            microvm_filesystem: None,
-            microvm_network: None,
             // TODO: devices, other stuff
             machine_profile,
             load_mode,
@@ -1149,6 +1614,45 @@ impl VmService {
             chipset_capabilities: chipset.capabilities,
             layout: layout_config,
             rtc_delta_milliseconds: 0,
+            microvm_network: None,
+            microvm_filesystem_bootstrap: authoritative_restore
+                .as_ref()
+                .is_some_and(|restore| restore.machine_contract.microvm_filesystem.is_some()),
+            microvm_filesystem: None,
+            microvm_sandbox_blocks: Vec::new(),
+            microvm_memory_capacity: authoritative_restore
+                .as_ref()
+                .and_then(|restore| {
+                    (restore.machine_contract.memory_expansion_version != 0)
+                        .then_some(restore.machine_contract.memory_capacity_bytes)
+                })
+                .or((memory_capacity_bytes != 0).then_some(memory_capacity_bytes)),
+            microvm_snapshot_memory_ranges: authoritative_restore
+                .as_ref()
+                .filter(|restore| restore.machine_contract.memory_expansion_version != 0)
+                .map(|restore| {
+                    restore
+                        .machine_contract
+                        .memory_ranges
+                        .iter()
+                        .map(|range| {
+                            MemoryRange::new(range.gpa_start..range.gpa_start + range.length)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            microvm_restore_memory_ranges: authoritative_restore
+                .as_ref()
+                .map(|restore| {
+                    restore
+                        .restore_memory_ranges
+                        .iter()
+                        .map(|range| {
+                            MemoryRange::new(range.gpa_start..range.gpa_start + range.length)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
 
         let guest_power_actions = {
@@ -1174,32 +1678,125 @@ impl VmService {
 
         let mut scsi_rpc = None;
         let mut consomme_rpc = None;
-        if let Some(devices_config) = req_config.devices_config {
-            if let Some(virtio_blk) = devices_config.virtio_blk {
-                anyhow::ensure!(is_microvm, "fixed virtio-blk requires the microVM profile");
-                let vmservice::VirtioBlk { backend, read_only } = virtio_blk;
-                let disk =
-                    build_disk_backend(backend.context("missing blk backend")?, read_only).await?;
+        let mut microvm_console_attachment = None;
+        let mut microvm_console_socket_cleanup = None;
+        let mut microvm_filesystem_attachment = None;
+        let mut microvm_filesystem_root_path = None;
+        if let Some((filesystem, root_path, attachment)) = restored_microvm_filesystem {
+            microvm_filesystem_root_path = Some(PathBuf::from(&root_path));
+            config.microvm_filesystem = Some(filesystem.clone());
+            config.virtio_devices.push((
+                VirtioBus::Mmio,
+                virtio_resources::fs::VirtioFsHandle {
+                    tag: "microvm".to_owned(),
+                    fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                        root_path,
+                        mount_options: String::new(),
+                    },
+                    profile: virtio_resources::fs::VirtioFsProfile::Microvm {
+                        stable_id: "fs:microvm0".to_owned(),
+                        root_identity: attachment.identity.clone(),
+                        read_only: filesystem.access.is_read_only(),
+                    },
+                }
+                .into_resource(),
+            ));
+            microvm_filesystem_attachment = Some(attachment);
+        }
+        if let Some(restore) = &authoritative_restore {
+            let has_console = restore
+                .machine_contract
+                .devices
+                .iter()
+                .any(|device| device.stable_id == "console:microvm-virtio0");
+            let attachment = restore
+                .machine_contract
+                .attachments
+                .iter()
+                .find(|attachment| attachment.stable_id == "console:microvm-virtio0");
+            anyhow::ensure!(
+                has_console == attachment.is_some(),
+                "snapshot microVM console device and attachment inventories disagree"
+            );
+            if let Some(attachment) = attachment {
+                let requested_attachment = restore_console_config.as_ref().map(|console| {
+                    if console.connect {
+                        SerialConfigCli::ConnectPipe(PathBuf::from(&console.socket_path))
+                    } else {
+                        SerialConfigCli::Pipe(PathBuf::from(&console.socket_path))
+                    }
+                });
+                let (endpoint_config, resource_attachment, snapshot_attachment) =
+                    crate::microvm_console_attachment_from_snapshot(
+                        attachment,
+                        requested_attachment.as_ref(),
+                    )?;
+                crate::validate_microvm_console_attachment_namespace(
+                    &snapshot_attachment,
+                    &restore.path,
+                )?;
+                let (backend, disconnect_policy) = match endpoint_config {
+                    SerialConfigCli::Pipe(path) => {
+                        let backend = bind_serial_without_cleanup(&path).with_context(|| {
+                            format!(
+                                "failed to recreate virtio console listener: {}",
+                                path.display()
+                            )
+                        })?;
+                        microvm_console_socket_cleanup =
+                            crate::microvm_console_socket_cleanup(path)?;
+                        (
+                            backend,
+                            virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                        )
+                    }
+                    SerialConfigCli::Tcp(address) => (
+                        crate::serial_io::bind_tcp_serial(&address)?,
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                    ),
+                    SerialConfigCli::ConnectPipe(path) => (
+                        crate::serial_io::connect_serial_with_timeout(
+                            &path,
+                            Duration::from_millis(
+                                openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                            ),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to reconnect virtio console client: {}",
+                                path.display()
+                            )
+                        })?,
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                    ),
+                    SerialConfigCli::ConnectTcp(address) => (
+                        crate::serial_io::connect_tcp_serial(
+                            &address,
+                            Duration::from_millis(
+                                openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                            ),
+                        )?,
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                    ),
+                    SerialConfigCli::None => (
+                        DisconnectedSerialBackendHandle.into_resource(),
+                        virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                    ),
+                    _ => unreachable!("saved microVM console was validated as an attachment"),
+                };
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
-                    virtio_resources::blk::VirtioBlkHandle { disk, read_only }.into_resource(),
+                    virtio_resources::console::VirtioConsoleHandle {
+                        backend,
+                        disconnect_policy,
+                        attachment: Some(resource_attachment),
+                    }
+                    .into_resource(),
                 ));
-                let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
-                    unreachable!("microVM was validated with pvh_boot");
-                };
-                anyhow::ensure!(
-                    config.virtio_devices.is_empty(),
-                    "microVM block devices require the fixed-role sandbox configuration"
-                );
-                openvmm_defs::config::append_microvm_virtio_discovery(
-                    cmdline,
-                    None,
-                    false,
-                    None,
-                    false,
-                    &[],
-                )?;
+                microvm_console_attachment = Some(snapshot_attachment);
             }
+        }
+        if let Some(devices_config) = req_config.devices_config {
             if !devices_config.scsi_disks.is_empty() {
                 let mut devices = Vec::new();
                 for disk in devices_config.scsi_disks {
@@ -1242,49 +1839,153 @@ impl VmService {
             }
 
             for virtiofs in devices_config.virtiofs_config {
-                let resource = virtio_resources::fs::VirtioFsHandle {
-                    tag: virtiofs.tag,
-                    fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                        root_path: virtiofs.root_path,
-                        mount_options: String::new(),
-                    },
-
-                    profile: virtio_resources::fs::VirtioFsProfile::Standard,
-                }
-                .into_resource();
-                // Use VPCI when possible (currently only on Windows and macOS due
-                // to KVM backend limitations).
-                if cfg!(windows) || cfg!(target_os = "macos") {
-                    config.vpci_devices.push(VpciDeviceConfig {
-                        vtl: DeviceVtl::Vtl0,
-                        instance_id: Guid::new_random(),
-                        resource: VirtioPciDeviceHandle(resource).into_resource(),
-                        vnode: None,
-                    });
-                } else {
+                if is_microvm {
+                    anyhow::ensure!(
+                        config.microvm_filesystem.is_none()
+                            && virtiofs.tag == "microvm"
+                            && !virtiofs.root_path.is_empty(),
+                        "microVM permits one virtio-fs attachment with tag 'microvm'"
+                    );
+                    let filesystem = openvmm_defs::config::MicrovmFilesystemConfig::new(
+                        virtiofs.guest_mount_target,
+                        if virtiofs.read_write {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite
+                        } else {
+                            openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly
+                        },
+                    )?;
+                    let (root_path, attachment) =
+                        crate::microvm_filesystem_attachment(Path::new(&virtiofs.root_path))?;
+                    microvm_filesystem_root_path = Some(PathBuf::from(&root_path));
+                    let resource = virtio_resources::fs::VirtioFsHandle {
+                        tag: "microvm".to_owned(),
+                        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                            root_path,
+                            mount_options: String::new(),
+                        },
+                        profile: virtio_resources::fs::VirtioFsProfile::Microvm {
+                            stable_id: "fs:microvm0".to_owned(),
+                            root_identity: attachment.identity.clone(),
+                            read_only: filesystem.access.is_read_only(),
+                        },
+                    }
+                    .into_resource();
+                    if snapshot_destination.is_some() {
+                        tracing::warn!(
+                            stable_id = "fs:microvm0",
+                            access_mode = filesystem.access.as_str(),
+                            "microVM snapshot excludes live host filesystem contents; restore revalidates the external directory and may fail after host changes"
+                        );
+                    }
+                    config.microvm_filesystem = Some(filesystem);
+                    config.microvm_filesystem_bootstrap = true;
+                    microvm_filesystem_attachment = Some(attachment);
                     config.virtio_devices.push((VirtioBus::Mmio, resource));
+                } else {
+                    anyhow::ensure!(
+                        virtiofs.guest_mount_target.is_empty() && !virtiofs.read_write,
+                        "guest_mount_target and read_write require the microVM profile"
+                    );
+                    let resource = virtio_resources::fs::VirtioFsHandle {
+                        tag: virtiofs.tag,
+                        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                            root_path: virtiofs.root_path,
+                            mount_options: String::new(),
+                        },
+                        profile: virtio_resources::fs::VirtioFsProfile::Standard,
+                    }
+                    .into_resource();
+                    // Use VPCI when possible (currently only on Windows and macOS due
+                    // to KVM backend limitations).
+                    if cfg!(windows) || cfg!(target_os = "macos") {
+                        config.vpci_devices.push(VpciDeviceConfig {
+                            vtl: DeviceVtl::Vtl0,
+                            instance_id: Guid::new_random(),
+                            resource: VirtioPciDeviceHandle(resource).into_resource(),
+                            vnode: None,
+                        });
+                    } else {
+                        config.virtio_devices.push((VirtioBus::Mmio, resource));
+                    }
                 }
             }
 
             if let Some(virtio_console) = devices_config.virtio_console {
                 if !virtio_console.socket_path.is_empty() {
-                    let (serial_fn, action) = open_socket_backend(virtio_console.connect);
-                    let backend =
-                        serial_fn(virtio_console.socket_path.as_ref()).with_context(|| {
-                            format!(
-                                "failed to {} virtio console socket: {}",
-                                action, virtio_console.socket_path
-                            )
-                        })?;
+                    let (backend, disconnect_policy, attachment) = if is_microvm {
+                        let endpoint_config = if virtio_console.connect {
+                            SerialConfigCli::ConnectPipe(PathBuf::from(&virtio_console.socket_path))
+                        } else {
+                            SerialConfigCli::Pipe(PathBuf::from(&virtio_console.socket_path))
+                        };
+                        let (endpoint_config, attachment, snapshot_attachment) =
+                            crate::microvm_console_attachment_from_cli(&endpoint_config)?;
+                        if let Some(snapshot_dir) = &snapshot_destination {
+                            crate::validate_microvm_console_attachment_namespace(
+                                &snapshot_attachment,
+                                snapshot_dir,
+                            )?;
+                        }
+                        let backend = match endpoint_config {
+                            SerialConfigCli::Pipe(path) => {
+                                let backend =
+                                    bind_serial_without_cleanup(&path).with_context(|| {
+                                        format!(
+                                            "failed to bind virtio console socket: {}",
+                                            path.display()
+                                        )
+                                    })?;
+                                microvm_console_socket_cleanup =
+                                    crate::microvm_console_socket_cleanup(path)?;
+                                backend
+                            }
+                            SerialConfigCli::ConnectPipe(path) => {
+                                crate::serial_io::connect_serial_with_timeout(
+                                    &path,
+                                    Duration::from_millis(
+                                        openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                                    ),
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "failed to connect virtio console socket: {}",
+                                        path.display()
+                                    )
+                                })?
+                            }
+                            _ => unreachable!("path input produced a non-path attachment"),
+                        };
+                        microvm_console_attachment = Some(snapshot_attachment);
+                        (
+                            backend,
+                            virtio_resources::console::VirtioConsoleDisconnectPolicy::Retain,
+                            Some(attachment),
+                        )
+                    } else {
+                        let (serial_fn, action) = open_socket_backend(virtio_console.connect);
+                        let backend =
+                            serial_fn(virtio_console.socket_path.as_ref()).with_context(|| {
+                                format!(
+                                    "failed to {} virtio console socket: {}",
+                                    action, virtio_console.socket_path
+                                )
+                            })?;
+                        (
+                            backend,
+                            virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                            None,
+                        )
+                    };
                     let resource: Resource<VirtioDeviceHandle> =
                         virtio_resources::console::VirtioConsoleHandle {
                             backend,
-                            disconnect_policy:
-                                virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
-                            attachment: None,
+                            disconnect_policy,
+                            attachment,
                         }
                         .into_resource();
-                    if cfg!(windows) || cfg!(target_os = "macos") {
+                    if is_microvm {
+                        config.virtio_devices.push((VirtioBus::Mmio, resource));
+                    } else if cfg!(windows) || cfg!(target_os = "macos") {
                         config.vpci_devices.push(VpciDeviceConfig {
                             vtl: DeviceVtl::Vtl0,
                             instance_id: Guid::new_random(),
@@ -1298,9 +1999,46 @@ impl VmService {
             }
         }
 
+        if microvm_filesystem_slot
+            && !config
+                .virtio_devices
+                .iter()
+                .any(|(_, device)| device.id() == "virtiofs")
+        {
+            config.virtio_devices.push((
+                VirtioBus::Mmio,
+                virtio_resources::fs::VirtioFsHandle {
+                    tag: "microvm".to_owned(),
+                    fs: virtio_resources::fs::VirtioFsBackend::Dormant,
+                    profile: virtio_resources::fs::VirtioFsProfile::MicrovmDormant {
+                        stable_id: "fs:microvm0".to_owned(),
+                    },
+                }
+                .into_resource(),
+            ));
+        }
+
+        if is_microvm && authoritative_restore.is_none() {
+            let has_console = config
+                .virtio_devices
+                .iter()
+                .any(|(_, device)| device.id() == "virtio-console");
+            let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
+                unreachable!("microVM was validated with pvh_boot");
+            };
+            openvmm_defs::config::append_microvm_virtio_discovery(
+                cmdline,
+                None,
+                microvm_filesystem_slot,
+                config.microvm_filesystem.as_ref(),
+                has_console,
+                &config.microvm_sandbox_blocks,
+            )?;
+        }
+
         if let Some(hvsocket_config) = req_config.hvsocket_config {
-            if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
-                bail!("microVM ABI version 2 does not support hvsocket");
+            if machine_profile == OpenvmmMachineProfile::Microvm {
+                bail!("microVM does not support hvsocket");
             }
             let listener = UnixListener::bind(&hvsocket_config.path).with_context(|| {
                 format!("failed to bind hvsocket path: {}", hvsocket_config.path)
@@ -1311,8 +2049,91 @@ impl VmService {
 
         openvmm_defs::config::validate_machine_config(&config, None)?;
 
+        let effective_command_line = match &config.load_mode {
+            LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
+            _ => None,
+        };
+        let microvm_filesystem = config.microvm_filesystem.clone();
+        if let Some(root_path) = microvm_filesystem_root_path.as_deref() {
+            crate::validate_microvm_filesystem_private_storage(
+                root_path,
+                snapshot_destination.as_deref(),
+                authoritative_restore
+                    .as_ref()
+                    .map(|restore| restore.path.as_path()),
+                None,
+            )?;
+        }
+        let snapshot_memory_file = if let Some(destination) = &snapshot_destination {
+            let parent = destination
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let parent_metadata = fs_err::symlink_metadata(parent).with_context(|| {
+                format!("failed to inspect snapshot parent {}", parent.display())
+            })?;
+            anyhow::ensure!(
+                parent_metadata.file_type().is_dir(),
+                "snapshot parent is not a directory: {}",
+                parent.display()
+            );
+            anyhow::ensure!(
+                fs_err::symlink_metadata(destination)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "snapshot destination already exists or cannot be inspected: {}",
+                destination.display()
+            );
+            let file = tempfile::Builder::new()
+                .prefix(".openvmm-microvm-memory-")
+                .tempfile_in(parent)
+                .context("failed to create snapshot memory backing")?;
+            openvmm_helpers::snapshot::initialize_snapshot_memory_backing_file(
+                file.as_file(),
+                config_mem_size,
+            )
+            .context("failed to initialize snapshot memory backing")?;
+            Some(file)
+        } else {
+            None
+        };
+        let snapshot_memory_path = snapshot_memory_file
+            .as_ref()
+            .map(|file| file.path().to_owned());
+        let snapshot_memory_handle = snapshot_memory_file
+            .as_ref()
+            .map(|file| {
+                file.reopen()
+                    .context("failed to duplicate automatic snapshot RAM handle")
+            })
+            .transpose()?;
+
+        let (
+            shared_memory,
+            saved_state,
+            shared_memory_copy_on_write,
+            restore_time,
+            snapshot_restore_guards,
+        ) = if let Some((fd, guards, state, restore_time)) = prepared_restore {
+            (
+                Some(fd),
+                Some(state),
+                true,
+                Some(restore_time),
+                Some(guards),
+            )
+        } else if let Some(file) = &snapshot_memory_handle {
+            let file = file
+                .try_clone()
+                .context("failed to duplicate snapshot RAM handle for worker")?;
+            let shared_memory = openvmm_helpers::shared_memory::file_to_shared_memory_fd(file)?;
+            (Some(shared_memory), None, false, None, None)
+        } else {
+            (None, None, false, None, None)
+        };
+
         let (send, recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
+        let memory_capacity = config.microvm_memory_capacity;
 
         // Create a VmmMesh for local/in-process workers.
         let mesh = VmmMesh::new(&self.driver, true)?;
@@ -1325,32 +2146,35 @@ impl VmService {
             .launch_worker(
                 VM_WORKER,
                 VmWorkerParameters {
-                    hypervisor: if matches!(machine_profile, OpenvmmMachineProfile::Microvm) {
-                        openvmm_helpers::hypervisor::choose_microvm_hypervisor()?
-                    } else {
-                        openvmm_helpers::hypervisor::choose_hypervisor()?
-                    },
+                    hypervisor,
                     cfg: config,
-                    saved_state: None,
-                    shared_memory: None,
-                    shared_memory_copy_on_write: false,
-                    snapshot_restore_guards: None,
-                    snapshot_boundary_requests: None,
-                    snapshot_ready: None,
-                    restore_downtime: None,
-                    restore_tsc_frequency_hz: None,
-                    restore_apic_frequency_hz: None,
-                    restore_cpu_contract: None,
-                    restore_ready_sink: None,
-                    restore_gate_timeout: None,
-                    restore_vp_count: None,
+                    saved_state,
+                    shared_memory,
+                    shared_memory_copy_on_write,
+                    snapshot_restore_guards,
+                    snapshot_boundary_requests: microvm_snapshot_requests,
+                    snapshot_ready,
+                    restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),
+                    restore_tsc_frequency_hz: restore_time
+                        .as_ref()
+                        .map(|(_, frequency, _, _)| *frequency),
+                    restore_apic_frequency_hz: restore_time
+                        .as_ref()
+                        .and_then(|(_, _, frequency, _)| *frequency),
+                    restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
+                    restore_ready_sink,
+                    restore_gate_timeout: (restore_online_vp_count.is_some()
+                        || authoritative_restore
+                            .as_ref()
+                            .is_some_and(|restore| !restore.restore_memory_ranges.is_empty()))
+                    .then_some(restore_gate_timeout),
+                    restore_vp_count: restore_online_vp_count,
                     rpc: recv,
                     notify: notify_send,
                 },
             )
             .await?;
 
-        let memory = config_mem_size;
         let processors = config_proc_count;
 
         // Create channels for VmController.
@@ -1359,26 +2183,6 @@ impl VmService {
 
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
-            snapshot_tier: None,
-            memory_capacity: None,
-            microvm_sandbox_block_sources: Vec::new(),
-            _private_scratch_dir: None,
-            microvm_console_attachment: None,
-            microvm_filesystem: None,
-            microvm_filesystem_slot: false,
-            microvm_filesystem_root_path: None,
-            microvm_filesystem_attachment: None,
-            microvm_network: None,
-            microvm_egress_policy: None,
-            microvm_network_attachment: None,
-            microvm_console_socket_cleanup: None,
-            snapshot_memory_handle: None,
-            snapshot_requests: None,
-            snapshot_destination: None,
-            snapshot_quiesce_timeout: Duration::from_secs(5),
-            source_hypervisor: String::new(),
-            effective_command_line: None,
-            snapshot_memory_file: None,
             machine_profile,
             mesh,
             vm_worker: worker,
@@ -1390,11 +2194,31 @@ impl VmService {
             vm_rpc: send.clone(),
             paravisor_diag: None,
             igvm_path: None,
-            memory_backing_file: None,
-            memory,
+            memory_backing_file: snapshot_memory_path,
+            snapshot_memory_handle,
+            memory: config_mem_size,
+            memory_capacity,
             processors,
             log_file: None,
             crash_dump_path: None,
+            snapshot_requests,
+            snapshot_destination,
+            snapshot_tier: None,
+            snapshot_quiesce_timeout,
+            source_hypervisor,
+            effective_command_line,
+            microvm_sandbox_block_sources: Vec::new(),
+            microvm_console_attachment,
+            microvm_network: None,
+            microvm_network_attachment: None,
+            microvm_egress_policy: None,
+            microvm_filesystem_slot,
+            microvm_filesystem,
+            microvm_filesystem_root_path,
+            microvm_filesystem_attachment,
+            microvm_console_socket_cleanup,
+            snapshot_memory_file,
+            _private_scratch_dir: None,
             guest_power_actions,
         };
 
@@ -1412,6 +2236,7 @@ impl VmService {
             consomme_rpc,
             worker_rpc: send,
         }));
+        self.restore_ready_pending = restore_ready_required;
         self.lifecycle = VmLifecycle::Paused;
         Ok(())
     }
@@ -1430,6 +2255,7 @@ impl VmService {
             task.await;
         }
         self.vm_controller_events.take();
+        self.restore_ready_pending = false;
         self.lifecycle = VmLifecycle::Uninitialized;
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("VM torn down"))));
@@ -1495,18 +2321,29 @@ impl VmService {
 
     async fn resume_vm(&mut self) -> anyhow::Result<()> {
         let vm = self.vm.clone().context("VM not created yet")?;
-        vm.worker_rpc
-            .call_failable(VmRpc::Resume, ())
-            .await
-            .map(drop)
-            .context("resume failed")?;
+        let resumed = match vm.worker_rpc.call_failable(VmRpc::Resume, ()).await {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                if self.restore_ready_pending {
+                    self.teardown_vm()
+                        .await
+                        .context("failed to tear down VM after restore readiness failure")?;
+                }
+                return Err(error).context("resume failed");
+            }
+        };
+        anyhow::ensure!(
+            resumed,
+            "VM did not resume; a state unit failed to start or the VM was already running"
+        );
+        self.restore_ready_pending = false;
         if !matches!(self.lifecycle, VmLifecycle::Halted(_)) {
             self.lifecycle = VmLifecycle::Running;
         }
         Ok(())
     }
 
-    fn handle_controller_event(&mut self, event: VmControllerEvent) {
+    fn handle_controller_event(&mut self, event: VmControllerEvent) -> bool {
         match event {
             VmControllerEvent::GuestHalt(reason) => {
                 tracing::info!(%reason, "guest halted (via controller)");
@@ -1514,6 +2351,7 @@ impl VmService {
                 if let Some((_, response)) = self.wait_vm_response.take() {
                     response.send(Ok(()));
                 }
+                false
             }
             VmControllerEvent::ExitRequested { code } => {
                 let reason = format!("guest exited with status {code}");
@@ -1522,6 +2360,7 @@ impl VmService {
                 if let Some((_, response)) = self.wait_vm_response.take() {
                     response.send(Ok(()));
                 }
+                true
             }
             VmControllerEvent::WorkerStopped { error } => {
                 if let Some(err) = &error {
@@ -1542,11 +2381,13 @@ impl VmService {
                 self.vm.take();
                 self.vm_controller.take();
                 self.lifecycle = VmLifecycle::Uninitialized;
+                false
             }
             VmControllerEvent::VncWorkerStopped { error } => {
                 if let Some(err) = &error {
                     tracing::error!(error = %err, "VNC worker stopped unexpectedly");
                 }
+                false
             }
         }
     }
@@ -1740,7 +2581,7 @@ impl VmService {
 fn open_socket_backend(
     connect: bool,
 ) -> (
-    fn(&std::path::Path) -> std::io::Result<Resource<SerialBackendHandle>>,
+    fn(&Path) -> io::Result<Resource<SerialBackendHandle>>,
     &'static str,
 ) {
     if connect {
@@ -1874,14 +2715,13 @@ fn parse_nic_config(
             } else {
                 Some(consomme.cidr)
             },
+            static_ipv4: None,
             ports: consomme
                 .ports
                 .into_iter()
                 .map(parse_port_config)
                 .collect::<anyhow::Result<_>>()?,
             recv,
-
-            static_ipv4: None,
         }
         .into_resource(),
         _ => anyhow::bail!("unsupported backend"),
@@ -2201,7 +3041,7 @@ fn build_vfio_device(vfio: vmservice::VfioDevice) -> anyhow::Result<Resource<Pci
     if host_pci_address.contains('/') || host_pci_address.contains("..") {
         anyhow::bail!("PCI address must not contain path separators");
     }
-    let sysfs_path = std::path::Path::new("/sys/bus/pci/devices").join(&host_pci_address);
+    let sysfs_path = Path::new("/sys/bus/pci/devices").join(&host_pci_address);
     let iommu_group_link =
         std::fs::read_link(sysfs_path.join("iommu_group")).with_context(|| {
             format!("failed to read IOMMU group for {host_pci_address} (is it bound to vfio-pci?)")
@@ -2323,7 +3163,6 @@ async fn build_virtio_device(
                     .parse::<MacAddress>()
                     .context("invalid mac address")?,
                 endpoint,
-
                 egress_policy: None,
                 save_restore: false,
                 static_ipv4: None,
@@ -2357,8 +3196,17 @@ async fn build_virtio_device(
             .into_resource()
         }
         Kind::VhostUser(vhost_user) => build_vhost_user_device(vhost_user)?,
-        Kind::Fs(vmservice::VirtioFs { tag, root_path }) => {
+        Kind::Fs(vmservice::VirtioFs {
+            tag,
+            root_path,
+            guest_mount_target,
+            read_write,
+        }) => {
             const VIRTIO_FS_TAG_LEN: usize = 36;
+            anyhow::ensure!(
+                guest_mount_target.is_empty() && !read_write,
+                "dynamic standard-machine virtio-fs does not accept microVM mount fields"
+            );
             anyhow::ensure!(!tag.is_empty(), "virtio-fs tag must not be empty");
             anyhow::ensure!(
                 !tag.contains('\0'),
@@ -2417,13 +3265,12 @@ fn build_nic_backend(
         Kind::Consomme(vmservice::ConsommeBackend { cidr, ports }) => {
             net_backend_resources::consomme::ConsommeHandle {
                 cidr: (!cidr.is_empty()).then_some(cidr),
+                static_ipv4: None,
                 ports: ports
                     .into_iter()
                     .map(parse_port_config)
                     .collect::<anyhow::Result<_>>()?,
                 recv: None,
-
-                static_ipv4: None,
             }
             .into_resource()
         }
@@ -2537,6 +3384,40 @@ fn build_vhost_user_device(
     _vhost_user: vmservice::VhostUser,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     anyhow::bail!("vhost-user is only supported on unix hosts")
+}
+
+#[cfg(test)]
+mod machine_profile_tests {
+    use super::*;
+
+    #[test]
+    fn ttrpc_microvm_profile_preserves_wire_identity_and_processor_policy() {
+        assert_eq!(
+            vmservice::vm_config::MachineProfile::Microvm as i32,
+            MICROVM_ABI_VERSION_2 as i32
+        );
+        assert_eq!(
+            openvmm_machine_profile(vmservice::vm_config::MachineProfile::Microvm),
+            OpenvmmMachineProfile::Microvm
+        );
+        assert_eq!(
+            ttrpc_machine_profile(MICROVM_ABI_VERSION_2).unwrap(),
+            vmservice::vm_config::MachineProfile::Microvm
+        );
+        assert!(vmservice::vm_config::MachineProfile::from_i32(1).is_none());
+        assert!(ttrpc_machine_profile(1).is_err());
+
+        for processor_count in [1, 2, 4, 8] {
+            assert!(openvmm_defs::config::microvm_processor_count_supported(
+                processor_count
+            ));
+        }
+        for processor_count in [0, 3, 5, 16] {
+            assert!(!openvmm_defs::config::microvm_processor_count_supported(
+                processor_count
+            ));
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
