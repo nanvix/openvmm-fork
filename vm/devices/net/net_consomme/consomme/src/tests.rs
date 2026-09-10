@@ -41,6 +41,30 @@ impl Client for TestClient {
     }
 }
 
+#[test]
+fn default_resource_limits_are_pinned() {
+    let params = ConsommeParams::new().unwrap();
+    assert_eq!(params.udp_timeout, Duration::from_secs(300));
+    assert_eq!(
+        params.tcp_rx_buffer,
+        TcpBufferBounds {
+            initial: 16 << 10,
+            max: 4 << 20,
+        }
+    );
+    assert_eq!(
+        params.tcp_tx_buffer,
+        TcpBufferBounds {
+            initial: 16 << 10,
+            max: 4 << 20,
+        }
+    );
+    assert_eq!(DEFAULT_MAX_ACTIVE_TCP_FLOWS, 128);
+    assert_eq!(DEFAULT_MAX_ACTIVE_UDP_FLOWS, 256);
+    assert_eq!(dns_resolver::DEFAULT_MAX_PENDING_DNS_REQUESTS, 256);
+    assert_eq!(DEFAULT_MAX_ACTIVE_ICMP_FLOWS, 16);
+}
+
 /// Build a minimal TCP SYN packet inside an Ethernet/IPv4 frame.
 fn build_ipv4_syn(
     buf: &mut [u8],
@@ -165,6 +189,34 @@ async fn ipv4_loopback_blocked_by_default(driver: DefaultDriver) {
     assert!(
         matches!(result, Err(DropReason::DestinationNotAllowed)),
         "loopback traffic should be rejected, got {result:?}"
+    );
+}
+
+/// IPv4 fragments are dropped before checksum validation or host socket work.
+#[pal_async::async_test]
+async fn ipv4_fragments_are_rejected(driver: DefaultDriver) {
+    let mut consomme = Consomme::new(ConsommeParams::new().unwrap());
+    let mut client = TestClient::new(driver);
+    let mut buf = vec![0u8; 1514];
+
+    let guest_mac = consomme.params_mut().client_mac;
+    let gateway_mac = consomme.params_mut().gateway_mac;
+    let guest_ip = consomme.params_mut().client_ip;
+    let len = build_ipv4_syn(
+        &mut buf,
+        guest_mac,
+        gateway_mac,
+        guest_ip,
+        Ipv4Address::new(192, 0, 2, 1),
+    );
+    Ipv4Packet::new_unchecked(&mut buf[ETHERNET_HEADER_LEN..len]).set_more_frags(true);
+
+    let result = consomme
+        .access(&mut client)
+        .send(&buf[..len], &ChecksumState::NONE);
+    assert!(
+        matches!(result, Err(DropReason::FragmentedPacket)),
+        "fragmented IPv4 traffic should be rejected, got {result:?}"
     );
 }
 
@@ -342,6 +394,62 @@ async fn ipv4_normal_destination_not_blocked(driver: DefaultDriver) {
     assert!(
         !matches!(result, Err(DropReason::DestinationNotAllowed)),
         "normal destination should not be blocked, got {result:?}"
+    );
+}
+
+#[test]
+fn static_ipv4_identity_is_exact_and_disables_ipv6_advertisement() {
+    let mut params = ConsommeParams::new().unwrap();
+    params
+        .set_static_ipv4(
+            Ipv4Addr::new(192, 168, 5, 37),
+            28,
+            Ipv4Addr::new(192, 168, 5, 33),
+            [0x52, 0x54, 0, 168, 5, 33],
+        )
+        .unwrap();
+
+    assert_eq!(params.client_ip, Ipv4Address::new(192, 168, 5, 37));
+    assert_eq!(params.gateway_ip, Ipv4Address::new(192, 168, 5, 33));
+    assert_eq!(params.net_mask, Ipv4Address::new(255, 255, 255, 240));
+    assert_eq!(
+        params.gateway_mac,
+        EthernetAddress([0x52, 0x54, 0, 168, 5, 33])
+    );
+    assert!(!params.advertise_routable_ipv6);
+    assert!(params.map_gateway_to_host_loopback);
+
+    let consomme = Consomme::new(params);
+    assert_eq!(
+        consomme
+            .state
+            .resolve_destination(&"192.168.5.33:8080".parse().unwrap()),
+        "127.0.0.1:8080".parse().unwrap()
+    );
+}
+
+#[test]
+fn static_ipv4_identity_rejects_inconsistent_values() {
+    let mut params = ConsommeParams::new().unwrap();
+    assert!(
+        params
+            .set_static_ipv4(
+                Ipv4Addr::new(10, 0, 0, 2),
+                31,
+                Ipv4Addr::new(10, 0, 0, 1),
+                [0x52, 0x54, 0, 0, 0, 1],
+            )
+            .is_err()
+    );
+    assert!(
+        params
+            .set_static_ipv4(
+                Ipv4Addr::new(10, 0, 0, 2),
+                24,
+                Ipv4Addr::new(10, 0, 0, 9),
+                [0x52, 0x54, 0, 0, 0, 9],
+            )
+            .is_err()
     );
 }
 
