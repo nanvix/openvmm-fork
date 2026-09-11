@@ -416,12 +416,10 @@ impl ControlSessionBroker {
         snapshot.header_count + snapshot.body_bytes.len()
     }
 
-    #[cfg_attr(test, expect(dead_code, reason = "used by the physical adapter"))]
     pub fn has_pending_guest_record(&self) -> bool {
         self.pending_guest_record.is_some()
     }
 
-    #[cfg_attr(test, expect(dead_code, reason = "used by the physical adapter"))]
     pub fn has_pending_host_record(&self) -> bool {
         self.pending_host_record.is_some()
     }
