@@ -85,6 +85,8 @@ pub struct VirtioConsoleDevice {
     worker: TaskControl<ConsoleWorker, ConsoleWorkerState>,
 }
 
+const HOST_TRANSPORT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
 impl VirtioConsoleDevice {
     /// Create a new virtio console device backed by the given serial I/O.
     pub fn new(driver_source: &VmTaskDriverSource, io: Box<dyn SerialIo>) -> Self {
@@ -151,6 +153,7 @@ impl VirtioConsoleDevice {
             config.capability,
         );
         let auth_timer = PolledTimer::new(&driver);
+        let transport_check_timer = PolledTimer::new(&driver);
         let mut worker = TaskControl::new(ConsoleWorker {
             mode: ConsoleWorkerMode::Broker(Box::new(BrokerWorker {
                 host_io,
@@ -159,7 +162,9 @@ impl VirtioConsoleDevice {
                 transport_state,
                 host_input: VecDeque::new(),
                 auth_timer,
+                transport_check_timer,
                 auth_deadline: None,
+                transport_check_deadline: None,
             })),
         });
         worker.insert(
@@ -279,10 +284,23 @@ impl VirtioDevice for VirtioConsoleDevice {
         state.input_gated = false;
         state.mem = GuestMemory::empty();
         if let ConsoleWorkerMode::Broker(mode) = &mut worker.mode {
+            // Linux resets a newly discovered virtio device before starting its
+            // queues. Preserve a host connection that the broker has not yet
+            // observed; established sessions still require a fresh attachment.
+            let preserve_unstarted_host = mode.broker.state()
+                == control_session_broker::BrokerState::AwaitGuestAttach
+                && !mode.broker.host_is_connected();
             mode.broker.reset_for_device();
             mode.host_input.clear();
             mode.auth_deadline = None;
-            mode.transport_state = if mode.host_io.disconnect_current().is_ok() {
+            mode.transport_check_deadline = None;
+            mode.transport_state = if preserve_unstarted_host {
+                if mode.host_io.is_connected() {
+                    HostTransportState::Connected
+                } else {
+                    HostTransportState::WaitingForDisconnect
+                }
+            } else if mode.host_io.disconnect_current().is_ok() {
                 HostTransportState::WaitingForConnect
             } else {
                 HostTransportState::WaitingForDisconnect
@@ -433,7 +451,9 @@ struct BrokerWorker {
     transport_state: HostTransportState,
     host_input: VecDeque<u8>,
     auth_timer: PolledTimer,
+    transport_check_timer: PolledTimer,
     auth_deadline: Option<Instant>,
+    transport_check_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1373,6 +1393,20 @@ impl BrokerWorker {
     ) -> Poll<Result<(), WorkerError>> {
         let mut made_progress = false;
 
+        if self.transport_state == HostTransportState::Connected {
+            let deadline = self
+                .transport_check_deadline
+                .get_or_insert_with(|| Instant::now() + HOST_TRANSPORT_CHECK_INTERVAL);
+            if self
+                .transport_check_timer
+                .poll_until(cx, *deadline)
+                .is_ready()
+            {
+                self.transport_check_deadline =
+                    Some(Instant::now() + HOST_TRANSPORT_CHECK_INTERVAL);
+            }
+        }
+
         match self.transport_state {
             HostTransportState::WaitingForDisconnect => match self.host_io.poll_disconnect(cx) {
                 Poll::Ready(Ok(())) => {
@@ -1596,6 +1630,10 @@ impl BrokerWorker {
         };
         match Pin::new(&mut *self.host_io).poll_write(cx, &bytes[..count]) {
             Poll::Ready(Ok(0)) => {
+                tracelimit::warn_ratelimited!(
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport returned a zero-length write"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1605,7 +1643,12 @@ impl BrokerWorker {
                     .map_err(WorkerError::Broker)?;
                 Ok(true)
             }
-            Poll::Ready(Err(_)) => {
+            Poll::Ready(Err(error)) => {
+                tracelimit::warn_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport write failed"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1641,6 +1684,10 @@ impl BrokerWorker {
         let mut bytes = [0; BUF_SIZE];
         match Pin::new(&mut *self.host_io).poll_read(cx, &mut bytes) {
             Poll::Ready(Ok(0)) => {
+                tracelimit::warn_ratelimited!(
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport reached EOF"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1648,7 +1695,12 @@ impl BrokerWorker {
                 self.host_input.extend(&bytes[..read]);
                 Ok(true)
             }
-            Poll::Ready(Err(_)) => {
+            Poll::Ready(Err(error)) => {
+                tracelimit::warn_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    broker_state = ?self.broker.state(),
+                    "control-console host transport read failed"
+                );
                 self.detach_host()?;
                 Ok(true)
             }
@@ -1662,6 +1714,7 @@ impl BrokerWorker {
             .map_err(WorkerError::Broker)?;
         self.host_input.clear();
         self.auth_deadline = None;
+        self.transport_check_deadline = None;
         self.transport_state = if self.host_io.disconnect_current().is_ok() {
             HostTransportState::WaitingForConnect
         } else {
@@ -1677,6 +1730,12 @@ impl BrokerWorker {
             Ok(Some(ref identity)) if identity == &self.config.expected_peer_identity
         ) {
             tracelimit::warn_ratelimited!(
+                identity_status = match &identity {
+                    Ok(Some(_)) => "unexpected",
+                    Ok(None) => "unavailable",
+                    Err(_) => "error",
+                },
+                identity_error = identity.as_ref().err().map(|error| error.to_string()),
                 "control-console host rejected because its local peer identity is unavailable or unexpected"
             );
             self.detach_host()?;
@@ -1688,6 +1747,7 @@ impl BrokerWorker {
                     Instant::now()
                         .saturating_add(Duration::from_millis(self.config.auth_timeout_ms)),
                 );
+                self.transport_check_deadline = None;
             }
             Err(error) => {
                 tracelimit::warn_ratelimited!(

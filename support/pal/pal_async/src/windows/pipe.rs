@@ -139,10 +139,10 @@ impl PolledPipe {
     /// Polls the pipe for entering the closing state, where the client has
     /// closed its handle.
     pub fn poll_closing(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.events & FILE_PIPE_DISCONNECTED != 0 {
-            // Make sure the pipe is still disconnected.
-            self.refresh_events()?;
+        if self.file.is_pipe_peer_closed()? {
+            return Poll::Ready(Ok(()));
         }
+        self.refresh_events()?;
         while self.events & FILE_PIPE_DISCONNECTED == 0 {
             ready!(
                 self.wakers
@@ -410,6 +410,9 @@ impl Future for ListeningPipe {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let inner = this.inner.as_mut().expect("polled after completion");
+        if inner.sync_success {
+            return Poll::Ready(Ok(this.inner.take().unwrap().file));
+        }
         ready!(inner.event.poll_wait(cx))?;
         let (status, _) = inner.overlapped.io_status().expect("io should be complete");
         chk_status(status)?;
@@ -419,13 +422,21 @@ impl Future for ListeningPipe {
 
 #[cfg(test)]
 mod tests {
+    use super::ListeningPipe;
     use super::PolledPipe;
     use crate::DefaultDriver;
     use crate::sys::pipe::NamedPipeServer;
     use futures::AsyncReadExt;
     use futures::AsyncWriteExt;
+    use futures::future::poll_fn;
+    use pal::windows::pipe::Disposition;
+    use pal::windows::pipe::PipeExt;
+    use pal::windows::pipe::PipeMode;
+    use pal::windows::pipe::new_named_pipe;
     use pal_async_test::async_test;
     use std::fs::OpenOptions;
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
 
     #[async_test]
     async fn named_pipe_server(driver: DefaultDriver) {
@@ -468,5 +479,40 @@ mod tests {
         let mut p1 = PolledPipe::new(&driver, p1).unwrap();
         let mut b = [0];
         assert_eq!(p1.read(&mut b).await.unwrap(), 0);
+    }
+
+    #[async_test]
+    async fn reuse_server_pipe_after_client_close(driver: DefaultDriver) {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).unwrap();
+        let path = format!(r#"\\.\pipe\{:0x}"#, u128::from_ne_bytes(id));
+        let server = new_named_pipe(
+            &path,
+            GENERIC_READ | GENERIC_WRITE,
+            Disposition::Create,
+            PipeMode::Byte,
+        )
+        .unwrap();
+
+        let mut listener = ListeningPipe::new(&driver, server).unwrap();
+        let client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut connected = PolledPipe::new(&driver, listener.await.unwrap()).unwrap();
+
+        drop(client);
+        poll_fn(|cx| connected.poll_closing(cx)).await.unwrap();
+        let server = connected.into_inner();
+        server.disconnect_pipe().unwrap();
+
+        listener = ListeningPipe::new(&driver, server).unwrap();
+        let _client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        listener.await.unwrap();
     }
 }

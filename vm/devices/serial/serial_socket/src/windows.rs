@@ -112,9 +112,20 @@ impl WindowsPipeSerialBackend {
     }
 
     fn disconnect(&mut self) -> io::Result<()> {
+        if !matches!(self.state, PipeState::Connected(_)) {
+            return Ok(());
+        }
         if let PipeState::Connected(pipe) = std::mem::replace(&mut self.state, PipeState::Done) {
             let pipe = pipe.into_inner();
-            pipe.disconnect_pipe()?;
+            match pipe.disconnect_pipe() {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                    ) => {}
+                Err(error) => return Err(error),
+            }
             self.state = PipeState::Listening(ListeningPipe::new(&self.driver, pipe)?);
         }
         Ok(())
