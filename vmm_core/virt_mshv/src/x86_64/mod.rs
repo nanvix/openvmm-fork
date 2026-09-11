@@ -8,6 +8,7 @@ mod vp_state;
 
 use crate::Error;
 use crate::ErrorInner;
+use crate::KernelError;
 use crate::LinuxMshv;
 use crate::MshvFinalizedPartition;
 use crate::MshvIsolationState;

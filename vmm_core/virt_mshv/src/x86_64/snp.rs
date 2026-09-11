@@ -521,10 +521,10 @@ pub(super) fn sanitize_snp_cpuid(
     expose_hypervisor: bool,
     values: &mut [u32; 4],
 ) {
-    if function == x86defs::cpuid::CpuidFunction::VersionAndFeatures.0 && !expose_hypervisor {
+    if function == CpuidFunction::VersionAndFeatures.0 && !expose_hypervisor {
         values[2] &= !(1 << 31);
     }
-    if function == x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0 && index == 1 {
+    if function == CpuidFunction::ExtendedStateEnumeration.0 && index == 1 {
         // TODO: Import a CPUID extended-state page and preserve supported XSS
         // components. The normal SNP CPUID page does not contain the required
         // component subleaves, so exposing this bitmap makes Linux consume
@@ -551,17 +551,14 @@ pub(super) fn snp_cpuid_overrides(expose_hypervisor: bool) -> [virt::CpuidLeaf; 
     [
         // Make the hypervisor-present bit match the guest contract.
         virt::CpuidLeaf::new(
-            x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
+            CpuidFunction::VersionAndFeatures.0,
             [0, 0, u32::from(expose_hypervisor) << 31, 0],
         )
         .masked([0, 0, 1 << 31, 0]),
         // Do not expose supervisor state without an SNP extended-state page.
-        virt::CpuidLeaf::new(
-            x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0,
-            [0; 4],
-        )
-        .indexed(1)
-        .masked([0, 0, u32::MAX, u32::MAX]),
+        virt::CpuidLeaf::new(CpuidFunction::ExtendedStateEnumeration.0, [0; 4])
+            .indexed(1)
+            .masked([0, 0, u32::MAX, u32::MAX]),
     ]
 }
 
@@ -782,9 +779,11 @@ impl MshvPartitionInner {
 
         self.complete_isolated_import(snp.config.as_deref())?;
 
+        let finalized = self.finalized()?;
         let sev_control =
             mshv_bindings::snp::get_sev_control_register(vmsa_gpa / hvdef::HV_PAGE_SIZE);
-        self.bsp_vcpufd
+        finalized
+            .bsp_vcpufd
             .set_hvdef_regs(&[HvRegisterAssoc::from((
                 HvX64RegisterName::SevControl,
                 sev_control,
@@ -802,7 +801,8 @@ impl MshvPartitionInner {
         if count > x86defs::snp::HV_PSP_CPUID_LEAF_COUNT_MAX {
             return Err(SnpError::TooManyCpuidEntries(count).into());
         }
-        if self.caps.hv1 {
+        let finalized = self.finalized()?;
+        if finalized.caps.hv1 {
             // TODO: Determine the correct long-term strategy for exposing
             // synthetic Hyper-V CPUID leaves to direct-boot SNP guests: include
             // them in the measured CPUID page, rely on GHCB CPUID fallback, or
@@ -837,12 +837,12 @@ impl MshvPartitionInner {
 
         for leaf in &mut page.cpuid_leaf_info[..count] {
             let values = get_snp_cpuid_values(
-                &self.bsp_vcpufd,
+                &finalized.bsp_vcpufd,
                 leaf.eax_in,
                 leaf.ecx_in,
                 leaf.xfem_in,
                 leaf.xss_in,
-                self.caps.hv1,
+                finalized.caps.hv1,
             )
             .map_err(|e| SnpError::Cpuid(e.into()))?;
             leaf.eax_out = values[0];
@@ -1396,7 +1396,7 @@ impl MshvProcessor<'_> {
                     0,
                     0,
                     0,
-                    self.partition.caps.hv1,
+                    self.partition.caps().hv1,
                 )
                 .map_err(|err| {
                     tracelimit::error_ratelimited!(
@@ -1547,7 +1547,7 @@ impl MshvProcessor<'_> {
                     index,
                     xfem,
                     xss,
-                    self.partition.caps.hv1,
+                    self.partition.caps().hv1,
                 )
                 .map_err(|err| {
                     tracelimit::error_ratelimited!(
@@ -1887,7 +1887,7 @@ mod tests {
 
         assert_eq!(
             exposed[1].function,
-            x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0
+            CpuidFunction::ExtendedStateEnumeration.0
         );
         assert_eq!(exposed[1].index, Some(1));
         assert_eq!(exposed[1].result[2..], [0, 0]);
@@ -2216,26 +2216,16 @@ mod tests {
     #[test]
     fn sanitizes_snp_cpuid() {
         let mut values = [0, 0, 1 << 31, 0];
-        sanitize_snp_cpuid(
-            x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
-            0,
-            false,
-            &mut values,
-        );
+        sanitize_snp_cpuid(CpuidFunction::VersionAndFeatures.0, 0, false, &mut values);
         assert_eq!(values[2], 0);
 
         let mut values = [0, 0, 1 << 31, 0];
-        sanitize_snp_cpuid(
-            x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
-            0,
-            true,
-            &mut values,
-        );
+        sanitize_snp_cpuid(CpuidFunction::VersionAndFeatures.0, 0, true, &mut values);
         assert_eq!(values[2], 1 << 31);
 
         let mut values = [0xb, 0x240, 0x1800, 1];
         sanitize_snp_cpuid(
-            x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0,
+            CpuidFunction::ExtendedStateEnumeration.0,
             1,
             false,
             &mut values,
