@@ -141,6 +141,8 @@ pub struct VmController {
     pub(crate) microvm_sandbox_block_sources:
         Vec<crate::storage_builder::MicrovmSandboxBlockSource>,
     pub(crate) microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    pub(crate) microvm_control_console_attachment:
+        Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_network: Option<openvmm_defs::config::MicrovmNetworkConfig>,
     pub(crate) microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
@@ -149,6 +151,7 @@ pub struct VmController {
     pub(crate) microvm_filesystem_root_path: Option<PathBuf>,
     pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
+    pub(crate) microvm_control_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     pub(crate) _private_scratch_dir: Option<tempfile::TempDir>,
     pub(crate) guest_power_actions: GuestPowerActions,
@@ -736,6 +739,7 @@ impl VmController {
                 self.microvm_filesystem_slot,
                 filesystem,
                 self.microvm_console_attachment.clone(),
+                self.microvm_control_console_attachment.clone(),
                 blocks,
                 self.processors,
                 self.memory,
@@ -858,6 +862,15 @@ impl VmController {
                     );
                     return GuestSnapshotAction::Terminate { exit_code: 1 };
                 }
+                if let Some(cleanup) = self.microvm_control_console_socket_cleanup.take()
+                    && let Err(error) = cleanup.remove_if_owned()
+                {
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot committed but the source control console socket could not be removed"
+                    );
+                    return GuestSnapshotAction::Terminate { exit_code: 1 };
+                }
                 tracing::info!(
                     path = %destination.display(),
                     "microVM snapshot committed; terminating source process"
@@ -874,6 +887,14 @@ impl VmController {
                         tracing::error!(
                             error = cleanup_error.as_ref() as &dyn std::error::Error,
                             "committed snapshot console socket could not be removed"
+                        );
+                    }
+                    if let Some(cleanup) = self.microvm_control_console_socket_cleanup.take()
+                        && let Err(cleanup_error) = cleanup.remove_if_owned()
+                    {
+                        tracing::error!(
+                            error = cleanup_error.as_ref() as &dyn std::error::Error,
+                            "committed snapshot control console socket could not be removed"
                         );
                     }
                     tracing::error!(

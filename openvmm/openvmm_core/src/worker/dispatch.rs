@@ -3106,6 +3106,10 @@ impl InitializedVm {
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
                                 openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
                             ),
+                            openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_ID => (
+                                openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE,
+                                openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ,
+                            ),
                             "virtio-blk" => {
                                 let block = microvm_sandbox_blocks
                                     .next()

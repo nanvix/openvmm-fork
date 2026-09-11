@@ -738,6 +738,7 @@ pub fn microvm_machine_contract(
         SnapshotAttachment,
     )>,
     console_attachment: Option<SnapshotAttachment>,
+    control_console_attachment: Option<SnapshotAttachment>,
     sandbox_blocks: Vec<SnapshotMicrovmSandboxBlock>,
     processor_count: u32,
     memory_size: u64,
@@ -1106,6 +1107,76 @@ pub fn microvm_machine_contract(
             queue_count: 1,
             queue_max_sizes: vec![256],
         });
+    }
+    if let Some(attachment) = control_console_attachment {
+        let policy_is_valid = match attachment.reconnect_policy.as_str() {
+            "recreate-listener" => {
+                !attachment.required
+                    && attachment.reconnect_timeout_ms == 0
+                    && matches!(
+                        attachment.identity_kind.as_str(),
+                        "unix-socket" | "named-pipe"
+                    )
+            }
+            "reconnect-client" => {
+                attachment.required
+                    && attachment.reconnect_timeout_ms
+                        == openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS
+                    && matches!(
+                        attachment.identity_kind.as_str(),
+                        "unix-socket" | "named-pipe"
+                    )
+            }
+            "discard-while-disconnected" => {
+                !attachment.required
+                    && attachment.reconnect_timeout_ms == 0
+                    && attachment.identity_kind == "disconnected"
+                    && attachment.identity == b"discard"
+            }
+            _ => false,
+        };
+        anyhow::ensure!(
+            attachment.stable_id == "console:microvm-control0"
+                && attachment.kind == "virtio-control-console"
+                && policy_is_valid
+                && !attachment.identity.is_empty()
+                && attachment.identity.len() <= MAX_ATTACHMENT_IDENTITY_BYTES
+                && attachment.length == 0,
+            "microVM control console attachment has an unsupported reconnect policy"
+        );
+        let discovery = format!(
+            "virtio_mmio.device={:#x}@{:#x}:{}",
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE,
+            openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ,
+        );
+        let tokens = effective_command_line
+            .split_ascii_whitespace()
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            tokens.contains(discovery.as_str())
+                && tokens.contains(openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE),
+            "microVM control console command line does not match its saved identity"
+        );
+        devices.push(SnapshotDevice {
+            stable_id: "console:microvm-control0".to_owned(),
+            state_unit_name: format!(
+                "virtio-control-console-{}",
+                openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE
+            ),
+            kind: "virtio-control-console".to_owned(),
+            order: devices.len() as u32,
+            ranges: vec![mmio(
+                openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            )],
+            irq: Some(openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ),
+            transport: "virtio-mmio".to_owned(),
+            feature_banks: vec![0x3000_0001, 0x0000_0003],
+            queue_count: 2,
+            queue_max_sizes: vec![256, 256],
+        });
+        attachments.push(attachment);
     }
 
     let mut contract = SnapshotMachineContract {
@@ -4468,6 +4539,19 @@ mod tests {
         }
     }
 
+    fn microvm_control_console_attachment() -> SnapshotAttachment {
+        SnapshotAttachment {
+            stable_id: "console:microvm-control0".to_owned(),
+            kind: "virtio-control-console".to_owned(),
+            required: false,
+            reconnect_policy: "discard-while-disconnected".to_owned(),
+            identity_kind: "disconnected".to_owned(),
+            identity: b"discard".to_vec(),
+            length: 0,
+            reconnect_timeout_ms: 0,
+        }
+    }
+
     fn microvm_network_attachment(source_hypervisor: &str) -> SnapshotAttachment {
         assert!(matches!(source_hypervisor, "kvm" | "mshv" | "whp"));
         SnapshotAttachment {
@@ -4528,6 +4612,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             Vec::new(),
             1,
             1024,
@@ -4563,6 +4648,7 @@ mod tests {
             false,
             None,
             Some(microvm_console_attachment()),
+            None,
             Vec::new(),
             1,
             1024,
@@ -4578,6 +4664,71 @@ mod tests {
                 "microvm-shutdown",
                 "microvm-snapshot-request",
                 "virtio-console-3489669120",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            std::time::SystemTime::now().into(),
+            1_000_000_000,
+            Some(1_000_000_000),
+            vec![1, 2, 3],
+        )
+        .unwrap()
+    }
+
+    fn generated_control_console_contract() -> SnapshotMachineContract {
+        microvm_machine_contract(
+            "whp",
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1 \
+             virtio_mmio.device=0x1000@0xd0002000:7 \
+             virtio_mmio.device=0x1000@0xd0003000:4 \
+             virtio_mmio.device=0x1000@0xd0006000:11 \
+             virtio_mmio.device=0x1000@0xd0007000:3 \
+             nvx_control_tty=hvc2"
+                .to_owned(),
+            None,
+            false,
+            None,
+            Some(microvm_console_attachment()),
+            Some(microvm_control_console_attachment()),
+            vec![
+                SnapshotMicrovmSandboxBlock {
+                    role: "distro".to_owned(),
+                    read_only: true,
+                    length: 512,
+                    identity_kind: "sha256".to_owned(),
+                    identity: vec![0x11; SHA256_SIZE],
+                    artifact: String::new(),
+                    logical_block_size: 512,
+                    physical_block_size: 4096,
+                },
+                SnapshotMicrovmSandboxBlock {
+                    role: "scratch".to_owned(),
+                    read_only: false,
+                    length: 512,
+                    identity_kind: "sha256".to_owned(),
+                    identity: vec![0x22; SHA256_SIZE],
+                    artifact: SCRATCH_FILE_NAME.to_owned(),
+                    logical_block_size: 512,
+                    physical_block_size: 4096,
+                },
+            ],
+            1,
+            1024,
+            None,
+            [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+                "virtio-console-3489669120",
+                "virtio-blk-3489673216",
+                "virtio-blk-3489685504",
+                "virtio-control-console-3489689600",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -4614,6 +4765,7 @@ mod tests {
                 microvm_filesystem_attachment(source_hypervisor),
             )),
             None,
+            None,
             Vec::new(),
             1,
             1024,
@@ -4647,6 +4799,7 @@ mod tests {
                 .to_owned(),
             None,
             true,
+            None,
             None,
             None,
             Vec::new(),
@@ -4688,6 +4841,37 @@ mod tests {
         assert_eq!(console.feature_banks, [0x3000_0001, 0x0000_0003]);
         assert_eq!(console.queue_max_sizes, [256, 256]);
         assert_eq!(contract.attachments, [microvm_console_attachment()]);
+    }
+
+    #[test]
+    fn generated_microvm_control_console_contract_has_distinct_fixed_abi() {
+        let contract = generated_control_console_contract();
+        let boot = contract
+            .devices
+            .iter()
+            .find(|device| device.stable_id == "console:microvm-virtio0")
+            .unwrap();
+        let control = contract
+            .devices
+            .iter()
+            .find(|device| device.stable_id == "console:microvm-control0")
+            .unwrap();
+        assert_eq!(boot.stable_id, "console:microvm-virtio0");
+        assert_eq!(control.stable_id, "console:microvm-control0");
+        assert_eq!(control.state_unit_name, "virtio-control-console-3489689600");
+        assert_eq!(control.ranges[0].start, 0xd000_7000);
+        assert_eq!(control.ranges[0].length, 0x1000);
+        assert_eq!(control.irq, Some(3));
+        assert_eq!(control.transport, "virtio-mmio");
+        assert_eq!(control.feature_banks, boot.feature_banks);
+        assert_eq!(control.queue_max_sizes, [256, 256]);
+        assert_eq!(
+            contract.attachments,
+            [
+                microvm_console_attachment(),
+                microvm_control_console_attachment()
+            ]
+        );
     }
 
     #[test]
@@ -4910,6 +5094,24 @@ mod tests {
         manifest.machine_contract = Some(contract.clone());
         let mut expected = contract;
         expected.attachments[0].identity = b"127.0.0.1:6666".to_vec();
+        let error = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
+        assert!(error.to_string().contains("attachment inventory"));
+    }
+
+    #[test]
+    fn validate_microvm_control_console_contract_rejects_attachment_change() {
+        let contract = generated_control_console_contract();
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 1024;
+        manifest.vp_count = 1;
+        manifest.machine_contract = Some(contract.clone());
+        let mut expected = contract;
+        expected
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.stable_id == "console:microvm-control0")
+            .unwrap()
+            .identity = b"unexpected".to_vec();
         let error = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
         assert!(error.to_string().contains("attachment inventory"));
     }
@@ -5265,6 +5467,7 @@ mod tests {
                 "console=hvc0".to_owned(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 Vec::new(),

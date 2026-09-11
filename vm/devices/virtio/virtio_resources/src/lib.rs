@@ -229,6 +229,34 @@ pub mod console {
     impl ResourceId<VirtioDeviceHandle> for VirtioConsoleHandle {
         const ID: &'static str = "virtio-console";
     }
+
+    #[derive(MeshPayload)]
+    pub struct VirtioControlConsoleHandle {
+        pub backend: Resource<SerialBackendHandle>,
+        pub disconnect_policy: VirtioConsoleDisconnectPolicy,
+        pub attachment: Option<VirtioConsoleAttachment>,
+    }
+
+    impl ResourceId<VirtioDeviceHandle> for VirtioControlConsoleHandle {
+        const ID: &'static str = "virtio-control-console";
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn console_resource_ids_are_distinct() {
+            assert_eq!(
+                <VirtioConsoleHandle as ResourceId<VirtioDeviceHandle>>::ID,
+                "virtio-console"
+            );
+            assert_eq!(
+                <VirtioControlConsoleHandle as ResourceId<VirtioDeviceHandle>>::ID,
+                "virtio-control-console"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
