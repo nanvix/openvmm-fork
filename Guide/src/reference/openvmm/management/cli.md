@@ -510,7 +510,7 @@ Serial devices can be configured to appear as different devices inside the guest
   boundary; it cannot prove that the remote application consumed bytes without
   its own acknowledgment protocol.
 
-* `--microvm-control-console <BACKEND>`: With `--machine microvm-v2`, expose a
+* `--microvm-control-console <BACKEND>`: With `--machine microvm`, expose a
   second independent single-port virtio console at fixed MMIO `0xd0007000`, IRQ
   3. `--virtio-console` is required on a fresh boot and remains the only kernel
   console. The control device normally appears as the profile-owned
@@ -521,6 +521,10 @@ Serial devices can be configured to appear as different devices inside the guest
   endpoints must be distinct. Snapshot capture records a separate
   `console:microvm-control0` attachment and restores it independently from the
   boot console.
+
+  Restore snapshots containing this device through the CLI. The OpenVMM
+  management RPC does not expose control-console restore attachments and
+  rejects these snapshots explicitly.
 
 The `BACKEND` argument is the same for all serial devices:
 
