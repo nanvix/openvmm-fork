@@ -355,8 +355,10 @@ fn canonical_microvm_console_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn microvm_console_attachment_from_cli(
+fn microvm_console_attachment_from_cli_with_identity(
     config: &SerialConfigCli,
+    stable_id: &'static str,
+    attachment_kind: &'static str,
 ) -> anyhow::Result<(
     SerialConfigCli,
     virtio_resources::console::VirtioConsoleAttachment,
@@ -502,7 +504,7 @@ fn microvm_console_attachment_from_cli(
     );
 
     let attachment = VirtioConsoleAttachment {
-        stable_id: MICROVM_CONSOLE_STABLE_ID.to_owned(),
+        stable_id: stable_id.to_owned(),
         backend_kind,
         mode,
         endpoint_identity: endpoint_identity.clone(),
@@ -511,8 +513,8 @@ fn microvm_console_attachment_from_cli(
         reconnect_timeout_ms,
     };
     let snapshot_attachment = openvmm_helpers::snapshot::SnapshotAttachment {
-        stable_id: MICROVM_CONSOLE_STABLE_ID.to_owned(),
-        kind: "virtio-console".to_owned(),
+        stable_id: stable_id.to_owned(),
+        kind: attachment_kind.to_owned(),
         required,
         reconnect_policy: reconnect_policy_name.to_owned(),
         identity_kind: identity_kind.to_owned(),
@@ -521,6 +523,20 @@ fn microvm_console_attachment_from_cli(
         reconnect_timeout_ms,
     };
     Ok((effective, attachment, snapshot_attachment))
+}
+
+fn microvm_console_attachment_from_cli(
+    config: &SerialConfigCli,
+) -> anyhow::Result<(
+    SerialConfigCli,
+    virtio_resources::console::VirtioConsoleAttachment,
+    openvmm_helpers::snapshot::SnapshotAttachment,
+)> {
+    microvm_console_attachment_from_cli_with_identity(
+        config,
+        MICROVM_CONSOLE_STABLE_ID,
+        "virtio-console",
+    )
 }
 
 pub(crate) fn validate_microvm_console_attachment_namespace(

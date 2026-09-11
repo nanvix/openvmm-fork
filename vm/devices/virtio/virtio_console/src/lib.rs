@@ -89,6 +89,16 @@ impl VirtioConsoleDevice {
         io: Box<dyn SerialIo>,
         disconnect_policy: VirtioConsoleDisconnectPolicy,
     ) -> Self {
+        Self::new_with_name_and_policy(driver_source, io, "virtio-console", disconnect_policy)
+    }
+
+    /// Create a named console with explicit disconnected-backend behavior.
+    pub fn new_with_name_and_policy(
+        driver_source: &VmTaskDriverSource,
+        io: Box<dyn SerialIo>,
+        worker_name: &'static str,
+        disconnect_policy: VirtioConsoleDisconnectPolicy,
+    ) -> Self {
         let driver = driver_source.simple();
         let mut worker = TaskControl::new(ConsoleWorker {
             io,
@@ -96,7 +106,7 @@ impl VirtioConsoleDevice {
         });
         worker.insert(
             &driver,
-            "virtio-console",
+            worker_name,
             ConsoleWorkerState {
                 receiveq: None,
                 transmitq: None,
@@ -458,193 +468,196 @@ enum WorkerError {
 }
 
 impl ConsoleWorker {
-    /// Core worker loop.
-    ///
-    /// Note that this must be cancel safe--it could be stopped at any await point.
-    /// So, be careful not to leave any state in a weird intermediate state across
-    /// an await point.
     async fn run_loop(&mut self, state: &mut ConsoleWorkerState) -> Result<(), WorkerError> {
-        let mut connected: bool = self.io.is_connected();
-        let receiveq = &mut state.receiveq;
-        let transmitq = &mut state.transmitq;
-        let mut io = parking_lot::Mutex::new(&mut self.io);
-        let mem = &state.mem;
-        let partial_transmit = &mut state.partial_transmit;
-        let staged_rx = &mut state.staged_rx;
-        let input_gated = state.input_gated;
-        let disconnect_policy = self.disconnect_policy;
+        run_direct_loop(&mut self.io, self.disconnect_policy, state).await
+    }
+}
 
-        // If neither queue is present, there's nothing to do.
-        if receiveq.is_none() && transmitq.is_none() {
-            std::future::pending::<()>().await;
-        }
-        loop {
-            if !connected {
-                poll_fn(|cx| io.get_mut().poll_disconnect(cx))
+async fn run_direct_loop(
+    serial_io: &mut Box<dyn SerialIo>,
+    disconnect_policy: VirtioConsoleDisconnectPolicy,
+    state: &mut ConsoleWorkerState,
+) -> Result<(), WorkerError> {
+    // This loop must be cancel safe because TaskControl may stop it at any
+    // await point.
+    let mut connected: bool = serial_io.is_connected();
+    let receiveq = &mut state.receiveq;
+    let transmitq = &mut state.transmitq;
+    let mut io = parking_lot::Mutex::new(serial_io);
+    let mem = &state.mem;
+    let partial_transmit = &mut state.partial_transmit;
+    let staged_rx = &mut state.staged_rx;
+    let input_gated = state.input_gated;
+
+    // If neither queue is present, there's nothing to do.
+    if receiveq.is_none() && transmitq.is_none() {
+        std::future::pending::<()>().await;
+    }
+    loop {
+        if !connected {
+            poll_fn(|cx| io.get_mut().poll_disconnect(cx))
+                .await
+                .map_err(WorkerError::Serial)?;
+            // Wait for the backend to connect, discarding any guest tx data
+            // in the meantime.
+            let wait_connect = async {
+                poll_fn(|cx| io.get_mut().poll_connect(cx))
                     .await
                     .map_err(WorkerError::Serial)?;
-                // Wait for the backend to connect, discarding any guest tx data
-                // in the meantime.
-                let wait_connect = async {
-                    poll_fn(|cx| io.get_mut().poll_connect(cx))
-                        .await
-                        .map_err(WorkerError::Serial)?;
-                    Ok::<_, WorkerError>(true)
+                Ok::<_, WorkerError>(true)
+            };
+            let drain_tx = async {
+                if disconnect_policy == VirtioConsoleDisconnectPolicy::Retain {
+                    return std::future::pending().await;
+                }
+                let Some(transmitq) = transmitq.as_mut() else {
+                    std::future::pending().await
                 };
-                let drain_tx = async {
-                    if disconnect_policy == VirtioConsoleDisconnectPolicy::Retain {
-                        return std::future::pending().await;
-                    }
-                    let Some(transmitq) = transmitq.as_mut() else {
-                        std::future::pending().await
-                    };
-                    loop {
-                        let work = transmitq.peek().await.map_err(WorkerError::Virtio)?;
-                        let work = work.consume();
-                        transmitq.complete(work, 0);
-                        *partial_transmit = 0;
-                    }
-                };
-                // Give wait_connect priority so that drain_tx cannot
-                // consume a descriptor on the same poll cycle where
-                // the backend becomes connected.
-                connected = match futures::future::select(pin!(wait_connect), pin!(drain_tx)).await
-                {
-                    futures::future::Either::Left((result, _))
-                    | futures::future::Either::Right((result, _)) => result?,
-                };
-            } else {
-                let rx = async {
-                    if input_gated {
-                        return std::future::pending().await;
-                    }
-                    'rx: loop {
-                        if staged_rx.is_empty() {
-                            let mut buf = [0u8; BUF_SIZE];
-                            let read = poll_fn(|cx| {
-                                if let Some(receiveq) = receiveq.as_mut() {
-                                    loop {
-                                        match receiveq.try_peek() {
-                                            Ok(Some(work)) => {
-                                                let writeable_len = work
-                                                    .payload()
-                                                    .iter()
-                                                    .filter(|payload| payload.writeable)
-                                                    .map(|payload| payload.length as usize)
-                                                    .sum::<usize>();
-                                                if writeable_len != 0 {
-                                                    break;
-                                                }
-                                                let work = work.consume();
-                                                receiveq.complete(work, 0);
-                                            }
-                                            Ok(None) => {
-                                                let _ = receiveq.poll_kick(cx);
+                loop {
+                    let work = transmitq.peek().await.map_err(WorkerError::Virtio)?;
+                    let work = work.consume();
+                    transmitq.complete(work, 0);
+                    *partial_transmit = 0;
+                }
+            };
+            // Give wait_connect priority so that drain_tx cannot
+            // consume a descriptor on the same poll cycle where
+            // the backend becomes connected.
+            connected = match futures::future::select(pin!(wait_connect), pin!(drain_tx)).await {
+                futures::future::Either::Left((result, _))
+                | futures::future::Either::Right((result, _)) => result?,
+            };
+        } else {
+            let rx = async {
+                if input_gated {
+                    return std::future::pending().await;
+                }
+                'rx: loop {
+                    if staged_rx.is_empty() {
+                        let mut buf = [0u8; BUF_SIZE];
+                        let read = poll_fn(|cx| {
+                            if let Some(receiveq) = receiveq.as_mut() {
+                                loop {
+                                    match receiveq.try_peek() {
+                                        Ok(Some(work)) => {
+                                            let writeable_len = work
+                                                .payload()
+                                                .iter()
+                                                .filter(|payload| payload.writeable)
+                                                .map(|payload| payload.length as usize)
+                                                .sum::<usize>();
+                                            if writeable_len != 0 {
                                                 break;
                                             }
-                                            Err(error) => {
-                                                return std::task::Poll::Ready(Err(
-                                                    WorkerError::Virtio(error),
-                                                ));
-                                            }
+                                            let work = work.consume();
+                                            receiveq.complete(work, 0);
+                                        }
+                                        Ok(None) => {
+                                            let _ = receiveq.poll_kick(cx);
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            return std::task::Poll::Ready(Err(
+                                                WorkerError::Virtio(error),
+                                            ));
                                         }
                                     }
                                 }
-                                Pin::new(&mut **io.lock())
-                                    .poll_read(cx, &mut buf)
-                                    .map(|result| result.map_err(WorkerError::Serial))
-                            })
-                            .await;
-                            let read = match read {
-                                Ok(read) => read,
-                                Err(WorkerError::Serial(_)) => break 'rx Ok(false),
-                                Err(error) => return Err(error),
-                            };
-                            if read == 0 {
-                                break 'rx Ok(false);
                             }
-                            staged_rx.extend(&buf[..read]);
-                        }
-
-                        let Some(receiveq) = receiveq.as_mut() else {
-                            std::future::pending().await
+                            Pin::new(&mut **io.lock())
+                                .poll_read(cx, &mut buf)
+                                .map(|result| result.map_err(WorkerError::Serial))
+                        })
+                        .await;
+                        let read = match read {
+                            Ok(read) => read,
+                            Err(WorkerError::Serial(_)) => break 'rx Ok(false),
+                            Err(error) => return Err(error),
                         };
-                        let work = receiveq.peek().await.map_err(WorkerError::Virtio)?;
-                        let writeable_len = work
-                            .payload()
-                            .iter()
-                            .filter(|p| p.writeable)
-                            .map(|p| p.length as usize)
-                            .sum::<usize>();
-                        if writeable_len == 0 {
-                            // Guest posted a zero-length buffer; complete it
-                            // immediately without calling poll_read (which
-                            // would return Ok(0) and look like a disconnect).
-                            let work = work.consume();
-                            receiveq.complete(work, 0);
-                            continue 'rx;
+                        if read == 0 {
+                            break 'rx Ok(false);
                         }
-                        let n = staged_rx.len().min(writeable_len);
-                        let work = work.consume();
-                        if let Err(err) = work.write(mem, &staged_rx.make_contiguous()[..n]) {
-                            tracelimit::error_ratelimited!(
-                                error = &err as &dyn std::error::Error,
-                                "failed to write to guest receive buffer"
-                            );
-                            receiveq.complete(work, 0);
-                        } else {
-                            staged_rx.drain(..n);
-                            receiveq.complete(work, n as u32);
-                        }
+                        staged_rx.extend(&buf[..read]);
                     }
-                };
-                let tx = async {
-                    let Some(transmitq) = transmitq.as_mut() else {
+
+                    let Some(receiveq) = receiveq.as_mut() else {
                         std::future::pending().await
                     };
-                    'tx: loop {
-                        let work = transmitq.peek().await.map_err(WorkerError::Virtio)?;
-                        let readable_len = work.readable_length() as usize;
-                        let mut buf = [0u8; BUF_SIZE];
-                        while *partial_transmit < readable_len {
-                            let n = work
-                                .read_at_offset(*partial_transmit as u64, mem, &mut buf)
-                                .map_err(WorkerError::GuestMemory)?;
-                            let mut written_this_chunk = 0;
-                            while written_this_chunk < n {
-                                match poll_fn(|cx| {
-                                    Pin::new(&mut **io.lock())
-                                        .poll_write(cx, &buf[written_this_chunk..n])
-                                })
-                                .await
-                                {
-                                    Ok(0) => {
-                                        break 'tx Ok(false);
-                                    }
-                                    Ok(written) => {
-                                        written_this_chunk += written;
-                                        *partial_transmit += written;
-                                    }
-                                    Err(_) => {
-                                        // Backend disconnected. Leave
-                                        // partial_transmit as-is so we can
-                                        // resume if the backend reconnects
-                                        // before the descriptor is drained.
-                                        break 'tx Ok(false);
-                                    }
+                    let work = receiveq.peek().await.map_err(WorkerError::Virtio)?;
+                    let writeable_len = work
+                        .payload()
+                        .iter()
+                        .filter(|p| p.writeable)
+                        .map(|p| p.length as usize)
+                        .sum::<usize>();
+                    if writeable_len == 0 {
+                        // Guest posted a zero-length buffer; complete it
+                        // immediately without calling poll_read (which
+                        // would return Ok(0) and look like a disconnect).
+                        let work = work.consume();
+                        receiveq.complete(work, 0);
+                        continue 'rx;
+                    }
+                    let n = staged_rx.len().min(writeable_len);
+                    let work = work.consume();
+                    if let Err(err) = work.write(mem, &staged_rx.make_contiguous()[..n]) {
+                        tracelimit::error_ratelimited!(
+                            error = &err as &dyn std::error::Error,
+                            "failed to write to guest receive buffer"
+                        );
+                        receiveq.complete(work, 0);
+                    } else {
+                        staged_rx.drain(..n);
+                        receiveq.complete(work, n as u32);
+                    }
+                }
+            };
+            let tx = async {
+                let Some(transmitq) = transmitq.as_mut() else {
+                    std::future::pending().await
+                };
+                'tx: loop {
+                    let work = transmitq.peek().await.map_err(WorkerError::Virtio)?;
+                    let readable_len = work.readable_length() as usize;
+                    let mut buf = [0u8; BUF_SIZE];
+                    while *partial_transmit < readable_len {
+                        let n = work
+                            .read_at_offset(*partial_transmit as u64, mem, &mut buf)
+                            .map_err(WorkerError::GuestMemory)?;
+                        let mut written_this_chunk = 0;
+                        while written_this_chunk < n {
+                            match poll_fn(|cx| {
+                                Pin::new(&mut **io.lock())
+                                    .poll_write(cx, &buf[written_this_chunk..n])
+                            })
+                            .await
+                            {
+                                Ok(0) => {
+                                    break 'tx Ok(false);
+                                }
+                                Ok(written) => {
+                                    written_this_chunk += written;
+                                    *partial_transmit += written;
+                                }
+                                Err(_) => {
+                                    // Backend disconnected. Leave
+                                    // partial_transmit as-is so we can
+                                    // resume if the backend reconnects
+                                    // before the descriptor is drained.
+                                    break 'tx Ok(false);
                                 }
                             }
                         }
-                        *partial_transmit = 0;
-                        let work = work.consume();
-                        transmitq.complete(work, 0);
                     }
-                };
+                    *partial_transmit = 0;
+                    let work = work.consume();
+                    transmitq.complete(work, 0);
+                }
+            };
 
-                // Run rx and tx concurrently; if either signals disconnect, loop
-                // back to the disconnected state.
-                connected = (rx, tx).race().await?;
-            }
+            // Run rx and tx concurrently; if either signals disconnect, loop
+            // back to the disconnected state.
+            connected = (rx, tx).race().await?;
         }
     }
 }
