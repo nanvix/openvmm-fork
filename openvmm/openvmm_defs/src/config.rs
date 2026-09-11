@@ -186,9 +186,7 @@ pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
         0xd000_4000 => MICROVM_VIRTIO_RUNTIME_BLK_STATUS_OFFSET,
         0xd000_5000 => MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET,
         0xd000_6000 => MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET,
-        MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE => {
-            MICROVM_VIRTIO_CONTROL_CONSOLE_STATUS_OFFSET
-        }
+        MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE => MICROVM_VIRTIO_CONTROL_CONSOLE_STATUS_OFFSET,
         _ => return None,
     };
     Some(MICROVM_SHARED_STATUS_PAGE_GPA + offset)
@@ -1587,16 +1585,8 @@ mod tests {
         validate_microvm_sandbox_blocks(&blocks).unwrap();
 
         let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
-        append_microvm_virtio_discovery(
-            &mut cmdline,
-            None,
-            false,
-            None,
-            false,
-            false,
-            &blocks,
-        )
-        .unwrap();
+        append_microvm_virtio_discovery(&mut cmdline, None, false, None, false, false, &blocks)
+            .unwrap();
         assert_eq!(
             cmdline,
             format!(
@@ -1612,16 +1602,7 @@ mod tests {
     #[test]
     fn microvm_control_console_slot_is_stable() {
         let mut cmdline = MICROVM_CONSOLE_COMMAND_LINE.to_owned();
-        append_microvm_virtio_discovery(
-            &mut cmdline,
-            None,
-            false,
-            None,
-            true,
-            true,
-            &[],
-        )
-        .unwrap();
+        append_microvm_virtio_discovery(&mut cmdline, None, false, None, true, true, &[]).unwrap();
         assert_eq!(
             cmdline,
             format!(
