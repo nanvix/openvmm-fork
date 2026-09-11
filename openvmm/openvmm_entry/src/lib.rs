@@ -95,7 +95,9 @@ use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
+#[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
+use openvmm_defs::config::build_microvm_v2_command_line;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -210,6 +212,8 @@ struct VmResources {
         Option<mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     microvm_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
+    microvm_control_console_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
+    microvm_control_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
     microvm_network_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     microvm_egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
     microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
@@ -227,8 +231,26 @@ struct ConsoleState<'a> {
 }
 
 const MICROVM_CONSOLE_STABLE_ID: &str = "console:microvm-virtio0";
+const MICROVM_CONTROL_CONSOLE_STABLE_ID: &str = "console:microvm-control0";
+const MICROVM_CONSOLE_ATTACHMENT_KIND: &str = "virtio-console";
+const MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND: &str = "virtio-control-console";
 const MICROVM_NETWORK_STABLE_ID: &str = "net:microvm0";
 const MICROVM_FILESYSTEM_STABLE_ID: &str = "fs:microvm0";
+
+fn microvm_console_attachments_share_endpoint(
+    left: &openvmm_helpers::snapshot::SnapshotAttachment,
+    right: &openvmm_helpers::snapshot::SnapshotAttachment,
+) -> bool {
+    left.identity_kind == right.identity_kind
+        && if left.identity_kind == "named-pipe" {
+            std::str::from_utf8(&left.identity)
+                .ok()
+                .zip(std::str::from_utf8(&right.identity).ok())
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        } else {
+            left.identity == right.identity
+        }
+}
 
 #[derive(Clone)]
 struct EffectiveMicrovmNetwork {
@@ -388,8 +410,16 @@ fn microvm_console_attachment_from_cli_with_identity(
                 .to_owned();
             #[cfg(windows)]
             let (backend_kind, identity_kind) = {
+                let name = path
+                    .to_str()
+                    .and_then(|path| path.strip_prefix("//./pipe/openvmm-microvm-"));
                 anyhow::ensure!(
-                    path.starts_with("//./pipe/openvmm-microvm-"),
+                    name.is_some_and(|name| {
+                        !name.is_empty()
+                            && name.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                            })
+                    }),
                     "Windows microVM console pipes must use //./pipe/openvmm-microvm-<NAME>"
                 );
                 (VirtioConsoleBackendKind::NamedPipe, "named-pipe")
@@ -535,7 +565,28 @@ fn microvm_console_attachment_from_cli(
     microvm_console_attachment_from_cli_with_identity(
         config,
         MICROVM_CONSOLE_STABLE_ID,
-        "virtio-console",
+        MICROVM_CONSOLE_ATTACHMENT_KIND,
+    )
+}
+
+fn microvm_control_console_attachment_from_cli(
+    config: &SerialConfigCli,
+) -> anyhow::Result<(
+    SerialConfigCli,
+    virtio_resources::console::VirtioConsoleAttachment,
+    openvmm_helpers::snapshot::SnapshotAttachment,
+)> {
+    anyhow::ensure!(
+        matches!(
+            config,
+            SerialConfigCli::Pipe(_) | SerialConfigCli::ConnectPipe(_) | SerialConfigCli::None
+        ),
+        "microVM control console requires listen=..., connect=..., or none"
+    );
+    microvm_console_attachment_from_cli_with_identity(
+        config,
+        MICROVM_CONTROL_CONSOLE_STABLE_ID,
+        MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
     )
 }
 
@@ -586,17 +637,20 @@ pub(crate) fn validate_microvm_console_attachment_namespace(
     Ok(())
 }
 
-fn microvm_console_attachment_from_snapshot(
+fn microvm_console_attachment_from_snapshot_with_identity(
     attachment: &openvmm_helpers::snapshot::SnapshotAttachment,
     requested: Option<&SerialConfigCli>,
+    stable_id: &'static str,
+    attachment_kind: &'static str,
+    control_console: bool,
 ) -> anyhow::Result<(
     SerialConfigCli,
     virtio_resources::console::VirtioConsoleAttachment,
     openvmm_helpers::snapshot::SnapshotAttachment,
 )> {
     anyhow::ensure!(
-        attachment.stable_id == MICROVM_CONSOLE_STABLE_ID
-            && attachment.kind == "virtio-console"
+        attachment.stable_id == stable_id
+            && attachment.kind == attachment_kind
             && attachment.length == 0,
         "snapshot has an invalid microVM console attachment"
     );
@@ -636,18 +690,99 @@ fn microvm_console_attachment_from_snapshot(
             "snapshot microVM console policy '{policy}' and backend kind '{kind}' are unsupported"
         ),
     };
-    let reconstructed = microvm_console_attachment_from_cli(&config)?;
+    let reconstructed = if control_console {
+        microvm_control_console_attachment_from_cli(&config)?
+    } else {
+        microvm_console_attachment_from_cli(&config)?
+    };
     anyhow::ensure!(
         reconstructed.2 == *attachment,
         "snapshot microVM console identity is not canonical"
     );
     if let Some(requested) = requested {
+        let requested = if control_console {
+            microvm_control_console_attachment_from_cli(requested)?
+        } else {
+            microvm_console_attachment_from_cli(requested)?
+        };
         anyhow::ensure!(
-            microvm_console_attachment_from_cli(requested)?.2 == *attachment,
+            requested.2 == *attachment,
             "restore-time virtio-console does not match the snapshot attachment"
         );
     }
+
     Ok(reconstructed)
+}
+
+fn microvm_console_attachment_from_snapshot(
+    attachment: &openvmm_helpers::snapshot::SnapshotAttachment,
+    requested: Option<&SerialConfigCli>,
+) -> anyhow::Result<(
+    SerialConfigCli,
+    virtio_resources::console::VirtioConsoleAttachment,
+    openvmm_helpers::snapshot::SnapshotAttachment,
+)> {
+    microvm_console_attachment_from_snapshot_with_identity(
+        attachment,
+        requested,
+        MICROVM_CONSOLE_STABLE_ID,
+        MICROVM_CONSOLE_ATTACHMENT_KIND,
+        false,
+    )
+}
+
+fn effective_microvm_console_with_identity(
+    requested: Option<&SerialConfigCli>,
+    restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
+    stable_id: &'static str,
+    attachment_kind: &'static str,
+    control_console: bool,
+) -> anyhow::Result<
+    Option<(
+        SerialConfigCli,
+        virtio_resources::console::VirtioConsoleAttachment,
+        openvmm_helpers::snapshot::SnapshotAttachment,
+    )>,
+> {
+    let Some(restore) = restore else {
+        return requested
+            .map(|requested| {
+                if control_console {
+                    microvm_control_console_attachment_from_cli(requested)
+                } else {
+                    microvm_console_attachment_from_cli(requested)
+                }
+            })
+            .transpose();
+    };
+    let has_console = restore
+        .devices
+        .iter()
+        .any(|device| device.stable_id == stable_id);
+    let saved_attachment = restore
+        .attachments
+        .iter()
+        .find(|attachment| attachment.stable_id == stable_id);
+    anyhow::ensure!(
+        has_console == saved_attachment.is_some(),
+        "snapshot microVM console device and attachment inventories disagree"
+    );
+    let Some(saved_attachment) = saved_attachment else {
+        anyhow::ensure!(
+            requested.is_none(),
+            "a restore-time virtio-console cannot be added to a snapshot without one"
+        );
+        return Ok(None);
+    };
+    Ok(Some(
+        microvm_console_attachment_from_snapshot_with_identity(
+            saved_attachment,
+            requested,
+            stable_id,
+            attachment_kind,
+            control_console,
+        )?,
+    ))
 }
 
 fn effective_microvm_console(
@@ -660,34 +795,32 @@ fn effective_microvm_console(
         openvmm_helpers::snapshot::SnapshotAttachment,
     )>,
 > {
-    let Some(restore) = restore else {
-        return requested
-            .map(microvm_console_attachment_from_cli)
-            .transpose();
-    };
-    let has_console = restore
-        .devices
-        .iter()
-        .any(|device| device.stable_id == MICROVM_CONSOLE_STABLE_ID);
-    let saved_attachment = restore
-        .attachments
-        .iter()
-        .find(|attachment| attachment.stable_id == MICROVM_CONSOLE_STABLE_ID);
-    anyhow::ensure!(
-        has_console == saved_attachment.is_some(),
-        "snapshot microVM console device and attachment inventories disagree"
-    );
-    let Some(saved_attachment) = saved_attachment else {
-        anyhow::ensure!(
-            requested.is_none(),
-            "a restore-time virtio-console cannot be added to a snapshot without one"
-        );
-        return Ok(None);
-    };
-    Ok(Some(microvm_console_attachment_from_snapshot(
-        saved_attachment,
+    effective_microvm_console_with_identity(
         requested,
-    )?))
+        restore,
+        MICROVM_CONSOLE_STABLE_ID,
+        MICROVM_CONSOLE_ATTACHMENT_KIND,
+        false,
+    )
+}
+
+fn effective_microvm_control_console(
+    requested: Option<&SerialConfigCli>,
+    restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
+) -> anyhow::Result<
+    Option<(
+        SerialConfigCli,
+        virtio_resources::console::VirtioConsoleAttachment,
+        openvmm_helpers::snapshot::SnapshotAttachment,
+    )>,
+> {
+    effective_microvm_console_with_identity(
+        requested,
+        restore,
+        MICROVM_CONTROL_CONSOLE_STABLE_ID,
+        MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
+        true,
+    )
 }
 
 fn microvm_network_attachment() -> openvmm_helpers::snapshot::SnapshotAttachment {
@@ -1321,6 +1454,20 @@ mod microvm_console_attachment_tests {
     }
 
     #[test]
+    fn named_pipe_endpoint_identity_is_case_insensitive() {
+        let mut left = socket_attachment(Path::new("unused"));
+        left.identity_kind = "named-pipe".to_owned();
+        left.identity = b"//./pipe/openvmm-microvm-Control".to_vec();
+        let mut right = left.clone();
+        right.identity = b"//./pipe/openvmm-microvm-control".to_vec();
+        assert!(microvm_console_attachments_share_endpoint(&left, &right));
+
+        left.identity_kind = "unix-socket".to_owned();
+        right.identity_kind = "unix-socket".to_owned();
+        assert!(!microvm_console_attachments_share_endpoint(&left, &right));
+    }
+
+    #[test]
     fn client_attachment_is_required_and_bounded() {
         let requested = SerialConfigCli::ConnectTcp("127.0.0.1:5555".parse().unwrap());
         let (_, resource, snapshot) = microvm_console_attachment_from_cli(&requested).unwrap();
@@ -1399,6 +1546,41 @@ mod microvm_console_attachment_tests {
     }
 
     #[test]
+    fn control_attachment_has_distinct_identity_and_rejects_tcp() {
+        let (_, resource, snapshot) =
+            microvm_control_console_attachment_from_cli(&SerialConfigCli::None).unwrap();
+        assert_eq!(resource.stable_id, MICROVM_CONTROL_CONSOLE_STABLE_ID);
+        assert_eq!(snapshot.stable_id, MICROVM_CONTROL_CONSOLE_STABLE_ID);
+        assert_eq!(snapshot.kind, MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND);
+        assert_ne!(
+            snapshot.stable_id,
+            microvm_console_attachment_from_cli(&SerialConfigCli::None)
+                .unwrap()
+                .2
+                .stable_id
+        );
+
+        let (_, restored_resource, restored_snapshot) =
+            microvm_console_attachment_from_snapshot_with_identity(
+                &snapshot,
+                None,
+                MICROVM_CONTROL_CONSOLE_STABLE_ID,
+                MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
+                true,
+            )
+            .unwrap();
+        assert_eq!(restored_resource.stable_id, resource.stable_id);
+        assert_eq!(restored_snapshot, snapshot);
+
+        assert!(
+            microvm_control_console_attachment_from_cli(&SerialConfigCli::Tcp(
+                "127.0.0.1:5555".parse().unwrap()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn snapshot_downtime_accepts_supported_elapsed_time() {
         let capture = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
 
@@ -1464,6 +1646,7 @@ mod microvm_console_attachment_tests {
             command_line,
             Some((&network, &policy, microvm_network_attachment())),
             false,
+            None,
             None,
             None,
             Vec::new(),
@@ -1608,6 +1791,7 @@ mod microvm_console_attachment_tests {
             true,
             Some((&filesystem, Path::new(&root_path), attachment)),
             None,
+            None,
             Vec::new(),
             1,
             1024,
@@ -1651,6 +1835,7 @@ mod microvm_console_attachment_tests {
             command_line,
             None,
             true,
+            None,
             None,
             None,
             Vec::new(),
@@ -2069,7 +2254,36 @@ async fn vm_config_from_command_line(
     } else {
         None
     };
+    let microvm_control_console = if is_microvm {
+        effective_microvm_control_console(
+            opt.microvm_control_console.as_ref(),
+            restore_machine_contract,
+        )?
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        microvm_control_console.is_none() || microvm_console.is_some(),
+        "microVM control console requires the boot virtio-console"
+    );
+    if let (Some((_, _, boot)), Some((_, _, control))) =
+        (&microvm_console, &microvm_control_console)
+        && control.identity_kind != "disconnected"
+    {
+        anyhow::ensure!(
+            !microvm_console_attachments_share_endpoint(boot, control),
+            "microVM boot and control consoles require distinct endpoints"
+        );
+    }
     if let Some((_, _, attachment)) = &microvm_console
+        && let Some(snapshot_dir) = opt
+            .restore_snapshot
+            .as_deref()
+            .or(opt.snapshot_destination.as_deref())
+    {
+        validate_microvm_console_attachment_namespace(attachment, snapshot_dir)?;
+    }
+    if let Some((_, _, attachment)) = &microvm_control_console
         && let Some(snapshot_dir) = opt
             .restore_snapshot
             .as_deref()
@@ -2194,7 +2408,7 @@ async fn vm_config_from_command_line(
     } else {
         opt.virtio_console.clone()
     };
-    let (virtio_console_backend, microvm_console_socket_cleanup) =
+    let (virtio_console_backend, microvm_console_socket_cleanup_guard) =
         if let Some(serial_cfg) = virtio_console_config {
             if is_microvm {
                 match serial_cfg {
@@ -2253,12 +2467,58 @@ async fn vm_config_from_command_line(
         } else {
             (None, None)
         };
+    let (microvm_control_console_backend, microvm_control_console_socket_cleanup) =
+        if let Some(serial_cfg) = microvm_control_console
+            .as_ref()
+            .map(|(config, _, _)| config.clone())
+        {
+            match serial_cfg {
+                SerialConfigCli::Pipe(path) => {
+                    let backend =
+                        serial_io::bind_serial_without_cleanup(&path).with_context(|| {
+                            format!(
+                                "failed to bind microVM control console listener {}",
+                                path.display()
+                            )
+                        })?;
+                    let cleanup = microvm_console_socket_cleanup(path)?;
+                    (Some(backend), cleanup)
+                }
+                SerialConfigCli::ConnectPipe(path) => (
+                    Some(
+                        serial_io::connect_serial_with_timeout(
+                            &path,
+                            Duration::from_millis(
+                                openvmm_defs::config::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                            ),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to reconnect microVM control console client {}",
+                                path.display()
+                            )
+                        })?,
+                    ),
+                    None,
+                ),
+                SerialConfigCli::None => {
+                    (Some(DisconnectedSerialBackendHandle.into_resource()), None)
+                }
+                _ => unreachable!("microVM control console backend was validated"),
+            }
+        } else {
+            (None, None)
+        };
 
     let mut resources = VmResources {
         microvm_console_attachment: microvm_console
             .as_ref()
             .map(|(_, _, attachment)| attachment.clone()),
-        microvm_console_socket_cleanup,
+        microvm_console_socket_cleanup: microvm_console_socket_cleanup_guard,
+        microvm_control_console_attachment: microvm_control_console
+            .as_ref()
+            .map(|(_, _, attachment)| attachment.clone()),
+        microvm_control_console_socket_cleanup,
         microvm_network_attachment,
         microvm_egress_policy: microvm_egress_policy.clone(),
         microvm_filesystem_attachment,
@@ -3175,7 +3435,12 @@ async fn vm_config_from_command_line(
             (
                 kernel.into(),
                 initrd.map(Into::into),
-                build_microvm_command_line(&opt.cmdline, microvm_console.is_some())?,
+                match opt.machine {
+                    MachineProfileCli::Microvm => {
+                        build_microvm_v2_command_line(&opt.cmdline, microvm_console.is_some())?
+                    }
+                    MachineProfileCli::Standard => unreachable!(),
+                },
             )
         };
 
@@ -3882,6 +4147,19 @@ async fn vm_config_from_command_line(
             add_virtio_device(VirtioBusCli::Auto, resource);
         }
     }
+    if let Some(backend) = microvm_control_console_backend {
+        let resource: Resource<VirtioDeviceHandle> =
+            virtio_resources::console::VirtioControlConsoleHandle {
+                backend,
+                disconnect_policy:
+                    virtio_resources::console::VirtioConsoleDisconnectPolicy::Discard,
+                attachment: microvm_control_console
+                    .as_ref()
+                    .map(|(_, attachment, _)| attachment.clone()),
+            }
+            .into_resource();
+        add_virtio_device(VirtioBusCli::Mmio, resource);
+    }
 
     // Handle --vhost-user arguments.
     #[cfg(target_os = "linux")]
@@ -4164,6 +4442,9 @@ async fn vm_config_from_command_line(
             .virtio_devices
             .iter()
             .any(|(_, device)| device.id() == "virtio-console");
+        let has_control_console = cfg.virtio_devices.iter().any(|(_, device)| {
+            device.id() == openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_ID
+        });
         let network_irq = cfg
             .microvm_network
             .as_ref()
@@ -4193,7 +4474,7 @@ async fn vm_config_from_command_line(
             microvm_filesystem_slot,
             cfg.microvm_filesystem.as_ref(),
             has_console,
-            false,
+            has_control_console,
             &cfg.microvm_sandbox_blocks,
         )?;
     }
@@ -4685,6 +4966,7 @@ fn prepare_snapshot_restore(
         &openvmm_helpers::snapshot::SnapshotAttachment,
     )>,
     console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
+    control_console_attachment: Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
     sandbox_block_sources: &[storage_builder::MicrovmSandboxBlockSource],
 ) -> anyhow::Result<PreparedSnapshotRestore> {
     let base_memory_size = snapshot.manifest().memory_size_bytes;
@@ -4709,6 +4991,7 @@ fn prepare_snapshot_restore(
             network,
             filesystem,
             console_attachment,
+            control_console_attachment,
             sandbox_blocks,
         ))
     } else {
@@ -4929,6 +5212,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             &openvmm_helpers::snapshot::SnapshotAttachment,
         )>,
         Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
+        Option<&openvmm_helpers::snapshot::SnapshotAttachment>,
         Vec<openvmm_helpers::snapshot::SnapshotMicrovmSandboxBlock>,
     )>,
 ) -> anyhow::Result<PreparedSnapshotRestore> {
@@ -4948,6 +5232,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
         network,
         filesystem,
         console_attachment,
+        control_console_attachment,
         sandbox_blocks,
     )) = expected_microvm_contract
     {
@@ -4970,6 +5255,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             filesystem_slot,
             filesystem,
             console_attachment.cloned(),
+            control_console_attachment.cloned(),
             sandbox_blocks,
             expected_vp_count,
             expected_memory_size,
@@ -5342,6 +5628,7 @@ async fn run_control_inner(
     let microvm_sandbox_block_sources =
         std::mem::take(&mut resources.microvm_sandbox_block_sources);
     let microvm_console_attachment = resources.microvm_console_attachment.clone();
+    let microvm_control_console_attachment = resources.microvm_control_console_attachment.clone();
     let microvm_network = vm_config.microvm_network.clone();
     let microvm_network_attachment = resources.microvm_network_attachment.clone();
     let microvm_egress_policy = resources.microvm_egress_policy.clone();
@@ -5585,6 +5872,7 @@ async fn run_control_inner(
                         (filesystem, root_path, attachment)
                     }),
                 microvm_console_attachment.as_ref(),
+                microvm_control_console_attachment.as_ref(),
                 &microvm_sandbox_block_sources,
             )?;
             (
@@ -5719,6 +6007,7 @@ async fn run_control_inner(
         effective_command_line,
         microvm_sandbox_block_sources,
         microvm_console_attachment,
+        microvm_control_console_attachment,
         microvm_network,
         microvm_network_attachment,
         microvm_egress_policy,
@@ -5727,6 +6016,9 @@ async fn run_control_inner(
         microvm_filesystem_root_path,
         microvm_filesystem_attachment,
         microvm_console_socket_cleanup: resources.microvm_console_socket_cleanup.take(),
+        microvm_control_console_socket_cleanup: resources
+            .microvm_control_console_socket_cleanup
+            .take(),
         snapshot_memory_file,
         _private_scratch_dir: private_scratch_dir,
         guest_power_actions: vm_controller::GuestPowerActions {
