@@ -1486,6 +1486,7 @@ async fn broker_rejects_wrong_capability_without_epoch_advance(driver: DefaultDr
         [0x7d; 32].to_vec(),
     )));
     yield_until(|| !harness.handle.is_connected()).await;
+    assert!(harness.handle.tx_data().is_empty());
 
     harness
         .send_guest_bytes(

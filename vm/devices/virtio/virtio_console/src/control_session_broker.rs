@@ -829,8 +829,7 @@ impl ControlSessionBroker {
             if !constant_time_eq_32(&self.capability, &record.payload) {
                 increment(&mut self.counters.authentication_errors);
                 self.host_rejected = true;
-                let payload = 1u32.to_le_bytes().to_vec();
-                self.enqueue_host_control(RecordType::Error, payload)?;
+                // Authentication rejection is close-only; the adapter detaches the host.
                 return Err(BrokerError::Authentication);
             }
             self.host_authenticated = true;
@@ -1159,8 +1158,7 @@ mod tests {
         assert_eq!(error, BrokerError::Authentication);
         assert_eq!(broker.epoch(), 1);
         assert!(!broker.host_is_authenticated());
-        let response = drain_record(&mut broker, OutputLegId::Host)?;
-        assert_eq!(response.record_type, RecordType::Error);
+        assert_eq!(broker.output_record_count(OutputLegId::Host), 0);
         assert_eq!(broker.counters().authentication_errors, 1);
         Ok(())
     }

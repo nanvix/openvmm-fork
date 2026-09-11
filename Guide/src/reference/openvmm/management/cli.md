@@ -531,8 +531,9 @@ Serial devices can be configured to appear as different devices inside the guest
   bytes must never appear in arguments, environment variables, endpoint names,
   logs, snapshots, or attachment identities. The first host record must prove
   that capability. Peer identity is checked first. Authentication must complete
-  within five seconds; a stalled or rejected client is closed without changing
-  the broker epoch.
+  within `--microvm-control-auth-timeout-ms` (default 5000, range 1 to 60000).
+  A stalled or failed authentication attempt closes the connection without a
+  protocol Error record and without changing the broker epoch.
 
   `none` needs no authentication handle. OpenVMM generates an unreachable
   random capability so disconnected process tests remain supported. Secure
