@@ -1896,7 +1896,7 @@ impl IntoPipeline for CheckinGatesCli {
                         FlowArch::X86_64,
                         format!("run vmm-perf [{label}]"),
                     )
-                    .gh_set_pool(pool)
+                    .gh_set_pool_with_fork_gate(pool, config)
                     .with_timeout_in_minutes(120)
                     .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init)
                     .dep_on(
@@ -1947,7 +1947,7 @@ impl IntoPipeline for CheckinGatesCli {
                     FlowArch::X86_64,
                     "build openvmm [distribution config, x64-linux-gnu]",
                 )
-                .gh_set_pool(gh_pools::linux_x64_gh())
+                .gh_set_pool_with_fork_gate(gh_pools::linux_x64_gh(), config)
                 .ado_set_pool(ado_pools::default_linux())
                 .side_effect(|done| {
                     flowey_lib_hvlite::_jobs::check_distro_build_from_checkout::Request { done }
@@ -2030,5 +2030,27 @@ impl IntoPipeline for CheckinGatesCli {
         }
 
         Ok(pipeline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_with_tracing::test;
+
+    #[test]
+    fn release_pr_jobs_keep_the_release_label_gate() {
+        let workflow = include_str!("../../../../.github/workflows/openvmm-pr-release.yaml");
+        let conditions: Vec<_> = workflow
+            .lines()
+            .filter(|line| line.starts_with("    if: "))
+            .collect();
+
+        assert!(!conditions.is_empty());
+        for condition in conditions {
+            assert!(
+                condition.contains("release-ci-required"),
+                "release PR job is missing the release label gate: {condition}"
+            );
+        }
     }
 }
