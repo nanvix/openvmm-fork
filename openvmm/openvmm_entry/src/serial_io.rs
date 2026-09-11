@@ -83,6 +83,7 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
         ));
     }
 
+    let control_listener = openvmm_defs::profile::ProfileSpan::start();
     let listener = UnixListener::bind(path)?;
     let bound_metadata = fs_err::symlink_metadata(path)?;
     let prepare_result = (|| {
@@ -112,6 +113,7 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
         }
         return Err(error);
     }
+    control_listener.complete_milestone("startup", "control_listener_ready", Default::default());
     Ok(OpenSocketSerialConfig::from(listener).into_resource())
 }
 

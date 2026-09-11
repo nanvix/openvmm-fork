@@ -3834,6 +3834,8 @@ impl LoadedVm {
                     ..Default::default()
                 },
             );
+        } else {
+            device_start.complete("startup", "device_start", Default::default());
         }
         if let Some(mut sink) = self.restore_ready_sink.take() {
             let signal_result = sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
