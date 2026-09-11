@@ -7666,11 +7666,13 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "inspect",
+ "libc",
  "mesh",
  "pal",
  "pal_async",
  "serial_core",
  "socket2",
+ "test_with_tracing",
  "tracing",
  "unix_socket",
  "vm_resource",
