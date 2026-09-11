@@ -519,6 +519,22 @@ impl TestHarness {
         self.handle = handle;
     }
 
+    fn replace_with_broker(&mut self, instance_id: [u8; 16], capability: [u8; 32]) {
+        let (io, handle) = new_mock_serial();
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(self.driver.clone()));
+        self.device = VirtioConsoleDevice::new_broker(
+            &driver_source,
+            Box::new(io),
+            VirtioControlConsoleBrokerConfig {
+                instance_id,
+                capability,
+                expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
+                auth_timeout_ms: 5000,
+            },
+        );
+        self.handle = handle;
+    }
+
     /// Allocate a data region in guest memory and return its GPA.
     fn alloc_data(&mut self, size: u32) -> u64 {
         let gpa = self.next_data_offset;
@@ -1180,6 +1196,7 @@ async fn saved_state_validator_rejects_wrong_schema(driver: DefaultDriver) {
         partial_transmit: 0,
         staged_rx: Vec::new(),
         disconnect_policy_id: 0,
+        broker: None,
     });
     assert!(
         validator(
@@ -1222,6 +1239,7 @@ async fn saved_state_validator_rejects_tx_offset_past_descriptor(driver: Default
         partial_transmit: 6,
         staged_rx: Vec::new(),
         disconnect_policy_id: 0,
+        broker: None,
     });
     let queues = [
         DeviceQueueState {
@@ -1265,6 +1283,7 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
         partial_transmit: 0,
         staged_rx: staged_rx.clone(),
         disconnect_policy_id: 0,
+        broker: None,
     }));
 
     let destination_harness = TestHarness::new(&driver);
@@ -1309,6 +1328,7 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
         partial_transmit: 0,
         staged_rx: vec![0; super::MAX_STAGED_RX_BYTES + 1],
         disconnect_policy_id: 0,
+        broker: None,
     }));
     let invalid_harness = TestHarness::new(&driver);
     let mut invalid_destination = VirtioMmioDevice::new(
@@ -1719,6 +1739,205 @@ async fn broker_fragmentation_partial_host_writes_and_backpressure(driver: Defau
         offset = end;
     }
     assert_eq!(offset, bytes.len());
+}
+
+#[async_test]
+async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    let old_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        b"partially-emitted".to_vec(),
+    ));
+    harness.handle.inject_rx_data(&old_data);
+    let first = harness.receive_guest_bytes(1, 13).await;
+    assert_eq!(first, old_data[..13]);
+
+    let old_guest_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        b"partially-parsed".to_vec(),
+    ));
+    harness.send_guest_bytes(2, &old_guest_data[..19]).await;
+
+    let receive_state = harness.device.stop_queue(0).await.unwrap();
+    let transmit_state = harness.device.stop_queue(1).await.unwrap();
+    let saved = harness.device.save_device().unwrap().unwrap();
+
+    const NEW_INSTANCE: [u8; 16] = [0x62; 16];
+    const NEW_CAPABILITY: [u8; 32] = [0xb8; 32];
+    harness.replace_with_broker(NEW_INSTANCE, NEW_CAPABILITY);
+    harness.handle.disconnect();
+    harness.device.restore_device(Some(saved)).unwrap();
+    harness
+        .enable_with_state(Some(receive_state), Some(transmit_state))
+        .await;
+
+    let remainder = harness.receive_guest_bytes(2, 128).await;
+    let mut completed_old_output = first;
+    completed_old_output.extend(remainder);
+    let completed_old_output = decode(&completed_old_output);
+    assert_eq!(completed_old_output.payload, b"partially-emitted");
+    assert_eq!(completed_old_output.instance_id, BROKER_INSTANCE);
+    let new_reset = decode(&harness.receive_guest_bytes(3, 128).await);
+    assert_eq!(
+        (
+            new_reset.record_type,
+            new_reset.instance_id,
+            new_reset.epoch
+        ),
+        (RecordType::Reset, NEW_INSTANCE, 1)
+    );
+
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| !harness.handle.is_connected()).await;
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        NEW_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!(
+        (wait.record_type, wait.instance_id, wait.epoch),
+        (RecordType::Wait, NEW_INSTANCE, 1)
+    );
+
+    harness.send_guest_bytes(3, &old_guest_data[19..]).await;
+    harness
+        .send_guest_bytes(
+            4,
+            &encode(&Record::session(
+                RecordType::Ack,
+                NEW_INSTANCE,
+                1,
+                0,
+                Vec::new(),
+            )),
+        )
+        .await;
+}
+
+#[async_test]
+async fn direct_and_broker_saved_state_schemas_are_not_interchangeable(driver: DefaultDriver) {
+    let mut direct = TestHarness::new(&driver);
+    direct.enable().await;
+    direct.device.stop_queue(0).await;
+    direct.device.stop_queue(1).await;
+    let direct_saved = direct.device.save_device().unwrap().unwrap();
+    let direct_state: crate::saved_state::SavedState = direct_saved.parse().unwrap();
+    assert_eq!(
+        direct_state.schema_version,
+        super::DIRECT_SAVED_STATE_VERSION
+    );
+    assert!(direct_state.broker.is_none());
+
+    let mut broker = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    assert!(broker.device.restore_device(Some(direct_saved)).is_err());
+
+    broker.enable().await;
+    broker.device.stop_queue(0).await;
+    broker.device.stop_queue(1).await;
+    let broker_saved = broker.device.save_device().unwrap().unwrap();
+    let broker_state: crate::saved_state::SavedState = broker_saved.parse().unwrap();
+    assert_eq!(
+        broker_state.schema_version,
+        super::BROKER_SAVED_STATE_VERSION
+    );
+    assert!(broker_state.broker.is_some());
+
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let mut direct_device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    assert!(direct_device.restore_device(Some(broker_saved)).is_err());
+}
+
+#[async_test]
+async fn direct_schema_v1_allows_staged_rx_without_receive_queue(driver: DefaultDriver) {
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    let state = crate::saved_state::SavedState {
+        schema_version: super::DIRECT_SAVED_STATE_VERSION,
+        columns: 0,
+        rows: 0,
+        partial_transmit: 0,
+        staged_rx: vec![1],
+        disconnect_policy_id: 0,
+        broker: None,
+    };
+    let saved = SavedStateBlob::new(state);
+    let validator = device.device_state_validator();
+    assert!(
+        validator(
+            Some(&saved),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_ok()
+    );
+}
+
+#[async_test]
+async fn oversized_saved_state_is_rejected_before_nested_decode(driver: DefaultDriver) {
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    let state = crate::saved_state::SavedState {
+        schema_version: super::DIRECT_SAVED_STATE_VERSION,
+        columns: 0,
+        rows: 0,
+        partial_transmit: 0,
+        staged_rx: vec![0; super::MAX_SAVED_STATE_BYTES],
+        disconnect_policy_id: 0,
+        broker: None,
+    };
+    let saved = SavedStateBlob::new(state);
+    assert!(saved.encoded_len() > super::MAX_SAVED_STATE_BYTES);
+    let validator = device.device_state_validator();
+    assert!(
+        validator(
+            Some(&saved),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
+}
+
+#[async_test]
+async fn broker_state_validator_rejects_malformed_private_state(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    harness.device.stop_queue(0).await;
+    harness.device.stop_queue(1).await;
+    let saved = harness.device.save_device().unwrap().unwrap();
+    let mut state: crate::saved_state::SavedState = saved.parse().unwrap();
+    state.broker.as_mut().unwrap().guest_parser.header_count = u32::MAX;
+    let malformed = SavedStateBlob::new(state);
+    let validator = harness.device.device_state_validator();
+    assert!(
+        validator(
+            Some(&malformed),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
 }
 
 #[async_test]
