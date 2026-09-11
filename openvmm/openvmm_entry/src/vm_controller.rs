@@ -588,7 +588,7 @@ impl VmController {
             return self.release_snapshot_boundary_without_capture().await;
         };
 
-        let preflight = (|| -> anyhow::Result<String> {
+        let preflight = (|| -> anyhow::Result<()> {
             anyhow::ensure!(
                 self.machine_profile == MachineProfile::Microvm,
                 "guest-requested snapshot capture requires the microVM profile"
@@ -659,22 +659,19 @@ impl VmController {
                     "automatic snapshot memory backing path changed unexpectedly"
                 );
             }
-            let command_line = self
-                .effective_command_line
-                .clone()
-                .context("microVM snapshot capture requires an effective PVH command line")?;
-            Ok(command_line)
+            anyhow::ensure!(
+                self.effective_command_line.is_some(),
+                "microVM snapshot capture requires an effective PVH command line"
+            );
+            Ok(())
         })();
-        let command_line = match preflight {
-            Ok(preflight) => preflight,
-            Err(error) => {
-                tracing::error!(
-                    error = error.as_ref() as &dyn std::error::Error,
-                    "microVM snapshot preflight failed; guest continues"
-                );
-                return self.release_snapshot_boundary_without_capture().await;
-            }
-        };
+        if let Err(error) = preflight {
+            tracing::error!(
+                error = error.as_ref() as &dyn std::error::Error,
+                "microVM snapshot preflight failed; guest continues"
+            );
+            return self.release_snapshot_boundary_without_capture().await;
+        }
 
         let response = match self
             .vm_rpc
@@ -707,6 +704,7 @@ impl VmController {
                 return GuestSnapshotAction::Terminate { exit_code: 1 };
             }
         };
+        let command_line = response.effective_command_line;
 
         let result = (|| -> anyhow::Result<()> {
             let network = self
