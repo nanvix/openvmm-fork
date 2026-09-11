@@ -116,6 +116,9 @@ vfio_assigned_device.workspace = true
 vfio_assigned_device_resources.workspace = true
 vmgs_broker = { workspace = true, features = ["encryption"] }
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [build-dependencies]
 build_rs_guest_arch.workspace = true
 

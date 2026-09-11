@@ -2090,6 +2090,7 @@ impl VmService {
                     snapshot_restore_guards,
                     snapshot_boundary_requests: microvm_snapshot_requests,
                     snapshot_ready,
+                    snapshot_capture_enabled: snapshot_destination.is_some(),
                     restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),
                     restore_tsc_frequency_hz: restore_time
                         .as_ref()

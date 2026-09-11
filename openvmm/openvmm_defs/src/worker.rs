@@ -73,6 +73,8 @@ pub struct VmWorkerParameters {
     /// Notifies the controller after the worker establishes the boundary.
     pub snapshot_ready:
         Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotScratchPolicy>>,
+    /// Whether this cold boot can publish a microVM snapshot.
+    pub snapshot_capture_enabled: bool,
     /// Host downtime to apply before starting a restored VM.
     pub restore_downtime: Option<std::time::Duration>,
     /// Saved effective TSC frequency required by restore.

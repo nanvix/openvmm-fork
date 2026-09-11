@@ -5361,6 +5361,7 @@ async fn run_control_inner(
             snapshot_restore_guards,
             snapshot_boundary_requests,
             snapshot_ready,
+            snapshot_capture_enabled: snapshot_destination.is_some(),
             restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),
             restore_tsc_frequency_hz: restore_time.as_ref().map(|(_, frequency, _, _)| *frequency),
             restore_apic_frequency_hz: restore_time

@@ -4018,6 +4018,16 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
         manifest.snapshot_tier,
     );
     if manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM {
+        let expected_tsc_frequency = format!("tsc_early_khz={}", contract.tsc_frequency_hz / 1000);
+        let tsc_frequency_tokens = contract
+            .effective_command_line
+            .split_ascii_whitespace()
+            .filter(|token| token.starts_with("tsc_early_khz="))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            tsc_frequency_tokens == [expected_tsc_frequency.as_str()],
+            "platform snapshot command line TSC frequency does not match its machine contract"
+        );
         anyhow::ensure!(
             contract
                 .effective_command_line
@@ -4040,15 +4050,16 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
             | "nvx_sandbox=1"
             | "nvx_config=0xd0010000,65536"
             | "nvx_snapshot_tier=platform"
-    ) || [
-        "virtio_mmio.device=",
-        "virtnet_ip=",
-        "virtnet_mask=",
-        "virtnet_gw=",
-        "virtnet_dns=",
-    ]
-    .iter()
-    .any(|prefix| token.starts_with(prefix))
+    ) || token.starts_with("tsc_early_khz=")
+        || [
+            "virtio_mmio.device=",
+            "virtnet_ip=",
+            "virtnet_mask=",
+            "virtnet_gw=",
+            "virtnet_dns=",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
 }
 
 fn ensure_unique<T>(values: &[T], description: &str) -> anyhow::Result<()>
@@ -4260,7 +4271,9 @@ mod tests {
             .machine_contract
             .as_mut()
             .unwrap()
-            .set_effective_command_line("console=hvc0 nvx_snapshot_tier=platform".to_owned());
+            .set_effective_command_line(
+                "console=hvc0 nvx_snapshot_tier=platform tsc_early_khz=1000000".to_owned(),
+            );
         validate_manifest_version(&manifest).unwrap();
     }
 
@@ -4322,7 +4335,7 @@ mod tests {
             scratch.identity.clear();
             scratch.artifact.clear();
             contract.set_effective_command_line(
-                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_entrypoint=/tenant".to_owned(),
+                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform tsc_early_khz=1000000 nvx_entrypoint=/tenant".to_owned(),
             );
         }
 
@@ -4338,7 +4351,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .set_effective_command_line(
-            "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform"
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform tsc_early_khz=1000000"
                 .to_owned(),
         );
         validate_manifest_version(&manifest).unwrap();
@@ -4348,7 +4361,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .set_effective_command_line(
-                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform nvx_config=tenant-data".to_owned(),
+                "earlycon=xe9 console=hvc0 reboot=t panic=-1 nvx_snapshot_tier=platform tsc_early_khz=1000000 nvx_config=tenant-data".to_owned(),
             );
         assert!(
             validate_manifest_version(&manifest)
@@ -4356,6 +4369,43 @@ mod tests {
                 .to_string()
                 .contains("contains tenant or unsupported configuration")
         );
+    }
+
+    #[test]
+    fn platform_snapshot_rejects_invalid_tsc_frequency_tokens() {
+        let scratch = vec![0x5a; 512];
+        for invalid in [
+            "tsc_early_khz=999999",
+            "tsc_early_khz=1000000 tsc_early_khz=1000000",
+        ] {
+            let mut manifest = paired_scratch_manifest(&scratch);
+            manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+            manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+            manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+            let contract = manifest.machine_contract.as_mut().unwrap();
+            for block in contract
+                .microvm_sandbox_blocks
+                .iter_mut()
+                .filter(|block| block.read_only)
+            {
+                block.identity_kind = "unbound".to_owned();
+                block.identity.clear();
+            }
+            let scratch = contract.microvm_sandbox_blocks.last_mut().unwrap();
+            scratch.identity_kind = "fresh".to_owned();
+            scratch.identity.clear();
+            scratch.artifact.clear();
+            contract.set_effective_command_line(format!(
+                "console=hvc0 nvx_snapshot_tier=platform {invalid}"
+            ));
+
+            assert!(
+                validate_manifest_version(&manifest)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TSC frequency does not match")
+            );
+        }
     }
 
     #[test]

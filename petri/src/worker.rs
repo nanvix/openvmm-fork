@@ -44,6 +44,7 @@ impl Worker {
             snapshot_restore_guards: None,
             snapshot_boundary_requests: None,
             snapshot_ready: None,
+            snapshot_capture_enabled: false,
             restore_downtime: None,
             restore_tsc_frequency_hz: None,
             restore_apic_frequency_hz: None,
