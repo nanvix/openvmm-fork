@@ -11,6 +11,7 @@ use virtio::resolve::VirtioResolveInput;
 use virtio_resources::console::VirtioConsoleAttachmentMode;
 use virtio_resources::console::VirtioConsoleHandle;
 use virtio_resources::console::VirtioConsoleReconnectPolicy;
+use virtio_resources::console::VirtioControlConsoleBrokerConfig;
 use virtio_resources::console::VirtioControlConsoleHandle;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
@@ -68,15 +69,10 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioControlConsoleHandle>
         resource: VirtioControlConsoleHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        resolve_console(
-            resolver,
-            input,
-            resource.backend,
-            resource.disconnect_policy,
-            resource.attachment,
-            "virtio-control-console",
-        )
-        .await
+        validate_attachment(resource.attachment.as_ref())?;
+        validate_broker_config(&resource.broker_config)?;
+        let io = resolve_backend(resolver, &input, resource.backend).await?;
+        Ok(VirtioConsoleDevice::new_broker(input.driver_source, io, resource.broker_config).into())
     }
 }
 
@@ -151,6 +147,22 @@ fn validate_attachment(
             ),
         }
     }
+    Ok(())
+}
+
+fn validate_broker_config(config: &VirtioControlConsoleBrokerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.instance_id != [0; 16],
+        "control-console broker instance ID must not be zero"
+    );
+    anyhow::ensure!(
+        config.capability != [0; 32],
+        "control-console broker capability must not be zero"
+    );
+    anyhow::ensure!(
+        (1..=60_000).contains(&config.auth_timeout_ms),
+        "control-console broker authentication timeout must be between 1 and 60000 ms"
+    );
     Ok(())
 }
 

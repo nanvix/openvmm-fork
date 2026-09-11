@@ -56,6 +56,12 @@ describes the source definitions.
   are rejected. Host-driven save/restore, pulse-save/restore, and worker
   restart remain unavailable.
 
+  `microvm` may also expose a dedicated control virtio-console at MMIO
+  `0xd0007000`, IRQ 3. It requires the boot virtio-console, preserves
+  `console=hvc1`, and publishes `nvx_control_tty=hvc2`. The profile fixes
+  boot-before-control discovery order and rejects user overrides that could
+  change it.
+
   `microvm` uses one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
@@ -575,6 +581,48 @@ Serial devices can be configured to appear as different devices inside the guest
   A generic byte stream guarantees no replay up to OpenVMM's backend write
   boundary; it cannot prove that the remote application consumed bytes without
   its own acknowledgment protocol.
+
+* `--microvm-control-console <BACKEND>`: With `--machine microvm`, expose a
+  second independent single-port virtio console at fixed MMIO `0xd0007000`, IRQ
+  3. `--virtio-console` is required on a fresh boot and remains the only kernel
+  console. The control device normally appears as the profile-owned
+  `nvx_control_tty=hvc2`.
+
+  On Linux, the only live backend is `listen=PATH`, and PATH is always an
+  AF_UNIX socket. TCP, client-connect, terminal, file, stdout/stderr, and
+  inherited console backends are rejected. A listener's parent must already be an owned,
+  non-symlink directory with mode `0700`; OpenVMM exclusively binds the socket,
+  sets and verifies mode `0600`, and never removes a pre-existing path.
+  OpenVMM verifies `SO_PEERCRED` before accepting the protocol attachment.
+
+  A live endpoint also requires the hidden launcher option
+  `--microvm-control-auth-handle=<FD>`. FD is an inherited, readable, one-way
+  pipe containing exactly 32 random capability bytes. The launcher must close
+  its writer before starting OpenVMM. OpenVMM duplicates the descriptor,
+  performs one bounded nonblocking read through EOF, and closes it. Capability
+  bytes must never appear in arguments, environment variables, endpoint names,
+  logs, snapshots, or attachment identities. The first host record must prove
+  that capability. Peer identity is checked first. Authentication must complete
+  within `--microvm-control-auth-timeout-ms` (default 5000, range 1 to 60000).
+  A stalled or failed authentication attempt closes the connection without a
+  protocol Error record and without changing the broker epoch.
+
+  `none` needs no authentication handle. OpenVMM generates an unreachable
+  random capability so disconnected process tests remain supported. Secure
+  Windows named-pipe SID verification and restrictive DACL creation are not
+  yet available in PAL, so live control-console endpoints are rejected on
+  Windows rather than falling back to capability-only authentication.
+
+  Boot and control endpoints must be distinct. Snapshot capture records only
+  the separate `console:microvm-control0` endpoint and broker-authenticated
+  reconnect policy. It never records a capability or UID/SID. Restore validates
+  the saved endpoint contract, requires a fresh launcher-provided capability
+  for a live endpoint, and generates a fresh VMM instance ID; saved credentials
+  and stale capabilities are never reused.
+
+  Restore snapshots containing this device through the CLI. The OpenVMM
+  management RPC does not expose control-console restore attachments and
+  rejects these snapshots explicitly.
 
 The `BACKEND` argument is the same for all serial devices:
 

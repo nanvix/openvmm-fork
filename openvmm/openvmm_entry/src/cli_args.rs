@@ -998,6 +998,30 @@ options:
     #[clap(long)]
     pub virtio_console: Option<SerialConfigCli>,
 
+    /// dedicated microVM ABI-v2 control console backed by a local serial endpoint
+    ///
+    /// Accepts listen=\<path\> or none. The boot
+    /// virtio-console is required and remains the only kernel console.
+    #[clap(long, value_name = "SERIAL")]
+    pub microvm_control_console: Option<SerialConfigCli>,
+
+    /// inherited one-way handle containing the control-console capability
+    #[clap(
+        long = "microvm-control-auth-handle",
+        value_name = "FD_OR_HANDLE",
+        hide = true
+    )]
+    pub microvm_control_auth_handle: Option<u64>,
+
+    /// maximum time for a control-console client to authenticate
+    #[clap(
+        long = "microvm-control-auth-timeout-ms",
+        value_name = "MILLISECONDS",
+        default_value_t = 5000,
+        hide = true
+    )]
+    pub microvm_control_auth_timeout_ms: u64,
+
     /// attach the virtio-console device to the specified PCIe port
     #[clap(long, value_name = "PORT", requires("virtio_console"))]
     pub virtio_console_pcie_port: Option<String>,
@@ -1674,8 +1698,10 @@ impl Options {
                     && self.microvm_sandbox_block.is_empty()
                     && self.restore_processors.is_none()
                     && self.restore_memory.is_none()
-                    && self.memory_capacity.is_none(),
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --restore-processors, --restore-memory, --memory-capacity, and microVM egress policy require a microVM machine"
+                    && self.memory_capacity.is_none()
+                    && self.microvm_control_console.is_none()
+                    && self.microvm_control_auth_handle.is_none(),
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-control-console, --microvm-control-auth-handle, --restore-processors, --restore-memory, --memory-capacity, and microVM egress policy require a microVM machine"
             );
             return Ok(());
         }
@@ -1823,6 +1849,43 @@ impl Options {
             self.virtio_console.is_some() || self.virtio_console_pcie_port.is_none(),
             "--virtio-console-pcie-port requires --virtio-console"
         );
+        if let Some(control_console) = &self.microvm_control_console {
+            anyhow::ensure!(
+                self.virtio_console.is_some() || self.restore_snapshot.is_some(),
+                "--microvm-control-console requires --virtio-console for a fresh boot"
+            );
+            anyhow::ensure!(
+                matches!(
+                    control_console,
+                    SerialConfigCli::Pipe(_) | SerialConfigCli::None
+                ),
+                "microVM control console requires listen=... or none"
+            );
+            anyhow::ensure!(
+                (1..=60_000).contains(&self.microvm_control_auth_timeout_ms),
+                "--microvm-control-auth-timeout-ms must be between 1 and 60000"
+            );
+            if matches!(control_console, SerialConfigCli::None) {
+                anyhow::ensure!(
+                    self.microvm_control_auth_handle.is_none(),
+                    "--microvm-control-auth-handle is not used with a disconnected control console"
+                );
+            } else {
+                anyhow::ensure!(
+                    cfg!(target_os = "linux"),
+                    "live microVM control consoles require Linux SO_PEERCRED support; secure Windows named-pipe SID/ACL support is not implemented"
+                );
+                anyhow::ensure!(
+                    self.microvm_control_auth_handle.is_some(),
+                    "live microVM control console requires --microvm-control-auth-handle"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                self.microvm_control_auth_handle.is_none(),
+                "--microvm-control-auth-handle requires --microvm-control-console"
+            );
+        }
         anyhow::ensure!(
             self.disk.is_empty()
                 && self.nvme.is_empty()
@@ -6332,7 +6395,11 @@ mod tests {
         assert_eq!(
             with_control_console,
             format!(
-                "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0007000:3 nvx_control_tty=hvc2"
+                "{MICROVM_CONSOLE_COMMAND_LINE} \
+                 virtio_mmio.device=0x1000@0xd0002000:7 \
+                 virtio_mmio.device=0x1000@0xd0007000:3 \
+                 {}",
+                openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE
             )
         );
 
@@ -6412,6 +6479,20 @@ mod tests {
         ] {
             assert!(build_microvm_command_line(&[reserved.into()], false).is_err());
         }
+        for reserved in [
+            "nvx_control_tty=hvc9",
+            "nvx-control-tty=hvc9",
+            "driver_async_probe=virtio_console",
+            "driver-async-probe=virtio_console",
+            "virtio-mmio.device=0x1000@0xd0007000:3",
+        ] {
+            assert!(build_microvm_v2_command_line(&[reserved.into()], false).is_err());
+            assert!(build_microvm_command_line(&[reserved.into()], false).is_ok());
+        }
+        for delimiter in ["--", "\"driver-async-probe=virtio_console\""] {
+            assert!(build_microvm_v2_command_line(&[delimiter.into()], false).is_err());
+            assert!(build_microvm_command_line(&[delimiter.into()], false).is_ok());
+        }
         assert!(build_microvm_command_line(&["foo=bar\0baz".into()], false).is_err());
         assert!(
             build_microvm_command_line(&["x".repeat(MICROVM_COMMAND_LINE_MAX_SIZE)], false)
@@ -6443,6 +6524,40 @@ mod tests {
         ])
         .unwrap();
         valid_console.validate_microvm_options().unwrap();
+        let valid_control_console = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "none",
+        ])
+        .unwrap();
+        valid_control_console.validate_microvm_options().unwrap();
+        let valid_restore_control_console = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--microvm-control-console",
+            "listen=control.sock",
+            "--microvm-control-auth-handle",
+            "42",
+        ])
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            valid_restore_control_console
+                .validate_microvm_options()
+                .unwrap();
+        } else {
+            assert!(
+                valid_restore_control_console
+                    .validate_microvm_options()
+                    .is_err()
+            );
+        }
         let valid_network = Options::try_parse_from([
             "openvmm",
             "--machine",
@@ -6494,6 +6609,42 @@ mod tests {
                 "listen=tcp:127.0.0.1:5555",
                 "--virtio-console-pcie-port",
                 "port0",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-control-console",
+                "none",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-control-console",
+                "listen=tcp:127.0.0.1:5555",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-control-console",
+                "listen=control.sock",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-control-console",
+                "none",
+                "--microvm-control-auth-handle",
+                "42",
             ],
             vec!["openvmm", "--machine", "microvm", "--net", "consomme"],
             vec![
