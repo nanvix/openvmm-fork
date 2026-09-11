@@ -178,6 +178,12 @@ Restore recreates and validates that rate before any vCPU runs. KVM snapshots
 likewise require the destination to reproduce their saved backend CPU and
 clock contract.
 
+For a PVH microVM boot configured with `--snapshot-destination`, OpenVMM adds
+the backend TSC frequency to the effective kernel command line so the captured
+guest clock matches this contract. Ordinary boots that cannot publish a
+snapshot retain the caller's command line and the guest's normal TSC discovery
+path.
+
 Every snapshot records a complete state-unit inventory. Each emulated device
 saves state under a unique name (for example `"pit"`, `"vmbus"`, or `"ide"`),
 and restore requires the saved and current inventories to match exactly. A

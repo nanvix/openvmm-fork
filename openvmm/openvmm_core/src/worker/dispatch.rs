@@ -349,6 +349,7 @@ impl Worker for VmWorker {
         let worker_construct = openvmm_defs::profile::ProfileSpan::start();
         let snapshot_boundary_requests = parameters.snapshot_boundary_requests;
         let snapshot_ready = parameters.snapshot_ready;
+        let snapshot_capture_enabled = parameters.snapshot_capture_enabled;
         let snapshot_restore_guards = parameters.snapshot_restore_guards;
         let restore_ready_sink = parameters.restore_ready_sink;
         let restore_gate_timeout = parameters.restore_gate_timeout;
@@ -419,7 +420,14 @@ impl Worker for VmWorker {
             .transpose()
             .context("failed to decode saved state")?;
 
-        let mut vm = block_with_io(|_| vm.load(saved_state, parameters.notify, restore_time))?;
+        let mut vm = block_with_io(|_| {
+            vm.load(
+                saved_state,
+                parameters.notify,
+                restore_time,
+                snapshot_capture_enabled,
+            )
+        })?;
         vm.snapshot_boundary_requests = snapshot_boundary_requests;
         vm.snapshot_ready = snapshot_ready;
         vm.restore_ready_sink = restore_ready_sink;
@@ -459,7 +467,7 @@ impl Worker for VmWorker {
             shared_memory,
         ))?;
         pal_async::local::block_on(async {
-            let mut vm = vm.load(Some(saved_state), notify, None).await?;
+            let mut vm = vm.load(Some(saved_state), notify, None, false).await?;
 
             LOADED_VM.store(&vm);
 
@@ -1731,6 +1739,7 @@ impl InitializedVm {
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
         restore_time: Option<(Duration, u64, Option<u64>)>,
+        snapshot_capture_enabled: bool,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
 
@@ -1754,6 +1763,32 @@ impl InitializedVm {
             igvm_file,
             driver_source,
         } = self;
+
+        #[cfg(guest_arch = "x86_64")]
+        let mut cfg = cfg;
+
+        #[cfg(guest_arch = "x86_64")]
+        if saved_state.is_none()
+            && matches!(cfg.machine_profile, MachineProfile::Microvm)
+            && let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode
+        {
+            match partition
+                .tsc_frequency_hz()
+                .context("failed to query the backend guest TSC frequency")?
+            {
+                Some(frequency_hz) => {
+                    super::vm_loaders::pvh::propagate_snapshot_tsc_frequency(
+                        cmdline,
+                        frequency_hz,
+                        snapshot_capture_enabled,
+                    )
+                    .context("failed to propagate the guest TSC frequency")?;
+                }
+                None => tracing::warn!(
+                    "backend does not expose a guest TSC frequency; preserving the microVM command line"
+                ),
+            }
+        }
 
         let mut resolver = ResourceResolver::new();
 
