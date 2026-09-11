@@ -998,6 +998,10 @@ options:
     #[clap(long)]
     pub virtio_console: Option<SerialConfigCli>,
 
+    /// Configure the microVM control console. Internal until public activation.
+    #[clap(long, hide = true)]
+    pub microvm_control_console: Option<SerialConfigCli>,
+
     /// attach the virtio-console device to the specified PCIe port
     #[clap(long, value_name = "PORT", requires("virtio_console"))]
     pub virtio_console_pcie_port: Option<String>,

@@ -823,25 +823,6 @@ fn effective_microvm_control_console(
     )
 }
 
-fn reject_control_console_before_activation(
-    restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
-) -> anyhow::Result<()> {
-    if let Some(restore) = restore {
-        anyhow::ensure!(
-            !restore
-                .devices
-                .iter()
-                .any(|device| device.stable_id == MICROVM_CONTROL_CONSOLE_STABLE_ID)
-                && !restore.attachments.iter().any(|attachment| {
-                    attachment.stable_id == MICROVM_CONTROL_CONSOLE_STABLE_ID
-                        || attachment.kind == MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND
-                }),
-            "microVM control console is unavailable before authenticated broker activation"
-        );
-    }
-    Ok(())
-}
-
 fn microvm_network_attachment() -> openvmm_helpers::snapshot::SnapshotAttachment {
     openvmm_helpers::snapshot::SnapshotAttachment {
         stable_id: MICROVM_NETWORK_STABLE_ID.to_owned(),
@@ -1600,43 +1581,6 @@ mod microvm_console_attachment_tests {
     }
 
     #[test]
-    fn control_console_is_unavailable_before_authenticated_activation() {
-        let error = match Options::try_parse_from([
-            "openvmm",
-            "--machine",
-            "microvm",
-            "--microvm-control-console",
-            "none",
-        ]) {
-            Ok(_) => panic!("staged control-console option must be unavailable"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("--microvm-control-console"));
-
-        let boot_only = network_contract();
-        reject_control_console_before_activation(Some(&boot_only)).unwrap();
-        assert!(
-            effective_microvm_control_console(None, Some(&boot_only))
-                .unwrap()
-                .is_none()
-        );
-
-        let (_, _, control_attachment) =
-            microvm_control_console_attachment_from_cli(&SerialConfigCli::None).unwrap();
-        let mut control_attachment_restore = boot_only.clone();
-        control_attachment_restore
-            .attachments
-            .push(control_attachment);
-        assert!(
-            reject_control_console_before_activation(Some(&control_attachment_restore)).is_err()
-        );
-
-        let mut control_device_restore = boot_only;
-        control_device_restore.devices[0].stable_id = MICROVM_CONTROL_CONSOLE_STABLE_ID.to_owned();
-        assert!(reject_control_console_before_activation(Some(&control_device_restore)).is_err());
-    }
-
-    #[test]
     fn snapshot_downtime_accepts_supported_elapsed_time() {
         let capture = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
 
@@ -2311,8 +2255,10 @@ async fn vm_config_from_command_line(
         None
     };
     let microvm_control_console = if is_microvm {
-        reject_control_console_before_activation(restore_machine_contract)?;
-        effective_microvm_control_console(None, restore_machine_contract)?
+        effective_microvm_control_console(
+            opt.microvm_control_console.as_ref(),
+            restore_machine_contract,
+        )?
     } else {
         None
     };
