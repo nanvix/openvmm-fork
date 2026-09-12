@@ -91,7 +91,12 @@ unsafe impl Sync for SendSyncRawHandle {}
 /// The launcher transfers ownership of a valid handle to the new process and
 /// must not use it there. This function immediately creates a non-inheritable
 /// duplicate and closes the inherited handle.
-pub fn take_inherited_file(raw: u64) -> Result<File> {
+///
+/// # Safety
+///
+/// `raw` must be a valid handle exclusively owned by the caller. No other
+/// owner may close or use it after this call.
+pub unsafe fn take_inherited_file(raw: u64) -> Result<File> {
     let raw = usize::try_from(raw)
         .map_err(|_| Error::new(io::ErrorKind::InvalidInput, "invalid inherited handle"))?
         as RawHandle;
