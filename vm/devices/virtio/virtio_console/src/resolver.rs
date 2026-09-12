@@ -11,6 +11,7 @@ use virtio::resolve::VirtioResolveInput;
 use virtio_resources::console::VirtioConsoleAttachmentMode;
 use virtio_resources::console::VirtioConsoleHandle;
 use virtio_resources::console::VirtioConsoleReconnectPolicy;
+use virtio_resources::console::VirtioControlConsoleHandle;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
 use vm_resource::declare_static_async_resolver;
@@ -18,10 +19,17 @@ use vm_resource::kind::VirtioDeviceHandle;
 
 /// Resolver for virtio-console devices.
 pub struct VirtioConsoleResolver;
+/// Resolver for the microVM control console resource identity.
+pub struct VirtioControlConsoleResolver;
 
 declare_static_async_resolver! {
     VirtioConsoleResolver,
     (VirtioDeviceHandle, VirtioConsoleHandle),
+}
+
+declare_static_async_resolver! {
+    VirtioControlConsoleResolver,
+    (VirtioDeviceHandle, VirtioControlConsoleHandle),
 }
 
 #[async_trait]
@@ -42,6 +50,31 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioConsoleHandle> for VirtioCon
             resource.disconnect_policy,
             resource.attachment,
             "virtio-console",
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl AsyncResolveResource<VirtioDeviceHandle, VirtioControlConsoleHandle>
+    for VirtioControlConsoleResolver
+{
+    type Output = ResolvedVirtioDevice;
+    type Error = anyhow::Error;
+
+    async fn resolve(
+        &self,
+        resolver: &ResourceResolver,
+        resource: VirtioControlConsoleHandle,
+        input: VirtioResolveInput<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        resolve_console(
+            resolver,
+            input,
+            resource.backend,
+            resource.disconnect_policy,
+            resource.attachment,
+            "virtio-control-console",
         )
         .await
     }

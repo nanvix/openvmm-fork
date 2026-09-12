@@ -41,6 +41,8 @@ use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::append_microvm_virtio_discovery;
 #[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
+#[cfg(test)]
+use openvmm_defs::config::build_microvm_v2_command_line;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -6308,12 +6310,29 @@ mod tests {
                 read_only: false,
             },
         ];
-        append_microvm_virtio_discovery(&mut with_devices, None, false, None, true, &blocks)
+        append_microvm_virtio_discovery(&mut with_devices, None, false, None, true, false, &blocks)
             .unwrap();
         assert_eq!(
             with_devices,
             format!(
                 "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0003000:4 virtio_mmio.device=0x1000@0xd0006000:11"
+            )
+        );
+        let mut with_control_console = build_microvm_v2_command_line(&[], true).unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_control_console,
+            None,
+            false,
+            None,
+            true,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            with_control_console,
+            format!(
+                "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0007000:3 nvx_control_tty=hvc2"
             )
         );
 
@@ -6328,6 +6347,7 @@ mod tests {
             )),
             false,
             None,
+            false,
             false,
             &[],
         )
@@ -6349,6 +6369,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             &[],
         )
         .unwrap();
@@ -6365,6 +6386,7 @@ mod tests {
             None,
             true,
             Some(&filesystem),
+            false,
             false,
             &[],
         )
