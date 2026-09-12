@@ -1363,7 +1363,24 @@ impl BrokerWorker {
         if state.receiveq.is_none() && state.transmitq.is_none() {
             std::future::pending::<()>().await;
         }
-        poll_fn(|cx| self.poll_once(state, cx)).await
+        match poll_fn(|cx| self.poll_once(state, cx)).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracelimit::error_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    "control-console worker faulted"
+                );
+                if let Err(detach_error) = self.detach_host() {
+                    tracelimit::error_ratelimited!(
+                        error = &detach_error as &dyn std::error::Error,
+                        "control-console host detach failed after worker fault"
+                    );
+                }
+                // Keep TaskControl restartable. Device reset clears the broker
+                // and queue state before the worker is started again.
+                std::future::pending().await
+            }
+        }
     }
 
     fn poll_once(
@@ -1657,9 +1674,7 @@ impl BrokerWorker {
     }
 
     fn detach_host(&mut self) -> Result<(), WorkerError> {
-        self.broker
-            .host_disconnected()
-            .map_err(WorkerError::Broker)?;
+        let broker_result = self.broker.host_disconnected().map_err(WorkerError::Broker);
         self.host_input.clear();
         self.auth_deadline = None;
         self.transport_state = if self.host_io.disconnect_current().is_ok() {
@@ -1667,7 +1682,7 @@ impl BrokerWorker {
         } else {
             HostTransportState::WaitingForDisconnect
         };
-        Ok(())
+        broker_result
     }
 
     fn begin_verified_host_attachment(&mut self) -> Result<(), WorkerError> {
