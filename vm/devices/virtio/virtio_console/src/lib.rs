@@ -30,6 +30,11 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the physical adapter is a follow-up")
+)]
+pub(crate) mod control_session_protocol;
 pub mod resolver;
 mod spec;
 #[cfg(test)]
