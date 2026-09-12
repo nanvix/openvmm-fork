@@ -636,13 +636,16 @@ impl virt::Partition for WhpPartition {
 
     #[cfg(guest_arch = "x86_64")]
     fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
-        Ok(Some(
-            self.inner
+        let frequency = match &self.inner.vtl0.lapic {
+            LocalApicKind::Emulated(_) => virt_support_apic::TIMER_FREQUENCY,
+            LocalApicKind::Offloaded => self
+                .inner
                 .vtl0
                 .whp
                 .apic_frequency()
                 .for_op("get APIC clock frequency")?,
-        ))
+        };
+        Ok(Some(frequency))
     }
 
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {

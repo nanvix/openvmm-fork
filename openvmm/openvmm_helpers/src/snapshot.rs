@@ -4104,6 +4104,22 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
             tsc_frequency_tokens == [expected_tsc_frequency.as_str()],
             "platform snapshot command line TSC frequency does not match its machine contract"
         );
+        let apic_frequency_tokens = contract
+            .effective_command_line
+            .split_ascii_whitespace()
+            .filter(|token| token.starts_with("lapic_timer_hz="))
+            .collect::<Vec<_>>();
+        if !apic_frequency_tokens.is_empty() {
+            let expected = contract
+                .apic_frequency_hz
+                .map(|frequency| format!("lapic_timer_hz={frequency}"));
+            anyhow::ensure!(
+                expected
+                    .as_deref()
+                    .is_some_and(|expected| apic_frequency_tokens == [expected]),
+                "platform snapshot command line LAPIC frequency does not match its machine contract"
+            );
+        }
         anyhow::ensure!(
             contract
                 .effective_command_line
@@ -4127,6 +4143,7 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
             | "nvx_config=0xd0010000,65536"
             | "nvx_snapshot_tier=platform"
     ) || token.starts_with("tsc_early_khz=")
+        || token.starts_with("lapic_timer_hz=")
         || [
             "virtio_mmio.device=",
             "virtnet_ip=",
@@ -5230,6 +5247,57 @@ mod tests {
         manifest.machine_contract = Some(contract.clone());
 
         validate_microvm_machine_contract(&manifest, &contract).unwrap();
+    }
+
+    #[test]
+    fn platform_snapshot_checks_apic_frequency_parameter() {
+        for (parameter, frequency, valid) in [
+            ("", Some(1_000_000_000), true),
+            ("lapic_timer_hz=1000000000", Some(1_000_000_000), true),
+            ("lapic_timer_hz=200000000", Some(1_000_000_000), false),
+            ("lapic_timer_hz=1000000000", None, false),
+            (
+                "lapic_timer_hz=1000000000 lapic_timer_hz=1000000000",
+                Some(1_000_000_000),
+                false,
+            ),
+        ] {
+            let mut manifest = paired_scratch_manifest(&[0x5a; 512]);
+            manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+            manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+            manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+            let contract = manifest.machine_contract.as_mut().unwrap();
+            for block in contract
+                .microvm_sandbox_blocks
+                .iter_mut()
+                .filter(|block| block.read_only)
+            {
+                block.identity_kind = "unbound".to_owned();
+                block.identity.clear();
+            }
+            let scratch = contract.microvm_sandbox_blocks.last_mut().unwrap();
+            scratch.identity_kind = "fresh".to_owned();
+            scratch.identity.clear();
+            scratch.artifact.clear();
+            contract.apic_frequency_hz = frequency;
+            contract.set_effective_command_line(format!(
+                "console=hvc0 nvx_snapshot_tier=platform tsc_early_khz=1000000 {parameter}"
+            ));
+            let result = validate_manifest_version(&manifest);
+            if valid {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("LAPIC frequency does not match")
+                );
+            }
+        }
+        assert!(platform_command_line_token_is_invariant(
+            "lapic_timer_hz=200000000"
+        ));
     }
 
     #[test]

@@ -181,8 +181,16 @@ clock contract.
 For a PVH microVM boot configured with `--snapshot-destination`, OpenVMM adds
 the backend TSC frequency to the effective kernel command line so the captured
 guest clock matches this contract. Ordinary boots that cannot publish a
-snapshot retain the caller's command line and the guest's normal TSC discovery
-path.
+snapshot retain the guest's normal TSC discovery path.
+
+All cold PVH microVM boots also receive `lapic_timer_hz=<Hz>` when the backend
+reports its LAPIC clock frequency. The NVX kernel uses this authoritative rate
+instead of verifying a counting LAPIC against scheduling-sensitive emulated
+PIT interrupts. TSC-deadline timers are unchanged. The parameter is canonicalized
+before device discovery and `--`; conflicting, duplicate, malformed, or
+out-of-range values are rejected. Platform snapshot validation checks a saved parameter
+against its APIC frequency contract, while snapshots without the parameter
+remain supported.
 
 Every snapshot records a complete state-unit inventory. Each emulated device
 saves state under a unique name (for example `"pit"`, `"vmbus"`, or `"ide"`),
