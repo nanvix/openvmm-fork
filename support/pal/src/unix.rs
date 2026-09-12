@@ -19,6 +19,74 @@ use std::os::unix::prelude::*;
 #[cfg(target_os = "linux")]
 const FIRST_DYNAMIC_FD: RawFd = usize::BITS as RawFd;
 
+/// Returns the effective user ID of the current process.
+pub fn effective_user_id() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+pub fn unix_socket_peer_user_id(socket: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `socket` is valid for the call and the output pointers refer to
+    // writable objects with the supplied sizes.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut credentials).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(Error::last_os_error());
+    }
+    if length as usize != size_of::<libc::ucred>() {
+        return Err(Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned an invalid credential length",
+        ));
+    }
+    Ok(credentials.uid)
+}
+
+/// Takes a numeric inherited descriptor and returns an owned duplicate.
+///
+/// The launcher transfers ownership of a valid descriptor to the new process
+/// and must not use it there. This function immediately creates a close-on-exec
+/// duplicate and closes the inherited descriptor.
+///
+/// # Safety
+///
+/// `raw` must be a valid descriptor exclusively owned by the caller. No other
+/// owner may close or use it after this call.
+pub unsafe fn take_inherited_file(raw: u64) -> io::Result<File> {
+    let raw = RawFd::try_from(raw)
+        .map_err(|_| Error::new(io::ErrorKind::InvalidInput, "invalid inherited descriptor"))?;
+    // SAFETY: `fcntl` accepts an integer descriptor and reports `EBADF` for an
+    // invalid value. On success, ownership of the new descriptor is unique.
+    let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: the validity and ownership contract above permits consuming the
+    // inherited descriptor. Do not retry close after EINTR.
+    if unsafe { libc::close(raw) } != 0 {
+        let error = Error::last_os_error();
+        // SAFETY: `duplicate` is uniquely owned here.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    // SAFETY: successful F_DUPFD_CLOEXEC returns a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(duplicate) })
+}
+
 /// A Linux error value.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Errno(pub i32);
