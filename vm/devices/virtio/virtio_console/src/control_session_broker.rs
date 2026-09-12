@@ -5,6 +5,7 @@
 
 use crate::control_session_protocol;
 use crate::control_session_protocol::Parser;
+use crate::control_session_protocol::ParserSnapshot;
 use crate::control_session_protocol::ProtocolError;
 use crate::control_session_protocol::Record;
 use crate::control_session_protocol::RecordType;
@@ -24,6 +25,20 @@ pub enum BrokerState {
     Active = 4,
     ResetPending = 5,
     Failed = 6,
+}
+
+impl BrokerState {
+    fn from_snapshot(value: u8) -> Result<Self, BrokerError> {
+        match value {
+            1 => Ok(Self::AwaitGuestAttach),
+            2 => Ok(Self::AwaitGuestAck),
+            3 => Ok(Self::ReadyNoHost),
+            4 => Ok(Self::Active),
+            5 => Ok(Self::ResetPending),
+            6 => Ok(Self::Failed),
+            _ => Err(BrokerError::InvalidSnapshot("invalid broker state")),
+        }
+    }
 }
 
 /// An output leg driven by a later physical-I/O adapter.
@@ -93,6 +108,40 @@ pub enum BrokerError {
     InvalidSnapshot(&'static str),
     #[error("broker is in a failed state")]
     Failed,
+}
+
+/// Serializable-neutral state for one partially emitted record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedRecordSnapshot {
+    pub bytes: Vec<u8>,
+    pub offset: usize,
+}
+
+/// Serializable-neutral state for an output leg.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OutputSnapshot {
+    pub current: Option<EncodedRecordSnapshot>,
+    pub queued_records: Vec<Vec<u8>>,
+}
+
+/// Serializable-neutral broker state. It intentionally contains no capability
+/// or live host-attachment identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerSnapshot {
+    pub state: u8,
+    pub instance_id: [u8; 16],
+    pub drain_foreign_instance_records: bool,
+    pub epoch: u64,
+    pub guest_parser: ParserSnapshot,
+    pub guest_output: OutputSnapshot,
+    pub host_output: OutputSnapshot,
+    pub guest_receive_sequence: u64,
+    pub guest_send_sequence: u64,
+    pub host_receive_sequence: u64,
+    pub host_send_sequence: u64,
+    pub pending_guest_record: Option<Record>,
+    pub pending_host_record: Option<Record>,
+    pub counters: BrokerCounters,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +231,95 @@ impl OutputLeg {
         self.queue.clear();
         self.queued_bytes = 0;
     }
+
+    fn snapshot(&self) -> OutputSnapshot {
+        OutputSnapshot {
+            current: self.current.as_ref().map(|current| EncodedRecordSnapshot {
+                bytes: current.bytes.clone(),
+                offset: current.offset,
+            }),
+            queued_records: self.queue.iter().cloned().collect(),
+        }
+    }
+
+    fn restore(snapshot: OutputSnapshot) -> Result<Self, BrokerError> {
+        Self::validate_snapshot(&snapshot)?;
+        let current = if let Some(current) = snapshot.current {
+            Some(EncodedRecord {
+                bytes: current.bytes,
+                offset: current.offset,
+            })
+        } else {
+            None
+        };
+
+        let mut queue = VecDeque::with_capacity(snapshot.queued_records.len());
+        let mut queued_bytes = 0usize;
+        for bytes in snapshot.queued_records {
+            queued_bytes =
+                queued_bytes
+                    .checked_add(bytes.len())
+                    .ok_or(BrokerError::InvalidSnapshot(
+                        "queued output byte count overflow",
+                    ))?;
+            if queued_bytes > MAX_QUEUED_BYTES_PER_LEG {
+                return Err(BrokerError::InvalidSnapshot(
+                    "queued output bytes exceed configured bound",
+                ));
+            }
+            queue.push_back(bytes);
+        }
+        Ok(Self {
+            current,
+            queue,
+            queued_bytes,
+        })
+    }
+
+    fn validate_snapshot(snapshot: &OutputSnapshot) -> Result<(), BrokerError> {
+        if let Some(current) = &snapshot.current {
+            validate_encoded_output(&current.bytes)?;
+            if current.offset >= current.bytes.len() {
+                return Err(BrokerError::InvalidSnapshot(
+                    "current output offset is out of bounds",
+                ));
+            }
+        }
+        if snapshot.queued_records.len() > MAX_QUEUED_RECORDS_PER_LEG {
+            return Err(BrokerError::InvalidSnapshot(
+                "too many queued output records",
+            ));
+        }
+        let mut queued_bytes = 0usize;
+        for bytes in &snapshot.queued_records {
+            validate_encoded_output(bytes)?;
+            queued_bytes =
+                queued_bytes
+                    .checked_add(bytes.len())
+                    .ok_or(BrokerError::InvalidSnapshot(
+                        "queued output byte count overflow",
+                    ))?;
+            if queued_bytes > MAX_QUEUED_BYTES_PER_LEG {
+                return Err(BrokerError::InvalidSnapshot(
+                    "queued output bytes exceed configured bound",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_encoded_output(bytes: &[u8]) -> Result<(), BrokerError> {
+    let record = control_session_protocol::decode_exact(bytes)?;
+    if matches!(
+        record.record_type,
+        RecordType::GuestAttach | RecordType::HostAttach
+    ) {
+        return Err(BrokerError::InvalidSnapshot(
+            "bootstrap record cannot be broker output",
+        ));
+    }
+    Ok(())
 }
 
 /// Pure protocol and reconnect state machine.
@@ -204,6 +342,7 @@ pub struct ControlSessionBroker {
     host_bound_epoch: u64,
     pending_guest_record: Option<Record>,
     pending_host_record: Option<Record>,
+    drain_foreign_instance_records: bool,
     counters: BrokerCounters,
 }
 
@@ -228,6 +367,7 @@ impl ControlSessionBroker {
             host_bound_epoch: 0,
             pending_guest_record: None,
             pending_host_record: None,
+            drain_foreign_instance_records: false,
             counters: BrokerCounters::default(),
         }
     }
@@ -274,6 +414,16 @@ impl ControlSessionBroker {
     pub fn guest_parser_buffered_bytes(&self) -> usize {
         let snapshot = self.guest_parser.snapshot();
         snapshot.header_count + snapshot.body_bytes.len()
+    }
+
+    #[cfg_attr(test, expect(dead_code, reason = "used by the physical adapter"))]
+    pub fn has_pending_guest_record(&self) -> bool {
+        self.pending_guest_record.is_some()
+    }
+
+    #[cfg_attr(test, expect(dead_code, reason = "used by the physical adapter"))]
+    pub fn has_pending_host_record(&self) -> bool {
+        self.pending_host_record.is_some()
     }
 
     /// Resets the device-facing protocol state without changing constructor
@@ -483,7 +633,110 @@ impl ControlSessionBroker {
         Ok(())
     }
 
+    pub fn snapshot(&self) -> BrokerSnapshot {
+        let mut guest_output = self.guest_output.snapshot();
+        guest_output.queued_records.clear();
+        if guest_output
+            .current
+            .as_ref()
+            .is_some_and(|current| current.offset == 0)
+        {
+            guest_output.current = None;
+        }
+        BrokerSnapshot {
+            state: self.state as u8,
+            instance_id: self.instance_id,
+            drain_foreign_instance_records: self.drain_foreign_instance_records,
+            epoch: self.epoch,
+            guest_parser: self.guest_parser.snapshot(),
+            guest_output,
+            host_output: OutputSnapshot::default(),
+            guest_receive_sequence: self.guest_receive_sequence,
+            guest_send_sequence: self.guest_send_sequence,
+            host_receive_sequence: self.host_receive_sequence,
+            host_send_sequence: self.host_send_sequence,
+            pending_guest_record: None,
+            pending_host_record: None,
+            counters: self.counters.clone(),
+        }
+    }
+
+    /// Restores only physical guest alignment state, then starts a fresh
+    /// instance at epoch one and queues RESET.
+    pub fn restore(
+        snapshot: BrokerSnapshot,
+        new_instance_id: [u8; 16],
+        new_capability: [u8; 32],
+    ) -> Result<Self, BrokerError> {
+        Self::validate_snapshot(&snapshot)?;
+        if new_instance_id == [0; 16] {
+            return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
+        }
+        if snapshot.instance_id == new_instance_id {
+            return Err(BrokerError::InvalidSnapshot(
+                "restore reused the saved instance ID",
+            ));
+        }
+        let guest_parser = Parser::restore(snapshot.guest_parser)?;
+        let mut saved_guest_output = OutputLeg::restore(snapshot.guest_output)?;
+        let _saved_host_output = OutputLeg::restore(snapshot.host_output)?;
+
+        saved_guest_output.queue.clear();
+        saved_guest_output.queued_bytes = 0;
+        if saved_guest_output
+            .current
+            .as_ref()
+            .is_some_and(|current| current.offset == 0)
+        {
+            saved_guest_output.current = None;
+        }
+        if let Some(current) = &saved_guest_output.current {
+            let record = control_session_protocol::decode_exact(&current.bytes)?;
+            if record.instance_id == [0; 16] || record.instance_id == new_instance_id {
+                return Err(BrokerError::InvalidSnapshot(
+                    "partial guest output does not belong to an old instance",
+                ));
+            }
+        }
+
+        let mut broker = Self::new(new_instance_id, new_capability);
+        broker.state = BrokerState::ResetPending;
+        broker.guest_parser = guest_parser;
+        broker.guest_output = saved_guest_output;
+        broker.drain_foreign_instance_records = true;
+        broker.counters = snapshot.counters;
+        broker.enqueue_guest_control(RecordType::Reset)?;
+        Ok(broker)
+    }
+
+    /// Validates all snapshot bounds and encoded values without constructing a
+    /// broker or allocating output queues.
+    pub fn validate_snapshot(snapshot: &BrokerSnapshot) -> Result<(), BrokerError> {
+        let _saved_state = BrokerState::from_snapshot(snapshot.state)?;
+        if snapshot.epoch == 0 {
+            return Err(BrokerError::InvalidSnapshot("saved epoch is zero"));
+        }
+        if snapshot.instance_id == [0; 16] {
+            return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
+        }
+        validate_pending(snapshot.pending_guest_record.as_ref())?;
+        validate_pending(snapshot.pending_host_record.as_ref())?;
+        Parser::validate_snapshot(&snapshot.guest_parser)?;
+        OutputLeg::validate_snapshot(&snapshot.guest_output)?;
+        OutputLeg::validate_snapshot(&snapshot.host_output)?;
+        Ok(())
+    }
+
     fn handle_guest_record(&mut self, record: Record) -> Result<(), BrokerError> {
+        if self.drain_foreign_instance_records
+            && matches!(
+                self.state,
+                BrokerState::ResetPending | BrokerState::AwaitGuestAck
+            )
+            && record.instance_id != self.instance_id
+        {
+            return Ok(());
+        }
         match self.state {
             BrokerState::AwaitGuestAttach => {
                 if record.record_type != RecordType::GuestAttach {
@@ -560,6 +813,7 @@ impl ControlSessionBroker {
             });
         }
         self.advance_guest_receive_sequence()?;
+        self.drain_foreign_instance_records = false;
         if self.host_authenticated {
             self.enqueue_host_control(RecordType::Ready, Vec::new())?;
             self.state = BrokerState::Active;
@@ -753,6 +1007,13 @@ impl ControlSessionBroker {
             OutputLegId::Host => &mut self.host_output,
         }
     }
+}
+
+fn validate_pending(record: Option<&Record>) -> Result<(), BrokerError> {
+    if let Some(record) = record {
+        control_session_protocol::encode(record)?;
+    }
+    Ok(())
 }
 
 fn advance_sequence(sequence: &mut u64, state: &mut BrokerState) -> Result<(), BrokerError> {
@@ -1122,6 +1383,165 @@ mod tests {
         assert_eq!(broker.host_disconnected(), Err(BrokerError::EpochOverflow));
         assert_eq!(broker.state(), BrokerState::Failed);
         assert_eq!(broker.counters().reset_errors, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_preserves_only_partial_guest_physical_records() -> Result<(), BrokerError> {
+        let mut broker = make_active()?;
+        feed_host(
+            &mut broker,
+            &Record::session(RecordType::Data, INSTANCE, 1, 0, b"outbound".to_vec()),
+        )?;
+        assert!(broker.begin_output(OutputLegId::Guest));
+        broker.advance_output(OutputLegId::Guest, 7)?;
+
+        let old_guest_record =
+            Record::session(RecordType::Data, INSTANCE, 1, 1, b"inbound".to_vec());
+        let old_bytes = control_session_protocol::encode(&old_guest_record)?;
+        let split = control_session_protocol::HEADER_LEN + 2;
+        let progress = broker.accept_guest_input(&old_bytes[..split])?;
+        assert_eq!(progress.status, InputStatus::NeedMore);
+
+        let snapshot = broker.snapshot();
+        let new_instance = [0x77; 16];
+        let new_capability = [0x88; 32];
+        let mut restored = ControlSessionBroker::restore(snapshot, new_instance, new_capability)?;
+        assert_eq!(restored.state(), BrokerState::ResetPending);
+        assert_eq!(restored.epoch(), 1);
+        assert_eq!(restored.instance_id(), new_instance);
+        assert!(!restored.host_is_authenticated());
+
+        let progress = restored.accept_guest_input(&old_bytes[split..])?;
+        assert_eq!(progress.status, InputStatus::RecordAccepted);
+        let remainder = restored
+            .peek_output(OutputLegId::Guest, usize::MAX)
+            .ok_or(BrokerError::InvalidOutputProgress)?
+            .len();
+        restored.advance_output(OutputLegId::Guest, remainder)?;
+        let reset = drain_record(&mut restored, OutputLegId::Guest)?;
+        assert_eq!(
+            (reset.record_type, reset.instance_id, reset.epoch),
+            (RecordType::Reset, new_instance, 1)
+        );
+        feed_guest(
+            &mut restored,
+            &Record::session(RecordType::Ack, new_instance, 1, 0, Vec::new()),
+        )?;
+        assert_eq!(restored.state(), BrokerState::ReadyNoHost);
+        assert!(
+            feed_guest(
+                &mut restored,
+                &Record::session(RecordType::Data, INSTANCE, 1, 4, vec![1])
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_snapshot_fields_are_rejected() {
+        let broker = ControlSessionBroker::new(INSTANCE, CAPABILITY);
+        let mut snapshot = broker.snapshot();
+        snapshot.state = 99;
+        assert!(ControlSessionBroker::restore(snapshot, [1; 16], [2; 32]).is_err());
+
+        let mut snapshot = broker.snapshot();
+        snapshot.guest_output.current = Some(EncodedRecordSnapshot {
+            bytes: vec![1, 2, 3],
+            offset: 4,
+        });
+        assert!(ControlSessionBroker::restore(snapshot, [1; 16], [2; 32]).is_err());
+    }
+
+    #[test]
+    fn restore_drains_multiple_old_instance_records_and_ack() -> Result<(), BrokerError> {
+        let broker = make_active()?;
+        let snapshot = broker.snapshot();
+        let new_instance = [0x77; 16];
+        let mut restored = ControlSessionBroker::restore(snapshot, new_instance, [0x88; 32])?;
+
+        for (record_type, sequence) in [
+            (RecordType::Data, 1),
+            (RecordType::Data, 2),
+            (RecordType::Ack, 3),
+        ] {
+            let payload = if record_type == RecordType::Data {
+                vec![sequence as u8]
+            } else {
+                Vec::new()
+            };
+            feed_guest(
+                &mut restored,
+                &Record::session(record_type, INSTANCE, 1, sequence, payload),
+            )?;
+        }
+
+        assert_eq!(
+            drain_record(&mut restored, OutputLegId::Guest)?.record_type,
+            RecordType::Reset
+        );
+        feed_guest(
+            &mut restored,
+            &Record::session(RecordType::Ack, new_instance, 1, 0, Vec::new()),
+        )?;
+        assert_eq!(restored.state(), BrokerState::ReadyNoHost);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_finishes_old_reset_before_new_reset() -> Result<(), BrokerError> {
+        let mut broker = ControlSessionBroker::new(INSTANCE, CAPABILITY);
+        feed_guest(
+            &mut broker,
+            &Record::bootstrap(RecordType::GuestAttach, Vec::new()),
+        )?;
+        assert!(broker.begin_output(OutputLegId::Guest));
+        broker.advance_output(OutputLegId::Guest, 7)?;
+
+        let new_instance = [0x77; 16];
+        let mut restored =
+            ControlSessionBroker::restore(broker.snapshot(), new_instance, [0x88; 32])?;
+        let old_remainder = restored
+            .peek_output(OutputLegId::Guest, usize::MAX)
+            .ok_or(BrokerError::InvalidOutputProgress)?
+            .len();
+        restored.advance_output(OutputLegId::Guest, old_remainder)?;
+        feed_guest(
+            &mut restored,
+            &Record::session(RecordType::Ack, INSTANCE, 1, 0, Vec::new()),
+        )?;
+        let reset = drain_record(&mut restored, OutputLegId::Guest)?;
+        assert_eq!(
+            (reset.record_type, reset.instance_id, reset.epoch),
+            (RecordType::Reset, new_instance, 1)
+        );
+        feed_guest(
+            &mut restored,
+            &Record::session(RecordType::Ack, new_instance, 1, 0, Vec::new()),
+        )?;
+        assert_eq!(restored.state(), BrokerState::ReadyNoHost);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_completed_restores_do_not_accumulate_identity_state() -> Result<(), BrokerError> {
+        let mut broker = make_active()?;
+        for index in 0..8u8 {
+            let new_instance = [0x80 + index; 16];
+            broker =
+                ControlSessionBroker::restore(broker.snapshot(), new_instance, [0x40 + index; 32])?;
+            assert_eq!(
+                drain_record(&mut broker, OutputLegId::Guest)?.record_type,
+                RecordType::Reset
+            );
+            feed_guest(
+                &mut broker,
+                &Record::session(RecordType::Ack, new_instance, 1, 0, Vec::new()),
+            )?;
+            assert_eq!(broker.state(), BrokerState::ReadyNoHost);
+            assert!(!broker.drain_foreign_instance_records);
+        }
         Ok(())
     }
 
