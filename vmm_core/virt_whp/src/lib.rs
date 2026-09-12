@@ -635,6 +635,19 @@ impl virt::Partition for WhpPartition {
     }
 
     #[cfg(guest_arch = "x86_64")]
+    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
+        if self.inner.vps.len() <= 1 {
+            return Ok(());
+        }
+
+        let partition = &self.inner.vtl0.whp;
+        partition
+            .suspend_time()
+            .for_op("suspend restored partition time")?;
+        synchronize_restored_tscs(partition, self.inner.vps.len())
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
         let frequency = match &self.inner.vtl0.lapic {
             LocalApicKind::Emulated(_) => virt_support_apic::TIMER_FREQUENCY,
@@ -731,6 +744,21 @@ impl virt::Partition for WhpPartition {
             }
         }
     }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn synchronize_restored_tscs(partition: &whp::Partition, vp_count: usize) -> Result<(), Error> {
+    let tsc = partition
+        .vp(0)
+        .get_register(whp::Register64::Tsc)
+        .for_op("read restored BSP TSC")?;
+    for vp_index in 1..vp_count as u32 {
+        partition
+            .vp(vp_index)
+            .set_register(whp::Register64::Tsc, tsc)
+            .for_op("synchronize restored VP TSC")?;
+    }
+    Ok(())
 }
 
 #[cfg(guest_arch = "x86_64")]
@@ -2223,6 +2251,49 @@ mod aarch64 {
                     error = &err as &dyn std::error::Error,
                     "failed to set interrupt state"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires WHP"]
+    fn restored_tscs_are_identical_while_partition_time_is_suspended() {
+        for vp_count in [1, 2, 4, 8] {
+            let mut config = whp::PartitionConfig::new().unwrap();
+            config
+                .set_property(whp::PartitionProperty::ProcessorCount(vp_count))
+                .unwrap();
+            let partition = config.create().unwrap();
+            for vp_index in 0..vp_count {
+                partition.create_vp(vp_index).create().unwrap();
+            }
+
+            partition.suspend_time().unwrap();
+            let expected_tsc = 1_000_000_u64;
+            for vp_index in 0..vp_count {
+                partition
+                    .vp(vp_index)
+                    .set_register(
+                        whp::Register64::Tsc,
+                        expected_tsc + u64::from(vp_index) * 100_000,
+                    )
+                    .unwrap();
+            }
+
+            synchronize_restored_tscs(&partition, vp_count as usize).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            for vp_index in 0..vp_count {
+                let actual_tsc = partition
+                    .vp(vp_index)
+                    .get_register(whp::Register64::Tsc)
+                    .unwrap();
+                assert_eq!(actual_tsc, expected_tsc, "VP {vp_index} TSC differs");
             }
         }
     }
