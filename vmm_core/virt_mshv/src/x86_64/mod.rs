@@ -125,7 +125,7 @@ impl virt::Hypervisor for LinuxMshv {
             snp,
             x2apic,
             config.processor_topology.smt_enabled(),
-            config.versioned_cpu_contract,
+            supported_processor_features1(config.versioned_cpu_contract),
         );
 
         let vmfd = create_vm_with_retry(&self.mshv, &create_args)?;
@@ -222,7 +222,7 @@ fn partition_create_args(
     snp: bool,
     x2apic: bool,
     smt: bool,
-    versioned_cpu_contract: bool,
+    processor_features1: hvdef::HvX64PartitionProcessorFeatures1,
 ) -> mshv_bindings::mshv_create_partition_v2 {
     let mut pt_flags =
         1 << mshv_bindings::MSHV_PT_BIT_LAPIC | 1 << mshv_bindings::MSHV_PT_BIT_GPA_SUPER_PAGES;
@@ -244,7 +244,7 @@ fn partition_create_args(
         pt_num_cpu_fbanks: mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16,
         pt_cpu_fbanks: [
             !u64::from(supported_processor_features()),
-            !u64::from(supported_processor_features1(versioned_cpu_contract)),
+            !u64::from(processor_features1),
         ],
         pt_disabled_xsave: !u64::from(supported_xsave_features()),
         ..Default::default()
@@ -1792,7 +1792,7 @@ mod tests {
 
     #[test]
     fn snp_partition_creation_uses_isolation_flags() {
-        let args = partition_create_args(true, false, false, false);
+        let args = partition_create_args(true, false, false, supported_processor_features1(false));
         let pt_isolation = args.pt_isolation;
         let pt_num_cpu_fbanks = args.pt_num_cpu_fbanks;
         let pt_cpu_fbanks = args.pt_cpu_fbanks;
@@ -1825,7 +1825,7 @@ mod tests {
 
     #[test]
     fn ordinary_partition_creation_keeps_feature_banks() {
-        let args = partition_create_args(false, false, true, false);
+        let args = partition_create_args(false, false, true, supported_processor_features1(false));
         let pt_isolation = args.pt_isolation;
         let pt_num_cpu_fbanks = args.pt_num_cpu_fbanks;
 
@@ -1850,8 +1850,16 @@ mod tests {
     }
     #[test]
     fn versioned_cpu_contract_does_not_expose_tsc_adjust() {
-        assert!(!supported_processor_features1(true).tsc_adjust_support());
-        assert!(supported_processor_features1(false).tsc_adjust_support());
+        for versioned_cpu_contract in [false, true] {
+            let processor_features1 = supported_processor_features1(versioned_cpu_contract);
+            assert_eq!(
+                processor_features1.tsc_adjust_support(),
+                !versioned_cpu_contract
+            );
+            let args = partition_create_args(false, false, false, processor_features1);
+            let pt_cpu_fbanks = args.pt_cpu_fbanks;
+            assert_eq!(pt_cpu_fbanks[1], !u64::from(processor_features1));
+        }
     }
 
     #[test]

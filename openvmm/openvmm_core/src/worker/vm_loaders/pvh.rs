@@ -31,7 +31,19 @@ const MIN_TSC_FREQUENCY_HZ: u64 = 500_000_000;
 const MAX_TSC_FREQUENCY_HZ: u64 = 10_000_000_000;
 const HZ_PER_KHZ: u64 = 1000;
 const TSC_EARLY_KHZ: &str = "tsc_early_khz";
+const LAPIC_TIMER_HZ: &str = "lapic_timer_hz";
+const MIN_APIC_FREQUENCY_HZ: u64 = 1_000_000;
 const VIRTIO_MMIO_DEVICE: &str = "virtio_mmio.device=";
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum FrequencyParameterError {
+    #[error("duplicate parameter")]
+    Duplicate,
+    #[error("malformed parameter: {0}")]
+    Malformed(String),
+    #[error("value {specified} does not match the backend-reported value {reported}")]
+    Mismatch { specified: u64, reported: u64 },
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum TscFrequencyError {
@@ -47,6 +59,30 @@ pub(crate) enum TscFrequencyError {
         "kernel command line tsc_early_khz value {specified} does not match the backend-reported value {reported}"
     )]
     Mismatch { specified: u64, reported: u64 },
+}
+
+impl From<FrequencyParameterError> for TscFrequencyError {
+    fn from(error: FrequencyParameterError) -> Self {
+        match error {
+            FrequencyParameterError::Duplicate => Self::Duplicate,
+            FrequencyParameterError::Malformed(parameter) => Self::Malformed(parameter),
+            FrequencyParameterError::Mismatch {
+                specified,
+                reported,
+            } => Self::Mismatch {
+                specified,
+                reported,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum ApicFrequencyError {
+    #[error("LAPIC frequency {0} Hz is outside the supported range of 1 MHz through 4294967295 Hz")]
+    OutOfRange(u64),
+    #[error("invalid lapic_timer_hz: {0}")]
+    Parameter(#[from] FrequencyParameterError),
 }
 
 fn command_line_tokens(cmdline: &str) -> (Vec<(usize, &str)>, Option<usize>) {
@@ -118,8 +154,33 @@ pub(crate) fn propagate_tsc_frequency(
     if !(MIN_TSC_FREQUENCY_HZ..=MAX_TSC_FREQUENCY_HZ).contains(&frequency_hz) {
         return Err(TscFrequencyError::OutOfRange(frequency_hz));
     }
-    let frequency_khz = frequency_hz / HZ_PER_KHZ;
-    let canonical_parameter = format!("{TSC_EARLY_KHZ}={frequency_khz}");
+    Ok(propagate_frequency_parameter(
+        cmdline,
+        TSC_EARLY_KHZ,
+        frequency_hz / HZ_PER_KHZ,
+    )?)
+}
+
+pub(crate) fn propagate_apic_frequency(
+    cmdline: &mut String,
+    frequency_hz: u64,
+) -> Result<(), ApicFrequencyError> {
+    if !(MIN_APIC_FREQUENCY_HZ..=u64::from(u32::MAX)).contains(&frequency_hz) {
+        return Err(ApicFrequencyError::OutOfRange(frequency_hz));
+    }
+    Ok(propagate_frequency_parameter(
+        cmdline,
+        LAPIC_TIMER_HZ,
+        frequency_hz,
+    )?)
+}
+
+fn propagate_frequency_parameter(
+    cmdline: &mut String,
+    parameter_name: &str,
+    frequency: u64,
+) -> Result<(), FrequencyParameterError> {
+    let canonical_parameter = format!("{parameter_name}={frequency}");
 
     let mut parameter = None;
     let mut delimiter_offset = None;
@@ -145,9 +206,9 @@ pub(crate) fn propagate_tsc_frequency(
             discovery_offset = Some(offset);
         }
         let name = token.split_once('=').map_or(token, |(name, _value)| name);
-        if linux_parameter_name_matches(name, TSC_EARLY_KHZ) {
+        if linux_parameter_name_matches(name, parameter_name) {
             if parameter.is_some() {
-                return Err(TscFrequencyError::Duplicate);
+                return Err(FrequencyParameterError::Duplicate);
             }
             parameter = Some((offset..offset + token_length, token.to_owned()));
         }
@@ -155,15 +216,15 @@ pub(crate) fn propagate_tsc_frequency(
 
     if let Some((range, parameter)) = parameter {
         let Some((_name, value)) = parameter.split_once('=') else {
-            return Err(TscFrequencyError::Malformed(parameter));
+            return Err(FrequencyParameterError::Malformed(parameter));
         };
         let specified = parse_linux_uint(value)
             .map(u64::from)
-            .ok_or_else(|| TscFrequencyError::Malformed(parameter.clone()))?;
-        if specified != frequency_khz {
-            return Err(TscFrequencyError::Mismatch {
+            .ok_or_else(|| FrequencyParameterError::Malformed(parameter.clone()))?;
+        if specified != frequency {
+            return Err(FrequencyParameterError::Mismatch {
                 specified,
-                reported: frequency_khz,
+                reported: frequency,
             });
         }
         cmdline.replace_range(range, &canonical_parameter);
@@ -239,6 +300,69 @@ mod tests {
     use test_with_tracing::test;
 
     const TSC_FREQUENCY_HZ: u64 = 2_500_000_999;
+
+    #[test]
+    fn propagates_backend_apic_frequency_without_changing_tsc_policy() {
+        let mut cmdline = "console=hvc0 -- tenant".to_owned();
+        propagate_snapshot_tsc_frequency(&mut cmdline, TSC_FREQUENCY_HZ, false).unwrap();
+        propagate_apic_frequency(&mut cmdline, 200_000_000).unwrap();
+        assert_eq!(cmdline, "console=hvc0 lapic_timer_hz=200000000 -- tenant");
+
+        let mut snapshot = "console=hvc0 virtio_mmio.device=0x1000@0xd0002000:7".to_owned();
+        propagate_snapshot_tsc_frequency(&mut snapshot, TSC_FREQUENCY_HZ, true).unwrap();
+        propagate_apic_frequency(&mut snapshot, 200_000_000).unwrap();
+        assert_eq!(
+            snapshot,
+            "console=hvc0 tsc_early_khz=2500000 lapic_timer_hz=200000000 \
+             virtio_mmio.device=0x1000@0xd0002000:7"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_apic_frequency_using_linux_parameter_rules() {
+        for parameter in [
+            "lapic_timer_hz=200000000",
+            "lapic-timer-hz=200000000",
+            "lapic_timer_hz=0xbebc200",
+            r#"lapic_timer_hz="200000000""#,
+            r#""lapic_timer_hz=200000000""#,
+        ] {
+            let mut cmdline = format!("console=hvc0 {parameter} -- lapic_timer_hz=1");
+            propagate_apic_frequency(&mut cmdline, 200_000_000).unwrap();
+            assert_eq!(
+                cmdline,
+                "console=hvc0 lapic_timer_hz=200000000 -- lapic_timer_hz=1"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_apic_frequency_without_mutating_command_line() {
+        for parameter in [
+            "lapic_timer_hz",
+            "lapic_timer_hz=",
+            "lapic_timer_hz=0",
+            "lapic_timer_hz=199999999",
+            "lapic_timer_hz=4294967296",
+            "lapic_timer_hz=200000000 lapic-timer-hz=200000000",
+        ] {
+            let mut cmdline = parameter.to_owned();
+            let error = propagate_apic_frequency(&mut cmdline, 200_000_000).unwrap_err();
+            assert!(error.to_string().contains(LAPIC_TIMER_HZ));
+            assert_eq!(cmdline, parameter);
+        }
+        for frequency in [0, MIN_APIC_FREQUENCY_HZ - 1, u64::from(u32::MAX) + 1] {
+            let mut cmdline = "console=hvc0".to_owned();
+            assert_eq!(
+                propagate_apic_frequency(&mut cmdline, frequency),
+                Err(ApicFrequencyError::OutOfRange(frequency))
+            );
+            assert_eq!(cmdline, "console=hvc0");
+        }
+        for frequency in [MIN_APIC_FREQUENCY_HZ, u64::from(u32::MAX)] {
+            propagate_apic_frequency(&mut String::new(), frequency).unwrap();
+        }
+    }
 
     #[test]
     fn preserves_non_snapshot_command_line() {
