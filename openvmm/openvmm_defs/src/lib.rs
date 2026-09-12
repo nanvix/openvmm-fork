@@ -15,6 +15,8 @@ pub mod profile {
     use std::sync::OnceLock;
     use std::time::Duration;
     use std::time::Instant;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     /// Environment variable that enables snapshot lifecycle profiling.
     pub const SNAPSHOT_PROFILE_ENV: &str = "OPENVMM_STARTUP_PROFILE";
@@ -89,6 +91,9 @@ pub mod profile {
             };
             let ended = Instant::now();
             let process_started = PROCESS_STARTED.get().copied().unwrap_or(started);
+            let unix_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
             let line = format_record(
                 operation,
                 phase,
@@ -96,6 +101,7 @@ pub mod profile {
                 ended.duration_since(started),
                 ended.duration_since(process_started),
                 std::process::id(),
+                unix_ns,
                 counters,
             );
             // Profiling must never change VM behavior. In particular, a closed
@@ -111,11 +117,12 @@ pub mod profile {
         duration: Duration,
         process_elapsed: Duration,
         pid: u32,
+        unix_ns: u128,
         counters: ProfileCounters,
     ) -> String {
         let mut line = format!(
             "{SNAPSHOT_PROFILE_PREFIX} operation={operation} phase={phase} exclusive={} \
-             duration_ns={} process_elapsed_ns={} pid={pid}",
+             duration_ns={} process_elapsed_ns={} pid={pid} unix_ns={unix_ns}",
             u8::from(exclusive),
             duration.as_nanos(),
             process_elapsed.as_nanos(),
@@ -151,16 +158,17 @@ pub mod profile {
                     Duration::from_nanos(12),
                     Duration::from_nanos(34),
                     56,
+                    78,
                     ProfileCounters {
-                        logical_bytes: Some(78),
-                        allocated_bytes: Some(90),
+                        logical_bytes: Some(90),
+                        allocated_bytes: Some(12),
                         gpa_faults: None,
                         populated_bytes: None,
                     },
                 ),
                 "OPENVMM_SNAPSHOT_PROFILE_V1 operation=restore phase=artifact_open \
                  exclusive=1 duration_ns=12 process_elapsed_ns=34 pid=56 \
-                 logical_bytes=78 allocated_bytes=90"
+                 unix_ns=78 logical_bytes=90 allocated_bytes=12"
             );
         }
     }

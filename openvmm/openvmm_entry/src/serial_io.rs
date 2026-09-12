@@ -9,6 +9,8 @@ use pal_async::pipe::PolledPipe;
 use serial_socket::net::OpenSocketSerialConfig;
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
+use std::io::Read;
 use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::path::Path;
@@ -55,6 +57,117 @@ pub fn bind_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
 /// Binds a listener without removing an existing socket path.
 pub fn bind_serial_without_cleanup(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
     bind_serial_inner(path, false)
+}
+
+#[cfg(unix)]
+pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control endpoint has no parent directory",
+        )
+    })?;
+    let parent_metadata = fs_err::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != pal::unix::effective_user_id()
+        || parent_metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control endpoint parent must be a non-symlink directory owned by OpenVMM with mode 0700",
+        ));
+    }
+
+    let control_listener = openvmm_defs::profile::ProfileSpan::start();
+    let listener = UnixListener::bind(path)?;
+    let bound_metadata = fs_err::symlink_metadata(path)?;
+    let prepare_result = (|| {
+        fs_err::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let socket_metadata = fs_err::symlink_metadata(path)?;
+        if !socket_metadata.file_type().is_socket()
+            || socket_metadata.dev() != bound_metadata.dev()
+            || socket_metadata.ino() != bound_metadata.ino()
+            || socket_metadata.uid() != parent_metadata.uid()
+            || socket_metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control endpoint must be an owned Unix socket with mode 0600",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepare_result {
+        drop(listener);
+        if let Ok(current) = fs_err::symlink_metadata(path)
+            && current.file_type().is_socket()
+            && current.dev() == bound_metadata.dev()
+            && current.ino() == bound_metadata.ino()
+        {
+            let _ = fs_err::remove_file(path);
+        }
+        return Err(error);
+    }
+    control_listener.complete_milestone("startup", "control_listener_ready", Default::default());
+    Ok(OpenSocketSerialConfig::from(listener).into_resource())
+}
+
+#[cfg(not(unix))]
+pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure control-console named pipes are not implemented",
+    ))
+}
+
+#[cfg(unix)]
+pub fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let mut file = pal::take_inherited_file(raw_handle)?;
+    if !file.metadata()?.file_type().is_fifo() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control authentication handle is not a one-way pipe",
+        ));
+    }
+    pal::unix::pipe::set_nonblocking(&file, true)?;
+
+    let mut bytes = [0u8; 33];
+    let mut count = 0;
+    loop {
+        match file.read(&mut bytes[count..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                count += read;
+                if count == bytes.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "control authentication payload has an invalid length",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control authentication writer was not closed",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    bytes[..count].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "control authentication payload has an invalid length",
+        )
+    })
 }
 
 fn bind_serial_inner(
@@ -166,4 +279,42 @@ pub fn connect_tcp_serial(
     let stream = TcpStream::connect_timeout(addr, timeout)
         .with_context(|| format!("failed to connect to tcp address {addr}"))?;
     Ok(OpenSocketSerialConfig::from(stream).into_resource())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    use test_with_tracing::test;
+
+    #[test]
+    fn control_listener_has_private_permissions_and_exclusive_path() {
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let directory = std::env::current_dir().unwrap().join(format!(
+            ".control-endpoint-test-{:016x}",
+            u64::from_ne_bytes(nonce)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let path = directory.join("control.sock");
+        let cleanup_path = path.clone();
+        let cleanup_directory = directory.clone();
+        let _cleanup = pal::ScopeExit::new(move || {
+            let _ = fs_err::remove_file(cleanup_path);
+            let _ = fs_err::remove_dir(cleanup_directory);
+        });
+
+        let listener = bind_control_serial(&path).unwrap();
+        let metadata = fs_err::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), pal::unix::effective_user_id());
+        assert!(bind_control_serial(&path).is_err());
+        drop(listener);
+    }
 }

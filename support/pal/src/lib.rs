@@ -26,6 +26,7 @@ pub use windows_sys;
 pub use sys::close_stdout;
 pub use sys::fs;
 pub use sys::pipe::pair as pipe_pair;
+pub use sys::take_inherited_file;
 
 #[cfg(unix)]
 use unix as sys;
