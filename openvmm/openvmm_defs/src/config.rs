@@ -681,16 +681,6 @@ fn validate_microvm_command_line(
     );
 
     let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
-    anyhow::ensure!(
-        !cmdline.contains('"') && !tokens.contains(&"--"),
-        "microVM ABI version 2 command line cannot contain quotes or the kernel argument delimiter"
-    );
-    anyhow::ensure!(
-        !tokens
-            .iter()
-            .any(|token| kernel_parameter_name_matches(token, "driver_async_probe")),
-        "microVM command line cannot override driver probe ordering"
-    );
     let has_console = config
         .virtio_devices
         .iter()
@@ -699,6 +689,7 @@ fn validate_microvm_command_line(
         .virtio_devices
         .iter()
         .any(|(_, device)| device.id() == MICROVM_VIRTIO_CONTROL_CONSOLE_ID);
+    validate_microvm_control_console_command_line(&tokens, has_control_console)?;
     let block_count = config
         .virtio_devices
         .iter()
@@ -755,7 +746,7 @@ fn validate_microvm_command_line(
         "virtfs_tag=",
         "virtfs_mode=",
     ] {
-        let count = if prefix == "virtio_mmio.device=" {
+        let count = if prefix == "virtio_mmio.device=" && has_control_console {
             tokens
                 .iter()
                 .filter(|token| kernel_parameter_name_matches(token, "virtio_mmio.device"))
@@ -779,14 +770,6 @@ fn validate_microvm_command_line(
             "microVM command line has an invalid number of {prefix} tokens"
         );
     }
-    let control_tty_count = tokens
-        .iter()
-        .filter(|token| kernel_parameter_name_matches(token, "nvx_control_tty"))
-        .count();
-    anyhow::ensure!(
-        control_tty_count == usize::from(has_control_console),
-        "microVM command line has an invalid number of nvx_control_tty= tokens"
-    );
     let dns_tokens = tokens
         .iter()
         .filter(|token| token.starts_with("virtnet_dns="))
@@ -895,6 +878,34 @@ fn kernel_parameter_name_matches(token: &str, expected: &str) -> bool {
             .bytes()
             .zip(expected.bytes())
             .all(|(actual, expected)| actual == expected || (actual == b'-' && expected == b'_'))
+}
+
+fn validate_microvm_control_console_command_line(
+    tokens: &[&str],
+    has_control_console: bool,
+) -> anyhow::Result<()> {
+    if !has_control_console {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !tokens.iter().any(|token| token.contains('"')) && !tokens.contains(&"--"),
+        "microVM ABI version 2 control-console command line cannot contain quotes or the kernel argument delimiter"
+    );
+    anyhow::ensure!(
+        !tokens
+            .iter()
+            .any(|token| kernel_parameter_name_matches(token, "driver_async_probe")),
+        "microVM control-console command line cannot override driver probe ordering"
+    );
+    anyhow::ensure!(
+        tokens
+            .iter()
+            .filter(|token| kernel_parameter_name_matches(token, "nvx_control_tty"))
+            .count()
+            == 1,
+        "microVM command line must contain exactly one nvx_control_tty= token"
+    );
+    Ok(())
 }
 
 fn build_microvm_command_line_inner(
@@ -1577,6 +1588,27 @@ pub enum GicConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_console_restrictions_do_not_change_legacy_abi_v2_command_lines() {
+        let cmdline = r#"earlycon=xe9 console=hvc1 reboot=t panic=-1 note="left right" -- driver_async_probe=virtio_mmio nvx_control_tty=hvc9"#;
+        let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
+        validate_microvm_control_console_command_line(&tokens, false).unwrap();
+    }
+
+    #[test]
+    fn control_console_rejects_ambiguous_or_overridden_discovery() {
+        for cmdline in [
+            r#"earlycon=xe9 console=hvc1 reboot=t panic=-1 note="left right" nvx_control_tty=hvc2"#,
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1 -- nvx_control_tty=hvc2",
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1 driver-async-probe=virtio_mmio nvx_control_tty=hvc2",
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1",
+            "earlycon=xe9 console=hvc1 reboot=t panic=-1 nvx_control_tty=hvc2 nvx-control-tty=hvc2",
+        ] {
+            let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
+            assert!(validate_microvm_control_console_command_line(&tokens, true).is_err());
+        }
+    }
 
     #[test]
     fn microvm_snapshot_tier_command_line_token_is_host_owned() {

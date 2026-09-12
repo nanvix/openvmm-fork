@@ -7676,6 +7676,7 @@ dependencies = [
  "tracing",
  "unix_socket",
  "vm_resource",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
