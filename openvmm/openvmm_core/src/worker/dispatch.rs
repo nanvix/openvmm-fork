@@ -1788,6 +1788,18 @@ impl InitializedVm {
                     "backend does not expose a guest TSC frequency; preserving the microVM command line"
                 ),
             }
+            match partition
+                .apic_frequency_hz()
+                .context("failed to query the backend guest LAPIC frequency")?
+            {
+                Some(frequency_hz) => {
+                    super::vm_loaders::pvh::propagate_apic_frequency(cmdline, frequency_hz)
+                        .context("failed to propagate the guest LAPIC frequency")?;
+                }
+                None => tracing::warn!(
+                    "backend does not expose a guest LAPIC frequency; retaining guest timer calibration"
+                ),
+            }
         }
 
         let mut resolver = ResourceResolver::new();
