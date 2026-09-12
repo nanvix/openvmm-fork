@@ -61,7 +61,12 @@ pub fn unix_socket_peer_user_id(socket: BorrowedFd<'_>) -> io::Result<u32> {
 /// The launcher transfers ownership of a valid descriptor to the new process
 /// and must not use it there. This function immediately creates a close-on-exec
 /// duplicate and closes the inherited descriptor.
-pub fn take_inherited_file(raw: u64) -> io::Result<File> {
+///
+/// # Safety
+///
+/// `raw` must be a valid descriptor exclusively owned by the caller. No other
+/// owner may close or use it after this call.
+pub unsafe fn take_inherited_file(raw: u64) -> io::Result<File> {
     let raw = RawFd::try_from(raw)
         .map_err(|_| Error::new(io::ErrorKind::InvalidInput, "invalid inherited descriptor"))?;
     // SAFETY: `fcntl` accepts an integer descriptor and reports `EBADF` for an

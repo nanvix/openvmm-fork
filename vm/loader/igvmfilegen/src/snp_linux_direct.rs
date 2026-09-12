@@ -112,6 +112,7 @@ impl FixedGuestLayout {
                 with_psp: false,
                 pm_base: DEFAULT_PM_PIO_BASE,
                 acpi_irq: DEFAULT_ACPI_IRQ,
+                level_triggered_irqs: &[],
                 iommu: None,
             },
         }
@@ -542,6 +543,14 @@ mod tests {
             let layout = FixedGuestLayout::new(64, processor_count).unwrap();
             assert_eq!(layout.processors.vp_count(), processor_count);
             assert_eq!(layout.memory.ram().len(), 1);
+            let AcpiArchConfig::X86 {
+                level_triggered_irqs,
+                ..
+            } = layout.acpi_builder().arch
+            else {
+                panic!("fixed layout must use x86 ACPI");
+            };
+            assert!(level_triggered_irqs.is_empty());
         }
     }
 
