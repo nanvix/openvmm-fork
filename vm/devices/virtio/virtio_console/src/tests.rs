@@ -1745,13 +1745,23 @@ async fn malformed_host_input_detaches_without_panicking(driver: DefaultDriver) 
 }
 
 #[async_test]
-async fn malformed_guest_input_stops_safely(driver: DefaultDriver) {
+async fn malformed_guest_input_recovers_after_device_reset(driver: DefaultDriver) {
     let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
     harness.enable().await;
-    harness.post_tx_and_signal(0, &[0x99; control_session_protocol::HEADER_LEN]);
+    activate_broker(&mut harness).await;
+    harness.post_tx_and_signal(2, &[0x99; control_session_protocol::HEADER_LEN]);
     for _ in 0..20 {
         yield_now().await;
     }
+
+    assert!(harness.device.stop_queue(0).await.is_some());
     assert!(harness.device.stop_queue(1).await.is_some());
+    assert!(!harness.handle.is_connected());
     assert!(harness.handle.tx_data().is_empty());
+
+    harness.device.reset().await;
+    harness.handle.reconnect();
+    harness.reset_rings();
+    harness.enable().await;
+    activate_broker(&mut harness).await;
 }
