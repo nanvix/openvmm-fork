@@ -59,7 +59,7 @@ pub fn bind_serial_without_cleanup(path: &Path) -> io::Result<Resource<SerialBac
     bind_serial_inner(path, false)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
@@ -115,19 +115,29 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
     Ok(OpenSocketSerialConfig::from(listener).into_resource())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "secure control-console named pipes are not implemented",
+        "secure control-console local endpoints are only supported on Linux",
     ))
 }
 
+/// Consumes an inherited one-way pipe and reads its control capability.
+///
+/// # Safety
+///
+/// `raw_handle` must identify a valid descriptor exclusively owned by the
+/// caller. No other owner may close or use it after this call.
 #[cfg(unix)]
-pub fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
+// UNSAFETY: Adopts the launcher-transferred descriptor under the caller's
+// exclusive-ownership contract.
+#[expect(unsafe_code)]
+pub unsafe fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
     use std::os::unix::fs::FileTypeExt;
 
-    let mut file = pal::take_inherited_file(raw_handle)?;
+    // SAFETY: inherited descriptor ownership is the caller's contract.
+    let mut file = unsafe { pal::take_inherited_file(raw_handle)? };
     if !file.metadata()?.file_type().is_fifo() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -279,7 +289,7 @@ pub fn connect_tcp_serial(
     Ok(OpenSocketSerialConfig::from(stream).into_resource())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
