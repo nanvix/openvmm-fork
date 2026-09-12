@@ -359,7 +359,7 @@ impl VirtioDevice for VirtioConsoleDevice {
 
     fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
         let (worker, runtime) = self.worker.get_mut();
-        let saved = validate_saved_state(state.as_ref(), worker.mode.validation_mode())?;
+        let mut saved = validate_saved_state(state.as_ref(), worker.mode.validation_mode())?;
         let runtime = runtime.ok_or_else(|| {
             RestoreError::Other(anyhow::anyhow!(
                 "virtio-console worker state is unavailable"
@@ -377,29 +377,44 @@ impl VirtioDevice for VirtioConsoleDevice {
         let partial_transmit = usize::try_from(saved.partial_transmit)
             .map_err(|_| invalid_saved_state("console TX offset is out of range"))?;
 
+        let restored_broker = match &mut worker.mode {
+            ConsoleWorkerMode::Direct { .. } => None,
+            ConsoleWorkerMode::Broker(mode) => {
+                let saved_broker = saved
+                    .broker
+                    .take()
+                    .ok_or_else(|| invalid_saved_state("missing control-console broker state"))?;
+                let snapshot = saved_broker.try_into().map_err(invalid_saved_state)?;
+                let broker = control_session_broker::ControlSessionBroker::restore(
+                    snapshot,
+                    mode.config.instance_id,
+                    mode.config.capability,
+                )
+                .map_err(|error| invalid_saved_state(error.to_string()))?;
+                if mode.host_io.is_connected() {
+                    mode.host_io.disconnect_current().map_err(|error| {
+                        RestoreError::Other(
+                            anyhow::Error::new(error)
+                                .context("failed to disconnect control-console host for restore"),
+                        )
+                    })?;
+                }
+                Some(broker)
+            }
+        };
+
         self.config = VirtioConsoleConfig {
             cols: columns,
             rows,
         };
         runtime.partial_transmit = partial_transmit;
         runtime.staged_rx = saved.staged_rx.into();
-        match &mut worker.mode {
-            ConsoleWorkerMode::Direct { .. } => {}
-            ConsoleWorkerMode::Broker(mode) => {
-                let saved_broker = saved
-                    .broker
-                    .ok_or_else(|| invalid_saved_state("missing control-console broker state"))?;
-                let snapshot = saved_broker.try_into().map_err(invalid_saved_state)?;
-                mode.broker = control_session_broker::ControlSessionBroker::restore(
-                    snapshot,
-                    mode.config.instance_id,
-                    mode.config.capability,
-                )
-                .map_err(|error| invalid_saved_state(error.to_string()))?;
-                mode.host_input.clear();
-                mode.transport_state = HostTransportState::WaitingForDisconnect;
-                mode.auth_deadline = None;
-            }
+        if let (ConsoleWorkerMode::Broker(mode), Some(broker)) = (&mut worker.mode, restored_broker)
+        {
+            mode.broker = broker;
+            mode.host_input.clear();
+            mode.transport_state = HostTransportState::WaitingForConnect;
+            mode.auth_deadline = None;
         }
         Ok(())
     }
@@ -615,12 +630,12 @@ fn validate_saved_state(
                 .broker
                 .as_ref()
                 .ok_or_else(|| invalid_saved_state("missing control-console broker state"))?;
-            validate_saved_broker(broker)?;
-            if broker.instance_id.as_slice() == current_instance_id {
-                return Err(invalid_saved_state(
-                    "control-console restore reused the saved instance ID",
-                ));
-            }
+            let snapshot = validate_saved_broker(broker)?;
+            control_session_broker::ControlSessionBroker::validate_restore(
+                &snapshot,
+                current_instance_id,
+            )
+            .map_err(|error| invalid_saved_state(error.to_string()))?;
         }
     }
     u16::try_from(saved.columns)
@@ -987,7 +1002,9 @@ mod saved_state {
     }
 }
 
-fn validate_saved_broker(saved: &saved_state::SavedBrokerSnapshot) -> Result<(), RestoreError> {
+fn validate_saved_broker(
+    saved: &saved_state::SavedBrokerSnapshot,
+) -> Result<control_session_broker::BrokerSnapshot, RestoreError> {
     use control_session_protocol::HEADER_LEN;
     use control_session_protocol::MAX_DATA_LEN;
 
@@ -1048,9 +1065,7 @@ fn validate_saved_broker(saved: &saved_state::SavedBrokerSnapshot) -> Result<(),
             backpressure_errors: saved.counters.backpressure_errors,
         },
     };
-    let _: control_session_broker::BrokerSnapshot =
-        snapshot.try_into().map_err(invalid_saved_state)?;
-    Ok(())
+    snapshot.try_into().map_err(invalid_saved_state)
 }
 
 fn validate_saved_output(saved: &saved_state::SavedOutputSnapshot) -> Result<(), RestoreError> {
