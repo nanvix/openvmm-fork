@@ -9,6 +9,7 @@ mod ioapic_iommu_wiring;
 mod pcie_topology;
 mod pcie_wiring;
 mod smmu_wiring;
+mod snapshot_rpc;
 
 use crate::emuplat;
 use crate::partition::BindHvliteVp;
@@ -4320,6 +4321,18 @@ impl LoadedVm {
                     }
                 };
                 (a, b, c, d, e).race().await
+            };
+
+            let event = match event {
+                Event::VmRpc(Ok(message)) => {
+                    let Some(message) =
+                        snapshot_rpc::filter(message, self.snapshot_stop_guard.is_some())
+                    else {
+                        continue;
+                    };
+                    Event::VmRpc(Ok(message))
+                }
+                event => event,
             };
 
             match event {
