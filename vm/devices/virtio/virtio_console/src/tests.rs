@@ -1774,8 +1774,8 @@ async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: Def
     const NEW_INSTANCE: [u8; 16] = [0x62; 16];
     const NEW_CAPABILITY: [u8; 32] = [0xb8; 32];
     harness.replace_with_broker(NEW_INSTANCE, NEW_CAPABILITY);
-    harness.handle.disconnect();
     harness.device.restore_device(Some(saved)).unwrap();
+    assert!(!harness.handle.is_connected());
     harness
         .enable_with_state(Some(receive_state), Some(transmit_state))
         .await;
@@ -1929,6 +1929,30 @@ async fn broker_state_validator_rejects_malformed_private_state(driver: DefaultD
     state.broker.as_mut().unwrap().guest_parser.header_count = u32::MAX;
     let malformed = SavedStateBlob::new(state);
     let validator = harness.device.device_state_validator();
+    assert!(
+        validator(
+            Some(&malformed),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
+
+    let mut state: crate::saved_state::SavedState = saved.parse().unwrap();
+    let broker = state.broker.as_mut().unwrap();
+    broker.instance_id = [0x44; 16].to_vec();
+    broker.guest_output.current = Some(crate::saved_state::SavedEncodedRecord {
+        bytes: encode(&Record::session(
+            RecordType::Reset,
+            BROKER_INSTANCE,
+            1,
+            0,
+            Vec::new(),
+        )),
+        offset: 1,
+    });
+    let malformed = SavedStateBlob::new(state);
     assert!(
         validator(
             Some(&malformed),
