@@ -75,6 +75,15 @@ removes the complete staging directory before resuming; if cleanup cannot be
 proved, it terminates the source instead.
 ```
 
+While a guest-requested snapshot boundary is held, VM-worker management RPCs
+that can change VM state are rejected rather than queued. This includes memory
+writes, pause/resume, reset, interrupt injection, hotplug, and state dumps.
+Snapshot lifecycle RPCs and memory reads remain available. Mutating RPCs with
+an error result report that the boundary is active; pause, clear-halt, and NMI
+requests report a reply-channel error because their result types cannot carry
+an application error. Retry a rejected operation after the boundary is
+released; ordinary paused VMs are not subject to this restriction.
+
 ## Restoring a snapshot
 
 To restore, pass the snapshot directory with `--restore-snapshot`:
