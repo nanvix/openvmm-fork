@@ -666,15 +666,7 @@ impl ControlSessionBroker {
         new_instance_id: [u8; 16],
         new_capability: [u8; 32],
     ) -> Result<Self, BrokerError> {
-        Self::validate_snapshot(&snapshot)?;
-        if new_instance_id == [0; 16] {
-            return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
-        }
-        if snapshot.instance_id == new_instance_id {
-            return Err(BrokerError::InvalidSnapshot(
-                "restore reused the saved instance ID",
-            ));
-        }
+        Self::validate_restore(&snapshot, new_instance_id)?;
         let guest_parser = Parser::restore(snapshot.guest_parser)?;
         let mut saved_guest_output = OutputLeg::restore(snapshot.guest_output)?;
         let _saved_host_output = OutputLeg::restore(snapshot.host_output)?;
@@ -688,14 +680,6 @@ impl ControlSessionBroker {
         {
             saved_guest_output.current = None;
         }
-        if let Some(current) = &saved_guest_output.current {
-            let record = control_session_protocol::decode_exact(&current.bytes)?;
-            if record.instance_id == [0; 16] || record.instance_id == new_instance_id {
-                return Err(BrokerError::InvalidSnapshot(
-                    "partial guest output does not belong to an old instance",
-                ));
-            }
-        }
 
         let mut broker = Self::new(new_instance_id, new_capability);
         broker.state = BrokerState::ResetPending;
@@ -705,6 +689,33 @@ impl ControlSessionBroker {
         broker.counters = snapshot.counters;
         broker.enqueue_guest_control(RecordType::Reset)?;
         Ok(broker)
+    }
+
+    /// Validates snapshot state against the fresh destination identity.
+    pub fn validate_restore(
+        snapshot: &BrokerSnapshot,
+        new_instance_id: [u8; 16],
+    ) -> Result<(), BrokerError> {
+        Self::validate_snapshot(snapshot)?;
+        if new_instance_id == [0; 16] {
+            return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
+        }
+        if snapshot.instance_id == new_instance_id {
+            return Err(BrokerError::InvalidSnapshot(
+                "restore reused the saved instance ID",
+            ));
+        }
+        if let Some(current) = &snapshot.guest_output.current
+            && current.offset != 0
+        {
+            let record = control_session_protocol::decode_exact(&current.bytes)?;
+            if record.instance_id == [0; 16] || record.instance_id == new_instance_id {
+                return Err(BrokerError::InvalidSnapshot(
+                    "partial guest output does not belong to an old instance",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Validates all snapshot bounds and encoded values without constructing a
