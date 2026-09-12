@@ -890,6 +890,9 @@ fn random_nonzero_bytes<const N: usize>(description: &'static str) -> anyhow::Re
     }
 }
 
+// UNSAFETY: The launcher transfers exclusive ownership of the inherited
+// capability descriptor to OpenVMM.
+#[cfg_attr(unix, expect(unsafe_code))]
 fn microvm_control_broker_config(
     opt: &Options,
     endpoint: &SerialConfigCli,
@@ -902,7 +905,9 @@ fn microvm_control_broker_config(
             .context("live microVM control console requires an inherited authentication handle")?;
         #[cfg(unix)]
         {
-            let capability = serial_io::read_control_capability(inherited)
+            // SAFETY: the CLI handle follows the launcher's exclusive-transfer
+            // contract and is consumed exactly once here.
+            let capability = unsafe { serial_io::read_control_capability(inherited) }
                 .context("failed to read control-console authentication capability")?;
             anyhow::ensure!(
                 capability != [0; 32],
@@ -1716,6 +1721,8 @@ mod microvm_console_attachment_tests {
         use std::io::Write as _;
         use std::os::fd::IntoRawFd as _;
 
+        // UNSAFETY: into_raw_fd transfers exclusive ownership to the reader.
+        #[expect(unsafe_code)]
         fn read_payload(payload: &[u8], keep_writer_open: bool) -> io::Result<[u8; 32]> {
             let (read, mut write) = pal::pipe_pair()?;
             write.write_all(payload)?;
@@ -1723,14 +1730,14 @@ mod microvm_console_attachment_tests {
                 drop(write);
             }
             let raw = read.into_raw_fd();
-            serial_io::read_control_capability(raw as u64)
+            // SAFETY: `read` relinquished exclusive ownership above.
+            unsafe { serial_io::read_control_capability(raw as u64) }
         }
 
         assert_eq!(read_payload(&[0x5a; 32], false).unwrap(), [0x5a; 32]);
         assert!(read_payload(&[0x5a; 31], false).is_err());
         assert!(read_payload(&[0x5a; 33], false).is_err());
         assert!(read_payload(&[0x5a; 32], true).is_err());
-        assert!(serial_io::read_control_capability(u64::MAX).is_err());
     }
 
     #[test]
