@@ -25,6 +25,10 @@ pal.workspace = true
 pal.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+workspace = true
+features = ["Win32_Foundation"]
+
 [dev-dependencies]
 test_with_tracing.workspace = true
 
